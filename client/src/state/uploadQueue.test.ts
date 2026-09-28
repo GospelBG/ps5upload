@@ -67,7 +67,7 @@ import {
   type AddQueueItem,
 } from "./uploadQueue";
 import { useUploadSettingsStore } from "./uploadSettings";
-import { runPkgInstall } from "./pkgLibrary";
+import { runPkgInstall, pkgLibraryStore } from "./pkgLibrary";
 import { registerInstallExecutor, type InstallResult } from "./consoleQueueBridge";
 import { sameInstall } from "./uploadQueue";
 
@@ -1381,5 +1381,67 @@ describe("install item lifecycle", () => {
       host, request: { via: "stream", source: "/w.pkg" }, displayName: "W",
     });
     await expect(q.done).resolves.toEqual({ ok: true });
+  });
+});
+
+describe("Retry via upload", () => {
+  const host = "10.0.0.2";
+  beforeEach(() => {
+    vi.useRealTimers();
+    useUploadQueueStore.getState().stop();
+    mockedEnsurePayload.mockReset().mockResolvedValue(undefined as never);
+    useUploadQueueStore.setState({
+      ...pristineQueue,
+      items: [],
+      runningHosts: {},
+      running: false,
+      continueOnFailure: true,
+      loaded: true,
+    });
+  });
+  afterEach(() => useUploadQueueStore.getState().stop());
+
+  it("offers it on a stream install the PS5 never fetched, and re-adds the file as an upload", async () => {
+    registerInstallExecutor(async () => ({
+      ok: false,
+      message: "unreachable",
+      stagedFallbackRecommended: true,
+    }));
+    const addAndUpload = vi.fn(async () => {});
+    pkgLibraryStore(host).setState({ addAndUpload } as never);
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "stream", source: "/games/a.pkg" }, displayName: "A",
+    });
+    await q.done;
+    const failed = useUploadQueueStore.getState().items.find((i) => i.id === q.id)!;
+    expect(failed.fallbackToUpload).toBe(true);
+    const r = await useUploadQueueStore.getState().retryInstallViaUpload(q.id);
+    expect(r.ok).toBe(true);
+    expect(useUploadQueueStore.getState().items.find((i) => i.id === q.id)).toBeUndefined();
+    expect(addAndUpload).toHaveBeenCalledWith("/games/a.pkg", host);
+  });
+
+  it("is refused for a link", async () => {
+    registerInstallExecutor(async () => ({ ok: false, stagedFallbackRecommended: true }));
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host,
+      request: { via: "link", url: "https://x.example/y.pkg", mode: "stream", insecureTls: false },
+      displayName: "Y",
+    });
+    await q.done;
+    expect(useUploadQueueStore.getState().items.find((i) => i.id === q.id)?.fallbackToUpload).toBeFalsy();
+    await expect(useUploadQueueStore.getState().retryInstallViaUpload(q.id)).resolves.toMatchObject({
+      ok: false,
+      message: expect.stringMatching(/only for a file on this computer/),
+    });
+  });
+
+  it("is not offered when the PS5 did fetch (a different failure)", async () => {
+    registerInstallExecutor(async () => ({ ok: false, message: "rejected" }));
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "stream", source: "/games/b.pkg" }, displayName: "B",
+    });
+    await q.done;
+    expect(useUploadQueueStore.getState().items.find((i) => i.id === q.id)?.fallbackToUpload).toBeFalsy();
   });
 });

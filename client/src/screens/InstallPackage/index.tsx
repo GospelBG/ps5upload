@@ -769,34 +769,18 @@ export default function InstallPackageScreen() {
             "The install didn't complete.",
           ),
     });
-    if (!r.ok && r.stagedFallbackRecommended) {
-      const fallback = await confirm({
-        title: tr(
-          "pkglib.stream.fallback.title",
-          undefined,
-          "Retry from PS5 staging?",
-        ),
-        message: `${r.message || "The PS5 couldn't complete the HTTP install."}\n\nUpload the same package to PS5 staging and install it now? This uses the PS5-local file path and does not depend on Sony's HTTP proxy.`,
-        confirmLabel: tr(
-          "pkglib.stream.fallback.confirm",
-          undefined,
-          "Upload & install",
-        ),
-        cancelLabel: tr("pkglib.stream.fallback.cancel", undefined, "Not now"),
-      });
-      if (fallback) {
-        setPickError(null);
-        await addAndUpload(sourcePath, host, {
-          installAfterUpload: true,
-          selectVariant: true,
-        });
-        // addAndUpload records an explicit variant choice when needed.
-        setAlternativeSelections(loadPkgAlternativeSelections(host));
-      } else if (r.message) {
-        setPickError(r.message);
-      }
-    } else if (!r.ok && r.message) {
-      setPickError(r.message);
+    if (!r.ok && r.message) {
+      // The PS5 couldn't fetch from this computer: its row in the Queue below
+      // offers Retry via upload, which copies the file to the PS5 first.
+      setPickError(
+        r.stagedFallbackRecommended
+          ? `${r.message} ${tr(
+              "pkglib.stream.retry_via_upload_hint",
+              undefined,
+              "Use Retry via upload on its row in the Queue to copy it to the PS5 and install from there.",
+            )}`
+          : r.message,
+      );
     }
   }
 

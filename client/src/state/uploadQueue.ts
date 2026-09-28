@@ -168,6 +168,9 @@ export interface QueueItem {
   /** Install-only: what to install and from where. A link is never persisted
    *  (see scheduleSave), so a restored item without it is dropped on hydrate. */
   install?: InstallRequest;
+  /** Install-only: a stream install the PS5 never fetched from — offer
+   *  "Retry via upload", which copies the file to the PS5 first. */
+  fallbackToUpload?: boolean;
   /** Pkg-only: run the installer once the .pkg upload commits (default on —
    *  staging a pkg exists to install it). Mirrors installSettings, captured at
    *  add time so toggling the default mid-queue doesn't disturb queued rows. */
@@ -302,6 +305,9 @@ interface QueueState {
   /** Re-run one failed install item; returns a fresh waiter, or null when the
    *  row is missing, not an install, or not failed. */
   retryInstall: (id: string) => EnqueuedInstall | null;
+  /** Replace a failed stream install of a file on this computer with an
+   *  upload & install of the same file. */
+  retryInstallViaUpload: (id: string) => Promise<{ ok: boolean; message?: string }>;
   remove: (id: string) => void;
   /** Cancel a single item and drop it from the queue. If it's the one
    *  actively uploading, its in-flight engine job is aborted (at the next
@@ -1182,6 +1188,13 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
                 errorDetail: detail,
                 completedAt: Date.now(),
                 ...(isInstall ? { installPhase: "error" as const } : {}),
+                ...(isInstall &&
+                e instanceof InstallItemError &&
+                e.result.stagedFallbackRecommended &&
+                next.install?.via === "stream" &&
+                !isRemotePath(next.install.source)
+                  ? { fallbackToUpload: true }
+                  : {}),
               }),
             }));
             scheduleSave();
@@ -1424,6 +1437,29 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       const done = new Promise<InstallResult>((resolve) => waiters.set(id, resolve));
       void get().startHost(hostOf(it.addr));
       return { id, done };
+    },
+
+    async retryInstallViaUpload(id) {
+      const it = get().items.find((x) => x.id === id);
+      if (
+        !it ||
+        it.status !== "failed" ||
+        it.install?.via !== "stream" ||
+        isRemotePath(it.install.source)
+      ) {
+        return {
+          ok: false,
+          message: "Retry via upload works only for a file on this computer.",
+        };
+      }
+      const source = it.install.source;
+      const host = hostOf(it.addr);
+      set((s) => ({ items: removeItem(s.items, id) }));
+      scheduleSave();
+      // Install Package's upload: its own checks, then an upload item and an
+      // install item in this queue.
+      void pkgLibraryStore(host).getState().addAndUpload(source, host);
+      return { ok: true };
     },
 
     add(input) {
