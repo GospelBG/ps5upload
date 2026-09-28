@@ -16,6 +16,13 @@ What's new in ps5upload, written for humans.
   when browsing a saved server, the file browser now has checkboxes that stay
   ticked while you move between folders, and an **Add N** button.
 
+**Nothing hidden behind More.**
+
+- **The sidebar lists every screen**, in its sections, from the first launch.
+  Hover a screen to hide it; fold a section you don't use. Hidden screens come
+  back from **More**, where each has a show/hide switch. (Favorites are
+  retired: starring screens is no longer needed to reach them.)
+
 **Convert, more ways.**
 
 - **A convert queue.** Queue several games; they're converted one after
@@ -30,6 +37,9 @@ What's new in ps5upload, written for humans.
 - **Game language.** For a game that stays in English on a console set to
   another language, Convert can declare one language in the package. Most
   games follow the console's language and aren't affected.
+- **Honest build times.** The time on each compression level now covers the
+  whole build — compress, write and verify — at the speed your drives
+  actually read and write, instead of the compression step alone.
 
 **Stream & install first.**
 
@@ -84,6 +94,8 @@ What's new in ps5upload, written for humans.
   name.
 - Every screen uses the same layout, buttons never squeeze their labels, and
   phones wrap long titles and button rows.
+- Section headers, tabs and small buttons show at their intended size; they
+  were all drawn at body-text size.
 - In the browser build, the FAQ and changelog load, and options a web page
   can't provide are hidden.
 
