@@ -117,3 +117,16 @@ describe("changeNotesText", () => {
     expect(html).not.toContain("What&#x27;s new");
   });
 });
+
+describe("installed line", () => {
+  it("says when an update's base game is missing", () => {
+    const html = view({
+      checks: { ...checks, installed: { verdict: "bad", relation: "base-missing", installedVer: null } },
+    });
+    expect(html).toContain("Base game not installed");
+  });
+  it("shows no installed line when the console couldn't say", () => {
+    const html = view({ checks: { ...checks, installed: null } });
+    expect(html).not.toContain("Not installed");
+  });
+});

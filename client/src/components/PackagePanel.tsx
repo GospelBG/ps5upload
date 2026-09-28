@@ -10,14 +10,17 @@ import { AlertTriangle, CheckCircle2, CircleHelp, Copy, XCircle } from "lucide-r
 import { Drawer } from "./Drawer";
 import { Button, ErrorCard, Spinner } from "./index";
 import { gameInspect, gameInspectImageUrl, type GameInspection } from "../api/gameInspect";
-import { installFreeBytes, pkgInstallPreflight } from "../api/ps5";
+import { listVolumes, pkgInstallPreflight } from "../api/ps5";
+import { pkgTypeForCategory } from "../state/pkgLibrary";
 import { formatBytes } from "../lib/format";
 import { hostOf, transferAddr } from "../lib/addr";
 import { parsePS5Firmware } from "../lib/ps5Firmware";
 import { useTitleInfo } from "../lib/useTitleInfo";
 import {
   firmwareCheck,
-  installedCheck,
+  installedFromPreflight,
+  largestFreeBytes,
+  platformFirmwareCheck,
   spaceCheck,
   type Verdict,
 } from "../lib/packageChecks";
@@ -32,7 +35,7 @@ export interface PanelAction {
 
 export interface PanelChecks {
   firmware: ReturnType<typeof firmwareCheck>;
-  installed: (ReturnType<typeof installedCheck> & { installedVer: string | null }) | null;
+  installed: ReturnType<typeof installedFromPreflight>;
   space: ReturnType<typeof spaceCheck> | null;
 }
 
@@ -145,7 +148,13 @@ export function PackagePanelView({
       text:
         inst.relation === "not-installed"
           ? tr("viewer_not_installed", undefined, "Not installed")
-          : inst.relation === "newer"
+          : inst.relation === "base-missing"
+            ? tr("viewer_base_missing", undefined, "Base game not installed")
+            : inst.relation === "installed"
+              ? ver
+                ? tr("viewer_installed_same", { ver }, `Already installed (${ver})`)
+                : tr("viewer_installed", undefined, "Installed")
+              : inst.relation === "newer"
             ? tr("viewer_installed_newer", { ver }, `Newer than the installed ${ver}`)
             : inst.relation === "older"
               ? tr("viewer_installed_older", { ver }, `Older than the installed ${ver}`)
@@ -381,16 +390,17 @@ export function PackagePanel({
         if (host) {
           const g = r.inspection;
           if (g.identity.content_id) {
-            void pkgInstallPreflight(transferAddr(host), g.identity.content_id)
+            void pkgInstallPreflight(transferAddr(host), g.identity.content_id, {
+              packageType: pkgTypeForCategory(g.identity.category, g.identity.platform),
+            })
               .then((pre) => {
-                if (latest.current !== path || !pre) return;
-                const ver = pre.state === "not_installed" ? null : pre.installedVersion;
-                setInstalled({ ...installedCheck(g.specs.app_ver, ver), installedVer: ver });
+                if (latest.current !== path) return;
+                setInstalled(installedFromPreflight(g.specs.app_ver, pre));
               })
               .catch(() => {});
           }
-          void installFreeBytes(transferAddr(host))
-            .then((b) => latest.current === path && setFree(b))
+          void listVolumes(transferAddr(host))
+            .then((vols) => latest.current === path && setFree(largestFreeBytes(vols)))
             .catch(() => {});
         }
       })
@@ -405,7 +415,11 @@ export function PackagePanel({
 
   const checks: PanelChecks = useMemo(
     () => ({
-      firmware: firmwareCheck(data?.inspection.specs.min_fw ?? null, parsePS5Firmware(kernel)),
+      firmware: platformFirmwareCheck(
+        data?.inspection.identity.platform ?? "",
+        data?.inspection.specs.min_fw ?? null,
+        parsePS5Firmware(kernel),
+      ),
       installed,
       space: data && host ? spaceCheck(data.inspection.source.size, free) : null,
     }),

@@ -49,3 +49,52 @@ export function spaceCheck(size: number, freeBytes: number | null) {
     ? { verdict: "ok" as Verdict, shortBy: 0 }
     : { verdict: "bad" as Verdict, shortBy: size - freeBytes };
 }
+
+/** Firmware check that only compares like with like: a PS4 package declares a
+ *  PS4 firmware, which says nothing about which PS5 firmware runs it. */
+export function platformFirmwareCheck(
+  platform: string,
+  minFw: string | null,
+  consoleFw: string | null,
+) {
+  return firmwareCheck(platform === "ps5" ? minFw : null, consoleFw);
+}
+
+export type InstalledRelation =
+  | "not-installed"
+  | "newer"
+  | "older"
+  | "same"
+  | "installed"
+  | "base-missing";
+
+/** The installed check from the engine's preflight answer. No answer, or an
+ *  answer the engine couldn't determine, is no verdict — never "not installed". */
+export function installedFromPreflight(
+  pkgVer: string,
+  pre: { state: string; installedVersion: string | null } | null,
+): { verdict: Verdict; relation: InstalledRelation; installedVer: string | null } | null {
+  if (!pre || pre.state === "unknown") return null;
+  const ver = pre.installedVersion;
+  if (pre.state === "base_missing") {
+    return { verdict: "bad", relation: "base-missing", installedVer: null };
+  }
+  if (pre.state === "not_installed") {
+    return { verdict: "ok", relation: "not-installed", installedVer: null };
+  }
+  // Installed, but one side's version is unknown: say installed, don't compare.
+  if (!ver || !pkgVer) {
+    return { verdict: "warn", relation: "installed", installedVer: ver };
+  }
+  return { ...installedCheck(pkgVer, ver), installedVer: ver };
+}
+
+/** Free bytes on the roomiest single drive: a package lands on one drive, so
+ *  the sum across drives would over-promise. Null when nothing is readable. */
+export function largestFreeBytes(
+  volumes: { free_bytes: number; is_placeholder?: boolean; writable?: boolean }[],
+): number | null {
+  const real = volumes.filter((v) => !v.is_placeholder && v.writable !== false);
+  if (real.length === 0) return null;
+  return Math.max(...real.map((v) => v.free_bytes));
+}

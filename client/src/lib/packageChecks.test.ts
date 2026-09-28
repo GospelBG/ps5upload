@@ -26,3 +26,55 @@ describe("package checks", () => {
     expect(spaceCheck(100, null).verdict).toBe("unknown");
   });
 });
+
+import { installedFromPreflight, largestFreeBytes, platformFirmwareCheck } from "./packageChecks";
+
+describe("review fixes", () => {
+  it("never compares a PS4 package's firmware with the PS5's", () => {
+    expect(platformFirmwareCheck("ps4", "9.00", "5.10").verdict).toBe("unknown");
+    expect(platformFirmwareCheck("ps5", "12.00", "5.10").verdict).toBe("bad");
+    expect(platformFirmwareCheck("", "5.10", "9.60").verdict).toBe("unknown");
+  });
+
+  it("an unknown or failed preflight is no verdict, never 'not installed'", () => {
+    expect(installedFromPreflight("01.04", null)).toBeNull();
+    expect(installedFromPreflight("01.04", { state: "unknown", installedVersion: null })).toBeNull();
+  });
+
+  it("installed without a version reads as installed", () => {
+    expect(installedFromPreflight("01.04", { state: "installed", installedVersion: null })).toMatchObject({
+      relation: "installed",
+    });
+  });
+
+  it("an update or DLC whose base is missing says so", () => {
+    expect(installedFromPreflight("01.04", { state: "base_missing", installedVersion: null })).toMatchObject({
+      verdict: "bad",
+      relation: "base-missing",
+    });
+  });
+
+  it("an empty package version is not compared", () => {
+    expect(installedFromPreflight("", { state: "installed", installedVersion: "01.04" })).toMatchObject({
+      relation: "installed",
+      installedVer: "01.04",
+    });
+  });
+
+  it("versions compare when both are known", () => {
+    expect(
+      installedFromPreflight("01.04", { state: "different_version_installed", installedVersion: "01.02" }),
+    ).toMatchObject({ relation: "newer" });
+    expect(installedFromPreflight("01.04", { state: "not_installed", installedVersion: null })).toMatchObject({
+      relation: "not-installed",
+    });
+  });
+
+  it("space is measured against the roomiest single drive, not the sum", () => {
+    const v = (path: string, free: number, extra: Record<string, unknown> = {}) =>
+      ({ path, free_bytes: free, total_bytes: free * 2, writable: true, fs_type: "x", ...extra }) as never;
+    expect(largestFreeBytes([v("/data", 100), v("/mnt/ext0", 300)])).toBe(300);
+    expect(largestFreeBytes([v("/data", 100), v("/mnt/x", 900, { is_placeholder: true })])).toBe(100);
+    expect(largestFreeBytes([])).toBeNull();
+  });
+});
