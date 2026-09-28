@@ -289,6 +289,7 @@ pub fn run() {
             commands::fpkg_inspect,
             commands::game_inspect,
             commands::game_inspect_image,
+            commands::game_inspect_files,
             commands::fpkg_build,
             commands::fpkg_delete,
             commands::fpkg_estimate,

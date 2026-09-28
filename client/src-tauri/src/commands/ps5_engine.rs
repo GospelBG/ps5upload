@@ -2357,6 +2357,23 @@ pub async fn game_inspect_image(token: String, name: String) -> Result<JsonValue
     }))
 }
 
+/// The Files tab of the package viewer: entries or files of an inspected source.
+/// GET /api/game/inspect/files.
+#[tauri::command]
+pub async fn game_inspect_files(token: String) -> Result<JsonValue, String> {
+    let base = engine::url();
+    let resp = http_client()
+        .get(format!("{base}/api/game/inspect/files"))
+        .query(&[("token", token.as_str())])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("file list request failed: {}", resp.status()));
+    }
+    resp.json::<JsonValue>().await.map_err(|e| e.to_string())
+}
+
 /// What a game source is, before converting it: readiness, size and cost.
 /// POST /api/fpkg/inspect.
 #[tauri::command]

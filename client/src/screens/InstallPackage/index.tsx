@@ -277,6 +277,15 @@ function PkgRow({
                   )}
                 </>
               )}
+              {!entry.sourcePath && onView && (
+                <button
+                  type="button"
+                  onClick={onView}
+                  className="ml-2 shrink-0 rounded px-1 text-[var(--color-accent)] hover:underline"
+                >
+                  {tr("viewer_open", undefined, "View details")}
+                </button>
+              )}
             </div>
             {/* Upload provenance. Computer-side details remain in this app's
                 local cache; older/other-computer rows still show the PS5 path
@@ -1267,11 +1276,7 @@ export default function InstallPackageScreen() {
         }
         onInstall={() => void handleInstall(entry)}
         onDelete={() => void handleDelete(entry)}
-        onView={
-          entry.sourcePath && !isRemotePath(entry.sourcePath)
-            ? () => setViewEntry(entry)
-            : undefined
-        }
+        onView={() => setViewEntry(entry)}
       />
     );
   };
@@ -1279,7 +1284,15 @@ export default function InstallPackageScreen() {
   return (
     <div className="p-6">
       <PackagePanel
-        path={viewEntry?.sourcePath ?? null}
+        path={
+          viewEntry
+            ? // The original on this computer reads fastest; otherwise the staged copy on the
+              // console, read over its FTP server.
+              viewEntry.sourcePath && !isRemotePath(viewEntry.sourcePath)
+              ? viewEntry.sourcePath
+              : `ps5://${hostOf(host)}${viewEntry.path}`
+            : null
+        }
         host={host}
         onClose={() => setViewEntry(null)}
         actions={

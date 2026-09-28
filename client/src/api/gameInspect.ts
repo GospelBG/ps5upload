@@ -46,6 +46,17 @@ export function gameInspect(path: string) {
   });
 }
 
+export interface InspectFile {
+  path: string;
+  size: number;
+  encrypted: boolean;
+}
+
+/** The Files tab: a package's entries, or the files of a folder or image. */
+export function gameInspectFiles(token: string) {
+  return invoke<{ files: InspectFile[]; truncated: boolean }>("game_inspect_files", { token });
+}
+
 /** An inspected source's image as a `data:` URL, in every build. */
 export async function gameInspectImageUrl(
   token: string,

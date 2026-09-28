@@ -695,6 +695,10 @@ export async function browserInvoke<T>(
     case "game_inspect": {
       return postJson<T>("/api/game/inspect", { path: args["path"] });
     }
+    case "game_inspect_files": {
+      const q = new URLSearchParams({ token: String(args["token"]) });
+      return getJson<T>(`/api/game/inspect/files?${q}`);
+    }
     case "game_inspect_image": {
       const q = new URLSearchParams({
         token: String(args["token"]),

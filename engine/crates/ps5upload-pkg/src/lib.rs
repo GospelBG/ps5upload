@@ -563,6 +563,16 @@ pub struct SplitPkgMetadata {
 pub fn parse_pkg(path: &Path) -> Result<PkgMetadata, PkgError> {
     let mut f = File::open(path)?;
     let size = f.metadata()?.len();
+    parse_pkg_from(&mut f, size, path)
+}
+
+/// [`parse_pkg`] over any seekable bytes of `size` (a package on a server or the console);
+/// `path` is only recorded in the result.
+pub fn parse_pkg_from<R: Read + Seek>(
+    f: &mut R,
+    size: u64,
+    path: &Path,
+) -> Result<PkgMetadata, PkgError> {
     if size < 0xA0 {
         // Header is ~160 bytes; anything smaller can't be a real PKG.
         return Err(PkgError::Truncated(size));
@@ -687,7 +697,7 @@ pub fn parse_pkg(path: &Path) -> Result<PkgMetadata, PkgError> {
 
     // Walk the entry table. Each entry is 0x20 bytes.
     if let Err(e) = walk_entries(
-        &mut f,
+        f,
         container_base,
         table_offset,
         entry_count,
@@ -812,7 +822,7 @@ pub fn parse_split_pkg(head_path: &Path) -> Result<SplitPkgMetadata, PkgError> {
 }
 
 fn walk_entries(
-    f: &mut File,
+    f: &mut (impl Read + Seek),
     container_base: u64,
     table_offset: u32,
     entry_count: u32,
@@ -1083,7 +1093,7 @@ fn known_entry_name(id: u32) -> Option<&'static str> {
 
 /// The metadata container of a package: its base offset in the file and its
 /// 0xA0-byte header. A PS5 `\x7FFIH` image points at an embedded `\x7FCNT`.
-fn container_of(f: &mut File, size: u64) -> Result<(u64, [u8; 0xA0]), PkgError> {
+fn container_of<R: Read + Seek>(f: &mut R, size: u64) -> Result<(u64, [u8; 0xA0]), PkgError> {
     if size < 0xA0 {
         return Err(PkgError::Truncated(size));
     }
@@ -1117,7 +1127,15 @@ fn container_of(f: &mut File, size: u64) -> Result<(u64, [u8; 0xA0]), PkgError> 
 pub fn pkg_entries(path: &Path) -> Result<Vec<PkgEntryInfo>, PkgError> {
     let mut f = File::open(path)?;
     let size = f.metadata()?.len();
-    let (base, head) = container_of(&mut f, size)?;
+    pkg_entries_from(&mut f, size)
+}
+
+/// [`pkg_entries`] over any seekable bytes of `size`.
+pub fn pkg_entries_from<R: Read + Seek>(
+    f: &mut R,
+    size: u64,
+) -> Result<Vec<PkgEntryInfo>, PkgError> {
+    let (base, head) = container_of(f, size)?;
     let count = u32::from_be_bytes([head[0x10], head[0x11], head[0x12], head[0x13]]);
     let table = u32::from_be_bytes([head[0x18], head[0x19], head[0x1A], head[0x1B]]);
     if count == 0 || count > 1024 {
@@ -1148,7 +1166,7 @@ pub fn pkg_entries(path: &Path) -> Result<Vec<PkgEntryInfo>, PkgError> {
     let names = entries
         .iter()
         .find(|(e, _)| e.id == ENTRY_NAMES && !e.encrypted && e.size <= 1 << 20)
-        .and_then(|(e, _)| read_pkg_entry(path, e, 1 << 20).ok());
+        .and_then(|(e, _)| read_pkg_entry_from(f, e, 1 << 20).ok());
     for (e, name_off) in entries.iter_mut() {
         let from_table = names.as_ref().and_then(|t| {
             let at = *name_off as usize;
@@ -1169,13 +1187,21 @@ pub fn pkg_entries(path: &Path) -> Result<Vec<PkgEntryInfo>, PkgError> {
 
 /// The bytes of one entry, when it is not encrypted and not larger than `max`.
 pub fn read_pkg_entry(path: &Path, entry: &PkgEntryInfo, max: u32) -> Result<Vec<u8>, PkgError> {
+    read_pkg_entry_from(&mut File::open(path)?, entry, max)
+}
+
+/// [`read_pkg_entry`] over any seekable bytes.
+pub fn read_pkg_entry_from<R: Read + Seek>(
+    f: &mut R,
+    entry: &PkgEntryInfo,
+    max: u32,
+) -> Result<Vec<u8>, PkgError> {
     if entry.encrypted {
         return Err(PkgError::Header("entry is encrypted"));
     }
     if entry.size > max {
         return Err(PkgError::Header("entry too large"));
     }
-    let mut f = File::open(path)?;
     let mut buf = vec![0u8; entry.size as usize];
     f.seek(SeekFrom::Start(entry.offset))?;
     f.read_exact(&mut buf)?;
@@ -2128,5 +2154,29 @@ mod tests {
         d.push(format!("ps5upload-pkg-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn a_package_parses_the_same_through_a_reader() {
+        let bytes = build_pkg_multi(
+            "UP0000-PPSA01234_00-TESTGAME00000000",
+            &[("TITLE", "Reader")],
+        );
+        let path = std::env::temp_dir().join(format!("pkg-reader-{}.pkg", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let by_path = parse_pkg(&path).unwrap();
+        let mut cur = std::io::Cursor::new(bytes.clone());
+        let by_reader = parse_pkg_from(&mut cur, bytes.len() as u64, &path).unwrap();
+        assert_eq!(format!("{by_path:?}"), format!("{by_reader:?}"));
+        let entries = pkg_entries(&path).unwrap();
+        let mut cur = std::io::Cursor::new(bytes.clone());
+        let via = pkg_entries_from(&mut cur, bytes.len() as u64).unwrap();
+        assert_eq!(format!("{entries:?}"), format!("{via:?}"));
+        let e = entries.iter().find(|e| !e.encrypted).unwrap();
+        let mut cur = std::io::Cursor::new(bytes);
+        assert_eq!(
+            read_pkg_entry(&path, e, 1 << 20).unwrap(),
+            read_pkg_entry_from(&mut cur, e, 1 << 20).unwrap()
+        );
     }
 }

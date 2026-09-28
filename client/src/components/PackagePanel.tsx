@@ -11,7 +11,12 @@ import { Drawer } from "./Drawer";
 import { Button, ErrorCard, Spinner } from "./index";
 import { gameInspect, gameInspectImageUrl, type GameInspection } from "../api/gameInspect";
 import { listVolumes, pkgInstallPreflight } from "../api/ps5";
-import { pkgTypeForCategory } from "../state/pkgLibrary";
+import { pkgTypeForCategory, usePkgLibrary } from "../state/pkgLibrary";
+import { useUploadQueueStore } from "../state/uploadQueue";
+import { relatedPackages } from "../lib/viewerLists";
+import { FilesTab } from "./packageViewer/FilesTab";
+import { ImagesTab } from "./packageViewer/ImagesTab";
+import { RelatedTab } from "./packageViewer/RelatedTab";
 import { formatBytes } from "../lib/format";
 import { hostOf, transferAddr } from "../lib/addr";
 import { parsePS5Firmware } from "../lib/ps5Firmware";
@@ -40,7 +45,9 @@ export interface PanelChecks {
   space: ReturnType<typeof spaceCheck> | null;
 }
 
-type Tab = "overview" | "details";
+type Tab = "overview" | "details" | "files" | "images" | "related";
+
+const TABS: Tab[] = ["overview", "details", "files", "images", "related"];
 
 /** The PARAM keys worth seeing first; the rest sit behind Show all. */
 const CURATED_KEYS = new Set([
@@ -104,6 +111,9 @@ export function PackagePanelView({
   actions,
   tab,
   onTab,
+  token = null,
+  related = [],
+  onOpenRelated,
 }: {
   inspection: GameInspection;
   coverUrl: string | null;
@@ -112,6 +122,10 @@ export function PackagePanelView({
   actions: PanelAction[];
   tab: Tab;
   onTab: (t: Tab) => void;
+  /** The inspection's token: the Files and Images tabs read through it. */
+  token?: string | null;
+  related?: ReturnType<typeof relatedPackages>;
+  onOpenRelated?: (path: string) => void;
 }) {
   const tr = useTr();
   const [showAll, setShowAll] = useState(false);
@@ -265,7 +279,7 @@ export function PackagePanelView({
       )}
 
       <div role="tablist" className="flex gap-1 overflow-x-auto border-b border-[var(--color-border)]">
-        {(["overview", "details"] as const).map((t) => (
+        {TABS.filter((t) => token || (t !== "files" && t !== "images")).map((t) => (
           <button
             key={t}
             type="button"
@@ -278,14 +292,26 @@ export function PackagePanelView({
                 : "border-transparent text-[var(--color-muted)] hover:text-[var(--color-text)]"
             }`}
           >
-            {t === "overview"
-              ? tr("viewer_tab_overview", undefined, "Overview")
-              : tr("viewer_tab_details", undefined, "Details")}
+            {
+              {
+                overview: tr("viewer_tab_overview", undefined, "Overview"),
+                details: tr("viewer_tab_details", undefined, "Details"),
+                files: tr("viewer_tab_files", undefined, "Files"),
+                images: tr("viewer_tab_images", undefined, "Images"),
+                related: tr("viewer_tab_related", undefined, "Related"),
+              }[t]
+            }
           </button>
         ))}
       </div>
 
-      {tab === "overview" ? (
+      {tab === "files" && token ? (
+        <FilesTab token={token} />
+      ) : tab === "images" && token ? (
+        <ImagesTab token={token} images={g.images} />
+      ) : tab === "related" ? (
+        <RelatedTab groups={related} onOpen={onOpenRelated} />
+      ) : tab === "overview" ? (
         <div className="grid gap-4">
           <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1.5 text-sm">
             {rows
@@ -362,6 +388,11 @@ export function PackagePanel({
   actions?: PanelAction[];
 }) {
   const tr = useTr();
+  // A related package opened from the Related tab replaces what the screen asked for until
+  // the screen asks for something else.
+  const [opened, setOpened] = useState<string | null>(null);
+  useEffect(() => setOpened(null), [path]);
+  const shown = opened ?? path;
   const [data, setData] = useState<{ token: string; inspection: GameInspection } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [cover, setCover] = useState<string | null>(null);
@@ -385,8 +416,8 @@ export function PackagePanel({
     setInstalled(null);
     setFree(null);
     setTab("overview");
-    if (!path) return;
-    void gameInspect(path)
+    if (!shown) return;
+    void gameInspect(shown)
       .then(async (r) => {
         if (!current()) return;
         setData(r);
@@ -422,7 +453,24 @@ export function PackagePanel({
       .catch((e) => {
         if (current()) setError(e instanceof Error ? e.message : String(e));
       });
-  }, [path, host]);
+  }, [shown, host]);
+
+  const library = usePkgLibrary(host ?? "", (s) => s.entries);
+  const queue = useUploadQueueStore((s) => s.items);
+  const related = useMemo(
+    () =>
+      data
+        ? relatedPackages(
+            data.inspection.identity.title_id,
+            shown?.replace(/^ps5:\/\/[^/]+/, "") ?? null,
+            host ? library : [],
+            queue
+              .filter((q) => q.sourceKind === "install" && (!host || hostOf(q.addr) === hostOf(host)))
+              .map((q) => ({ id: q.id, displayName: q.displayName, contentId: q.contentId, category: q.category, status: q.status })),
+          )
+        : [],
+    [data, shown, host, library, queue],
+  );
 
   // The console's own copy, or the online cover, when the source has no icon.
   const online = useTitleInfo(data && !cover ? data.inspection.identity.title_id || null : null);
@@ -464,6 +512,9 @@ export function PackagePanel({
           actions={actions}
           tab={tab}
           onTab={setTab}
+          token={data.token}
+          related={related}
+          onOpenRelated={host ? (p) => setOpened(`ps5://${hostOf(host)}${p}`) : undefined}
         />
       )}
     </Drawer>

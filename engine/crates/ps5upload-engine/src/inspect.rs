@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
-use ps5upload_pkg::{pkg_entries, read_pkg_entry, sfo_params, PkgAuthenticity, SfoValue};
+use ps5upload_fpkg::remote_source;
+use ps5upload_pkg::{
+    parse_pkg_from, pkg_entries_from, read_pkg_entry_from, sfo_params, PkgAuthenticity, SfoValue,
+};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -33,7 +36,7 @@ pub struct GameInspection {
 pub struct SourceInfo {
     /// `pkg`, `split-pkg`, `exfat`, `ffpkg`, `ffpfsc` or `folder`.
     pub format: String,
-    /// `local` in this step.
+    /// `local`, `server` (a saved server) or `ps5` (the console).
     pub location: String,
     pub path: String,
     pub size: u64,
@@ -306,8 +309,31 @@ fn finish(g: &mut GameInspection) {
     g.identity.content_type = content_type_of(&g.identity.category);
 }
 
+/// Where a source lives, as `SourceInfo::location` says it.
+fn location_of(path: &Path) -> &'static str {
+    let p = path.to_string_lossy();
+    if p.starts_with("remote://") {
+        "server"
+    } else if p.starts_with("ps5://") {
+        "ps5"
+    } else {
+        "local"
+    }
+}
+
+/// A file's bytes and size, here or through the remote opener.
+fn open_bytes(path: &Path) -> Result<(Box<dyn ps5upload_fpkg::ReadSeek>, u64)> {
+    if remote_source::is_remote(path) {
+        return Ok(remote_source::open_file(path)?);
+    }
+    let f = std::fs::File::open(path)?;
+    let size = f.metadata()?.len();
+    Ok((Box::new(f), size))
+}
+
 fn format_of(path: &Path) -> Result<&'static str> {
-    if path.is_dir() {
+    let remote = remote_source::is_remote(path);
+    if !remote && path.is_dir() {
         return Ok("folder");
     }
     let ext = path
@@ -320,6 +346,9 @@ fn format_of(path: &Path) -> Result<&'static str> {
         "exfat" => "exfat",
         "ffpkg" | "ufs2" => "ffpkg",
         "ffpfsc" => "ffpfsc",
+        // A server path names no kind; anything else there is taken as a folder, and the
+        // opener says so when it is not one.
+        _ if remote => "folder",
         _ => bail!("not a package, image or game folder: {}", path.display()),
     })
 }
@@ -333,7 +362,19 @@ pub fn inspect_local(path: &Path) -> Result<GameInspection> {
 }
 
 fn inspect_pkg(path: &Path) -> Result<GameInspection> {
-    let split = ps5upload_pkg::parse_split_pkg(path)?;
+    // A split set is found by its sibling files, which only a local package has.
+    let split = if remote_source::is_remote(path) {
+        let (mut r, size) = open_bytes(path)?;
+        let head = parse_pkg_from(&mut r, size, path)?;
+        ps5upload_pkg::SplitPkgMetadata {
+            parts: vec![path.to_path_buf()],
+            part_sizes: vec![size],
+            total_size: size,
+            head,
+        }
+    } else {
+        ps5upload_pkg::parse_split_pkg(path)?
+    };
     let head = &split.head;
     let mut g = GameInspection {
         authenticity: authenticity_label(&head.authenticity),
@@ -347,7 +388,7 @@ fn inspect_pkg(path: &Path) -> Result<GameInspection> {
             "pkg"
         }
         .to_string(),
-        location: "local".to_string(),
+        location: location_of(path).to_string(),
         path: path.display().to_string(),
         size: split.total_size,
         parts: split
@@ -367,7 +408,8 @@ fn inspect_pkg(path: &Path) -> Result<GameInspection> {
     g.identity.category = head.category.clone();
     g.specs.app_ver = head.app_ver.clone();
 
-    let entries = match pkg_entries(path) {
+    let (mut r, size) = open_bytes(path)?;
+    let entries = match pkg_entries_from(&mut r, size) {
         Ok(e) => e,
         Err(e) => {
             g.partial = true;
@@ -379,7 +421,7 @@ fn inspect_pkg(path: &Path) -> Result<GameInspection> {
     let by_name = |n: &str| entries.iter().find(|e| e.name.as_deref() == Some(n));
     let mut have_param = false;
     if let Some(e) = by_name("param.sfo") {
-        if let Ok(bytes) = read_pkg_entry(path, e, MAX_TEXT_BYTES) {
+        if let Ok(bytes) = read_pkg_entry_from(&mut r, e, MAX_TEXT_BYTES) {
             if let Ok(params) = sfo_params(&bytes) {
                 apply_sfo(&mut g, &params);
                 have_param = true;
@@ -387,7 +429,7 @@ fn inspect_pkg(path: &Path) -> Result<GameInspection> {
         }
     }
     if let Some(e) = by_name("param.json") {
-        if let Ok(bytes) = read_pkg_entry(path, e, MAX_TEXT_BYTES) {
+        if let Ok(bytes) = read_pkg_entry_from(&mut r, e, MAX_TEXT_BYTES) {
             let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes[..end]) {
                 apply_param_json(&mut g, &v);
@@ -409,7 +451,7 @@ fn inspect_pkg(path: &Path) -> Result<GameInspection> {
         }
     }
     if let Some(e) = by_name(CHANGEINFO) {
-        if let Ok(bytes) = read_pkg_entry(path, e, MAX_TEXT_BYTES) {
+        if let Ok(bytes) = read_pkg_entry_from(&mut r, e, MAX_TEXT_BYTES) {
             g.change_notes = Some(
                 String::from_utf8_lossy(&bytes)
                     .trim_end_matches('\0')
@@ -447,10 +489,12 @@ fn inspect_tree(path: &Path, format: &str) -> Result<GameInspection> {
     };
     g.source = SourceInfo {
         format: format.to_string(),
-        location: "local".to_string(),
+        location: location_of(path).to_string(),
         path: path.display().to_string(),
-        size: if path.is_dir() {
+        size: if format == "folder" {
             files.iter().map(|f| f.size).sum()
+        } else if remote_source::is_remote(path) {
+            open_bytes(path).map(|(_, n)| n).unwrap_or(0)
         } else {
             std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
         },
@@ -506,11 +550,12 @@ pub fn read_image(path: &Path, format: &str, name: &str) -> Result<Vec<u8>> {
         bail!("unknown image {name}");
     }
     if format == "pkg" || format == "split-pkg" {
-        let entries = pkg_entries(path)?;
+        let (mut r, size) = open_bytes(path)?;
+        let entries = pkg_entries_from(&mut r, size)?;
         let Some(e) = entries.iter().find(|e| e.name.as_deref() == Some(name)) else {
             bail!("no {name} in this package");
         };
-        return Ok(read_pkg_entry(path, e, MAX_IMAGE_BYTES)?);
+        return Ok(read_pkg_entry_from(&mut r, e, MAX_IMAGE_BYTES)?);
     }
     let mut tree = ps5upload_fpkg::source::open(path)?;
     let p = format!("sce_sys/{name}");
@@ -519,6 +564,45 @@ pub fn read_image(path: &Path, format: &str, name: &str) -> Result<Vec<u8>> {
         Some(f) if f.size > u64::from(MAX_IMAGE_BYTES) => bail!("{name} is too large to show"),
         Some(_) => Ok(tree.read(&p)?),
     }
+}
+
+/// One row of the Files tab: a package entry or a file of a folder or image.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileRow {
+    pub path: String,
+    pub size: u64,
+    /// A package entry sealed with keys this app never has.
+    pub encrypted: bool,
+}
+
+/// Rows past this are left out (and the reply says so): a list, not a copy of the game.
+const MAX_FILE_ROWS: usize = 200_000;
+
+/// What a source holds: a package's entries, or the tree's files. Sorted by path.
+pub fn list_files(path: &Path, format: &str) -> Result<Vec<FileRow>> {
+    let mut rows: Vec<FileRow> = if format == "pkg" || format == "split-pkg" {
+        let (mut r, size) = open_bytes(path)?;
+        pkg_entries_from(&mut r, size)?
+            .into_iter()
+            .map(|e| FileRow {
+                path: e.name.unwrap_or_else(|| format!("#{:04X}", e.id)),
+                size: u64::from(e.size),
+                encrypted: e.encrypted,
+            })
+            .collect()
+    } else {
+        ps5upload_fpkg::source::open(path)?
+            .files()
+            .iter()
+            .map(|f| FileRow {
+                path: f.path.clone(),
+                size: f.size,
+                encrypted: false,
+            })
+            .collect()
+    };
+    rows.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(rows)
 }
 
 /// Inspections by token, so the image requests that follow reuse one parse.
@@ -587,6 +671,10 @@ impl InspectCache {
 /// PARAM files (editing them leaves the folder's own mtime alone) and a
 /// package's split parts.
 fn fingerprint(path: &Path) -> Result<Vec<(u64, std::time::SystemTime)>> {
+    // A server or console file is not stat'ed here: its token lives for the TTL.
+    if remote_source::is_remote(path) {
+        return Ok(Vec::new());
+    }
     let stamp = |p: &Path| {
         std::fs::metadata(p)
             .ok()
@@ -661,6 +749,47 @@ pub(crate) async fn inspect_handler(
 pub(crate) struct ImageQuery {
     token: String,
     name: String,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct FilesQuery {
+    token: String,
+}
+
+#[derive(Serialize)]
+struct FilesResp {
+    files: Vec<FileRow>,
+    /// More rows existed than a list shows.
+    truncated: bool,
+}
+
+/// GET /api/game/inspect/files?token — the Files tab: a package's entries or the tree's files.
+pub(crate) async fn inspect_files_handler(
+    axum::extract::Query(q): axum::extract::Query<FilesQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some((path, format)) = CACHE.source_of(&q.token) else {
+        return crate::json_err(
+            axum::http::StatusCode::NOT_FOUND,
+            "unknown or expired token",
+        )
+        .into_response();
+    };
+    match tokio::task::spawn_blocking(move || list_files(&path, &format)).await {
+        Ok(Ok(mut files)) => {
+            let truncated = files.len() > MAX_FILE_ROWS;
+            files.truncate(MAX_FILE_ROWS);
+            axum::Json(FilesResp { files, truncated }).into_response()
+        }
+        Ok(Err(e)) => {
+            crate::json_err(axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
+        Err(join) => crate::json_err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the file list task failed: {join}"),
+        )
+        .into_response(),
+    }
 }
 
 /// GET /api/game/inspect/image — one image of an inspected source.
@@ -1039,5 +1168,71 @@ mod tests {
             read_image(&packed, "ffpfsc", "icon0.png").unwrap(),
             read_image(&fixture, "exfat", "icon0.png").unwrap()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_package_and_a_folder_on_a_server_are_inspected_in_place() {
+        let dir = test_fixtures::scratch();
+        let pkg = std::fs::read(test_fixtures::write_cnt_pkg(dir.join("a.pkg"), "gd")).unwrap();
+        let r = crate::remote::pool::testing::install_global(&[
+            ("/viewer/a.pkg", &pkg),
+            (
+                "/viewer/game/sce_sys/param.json",
+                br#"{"titleId":"PPSA04321","contentId":"UP9000-PPSA04321_00-GAME000000000000"}"#,
+            ),
+            ("/viewer/game/eboot.bin", &[1u8; 64]),
+        ]);
+        let id = r
+            .store
+            .add(
+                crate::remote::store::conn("NAS", crate::remote::store::Protocol::Smb),
+                crate::remote::store::Secret::None,
+            )
+            .unwrap()
+            .conn
+            .id;
+        crate::fpkg_remote::register();
+        let (p1, p2) = (
+            format!("remote://{id}/viewer/a.pkg"),
+            format!("remote://{id}/viewer/game"),
+        );
+        let (g1, g2, files) = tokio::task::spawn_blocking(move || {
+            let g1 = inspect_local(Path::new(&p1)).unwrap();
+            let files = list_files(Path::new(&p1), "pkg").unwrap();
+            let img = g1.images.first().map(|i| i.name.clone());
+            if let Some(name) = img {
+                assert!(!read_image(Path::new(&p1), "pkg", &name).unwrap().is_empty());
+            }
+            (g1, inspect_local(Path::new(&p2)).unwrap(), files)
+        })
+        .await
+        .unwrap();
+        assert_eq!(g1.source.format, "pkg");
+        assert_eq!(g1.source.location, "server");
+        assert_eq!(g1.identity.title, "Fixture");
+        assert_eq!(g1.source.size, pkg.len() as u64);
+        assert!(!files.is_empty());
+        assert_eq!(g2.source.format, "folder");
+        assert_eq!(g2.source.location, "server");
+        assert_eq!(g2.identity.title_id, "PPSA04321");
+    }
+
+    #[test]
+    fn a_folder_lists_its_files_and_a_package_its_entries() {
+        let dir = test_fixtures::scratch();
+        std::fs::create_dir_all(dir.join("g/sce_sys")).unwrap();
+        std::fs::write(dir.join("g/sce_sys/param.json"), b"{}").unwrap();
+        std::fs::write(dir.join("g/eboot.bin"), [0u8; 10]).unwrap();
+        let files = list_files(&dir.join("g"), "folder").unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .map(|f| (f.path.as_str(), f.size))
+                .collect::<Vec<_>>(),
+            [("eboot.bin", 10), ("sce_sys/param.json", 2)]
+        );
+        let p = test_fixtures::write_cnt_pkg(dir.join("a.pkg"), "gd");
+        let entries = list_files(&p, "pkg").unwrap();
+        assert!(entries.iter().any(|e| e.path == "param.sfo"));
     }
 }

@@ -57,6 +57,23 @@ pub fn open_path(path: &Path) -> Result<Box<dyn SourceTree>> {
     open_remote(files, &inner)
 }
 
+/// One file a `remote://` or `ps5://` path names, and its size (a package the viewer reads).
+pub fn open_file(path: &Path) -> Result<(Box<dyn ReadSeek>, u64)> {
+    let url = path.to_string_lossy();
+    let (files, inner) = {
+        let guard = OPENER.read().unwrap_or_else(|e| e.into_inner());
+        let Some(open) = guard.as_ref() else {
+            return format_err(format!("{url}: this build cannot read saved servers"));
+        };
+        open(&url)?
+    };
+    let (size, is_dir) = files.stat(&inner).map_err(|e| io(&inner, e))?;
+    if is_dir {
+        return format_err(format!("{url} is a folder, not a file"));
+    }
+    Ok((files.open(&inner).map_err(|e| io(&inner, e))?, size))
+}
+
 fn io(path: &str, e: std::io::Error) -> Error {
     Error::Io(std::io::Error::new(e.kind(), format!("{path}: {e}")))
 }

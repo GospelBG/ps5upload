@@ -8861,6 +8861,10 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
             "/api/game/inspect/image",
             get(inspect::inspect_image_handler),
         )
+        .route(
+            "/api/game/inspect/files",
+            get(inspect::inspect_files_handler),
+        )
         .route("/api/fpkg/inspect", post(fpkg_api::fpkg_inspect_handler))
         .route("/api/fpkg/build", post(fpkg_api::fpkg_build_handler))
         .route("/api/fpkg/delete", post(fpkg_api::fpkg_delete_handler))
