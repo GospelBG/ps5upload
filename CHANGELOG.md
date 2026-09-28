@@ -4,6 +4,25 @@ What's new in ps5upload, written for humans.
 
 ---
 
+## Unreleased
+
+**One queue for each console.**
+
+- **Queue stream installs.** Stream installs, links, library installs and
+  External Packages now all go into the console's queue and run one after
+  another — no more "Another install is in progress", and a running install
+  no longer greys out the buttons for the next one. A game's update and DLC
+  always install after the game itself, whatever order you queue them in.
+- **See the queue where you install.** Install Package shows the console's
+  queue at the top: what is installing, and each waiting item's place in
+  line. The console tab shows how many items are waiting.
+- **Retry via upload.** If the PS5 can't reach this computer for a stream
+  install, its queue row offers to upload the package and install it instead.
+- An install that was running when the app closed is never re-run by itself —
+  check the game, then retry if needed. Queued links aren't saved to disk.
+
+---
+
 ## 5.36.0
 
 **Choose which drive install packages are kept on.**
