@@ -36,11 +36,38 @@ vi.mock("../api/ps5", () => ({
   pkgInstallStatus: vi.fn(async () => ({ phase: "done", verdict: "installed" })),
   // Package drives; tests that care set the list.
   listVolumes: vi.fn(async () => []),
+  // The console queue (installs run through it) persists and mints tx ids.
+  generateTxIdHex: () => Math.random().toString(16).slice(2).padEnd(12, "0"),
+  uploadQueueSave: vi.fn(async () => {}),
+  uploadQueueLoad: vi.fn(async () => ({ items: [], continueOnFailure: false })),
+  UploadJobError: class UploadJobError extends Error {
+    reason?: string;
+    detail?: string;
+  },
+  jobCancel: vi.fn(async () => {}),
 }));
+vi.mock("../lib/ensurePayloadCurrent", () => ({ ensurePayloadCurrent: vi.fn(async () => {}) }));
 // No active transfer in tests → installs proceed immediately.
 vi.mock("../lib/ps5Transfers", () => ({ transferScreenBusy: () => false }));
 
 import { invoke } from "@tauri-apps/api/core";
+import { useUploadQueueStore } from "./uploadQueue";
+import { getInstallExecutor, registerInstallExecutor } from "./consoleQueueBridge";
+
+// Installs run through the console queue: start every test with an empty,
+// idle queue so one test's items never hold up the next.
+const pristineQueue = useUploadQueueStore.getState();
+beforeEach(() => {
+  useUploadQueueStore.getState().stop();
+  useUploadQueueStore.setState({
+    ...pristineQueue,
+    items: [],
+    runningHosts: {},
+    running: false,
+    continueOnFailure: true,
+    loaded: true,
+  });
+});
 import { useInstallSettingsStore } from "./installSettings";
 import { usePkgStorageStore } from "../lib/pkgStorage";
 import {
@@ -1742,24 +1769,20 @@ describe("refresh — base + update coexistence and badging", () => {
 });
 
 describe("installAll as one activity row", () => {
+  const realExecutor = getInstallExecutor();
   beforeEach(() => {
     useTaskStore.setState({ tasks: [] });
   });
+  afterEach(() => {
+    if (realExecutor) registerInstallExecutor(realExecutor);
+  });
 
+  // installAll queues each row; a fake executor decides each install's outcome.
   function stubInstall(outcome: (path: string) => boolean) {
-    const store = pkgLibraryStore(HOST);
-    store.setState({
-      installing: false,
-      installingAll: false,
-      install: async (path: string) => {
-        const ok = outcome(path);
-        store.setState((s) => ({
-          entries: s.entries.map((e) =>
-            e.path === path ? { ...e, lastResult: { ok, message: ok ? "" : "no" } } : e,
-          ),
-        }));
-      },
-    } as never);
+    registerInstallExecutor(async (req) => {
+      const ok = outcome(req.via === "library" ? req.path : "");
+      return ok ? { ok: true } : { ok: false, message: "no" };
+    });
   }
 
   const batch = () => useTaskStore.getState().tasks.filter((t) => t.kind === "install-batch");
@@ -1972,4 +1995,98 @@ describe("package storage drive", () => {
     expect(dest.startsWith("/user/data/ps5upload/pkg_library/")).toBe(true);
     expect(pkgLibraryStore(host).getState().busyNotice ?? "").toMatch(/internal storage/);
   });
+});
+
+describe("installs go through the console queue", () => {
+  const pristine = useUploadQueueStore.getState();
+  beforeEach(() => {
+    useUploadQueueStore.setState({
+      ...pristine,
+      items: [],
+      runningHosts: {},
+      running: false,
+      continueOnFailure: true,
+      loaded: true,
+    });
+    // A fresh store: other blocks replace store methods and never put them back.
+    evictPkgLibraryStore(HOST);
+    // Earlier blocks mockReset() these, which drops their default answers.
+    vi.mocked(pkgInstall).mockReset().mockResolvedValue({ ok: true, job: "job1" });
+    vi.mocked(pkgInstallStatus)
+      .mockReset()
+      .mockResolvedValue(installStatus({ phase: "done", verdict: "installed" }));
+  });
+  afterEach(() => useUploadQueueStore.getState().stop());
+
+  it("[RF 3] a library install while a stream install runs is queued, not refused", async () => {
+    let release!: () => void;
+    vi.mocked(pkgInstall).mockImplementationOnce(
+      () => new Promise((r) => (release = () => r({ ok: true, job: "j1" }))) as never,
+    );
+    vi.mocked(invoke).mockImplementation(async (command: unknown) =>
+      command === "pkg_metadata_split"
+        ? { parts: [{}], total_size: 10, head: { content_id: "UP0001-CUSA00001_00-GAME000000000001" } }
+        : {},
+    );
+    const api = pkgLibraryStore(HOST);
+    const stream = api.getState().installStream("/games/a.pkg", HOST);
+    const lib = api.getState().install("/user/data/ps5upload/pkg_library/b.pkg", HOST);
+    await vi.waitFor(() =>
+      expect(useUploadQueueStore.getState().items.map((i) => i.status)).toEqual([
+        "running",
+        "pending",
+      ]),
+    );
+    release();
+    const r = await stream;
+    expect(r.message ?? "").not.toMatch(/Another install is in progress/);
+    await lib;
+    await vi.waitFor(() =>
+      expect(useUploadQueueStore.getState().items.every((i) => i.status !== "pending")).toBe(true),
+    );
+  });
+
+  it("[RF 2] installUrl (stream mode) runs as ONE queue item (no self-wait)", async () => {
+    const r = pkgLibraryStore(HOST)
+      .getState()
+      .installUrl("https://example.com/x.pkg", HOST, { mode: "stream" });
+    await vi.waitFor(() => expect(useUploadQueueStore.getState().items).toHaveLength(1));
+    await r;
+    expect(useUploadQueueStore.getState().items).toHaveLength(1);
+  });
+
+  it("[RF 2] installUrl (direct mode) runs as ONE queue item (no self-wait)", async () => {
+    const r = pkgLibraryStore(HOST)
+      .getState()
+      .installUrl("https://example.com/x.pkg", HOST, { mode: "direct" });
+    await vi.waitFor(() => expect(useUploadQueueStore.getState().items).toHaveLength(1));
+    await r;
+    expect(useUploadQueueStore.getState().items).toHaveLength(1);
+  });
+
+  it("[RF 2] installFromConsolePath on internal storage runs as ONE item", async () => {
+    const r = pkgLibraryStore(HOST).getState().installFromConsolePath("/data/g/x.pkg", HOST);
+    await vi.waitFor(() => expect(useUploadQueueStore.getState().items).toHaveLength(1));
+    await r;
+    expect(useUploadQueueStore.getState().items).toHaveLength(1);
+  });
+
+  it("installAll queues every row; the queue orders them base → update → DLC", async () => {
+    pkgLibraryStore(HOST).setState({
+      entries: [
+        entry({ name: "D.pkg", category: "ac", contentId: "UP0001-CUSA00001_00-DLC0000000000001" }),
+        entry({ name: "U.pkg", category: "gp", contentId: "UP0001-CUSA00001_00-GAME000000000001" }),
+        entry({ name: "B.pkg", category: "gd", contentId: "UP0001-CUSA00001_00-GAME000000000001" }),
+      ],
+      error: null,
+    });
+    const order: string[] = [];
+    vi.mocked(pkgInstall).mockImplementation(async (req: { source: unknown }) => {
+      order.push(JSON.stringify(req.source));
+      return { ok: true, job: "j" };
+    });
+    await pkgLibraryStore(HOST).getState().installAll(HOST);
+    expect(order.map((o) => o.match(/([BUD])\.pkg/)?.[1])).toEqual(["B", "U", "D"]);
+    // Three installs with the queue's 1.5 s settle between them.
+  }, 15_000);
 });

@@ -500,7 +500,6 @@ export default function InstallPackageScreen() {
   const installing = usePkgLibrary(host, (s) => s.installing);
   const installingAll = usePkgLibrary(host, (s) => s.installingAll);
   const busyNotice = usePkgLibrary(host, (s) => s.busyNotice);
-  const installPending = usePkgLibrary(host, (s) => s.installPending);
   const refresh = usePkgLibrary(host, (s) => s.refresh);
   const addAndUpload = usePkgLibrary(host, (s) => s.addAndUpload);
   const install = usePkgLibrary(host, (s) => s.install);
@@ -513,10 +512,6 @@ export default function InstallPackageScreen() {
   const setLinkMode = useLinkInstallPrefs((s) => s.setMode);
   const setLinkInsecure = useLinkInstallPrefs((s) => s.setInsecure);
   const installUrl = usePkgLibrary(host, (s) => s.installUrl);
-  const cancelPendingInstall = usePkgLibrary(
-    host,
-    (s) => s.cancelPendingInstall,
-  );
   const remove = usePkgLibrary(host, (s) => s.remove);
   const clearFinished = usePkgLibrary(host, (s) => s.clearFinished);
   const clearAll = usePkgLibrary(host, (s) => s.clearAll);
@@ -1210,13 +1205,9 @@ export default function InstallPackageScreen() {
     }
     return [...grouped.values()];
   }, [entries]);
-  // Installing swaps the payload out (it owns the transfer port :9113), so it
-  // can't run concurrently with an upload. Rather than block the button, the
-  // store QUEUES an install behind any active transfer and surfaces a notice
-  // (see `busyNotice` / `install()` in pkgLibrary). So the only thing that
-  // disables the Install button here is another install already in progress
-  // (or queued) — clicking during an upload is allowed and just waits.
-  const installBlocked = installing;
+  // Installs go into the console's queue, which runs them one at a time, so a
+  // busy console never blocks the Install button — the click just queues.
+  const installBlocked = false;
 
   const renderPkgRow = (entry: PkgEntry) => {
     const installed = pkgRowInstalled(
@@ -1624,19 +1615,6 @@ export default function InstallPackageScreen() {
               <Spinner size={14} tone="accent" className="mt-0.5 shrink-0" />
               <span>{busyNotice}</span>
             </div>
-            {/* Only offer Cancel while the install is still WAITING its turn.
-                During the real install (FW 12.x keeps busyNotice set for the
-                "screen may go black" notice) cancelling would tear the payload
-                out mid-swap, so the button is hidden then. */}
-            {installPending && (
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={cancelPendingInstall}
-              >
-                {tr("cancel", undefined, "Cancel")}
-              </Button>
-            )}
           </div>
         )}
 

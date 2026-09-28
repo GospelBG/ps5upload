@@ -20,11 +20,32 @@ vi.mock("../api/ps5", () => ({
   pkgInstallPreflight: vi.fn(async () => null),
   pkgInstall: vi.fn(async () => ({ ok: true, job: "job1" })),
   pkgInstallStatus: vi.fn(async () => ({ phase: "done", verdict: "installed" })),
+  // Installs run through the console queue, which persists and mints tx ids.
+  generateTxIdHex: () => Math.random().toString(16).slice(2).padEnd(12, "0"),
+  uploadQueueSave: vi.fn(async () => {}),
+  uploadQueueLoad: vi.fn(async () => ({ items: [], continueOnFailure: false })),
+  UploadJobError: class UploadJobError extends Error {},
+  jobCancel: vi.fn(async () => {}),
 }));
+vi.mock("../lib/ensurePayloadCurrent", () => ({ ensurePayloadCurrent: vi.fn(async () => {}) }));
 vi.mock("../lib/ps5Transfers", () => ({ transferScreenBusy: () => false }));
 
 import { invoke } from "@tauri-apps/api/core";
 import { pkgLibraryStore } from "./pkgLibrary";
+import { useUploadQueueStore } from "./uploadQueue";
+
+const pristineQueue = useUploadQueueStore.getState();
+beforeEach(() => {
+  useUploadQueueStore.getState().stop();
+  useUploadQueueStore.setState({
+    ...pristineQueue,
+    items: [],
+    runningHosts: {},
+    running: false,
+    continueOnFailure: true,
+    loaded: true,
+  });
+});
 import {
   pkgInstall,
   pkgInstallStatus,

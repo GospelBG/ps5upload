@@ -67,6 +67,13 @@ import {
 import { useTaskStore } from "./tasks";
 import { useToastStore } from "./toasts";
 import { parsePS5Firmware } from "../lib/ps5Firmware";
+import {
+  enqueueInstall,
+  registerInstallExecutor,
+  type InstallHooks,
+  type InstallRequest,
+  type InstallResult,
+} from "./consoleQueueBridge";
 
 /**
  * Package Library — the model behind the redesigned Install Package screen.
@@ -942,13 +949,6 @@ interface PkgLibraryState {
    *  upload is QUEUED behind an active transfer (the PS5 can only do one at a
    *  time). Null when nothing is waiting. */
   busyNotice: string | null;
-  /** True ONLY while an install is still WAITING its turn behind an active
-   *  transfer (the cancellable window). It is cleared the instant the real
-   *  install begins — unlike `busyNotice`, which on FW 12.x stays set during
-   *  the actual install to show the "screen may go black" notice. Cancel must
-   *  key off this, never `busyNotice`, or it could abort a real install
-   *  mid-swap and leave a half-loaded payload. */
-  installPending: boolean;
 
   /** True while `installAll` is driving a sequential batch. Cosmetic — it
    *  disables the Install-all button and shows batch progress; it does NOT
@@ -961,7 +961,29 @@ interface PkgLibraryState {
     host: string,
     options?: PkgUploadOptions,
   ) => Promise<void>;
+  /** Queue an install of a staged library row on this console's queue and
+   *  wait for it. */
   install: (path: string, host: string) => Promise<void>;
+  // ── Executors: run ONE install now. Only the console queue calls these
+  // (through the executor registered at the bottom of this file); the public
+  // methods above and below queue instead. An executor that needs another
+  // install path calls that path's executor, never its public method — a
+  // queued install waiting on a second queued install would wait forever.
+  _execLibrary: (path: string, host: string, hooks?: InstallHooks) => Promise<InstallResult>;
+  _execStream: (
+    source: StreamInstallSource,
+    host: string,
+    opts?: { onTask?: (taskId: string) => void },
+    hooks?: InstallHooks,
+  ) => Promise<InstallResult>;
+  _execUrl: (
+    url: string,
+    host: string,
+    opts?: { mode?: LinkInstallMode },
+    hooks?: InstallHooks,
+  ) => Promise<InstallResult>;
+  _execExternal: (pkg: ExternalPkg, host: string, hooks?: InstallHooks) => Promise<InstallResult>;
+  _execConsolePath: (path: string, host: string, hooks?: InstallHooks) => Promise<InstallResult>;
   /** Upload a local .pkg to PS5 staging, then install that copy, and say how
    * it went. Convert's "Upload & install": the route that never asks the
    * console to reach this computer over HTTP. `onDest` names the staged row
@@ -1028,8 +1050,6 @@ interface PkgLibraryState {
      * replaces another. */
     installedPaths?: string[],
   ) => Promise<void>;
-  /** Abandon an install that's still waiting its turn behind an upload. */
-  cancelPendingInstall: () => void;
   remove: (path: string, host: string) => Promise<void>;
   /** Install a `.pkg` discovered on an external/USB drive. Sony's installer
    *  can't read the exfat USB mount directly (hardware-confirmed: it accepts
@@ -2139,7 +2159,6 @@ const makePkgLibraryStore = () =>
     error: null,
     installing: false,
     busyNotice: null,
-    installPending: false,
     installingAll: false,
 
     async refresh(host) {
@@ -2640,17 +2659,10 @@ const makePkgLibraryStore = () =>
       };
     },
 
-    async install(path, host) {
-      if (!host?.trim() || get().installing) return;
-      set({ installing: true, busyNotice: null, installPending: false });
-      // Any transfer that the payload swap would interrupt: an Upload-screen
-      // transfer, or a .pkg upload/queued here. Installing must wait for all of
-      // them so it doesn't tear the payload out mid-upload.
-      const transfersActive = () =>
-        transferScreenBusy(host) ||
-        get().entries.some(
-          (e) => e.status === "uploading" || e.status === "queued",
-        );
+    async _execLibrary(path, host, hooks) {
+      // Runs from the console queue, one install at a time per console.
+      set({ installing: true, busyNotice: null });
+      let outcome: InstallResult;
       const patch = (p: Partial<PkgEntry>) =>
         set({
           entries: get().entries.map((e) =>
@@ -2658,25 +2670,6 @@ const makePkgLibraryStore = () =>
           ),
         });
       try {
-        // Queue behind any active transfer instead of crashing it. Cancellable
-        // via cancelPendingInstall (which flips `installing` off mid-wait).
-        if (transfersActive()) {
-          // `installPending` marks the cancellable WAITING window — cleared the
-          // moment the real install starts below.
-          set({
-            installPending: true,
-            busyNotice:
-              "Waiting for the current upload to finish before installing…",
-          });
-          while (transfersActive()) {
-            if (!get().installing) return; // user cancelled the pending install
-            await sleep(400);
-          }
-          set({ installPending: false, busyNotice: null });
-        }
-        // The real install begins here: clear installPending so Cancel can no
-        // longer abort it (even though busyNotice gets set again on FW 12.x).
-        set({ installPending: false });
         // Inside the try so any throw still hits `finally` and clears the
         // `installing` flag — otherwise a wedged flag would lock the screen.
         patch({ status: "installing", lastResult: undefined });
@@ -2723,7 +2716,8 @@ const makePkgLibraryStore = () =>
           pushNotification("warning", `Not enough space for ${label}`, {
             body: spaceWarn,
           });
-          return;
+          outcome = { ok: false, message: spaceWarn };
+          return outcome;
         }
 
         // delete_staging = the user's Auto Delete preference: the engine keeps
@@ -2762,6 +2756,7 @@ const makePkgLibraryStore = () =>
                 Math.floor((installedBytes / total) * 100),
               );
               set({ busyNotice: `Installing on the PS5… ${pct}%` });
+              hooks?.onProgress(pct);
             }
           },
           // Readiness-gate status (pre-install wait / DPI transient retry).
@@ -2783,7 +2778,9 @@ const makePkgLibraryStore = () =>
             mayNotLaunch,
             autoRemove,
           });
+          outcome = { ok: true, mayNotLaunch };
         } else {
+          outcome = { ok: false, message: mainErr || "Install was rejected." };
           // Failed verdict → the pkg was KEPT on the PS5 (never deleted on a
           // non-confirmed install), so re-running the install is the natural
           // next step. The engine resolves the install synchronously, so there
@@ -2814,17 +2811,29 @@ const makePkgLibraryStore = () =>
         );
         const label = entry?.title || entry?.contentId || basenameOf(path);
         pushNotification("error", `${label} install failed`, { body: message });
+        outcome = { ok: false, message };
       } finally {
-        set({ installing: false, busyNotice: null, installPending: false });
+        set({ installing: false, busyNotice: null });
       }
+      return outcome;
+    },
+
+    async install(path, host) {
+      if (!host?.trim()) return;
+      const entry = get().entries.find((e) => e.path === path);
+      await enqueueInstall({
+        host,
+        request: { via: "library", path },
+        displayName: entry?.title || entry?.contentId || basenameOf(path),
+        contentId: entry?.contentId ?? null,
+        category: entry?.category ?? null,
+      }).done;
     },
 
     async installAll(host, selections, installedPaths) {
       if (!host?.trim()) return;
-      // Don't start a batch on top of a single in-flight install (or another
-      // batch) — the inner install() would early-return and we'd silently skip
-      // rows. The button is disabled in this state too; this is the guard.
-      if (get().installing || get().installingAll) return;
+      // One batch at a time; single installs already running just queue ahead.
+      if (get().installingAll) return;
 
       // Snapshot the not-yet-installed, idle rows and order them base → update →
       // DLC so an add-on never installs before its base. `installedHere` is the
@@ -2869,30 +2878,28 @@ const makePkgLibraryStore = () =>
         consoleId: host,
       });
       try {
-        for (const [i, target] of targets.entries()) {
-          useTaskStore.getState().updateTask(batchTaskId, {
-            stage: `Installing ${i + 1} of ${n}`,
-            progress: { current: i, total: n, unit: "items" },
-          });
-          // Re-read the row: an earlier item in the batch (or an outside action)
-          // may have changed its state. Skip if it's no longer an idle, not-yet-
-          // installed row.
-          const cur = get().entries.find((e) => e.path === target.path);
-          if (
-            !cur ||
-            cur.status !== "idle" ||
-            (liveInstalled ? liveInstalled.has(cur.path) : cur.installedHere)
-          )
-            continue;
-          // install() self-serializes on `installing` and awaits the full
-          // readiness-gated cascade; it sets the row's lastResult. It never
-          // throws (it catches internally), so a single failure can't abort the
-          // batch — we just count the outcome and move on.
-          await get().install(target.path, host);
-          const after = get().entries.find((e) => e.path === target.path);
-          if (after?.lastResult?.ok) ok++;
-          else failed++;
-        }
+        // Queue every target at once; the console queue runs them one at a
+        // time in base → update → DLC order and never refuses a busy console.
+        let finished = 0;
+        await Promise.all(
+          targets.map((target) =>
+            enqueueInstall({
+              host,
+              request: { via: "library", path: target.path },
+              displayName: target.title || target.contentId || basenameOf(target.path),
+              contentId: target.contentId ?? null,
+              category: target.category ?? null,
+            }).done.then((r) => {
+              if (r.ok) ok++;
+              else failed++;
+              finished++;
+              useTaskStore.getState().updateTask(batchTaskId, {
+                stage: `Installed ${finished} of ${n}`,
+                progress: { current: finished, total: n, unit: "items" },
+              });
+            }),
+          ),
+        );
       } finally {
         set({ installingAll: false });
         useTaskStore.getState().updateTask(batchTaskId, {
@@ -3048,44 +3055,50 @@ const makePkgLibraryStore = () =>
     },
     async installUrl(url, host, opts) {
       const trimmed = url.trim();
-      let parsed: URL;
+      // A bad link is answered at once, not as a failed queue row.
+      const invalid = invalidInstallUrl(trimmed);
+      if (invalid) return { ok: false, message: invalid };
+      const mode = opts?.mode ?? useLinkInstallPrefs.getState().modeFor(host);
+      // Download first: the download needs only this computer, so it runs now
+      // and the finished local file joins the queue (see installDownloadedLink).
+      if (mode === "download") {
+        return get().installDownloadedLink(
+          trimmed,
+          host,
+          useLinkInstallPrefs.getState().insecureFor(host),
+        );
+      }
+      let name = "package";
       try {
-        parsed = new URL(trimmed);
+        name = basenameOf(new URL(trimmed).pathname) || "package";
       } catch {
-        return {
-          ok: false,
-          message: "Enter a valid HTTP or HTTPS package URL.",
-        };
+        /* _execUrl reports the invalid link */
       }
-      // The engine re-validates (it is also a plain HTTP API), but rejecting
-      // here keeps the user's mistake a local message instead of a round trip.
-      const hasControlChars = [...trimmed].some((ch) => {
-        const code = ch.charCodeAt(0);
-        return code < 32 || code === 127;
-      });
-      if (
-        !["http:", "https:"].includes(parsed.protocol) ||
-        !parsed.hostname ||
-        parsed.hash ||
-        hasControlChars ||
-        new TextEncoder().encode(trimmed).length > 4093
-      ) {
-        return {
-          ok: false,
-          message:
-            "Enter an HTTP(S) package URL with no fragment or control characters (max 4093 bytes).",
-        };
-      }
+      return enqueueInstall({
+        host,
+        request: {
+          via: "link",
+          url: trimmed,
+          mode,
+          insecureTls: useLinkInstallPrefs.getState().insecureFor(host),
+        },
+        displayName: name,
+      }).done;
+    },
+
+    async _execUrl(url, host, opts, hooks) {
+      const trimmed = url.trim();
+      const invalid = invalidInstallUrl(trimmed);
+      if (invalid) return { ok: false, message: invalid };
+      const parsed = new URL(trimmed);
       const mode =
         opts?.mode ?? useLinkInstallPrefs.getState().modeFor(host);
       const insecureTls = useLinkInstallPrefs.getState().insecureFor(host);
 
-      // Download first, then install the local file. The only mode that
-      // survives a link dying mid-install: the transfer finishes on its own
-      // and the install afterwards never touches the network.
-      if (mode === "download") {
-        return get().installDownloadedLink(trimmed, host, insecureTls);
-      }
+      // "download" never reaches here: installUrl downloads first and queues
+      // the local file. Calling installDownloadedLink from inside a queued
+      // install would queue behind itself.
+      void insecureTls;
 
       // Direct: hand the URL to the console's own installer via the DPI
       // daemon and get out of the way — this computer serves nothing and may
@@ -3163,14 +3176,11 @@ const makePkgLibraryStore = () =>
           );
         }
       }
-      return get().installStream({ remoteUrl: trimmed }, host);
+      return get()._execStream({ remoteUrl: trimmed }, host, undefined, hooks);
     },
-    async installStream(source, host, opts) {
+    async _execStream(source, host, opts, hooks) {
       if (!host?.trim()) {
         return { ok: false, message: "No PS5 host selected." };
-      }
-      if (get().installing) {
-        return { ok: false, message: "Another install is in progress." };
       }
       // A link and a local file differ only in where the bytes come from and
       // what we call them; the install itself is one path.
@@ -3233,35 +3243,10 @@ const makePkgLibraryStore = () =>
         }
         return result;
       };
-      set({ installing: true, busyNotice: null, installPending: false });
-      const clearBusy = () =>
-        set({ installing: false, busyNotice: null, installPending: false });
+      // Runs from the console queue, one install at a time per console.
+      set({ installing: true, busyNotice: null });
+      const clearBusy = () => set({ installing: false, busyNotice: null });
       try {
-        // Wait behind any active transfer — the DPI payload swap would kill
-        // the transfer port mid-upload, same as install()/installExternal().
-        const transfersActive = () =>
-          transferScreenBusy(host) ||
-          get().entries.some(
-            (e) => e.status === "uploading" || e.status === "queued",
-          );
-        if (transfersActive()) {
-          set({
-            installPending: true,
-            busyNotice:
-              "Waiting for the current upload to finish before installing…",
-          });
-          while (transfersActive()) {
-            if (!get().installing) {
-              return finishStreamTask(
-                { ok: false, message: "Cancelled." },
-                true,
-              );
-            }
-            await sleep(400);
-          }
-          set({ installPending: false, busyNotice: null });
-        }
-        set({ installPending: false });
         useTaskStore.getState().updateTask(taskId, {
           status: "running",
           detail: "Reading package metadata…",
@@ -3431,6 +3416,11 @@ const makePkgLibraryStore = () =>
                 lastDetail = detail;
                 set({ busyNotice: detail });
               }
+              if (sample.total > 0) {
+                hooks?.onProgress(
+                  Math.min(99, Math.floor((current / sample.total) * 100)),
+                );
+              }
               useTaskStore.getState().updateTask(taskId, {
                 detail,
                 ...(sample.total > 0
@@ -3484,11 +3474,40 @@ const makePkgLibraryStore = () =>
       }
     },
 
-    async installExternal(pkg, host) {
-      if (!host?.trim() || get().installing) {
-        return { ok: false, message: "Another install is in progress." };
+    async installStream(source, host, opts) {
+      if (!host?.trim()) return { ok: false, message: "No PS5 host selected." };
+      let name = "package";
+      try {
+        name =
+          typeof source === "object"
+            ? basenameOf(new URL(source.remoteUrl).pathname) || "package"
+            : basenameOf(source.replace(/\\/g, "/")) || "package";
+      } catch {
+        /* keep the generic name */
       }
-      set({ installing: true, busyNotice: null, installPending: false });
+      const request: InstallRequest =
+        typeof source === "object"
+          ? { via: "link", url: source.remoteUrl, mode: "stream", insecureTls: false }
+          : { via: "stream", source };
+      // Convert follows the install's task: hand it the id once the queue runs it.
+      if (opts?.onTask) streamTaskCallbacks.set(installRequestKey(request), opts.onTask);
+      return enqueueInstall({ host, request, displayName: name }).done;
+    },
+
+    async installExternal(pkg, host) {
+      if (!host?.trim()) return { ok: false, message: "No PS5 host selected." };
+      return enqueueInstall({
+        host,
+        request: { via: "external", pkg },
+        displayName: pkg.name,
+        contentId: pkg.contentId || null,
+      }).done;
+    },
+
+    async _execExternal(pkg, host, hooks) {
+      if (!host?.trim()) return { ok: false, message: "No PS5 host selected." };
+      // Runs from the console queue, one install at a time per console.
+      set({ installing: true, busyNotice: null });
       // The fast external scan often returns an EMPTY content id — it derives the
       // title id from the filename and skips the per-file header read. But Sony's
       // installer keys on the staged basename matching the content id, so staging
@@ -3523,23 +3542,10 @@ const makePkgLibraryStore = () =>
             Math.floor((sample.installedBytes / sample.total) * 100),
           );
           set({ busyNotice: `Installing ${label} from ${pkg.drive}… ${pct}%` });
+          hooks?.onProgress(pct);
         }
       };
       try {
-        // Wait for any active transfer (the :9113 port is single-client and an
-        // install swaps the payload).
-        if (transferScreenBusy(host)) {
-          set({
-            busyNotice:
-              "Waiting for the current upload to finish before installing…",
-          });
-          while (transferScreenBusy(host)) {
-            if (!get().installing) return { ok: false, message: "Cancelled." };
-            await sleep(400);
-          }
-          set({ busyNotice: null });
-        }
-
         // Copy USB → internal, then install from there. We do NOT install
         // directly from the USB path: handing Sony's installer a `/mnt/usb…`
         // package registers it as a BGFT *download task* that streams the pkg off
@@ -3651,18 +3657,27 @@ const makePkgLibraryStore = () =>
               : ""),
         };
       } finally {
-        set({ installing: false, busyNotice: null, installPending: false });
+        set({ installing: false, busyNotice: null });
       }
     },
 
     async installFromConsolePath(path, host) {
+      if (!host?.trim()) return { ok: false, message: "No PS5 host selected." };
+      return enqueueInstall({
+        host,
+        request: { via: "console-path", path },
+        displayName: path.split("/").pop() || path,
+      }).done;
+    },
+
+    async _execConsolePath(path, host, hooks) {
       const name = path.split("/").pop() || path;
       // Removable mounts can't be installed off directly (exfat + Sony's
       // installer) — reuse the staged copy-then-install path. Derive the
       // mount root so the staging notice names the right drive.
       const mountRoot = removableMountRoot(path);
       if (mountRoot) {
-        return get().installExternal(
+        return get()._execExternal(
           {
             path,
             drive: mountRoot,
@@ -3673,25 +3688,14 @@ const makePkgLibraryStore = () =>
             platform: "",
           },
           host,
+          hooks,
         );
       }
       // Already on internal storage (/data, /user, …): Sony can read it in
       // place, so install directly with no wasteful copy.
-      if (!host?.trim() || get().installing) {
-        return { ok: false, message: "Another install is in progress." };
-      }
-      set({ installing: true, busyNotice: null, installPending: false });
+      if (!host?.trim()) return { ok: false, message: "No PS5 host selected." };
+      set({ installing: true, busyNotice: null });
       try {
-        if (transferScreenBusy(host)) {
-          set({
-            busyNotice:
-              "Waiting for the current upload to finish before installing…",
-          });
-          while (transferScreenBusy(host)) {
-            if (!get().installing) return { ok: false, message: "Cancelled." };
-            await sleep(400);
-          }
-        }
         set({ busyNotice: `Installing ${name}…` });
         // In-place install of a pkg the user pointed at on the console's disk
         // (e.g. from the File System browser). It's THEIR file at THEIR path, not
@@ -3715,18 +3719,7 @@ const makePkgLibraryStore = () =>
       } catch (e) {
         return { ok: false, message: pkgError(e) };
       } finally {
-        set({ installing: false, busyNotice: null, installPending: false });
-      }
-    },
-
-    cancelPendingInstall() {
-      // Only abandon an install still WAITING its turn (installPending) — never
-      // yank a real install mid-swap, which would leave the payload half-loaded.
-      // Keyed off installPending, NOT busyNotice: on FW 12.x busyNotice stays set
-      // during the genuine install to show the "screen may go black" notice, so
-      // keying off it let Cancel kill a real install.
-      if (get().installPending) {
-        set({ installing: false, busyNotice: null, installPending: false });
+        set({ installing: false, busyNotice: null });
       }
     },
 
@@ -3905,4 +3898,67 @@ async function bulkDelete(
       error: `Failed to delete ${failed.length} file(s).`,
     }));
   }
+}
+
+/** Convert's `onTask` for a queued stream install, keyed by the request, until
+ *  the queue runs it (the queue item itself carries no callbacks). */
+const streamTaskCallbacks = new Map<string, (taskId: string) => void>();
+
+function installRequestKey(r: InstallRequest): string {
+  return r.via === "stream" ? `pc:${r.source}` : r.via === "link" ? `url:${r.url}` : "";
+}
+
+// The console queue runs installs through this executor, on the store of the
+// console the item belongs to.
+registerInstallExecutor(async (req, host, hooks) => {
+  const store = pkgLibraryStore(host).getState();
+  switch (req.via) {
+    case "library":
+      return store._execLibrary(req.path, host, hooks);
+    case "console-path":
+      return store._execConsolePath(req.path, host, hooks);
+    case "external":
+      return store._execExternal(req.pkg, host, hooks);
+    case "stream": {
+      const key = installRequestKey(req);
+      const onTask = streamTaskCallbacks.get(key);
+      streamTaskCallbacks.delete(key);
+      return store._execStream(req.source, host, onTask ? { onTask } : undefined, hooks);
+    }
+    case "link": {
+      if (req.mode === "stream") {
+        const key = installRequestKey(req);
+        const onTask = streamTaskCallbacks.get(key);
+        streamTaskCallbacks.delete(key);
+        return store._execStream({ remoteUrl: req.url }, host, onTask ? { onTask } : undefined, hooks);
+      }
+      return store._execUrl(req.url, host, { mode: req.mode }, hooks);
+    }
+  }
+});
+
+/** Why a package link can't be installed, or null when it looks usable. The
+ *  engine re-validates (it is also a plain HTTP API), but rejecting here keeps
+ *  the user's mistake a local message instead of a round trip. */
+function invalidInstallUrl(trimmed: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return "Enter a valid HTTP or HTTPS package URL.";
+  }
+  const hasControlChars = [...trimmed].some((ch) => {
+    const code = ch.charCodeAt(0);
+    return code < 32 || code === 127;
+  });
+  if (
+    !["http:", "https:"].includes(parsed.protocol) ||
+    !parsed.hostname ||
+    parsed.hash ||
+    hasControlChars ||
+    new TextEncoder().encode(trimmed).length > 4093
+  ) {
+    return "Enter an HTTP(S) package URL with no fragment or control characters (max 4093 bytes).";
+  }
+  return null;
 }
