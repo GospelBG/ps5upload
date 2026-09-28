@@ -9,7 +9,8 @@ import { useConnectionStore } from "./connection";
 import { useEngineStore, normalizeEngineUrl } from "./engine";
 import { useSaveSettingsStore, normalizeSavePath } from "./saveSettings";
 import { useAccessibilityStore } from "./accessibility";
-import { useNavFavoritesStore } from "./navFavorites";
+import { useNavSidebarStore } from "./navSidebar";
+import { navListsFromSettings, type NavSettings } from "./navSettings";
 import { useBetaFeaturesStore } from "./betaFeatures";
 
 /**
@@ -53,15 +54,9 @@ interface SettingsSnapshot {
     show_transfer_files?: boolean;
     bandwidth_cap_mbps?: number;
   };
-  /** Sidebar Favorites — which screens the user pinned, in their order.
-   *  Mirrored like every other preference so a pinned sidebar survives a
-   *  storage reset, a reinstall, or a hand-edit of this file. Before this was
-   *  mirrored, Favorites was the ONE setting that lived only in localStorage
-   *  and so was the one users lost. */
-  nav?: {
-    favorites?: string[];
-    favorites_hint_dismissed?: boolean;
-  };
+  /** The desktop sidebar: screens the user hid and sections they folded. Mirrored like every
+   *  other preference so it survives a storage reset, a reinstall, or a hand-edit. */
+  nav?: NavSettings;
   accessibility?: {
     motion?: string;
     density?: string;
@@ -89,8 +84,8 @@ function snapshotCurrent(): SettingsSnapshot {
       bandwidth_cap_mbps: useUploadSettingsStore.getState().bandwidthCapMbps,
     },
     nav: {
-      favorites: useNavFavoritesStore.getState().favorites,
-      favorites_hint_dismissed: useNavFavoritesStore.getState().hintDismissed,
+      hidden: useNavSidebarStore.getState().hidden,
+      closed_sections: useNavSidebarStore.getState().closedSections,
     },
     accessibility: {
       motion: useAccessibilityStore.getState().motion,
@@ -156,7 +151,7 @@ export function installUserConfigMirror() {
   });
   useSaveSettingsStore.subscribe(schedulePersist);
   useAccessibilityStore.subscribe(schedulePersist);
-  useNavFavoritesStore.subscribe(schedulePersist);
+  useNavSidebarStore.subscribe(schedulePersist);
   useBetaFeaturesStore.subscribe(schedulePersist);
 }
 
@@ -298,17 +293,14 @@ export async function hydrateFromUserConfig(): Promise<void> {
   // already scheduled a debounced persist; this ensures the file
   // converges to the authoritative (merged) snapshot without waiting
   // for the debounce window.
-  if (data.nav && Array.isArray(data.nav.favorites)) {
-    const fav = data.nav.favorites.filter((p) => typeof p === "string");
-    const ns = useNavFavoritesStore.getState();
+  const nav = navListsFromSettings(data.nav);
+  if (nav) {
+    const ns = useNavSidebarStore.getState();
     // Compare by content, not identity — a no-op hydrate would re-fire the
     // mirror write on every launch.
-    const same =
-      fav.length === ns.favorites.length &&
-      fav.every((p, i) => p === ns.favorites[i]);
-    const hint = data.nav.favorites_hint_dismissed;
-    if (!same || (typeof hint === "boolean" && hint !== ns.hintDismissed)) {
-      ns.setFavorites(fav, typeof hint === "boolean" ? hint : undefined);
+    const same = (a: string[], b: string[]) => a.length === b.length && a.every((p, i) => p === b[i]);
+    if (!same(nav.hidden, ns.hidden) || !same(nav.closedSections, ns.closedSections)) {
+      ns.setAll(nav.hidden, nav.closedSections);
     }
   }
   if (data.accessibility) {

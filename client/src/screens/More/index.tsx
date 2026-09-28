@@ -18,11 +18,11 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import { NavLink } from "react-router";
-import { ChevronRight, LayoutGrid, Search, Star, X } from "lucide-react";
+import { ChevronRight, Eye, EyeOff, LayoutGrid, Search, X } from "lucide-react";
 
 import { PageHeader, Input, EmptyState } from "../../components";
 import { useTr } from "../../state/lang";
-import { useNavFavoritesStore } from "../../state/navFavorites";
+import { useNavSidebarStore } from "../../state/navSidebar";
 import { useLogsStore } from "../../state/logs";
 import { useUpdateStore } from "../../state/update";
 import { useThemeStore } from "../../state/theme";
@@ -33,11 +33,9 @@ import { useBetaFeaturesStore } from "../../state/betaFeatures";
 import NotificationInbox from "../../layout/NotificationInbox";
 import {
   NAV_ITEMS,
-  PERMANENT_NAV_ITEMS,
   groupNavItems,
   filterNavItems,
   navItemVisible,
-  resolveFavorites,
   type NavItem,
 } from "../../layout/navItems";
 
@@ -72,15 +70,6 @@ export default function MoreScreen() {
   );
   const groups = useMemo(() => groupNavItems(matches), [matches]);
   const searching = query.trim().length > 0;
-  // Starred screens, resolved against the real nav table so a stale stored
-  // path cannot render a row that goes nowhere. Only shown when not
-  // searching — a narrowed list is already the user's shortcut.
-  const favoritePaths = useNavFavoritesStore((s) => s.favorites);
-  const favoriteItems = useMemo(
-    () => resolveFavorites(favoritePaths, betaEnabled),
-    [favoritePaths, betaEnabled],
-  );
-
   return (
     <div className="app-page max-w-4xl! pb-6!">
       <PageHeader
@@ -163,40 +152,6 @@ export default function MoreScreen() {
         </ul>
       ) : (
         <>
-          {/* Starred screens, pinned above everything else.
-
-              Favorites used to feed exactly one consumer — the desktop
-              sidebar — while the star that creates them lives here, on the
-              screen that IS the navigation on a phone. Starring on Android
-              therefore changed nothing anywhere, which is a worse outcome
-              than not offering it. This is the missing half: the star now
-              means the same thing on both platforms, "put this where I can
-              reach it fast".
-
-              Unknown paths are dropped by resolveFavorites, so a favorite
-              left over from a version that had a screen this one doesn't
-              simply disappears instead of rendering a dead row. */}
-          {favoriteItems.length > 0 && (
-            <section className="mt-1">
-              <h2 className="flex items-center gap-1.5 px-1 pb-1 text-xs font-semibold uppercase tracking-wider text-[var(--color-muted)]">
-                <Star
-                  size={12}
-                  className="fill-current text-[var(--color-accent)]"
-                />
-                {tr("nav_section_favorites", undefined, "Favorites")}
-              </h2>
-              <ul className="surface-panel overflow-hidden divide-y divide-[var(--color-border)]">
-                {favoriteItems.map((item) => (
-                  <MoreRow
-                    key={item.to}
-                    item={item}
-                    errorCount={errorCount}
-                    updateAvailable={updateAvailable}
-                  />
-                ))}
-              </ul>
-            </section>
-          )}
           {groups.map((group) => (
             <section key={group.section.key} className="mt-4 first:mt-1">
               <h2 className="px-1 pb-1 text-xs font-semibold uppercase tracking-wider text-[var(--color-muted)]">
@@ -251,7 +206,7 @@ export default function MoreScreen() {
  * — losing them on mobile would hide the only signal that something
  * needs attention.
  */
-function MoreRow({
+export function MoreRow({
   item,
   errorCount,
   updateAvailable,
@@ -264,12 +219,8 @@ function MoreRow({
   const Icon = item.icon;
   const showErrors = item.to === "/logs" && errorCount > 0;
   const showUpdate = item.to === "/settings" && updateAvailable;
-  const favorites = useNavFavoritesStore((s) => s.favorites);
-  const toggleFavorite = useNavFavoritesStore((s) => s.toggle);
-  const starred = favorites.includes(item.to);
-  // Home and About are permanently in the sidebar, so offering to pin
-  // either is a lie — `resolveFavorites` filters them back out.
-  const canFavorite = !PERMANENT_NAV_ITEMS.some((p) => p.to === item.to);
+  const hidden = useNavSidebarStore((s) => s.hidden.includes(item.to));
+  const toggleHidden = useNavSidebarStore((s) => s.toggleHidden);
   const label = tr(item.key, undefined, item.fallback);
   return (
     <li className="flex items-center">
@@ -292,6 +243,11 @@ function MoreRow({
         <span className="min-w-0 flex-1 truncate">
           {tr(item.key, undefined, item.fallback)}
         </span>
+        {hidden && (
+          <span className="hidden shrink-0 text-xs text-[var(--color-muted)] md:inline">
+            {tr("nav_hidden_marker", undefined, "Hidden from the sidebar")}
+          </span>
+        )}
         {showErrors && (
           <span
             className="rounded-full bg-[var(--color-bad)] px-2 py-0.5 text-xs font-semibold tabular-nums text-white"
@@ -322,50 +278,27 @@ function MoreRow({
       </NavLink>
       {/* Sibling of the link, not a child: a <button> inside an <a> is
           invalid markup and the click would navigate instead of toggling. */}
-      {canFavorite && (
-        <button
-          type="button"
-          onClick={() => toggleFavorite(item.to)}
-          aria-pressed={starred}
-          aria-label={
-            starred
-              ? tr(
-                  "nav_favorite_remove",
-                  { name: label },
-                  `Unpin ${label} from the sidebar`,
-                )
-              : tr(
-                  "nav_favorite_add",
-                  { name: label },
-                  `Pin ${label} to the sidebar`,
-                )
-          }
-          title={
-            starred
-              ? tr(
-                  "nav_favorite_remove",
-                  { name: label },
-                  `Unpin ${label} from the sidebar`,
-                )
-              : tr(
-                  "nav_favorite_add",
-                  { name: label },
-                  `Pin ${label} to the sidebar`,
-                )
-          }
-          className={`mr-2 flex h-11 w-11 shrink-0 items-center justify-center rounded-md transition-colors hover:bg-[var(--color-surface-3)] ${
-            starred
-              ? "text-[var(--color-accent)]"
-              : "text-[var(--color-muted)] opacity-60 hover:opacity-100"
-          }`}
-        >
-          <Star
-            size={16}
-            aria-hidden
-            fill={starred ? "currentColor" : "none"}
-          />
-        </button>
-      )}
+      {/* Desktop only: phones navigate by tabs and this list, and have no sidebar to change. */}
+      <button
+        type="button"
+        onClick={() => toggleHidden(item.to)}
+        aria-pressed={!hidden}
+        aria-label={
+          hidden
+            ? tr("nav_show_item", { name: label }, "Show {name} in the sidebar")
+            : tr("nav_hide_item", { name: label }, "Hide {name} from the sidebar")
+        }
+        title={
+          hidden
+            ? tr("nav_show_item", { name: label }, "Show {name} in the sidebar")
+            : tr("nav_hide_item", { name: label }, "Hide {name} from the sidebar")
+        }
+        className={`mr-2 hidden h-11 w-11 shrink-0 items-center justify-center rounded-md transition-colors hover:bg-[var(--color-surface-3)] md:flex ${
+          hidden ? "text-[var(--color-muted)] opacity-60 hover:opacity-100" : "text-[var(--color-accent)]"
+        }`}
+      >
+        {hidden ? <EyeOff size={16} aria-hidden /> : <Eye size={16} aria-hidden />}
+      </button>
     </li>
   );
 }

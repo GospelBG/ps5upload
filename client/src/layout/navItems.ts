@@ -267,52 +267,15 @@ export const NAV_ITEMS: NavItem[] = [
   { to: "/about", key: "about", fallback: "About", icon: Info },
 ];
 
-/** The one destination that is always in the sidebar.
- *
- * Home and About are deliberately not favorites: neither can be unstarred,
- * so the sidebar can never end up empty and there is always a way back to a
- * known screen AND to the links/help a newcomer needs. Everything else is
- * the user's choice — see `resolveFavorites`. The section label lives on the
- * first item so `groupNavItems` has a header to open the group with.
- */
+/** Home: always first in the sidebar, above the sections, and never hidden — there is always
+ *  a way back to a known screen. */
 export const HOME_NAV_ITEM: NavItem = {
   to: "/home",
   key: "v5_tab_home",
   fallback: "Home",
   icon: LayoutDashboard,
-  section: { key: "nav_section_favorites", fallback: "Favorites" },
 };
 
-/** Pinned at the BOTTOM of the sidebar. About carries the project links
- *  (GitHub, Discord, X), the changelog and the disclaimer — the things
- *  someone new needs to find without first learning that More exists — but it
- *  is reference material, so it sits below the user's favourites rather than
- *  pushing them down. No `section`: it joins the group Home opens rather than
- *  starting another, which is what keeps it inside the same list. */
-export const ABOUT_NAV_ITEM: NavItem = {
-  to: "/about",
-  key: "about",
-  fallback: "About",
-  icon: Info,
-};
-
-/** The rows that are always present. Order here is for de-duplication only —
- *  the sidebar composes the render order itself (Home, favourites, About). */
-export const PERMANENT_NAV_ITEMS: readonly NavItem[] = [
-  HOME_NAV_ITEM,
-  ABOUT_NAV_ITEM,
-];
-
-/**
- * Resolve stored favorite route paths into real nav items.
- *
- * Unknown paths are DROPPED rather than rendered. Favorites are persisted
- * per-machine and outlive the build that wrote them, so a screen that is
- * later renamed or removed would otherwise stay pinned in someone's
- * sidebar forever, linking nowhere. Order follows the stored list (the
- * order the user starred things in), and the permanent rows are filtered out
- * so they can never appear twice.
- */
 /** Whether an item is currently visible. Beta items stay hidden until the
  *  user turns them on, which is what keeps a half-finished screen out of a
  *  sidebar that the user never asked to be a test bench. */
@@ -325,46 +288,24 @@ export function navItemVisible(item: NavItem, betaEnabled: boolean): boolean {
   return !item.beta || betaEnabled;
 }
 
-export function resolveFavorites(
-  paths: readonly string[],
-  betaEnabled = false,
-): NavItem[] {
-  const byPath = new Map(NAV_ITEMS.map((item) => [item.to, item]));
-  const seen = new Set<string>(PERMANENT_NAV_ITEMS.map((i) => i.to));
-  const out: NavItem[] = [];
-  for (const path of paths) {
-    if (seen.has(path)) continue;
-    const item = byPath.get(path);
-    if (!item || !navItemVisible(item, betaEnabled)) continue;
-    seen.add(path);
-    // Strip any section header the item carries in the More list — inside
-    // Favorites it is a plain row under the Favorites header, not the start
-    // of a new group.
-    const { section: _section, ...rest } = item;
-    out.push(rest);
-  }
-  return out;
-}
-
 /**
- * The sidebar's Favorites list, in render order: Home first, the user's
- * starred screens in the order they starred them, About last.
+ * The desktop sidebar's sections: every screen in its section, minus the ones the user hid
+ * (and beta screens while beta is off, and what the browser build can't offer).
  *
- * About is pinned to the BOTTOM rather than beside Home because it is
- * reference material — you go there once to find the links and the
- * changelog, not on the way to anything else — so it should not push the
- * favourites down. It carries no `section`, which is what keeps it inside
- * the group Home opens instead of starting a second one.
+ * Grouped BEFORE filtering: a section's header rides on its first screen, so hiding that
+ * screen and grouping afterwards would fold the rest of the section into the one above. A
+ * section with nothing left in it goes.
  */
-export function sidebarNavItems(
-  favorites: readonly string[],
-  betaEnabled = false,
-): NavItem[] {
-  return [
-    HOME_NAV_ITEM,
-    ...resolveFavorites(favorites, betaEnabled),
-    ABOUT_NAV_ITEM,
-  ];
+export function sidebarGroups(
+  hidden: readonly string[],
+  betaEnabled: boolean,
+  inBrowser: boolean,
+): NavGroup[] {
+  const shown = (i: NavItem) =>
+    navItemVisible(i, betaEnabled) && !(inBrowser && i.hideInBrowser) && !hidden.includes(i.to);
+  return groupNavItems(NAV_ITEMS)
+    .map((g) => ({ section: g.section, items: g.items.filter(shown) }))
+    .filter((g) => g.items.length > 0);
 }
 
 /**

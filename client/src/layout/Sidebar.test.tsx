@@ -9,8 +9,11 @@ vi.mock("../lib/safeStorage", () => ({
 }));
 vi.mock("../state/lang", () => ({
   useTr: () =>
-    (key: string, _vars?: Record<string, string | number>, fallback?: string) =>
-      fallback ?? key,
+    (key: string, vars?: Record<string, string | number>, fallback?: string) => {
+      let out = fallback ?? key;
+      for (const [k, v] of Object.entries(vars ?? {})) out = out.replace(`{${k}}`, String(v));
+      return out;
+    },
 }));
 vi.mock("../state/logs", () => ({
   useLogsStore: (
@@ -31,70 +34,61 @@ vi.mock("./RosterPicker", () => ({
 
 import Sidebar from "./Sidebar";
 
+function render(el: React.ReactElement = <Sidebar />) {
+  return renderToStaticMarkup(<MemoryRouter initialEntries={["/home"]}>{el}</MemoryRouter>);
+}
+
+/** A sidebar whose store holds these lists. */
+async function withLists(hidden: string[], closedSections: string[]) {
+  vi.resetModules();
+  vi.doMock("../state/navSidebar", () => ({
+    useNavSidebarStore: (
+      selector: (state: {
+        hidden: string[];
+        closedSections: string[];
+        toggleHidden: () => void;
+        toggleSection: () => void;
+      }) => unknown,
+    ) => selector({ hidden, closedSections, toggleHidden: () => {}, toggleSection: () => {} }),
+  }));
+  return (await import("./Sidebar")).default;
+}
+
 describe("Sidebar", () => {
-  it("assumes nothing beyond Home, and always keeps More reachable", () => {
-    // safeStorage is mocked empty above, so this is a first run: no
-    // favorites stored. The sidebar used to hardcode five screens; now it
-    // picks exactly one for the user and offers the rest via More.
-    const html = renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/home"]}>
-        <Sidebar />
-      </MemoryRouter>,
-    );
-
+  it("shows every screen from the start, in its sections, and keeps More", () => {
+    // safeStorage is mocked empty: a first run, nothing hidden.
+    const html = render();
     expect(html).toContain('data-collapsed="false"');
-    expect(html).toContain('href="/home"');
-    // Not assumed on the user's behalf any more.
-    expect(html).not.toContain('href="/games"');
-    expect(html).not.toContain('href="/files"');
-    expect(html).not.toContain('href="/console"');
-    expect(html).not.toContain('href="/tasks"');
-    // The escape hatch must survive, or an empty Favorites list would
-    // strand the user on Home with no way to reach anything else.
+    for (const to of ["/home", "/upload", "/install-package", "/convert", "/files", "/games", "/console", "/settings"]) {
+      expect(html).toContain(`href="${to}"`);
+    }
+    expect(html).toContain("Files &amp; storage");
     expect(html).toContain('href="/more"');
-    expect(html).not.toContain('href="/install-package"');
+    // The old favorites hint is gone.
+    expect(html).not.toContain("Star screens in More");
   });
 
-  it("shows the hint that explains how to fill the sidebar", () => {
-    const html = renderToStaticMarkup(
-      <MemoryRouter initialEntries={["/home"]}>
-        <Sidebar />
-      </MemoryRouter>,
-    );
-    expect(html).toContain("Star screens in More");
+  it("offers to hide each screen but Home", () => {
+    const html = render();
+    expect(html).toContain('aria-label="Hide Convert to FPKG from the sidebar"');
+    expect(html).not.toContain('aria-label="Hide Home from the sidebar"');
   });
 
-  it("renders stored favorites after Home", () => {
-    vi.resetModules();
-    vi.doMock("../state/navFavorites", () => ({
-      useNavFavoritesStore: (
-        selector: (state: {
-          favorites: string[];
-          hintDismissed: boolean;
-          dismissHint: () => void;
-        }) => unknown,
-      ) =>
-        selector({
-          favorites: ["/files", "/games"],
-          hintDismissed: true,
-          dismissHint: () => {},
-        }),
-    }));
-    return import("./Sidebar").then(({ default: Pinned }) => {
-      const html = renderToStaticMarkup(
-        <MemoryRouter initialEntries={["/home"]}>
-          <Pinned />
-        </MemoryRouter>,
-      );
-      expect(html).toContain('href="/home"');
-      expect(html).toContain('href="/files"');
-      expect(html).toContain('href="/games"');
-      // Hint retires once something is pinned.
-      expect(html).not.toContain("Star screens in More");
-      // Order follows the stored list, not NAV_ITEMS order.
-      expect(html.indexOf('href="/files"')).toBeLessThan(
-        html.indexOf('href="/games"'),
-      );
-    });
+  it("leaves hidden screens out and says how many, with the way back", async () => {
+    const Hidden = await withLists(["/cheats", "/shell"], []);
+    const html = render(<Hidden />);
+    expect(html).not.toContain('href="/cheats"');
+    expect(html).not.toContain('href="/shell"');
+    expect(html).toContain('href="/games"');
+    expect(html).toContain("2 hidden");
+  });
+
+  it("folds a closed section away but keeps its header", async () => {
+    const Folded = await withLists([], ["nav_section_diagnostics"]);
+    const html = render(<Folded />);
+    expect(html).toContain("Diagnostics");
+    expect(html).toMatch(/aria-expanded="false"[^>]*>(?:(?!<\/button>).)*Diagnostics/);
+    expect(html).not.toContain('href="/logs"');
+    expect(html).toContain('href="/games"');
   });
 });

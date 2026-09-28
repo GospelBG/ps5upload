@@ -3011,6 +3011,11 @@ fanCurve_preview: "Preview",
   v5_tab_tasks: "Tasks",
   v5_tab_tasks_desc: "Active and recent background tasks",
   v5_tab_more: "More",
+  "nav_hide": "Hide from the sidebar",
+  "nav_hide_item": "Hide {name} from the sidebar",
+  "nav_show_item": "Show {name} in the sidebar",
+  "nav_hidden_count": "{count} hidden — show them from More",
+  "nav_hidden_marker": "Hidden from the sidebar",
   // ─ v5 More screen (mobile "everything else" hub) ─
   more_title: "More",
   more_description: "Every screen, plus your consoles and app settings.",
@@ -3385,11 +3390,6 @@ fs_replace_confirm_ok: "Replace",
 fs_busy_uploading: "Copying to PS5",
 notif_fs_upload_failed: "Copy to PS5 failed",
 volumes_mounted_rw: "read-write",
-nav_section_favorites: "Favorites",
-nav_favorites_hint: "Star screens in More to pin them here.",
-nav_favorites_hint_dismiss: "Dismiss",
-nav_favorite_add: "Pin {name} to the sidebar",
-nav_favorite_remove: "Unpin {name} from the sidebar",
 
 // Editing a game image in place (ShadowMount+ checkout). ShadowMount+ mounts
 // everything read-only and re-adopts any image whose mount disappears, so

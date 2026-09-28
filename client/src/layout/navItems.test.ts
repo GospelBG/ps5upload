@@ -4,10 +4,7 @@ import en from "../i18n/locales/en";
 import {
   NAV_ITEMS,
   HOME_NAV_ITEM,
-  ABOUT_NAV_ITEM,
-  PERMANENT_NAV_ITEMS,
-  sidebarNavItems,
-  resolveFavorites,
+  sidebarGroups,
   groupNavItems,
   filterNavItems,
   type NavItem,
@@ -54,66 +51,54 @@ describe("NAV_ITEMS", () => {
   });
 });
 
-describe("sidebar favorites", () => {
-  it("pins Home permanently and starts with nothing else assumed", () => {
-    // The sidebar used to hardcode five screens. Home is the only one the
-    // app still chooses for the user; everything else is opt-in.
-    expect(HOME_NAV_ITEM.to).toBe("/home");
-    expect(HOME_NAV_ITEM.section).toBeDefined();
-    expect(resolveFavorites([])).toEqual([]);
+describe("the sidebar's sections", () => {
+  const paths = (groups: ReturnType<typeof sidebarGroups>) => groups.flatMap((g) => g.items.map((i) => i.to));
+  const sections = (groups: ReturnType<typeof sidebarGroups>) => groups.map((g) => g.section.key);
+
+  it("lists every screen, in its sections, with nothing hidden", () => {
+    const groups = sidebarGroups([], false, false);
+    expect(paths(groups)).toEqual(NAV_ITEMS.filter((i) => !i.beta).map((i) => i.to));
+    expect(sections(groups)).toContain("nav_section_files");
+    // Home sits above the sections, not inside one.
+    expect(paths(groups)).not.toContain(HOME_NAV_ITEM.to);
   });
 
-  it("resolves stored paths in the order they were starred", () => {
-    const out = resolveFavorites(["/files", "/games"]);
-    expect(out.map((i) => i.to)).toEqual(["/files", "/games"]);
+  it("leaves hidden screens out", () => {
+    const groups = sidebarGroups(["/cheats", "/shell"], false, false);
+    expect(paths(groups)).not.toContain("/cheats");
+    expect(paths(groups)).not.toContain("/shell");
+    expect(paths(groups)).toContain("/games");
   });
 
-  it("drops paths that no longer exist", () => {
-    // Favorites outlive the build that wrote them, so a screen removed or
-    // renamed in a later version must not leave a dead row linking nowhere.
-    expect(
-      resolveFavorites(["/files", "/screen-that-was-removed"]).map((i) => i.to),
-    ).toEqual(["/files"]);
+  it("keeps a section whose first screen is hidden, with the rest in it", () => {
+    // Upload opens Files & storage: hiding it must not merge the rest into Setup.
+    const groups = sidebarGroups(["/upload"], false, false);
+    const files = groups.find((g) => g.section.key === "nav_section_files");
+    expect(files?.items.map((i) => i.to)).toContain("/files");
+    const setup = groups.find((g) => g.section.key === "nav_section_setup");
+    expect(setup?.items.map((i) => i.to)).not.toContain("/files");
   });
 
-  it("never lets Home appear twice", () => {
-    expect(resolveFavorites(["/home", "/files"]).map((i) => i.to)).toEqual([
-      "/files",
-    ]);
+  it("drops a section once every screen in it is hidden", () => {
+    const help = groupNavItems(NAV_ITEMS).find((g) => g.section.key === "nav_section_help")!;
+    const groups = sidebarGroups(help.items.map((i) => i.to), false, false);
+    expect(sections(groups)).not.toContain("nav_section_help");
   });
 
-  it("ignores a duplicate entry in the stored list", () => {
-    expect(resolveFavorites(["/files", "/files"]).map((i) => i.to)).toEqual([
-      "/files",
-    ]);
-  });
-
-  it("renders as one group under the Favorites header", () => {
-    const groups = groupNavItems([
-      HOME_NAV_ITEM,
-      ...resolveFavorites(["/files", "/games"]),
-    ]);
-    expect(groups).toHaveLength(1);
-    expect(groups[0].section.key).toBe("nav_section_favorites");
-    expect(groups[0].items.map((i) => i.to)).toEqual([
-      "/home",
-      "/files",
-      "/games",
-    ]);
-  });
-
-  it("uses translation keys present in the English catalogue", () => {
-    for (const item of NAV_ITEMS) {
-      expect(en, `missing navigation translation: ${item.key}`).toHaveProperty(
-        item.key,
-      );
-      if (item.section) {
-        expect(
-          en,
-          `missing navigation section translation: ${item.section.key}`,
-        ).toHaveProperty(item.section.key);
-      }
+  it("names every screen and section with a key the English catalogue has", () => {
+    const catalogue = en as Record<string, string>;
+    for (const g of sidebarGroups([], true, false)) {
+      expect(catalogue[g.section.key], g.section.key).toBeTruthy();
+      for (const i of g.items) expect(catalogue[i.key], i.key).toBeTruthy();
     }
+    expect(catalogue[HOME_NAV_ITEM.key]).toBeTruthy();
+  });
+
+  it("leaves out what the browser build can't offer", () => {
+    const browserOnlyHidden = NAV_ITEMS.filter((i) => i.hideInBrowser).map((i) => i.to);
+    expect(browserOnlyHidden.length).toBeGreaterThan(0);
+    const inBrowser = paths(sidebarGroups([], false, true));
+    for (const p of browserOnlyHidden) expect(inBrowser).not.toContain(p);
   });
 });
 
@@ -222,61 +207,6 @@ describe("filterNavItems", () => {
   });
 });
 
-describe("permanent sidebar rows", () => {
-  it("pins Home and About", () => {
-    expect([...PERMANENT_NAV_ITEMS].map((i) => i.to).sort()).toEqual([
-      "/about",
-      "/home",
-    ]);
-  });
-
-  it("renders Home first and About last, whatever is starred", () => {
-    expect(sidebarNavItems([]).map((i) => i.to)).toEqual(["/home", "/about"]);
-    expect(sidebarNavItems(["/settings", "/logs"]).map((i) => i.to)).toEqual([
-      "/home",
-      "/settings",
-      "/logs",
-      "/about",
-    ]);
-  });
-
-  it("keeps About last even when it is stored as a favorite", () => {
-    expect(sidebarNavItems(["/about", "/settings"]).map((i) => i.to)).toEqual([
-      "/home",
-      "/settings",
-      "/about",
-    ]);
-  });
-
-  it("puts every row in one group, with About in it", () => {
-    const groups = groupNavItems(sidebarNavItems(["/settings"]));
-    expect(groups).toHaveLength(1);
-    expect(groups[0].items.map((i) => i.to)).toEqual([
-      "/home",
-      "/settings",
-      "/about",
-    ]);
-  });
-
-  it("only the first permanent row opens the section", () => {
-    // groupNavItems drops anything before the first section header, so if
-    // About ever grew its own `section` it would split the group in two.
-    expect(HOME_NAV_ITEM.section).toBeDefined();
-    expect(ABOUT_NAV_ITEM.section).toBeUndefined();
-  });
-
-  it("never renders a permanent row twice when it is also starred", () => {
-    // Favorites are hand-editable on disk and survive downgrades, so a stored
-    // "/about" from an older build must not produce a duplicate row.
-    const resolved = resolveFavorites(["/about", "/home", "/settings"]);
-    expect(resolved.map((i) => i.to)).not.toContain("/about");
-    expect(resolved.map((i) => i.to)).not.toContain("/home");
-    expect(resolved.map((i) => i.to)).toContain("/settings");
-  });
-});
-
-// SMB Browser and FTP Server were replaced by Connections: they are gone from the navigation,
-// and an old link or saved favourite to either lands on Connections.
 describe("retired screens", () => {
   const APP = Object.values(
     import.meta.glob("../App.tsx", { query: "?raw", import: "default", eager: true }) as Record<

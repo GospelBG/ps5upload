@@ -1,17 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import { NavLink } from "react-router";
-import { ChevronLeft, ChevronRight, LayoutGrid, X } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, EyeOff, LayoutGrid } from "lucide-react";
 
 import { getAppVersion } from "../lib/appVersion";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { useTr } from "../state/lang";
 import { useLogsStore } from "../state/logs";
 import { useUpdateStore } from "../state/update";
-import { useNavFavoritesStore } from "../state/navFavorites";
+import { useNavSidebarStore } from "../state/navSidebar";
+import { isTauriEnv } from "../lib/tauriEnv";
 import { useBetaFeaturesStore } from "../state/betaFeatures";
 import NotificationInbox from "./NotificationInbox";
 import RosterPicker from "./RosterPicker";
-import { groupNavItems, sidebarNavItems } from "./navItems";
+import { HOME_NAV_ITEM, sidebarGroups, type NavItem } from "./navItems";
 
 const COLLAPSED_KEY = "ps5upload.desktop-sidebar.collapsed.v1";
 
@@ -49,19 +50,18 @@ export default function Sidebar() {
     (s) => s.entries.filter((e) => e.level === "error").length,
   );
   const updateAvailable = useUpdateStore((s) => s.phase.kind === "available");
-  const favorites = useNavFavoritesStore((s) => s.favorites);
   // Subscribed, not read once: flipping the switch in Settings must add or
   // remove the row without a reload.
   const betaEnabled = useBetaFeaturesStore((s) => s.enabled);
-  const hintDismissed = useNavFavoritesStore((s) => s.hintDismissed);
-  const dismissHint = useNavFavoritesStore((s) => s.dismissHint);
-  // Home pinned at the top, About pinned at the bottom, the user's starred
-  // screens in between — see `sidebarNavItems`.
+  // Every screen, in its sections, minus what the user hid — see `sidebarGroups`.
+  const hidden = useNavSidebarStore((s) => s.hidden);
+  const closedSections = useNavSidebarStore((s) => s.closedSections);
+  const toggleHidden = useNavSidebarStore((s) => s.toggleHidden);
+  const toggleSection = useNavSidebarStore((s) => s.toggleSection);
   const groups = useMemo(
-    () => groupNavItems(sidebarNavItems(favorites, betaEnabled)),
-    [favorites, betaEnabled],
+    () => sidebarGroups(hidden, betaEnabled, !isTauriEnv()),
+    [hidden, betaEnabled],
   );
-  const showFavoritesHint = favorites.length === 0 && !hintDismissed;
 
   const toggleCollapsed = () => {
     setCollapsed((current) => {
@@ -69,6 +69,66 @@ export default function Sidebar() {
       safeSetItem(COLLAPSED_KEY, next ? "1" : "0");
       return next;
     });
+  };
+
+  const renderItem = (item: NavItem, hideable: boolean) => {
+    const Icon = item.icon;
+    const label = tr(item.key, undefined, item.fallback);
+    const showErrors = item.to === "/logs" && errorCount > 0;
+    const showUpdate = item.to === "/settings" && updateAvailable;
+    return (
+      <li key={item.to} className="group relative">
+        <NavLink
+          to={item.to}
+          title={collapsed ? label : undefined}
+          aria-label={collapsed ? label : undefined}
+          className={({ isActive }) =>
+            [
+              "relative flex min-h-10 items-center rounded-[0.65rem] text-[0.8125rem] transition-[background-color,color,box-shadow]",
+              "focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--color-accent)]",
+              collapsed ? "justify-center px-2" : "gap-2.5 px-2.5",
+              isActive
+                ? "bg-[var(--color-accent-soft)] font-semibold text-[var(--color-accent)] shadow-[inset_3px_0_0_var(--color-accent)]"
+                : "text-[var(--color-muted)] hover:bg-[var(--color-surface-3)] hover:text-[var(--color-text)]",
+            ].join(" ")
+          }
+        >
+          <Icon size={18} strokeWidth={1.8} className="shrink-0" />
+          {!collapsed && <span className="min-w-0 flex-1 truncate">{label}</span>}
+          {showErrors && (
+            <span
+              className={
+                collapsed
+                  ? "absolute right-1 top-1 h-2 w-2 rounded-full bg-[var(--color-bad)]"
+                  : "rounded-full bg-[var(--color-bad)] px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-white"
+              }
+              aria-label={`${errorCount} logged errors`}
+            >
+              {!collapsed && (errorCount > 99 ? "99+" : errorCount)}
+            </span>
+          )}
+          {showUpdate && (
+            <span
+              className="h-2 w-2 shrink-0 rounded-full bg-[var(--color-accent)]"
+              aria-label={tr("update_available_short", undefined, "Update available")}
+            />
+          )}
+        </NavLink>
+        {/* A sibling of the link (a button inside <a> is invalid and would navigate), shown on
+            hover or keyboard focus so the list stays quiet. */}
+        {hideable && !collapsed && (
+          <button
+            type="button"
+            onClick={() => toggleHidden(item.to)}
+            aria-label={tr("nav_hide_item", { name: label }, "Hide {name} from the sidebar")}
+            title={tr("nav_hide", undefined, "Hide from the sidebar")}
+            className="absolute right-1.5 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md bg-[var(--color-surface-2)] text-[var(--color-muted)] opacity-0 hover:text-[var(--color-text)] focus-visible:opacity-100 group-hover:opacity-100"
+          >
+            <EyeOff size={14} aria-hidden />
+          </button>
+        )}
+      </li>
+    );
   };
 
   return (
@@ -133,107 +193,39 @@ export default function Sidebar() {
         aria-label={tr("v5_tab_primary_nav", undefined, "Primary")}
         className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2.5 py-3 [overscroll-behavior:contain]"
       >
-        {groups.map((group, groupIndex) => (
-          <section
-            key={group.section.key}
-            className={groupIndex === 0 ? "" : "mt-3"}
-          >
-            {collapsed ? (
-              groupIndex > 0 && (
-                <div
-                  aria-hidden
-                  className="mx-2 mb-2 border-t border-[var(--color-border)]"
-                />
-              )
-            ) : (
-              <h2 className="px-2.5 pb-1.5 text-[0.625rem] font-bold uppercase tracking-[0.12em] text-[var(--color-muted)]">
-                {tr(group.section.key, undefined, group.section.fallback)}
-              </h2>
-            )}
-            <ul className="space-y-1">
-              {group.items.map((item) => {
-                const Icon = item.icon;
-                const label = tr(item.key, undefined, item.fallback);
-                const showErrors = item.to === "/logs" && errorCount > 0;
-                const showUpdate = item.to === "/settings" && updateAvailable;
-                return (
-                  <li key={item.to}>
-                    <NavLink
-                      to={item.to}
-                      title={collapsed ? label : undefined}
-                      aria-label={collapsed ? label : undefined}
-                      className={({ isActive }) =>
-                        [
-                          "relative flex min-h-10 items-center rounded-[0.65rem] text-[0.8125rem] transition-[background-color,color,box-shadow]",
-                          "focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--color-accent)]",
-                          collapsed ? "justify-center px-2" : "gap-2.5 px-2.5",
-                          isActive
-                            ? "bg-[var(--color-accent-soft)] font-semibold text-[var(--color-accent)] shadow-[inset_3px_0_0_var(--color-accent)]"
-                            : "text-[var(--color-muted)] hover:bg-[var(--color-surface-3)] hover:text-[var(--color-text)]",
-                        ].join(" ")
-                      }
-                    >
-                      <Icon size={18} strokeWidth={1.8} className="shrink-0" />
-                      {!collapsed && (
-                        <span className="min-w-0 flex-1 truncate">{label}</span>
-                      )}
-                      {showErrors && (
-                        <span
-                          className={
-                            collapsed
-                              ? "absolute right-1 top-1 h-2 w-2 rounded-full bg-[var(--color-bad)]"
-                              : "rounded-full bg-[var(--color-bad)] px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-white"
-                          }
-                          aria-label={`${errorCount} logged errors`}
-                        >
-                          {!collapsed && (errorCount > 99 ? "99+" : errorCount)}
-                        </span>
-                      )}
-                      {showUpdate && (
-                        <span
-                          className="h-2 w-2 shrink-0 rounded-full bg-[var(--color-accent)]"
-                          aria-label={tr(
-                            "update_available_short",
-                            undefined,
-                            "Update available",
-                          )}
-                        />
-                      )}
-                    </NavLink>
-                  </li>
-                );
-              })}
-            </ul>
-          </section>
-        ))}
+        <ul>{renderItem(HOME_NAV_ITEM, false)}</ul>
+        {groups.map((group) => {
+          const title = tr(group.section.key, undefined, group.section.fallback);
+          // The icon rail has no header to reopen a folded section from, so it shows them all.
+          const open = collapsed || !closedSections.includes(group.section.key);
+          return (
+            <section key={group.section.key} className="mt-3">
+              {collapsed ? (
+                <div aria-hidden className="mx-2 mb-2 border-t border-[var(--color-border)]" />
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => toggleSection(group.section.key)}
+                  aria-expanded={open}
+                  className="flex w-full items-center gap-1 rounded px-2.5 pb-1.5 text-left text-[0.625rem] font-bold uppercase tracking-[0.12em] text-[var(--color-muted)] hover:text-[var(--color-text)]"
+                >
+                  <span className="min-w-0 flex-1 truncate">{title}</span>
+                  {open ? <ChevronDown size={12} aria-hidden /> : <ChevronRight size={12} aria-hidden />}
+                </button>
+              )}
+              {open && <ul className="space-y-1">{group.items.map((item) => renderItem(item, true))}</ul>}
+            </section>
+          );
+        })}
 
-        {/* Shown only until the user stars something (or dismisses it).
-            Without it a fresh sidebar is a single Home row with no clue
-            that the rest of the app is one click away in More. Hidden
-            while collapsed — there is no room for prose in a 4.25rem rail. */}
-        {showFavoritesHint && !collapsed && (
-          <div className="mt-3 flex items-start gap-1.5 rounded-[0.65rem] border border-dashed border-[var(--color-border)] px-2.5 py-2 text-[0.6875rem] leading-snug text-[var(--color-muted)]">
-            <span className="min-w-0 flex-1">
-              {tr(
-                "nav_favorites_hint",
-                undefined,
-                "Star screens in More to pin them here.",
-              )}
-            </span>
-            <button
-              type="button"
-              onClick={dismissHint}
-              aria-label={tr(
-                "nav_favorites_hint_dismiss",
-                undefined,
-                "Dismiss",
-              )}
-              title={tr("nav_favorites_hint_dismiss", undefined, "Dismiss")}
-              className="shrink-0 rounded p-0.5 hover:bg-[var(--color-surface-3)] hover:text-[var(--color-text)]"
-            >
-              <X size={12} aria-hidden />
-            </button>
-          </div>
+        {/* The way back for anything hidden: More lists every screen with its switch. */}
+        {hidden.length > 0 && !collapsed && (
+          <NavLink
+            to="/more"
+            className="mt-3 block rounded-[0.65rem] px-2.5 py-1.5 text-[0.6875rem] text-[var(--color-muted)] hover:bg-[var(--color-surface-3)] hover:text-[var(--color-text)]"
+          >
+            {tr("nav_hidden_count", { count: hidden.length }, "{count} hidden — show them from More")}
+          </NavLink>
         )}
       </nav>
 

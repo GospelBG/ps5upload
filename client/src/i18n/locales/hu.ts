@@ -2949,6 +2949,11 @@ smb_upload_ps5: "Feltöltés a PS5-re",
   v5_tab_tasks: "Feladatok",
   v5_tab_tasks_desc: "Aktív és legutóbbi háttérfeladatok",
   v5_tab_more: "Több",
+  "nav_hide": "Elrejtés az oldalsávról",
+  "nav_hide_item": "{name} elrejtése az oldalsávról",
+  "nav_show_item": "{name} megjelenítése az oldalsávon",
+  "nav_hidden_count": "{count} elrejtve — a Továbbiakban megjeleníthetők",
+  "nav_hidden_marker": "Elrejtve az oldalsávon",
   // ─ v5 Több képernyő ("minden más" mobil hub) ─
   more_title: "Több",
   more_description: "Minden képernyő, plusz a konzolaid és az alkalmazás beállításai.",
@@ -3322,11 +3327,6 @@ fs_replace_confirm_ok: "Csere",
 fs_busy_uploading: "Másolás a PS5-re",
 notif_fs_upload_failed: "A PS5-re másolás sikertelen",
 volumes_mounted_rw: "írható-olvasható",
-nav_section_favorites: "Kedvencek",
-nav_favorites_hint: "Csillagozz meg képernyőket a Több menüben, hogy ide kitűzd őket.",
-nav_favorites_hint_dismiss: "Elvetés",
-nav_favorite_add: "{name} kitűzése az oldalsávra",
-nav_favorite_remove: "{name} eltávolítása az oldalsávról",
 
 // Egy játékkép helyben szerkesztése (ShadowMount+ checkout). A ShadowMount+
 // mindent csak olvashatóként csatol, és újra átveszi bármely képet, amelynek
