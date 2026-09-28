@@ -238,7 +238,7 @@ export default function ProcessesScreen() {
   const systemCount = procs.filter((p) => p.kind === "system").length;
 
   return (
-    <div className="mx-auto max-w-5xl p-6">
+    <div className="app-page">
       <PageHeader
         icon={Cpu}
         title={tr("processes_title", undefined, "Processes")}

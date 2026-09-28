@@ -706,7 +706,7 @@ export default function UploadScreen() {
     r.source ? detectedLabel(r.source, tr).label : r.isDir ? tr("upload_kind_folder", "Folder") : "";
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       {pending && (
         <ExistingDestinationDialog
           entryCount={pending.entryCount}

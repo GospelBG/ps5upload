@@ -232,7 +232,7 @@ export default function CheatsScreen() {
   };
 
   return (
-    <div className="mx-auto max-w-5xl space-y-4 p-4">
+    <div className="app-page space-y-4">
       <PageHeader
         icon={Gamepad2}
         title={tr("cheats_title", undefined, "Cheats")}

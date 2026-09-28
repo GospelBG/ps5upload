@@ -41,7 +41,7 @@ export default function ChangelogScreen() {
   }, []);
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <PageHeader
         icon={Sparkles}
         title={tr("whats_new", undefined, "What's new")}

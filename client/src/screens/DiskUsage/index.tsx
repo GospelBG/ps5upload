@@ -175,7 +175,7 @@ export default function DiskUsageScreen() {
   const PRESET_PATHS = ["/user", "/data", "/system_data", "/system_ex", "/mnt"];
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <PageHeader
         icon={PieChart}
         title={tr("disk_usage_title", undefined, "Disk usage")}

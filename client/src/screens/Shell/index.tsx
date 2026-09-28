@@ -162,7 +162,7 @@ export default function ShellScreen() {
   }
 
   return (
-    <div className="flex h-full flex-col p-6">
+    <div className="app-page flex h-full flex-col">
       <PageHeader
         icon={TerminalSquare}
         title={tr("shell_title", undefined, "Shell")}

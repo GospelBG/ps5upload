@@ -35,7 +35,7 @@ export default function AuditLogScreen() {
   );
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <PageHeader
         icon={ScrollText}
         title={tr("audit_log_title", undefined, "Audit log")}

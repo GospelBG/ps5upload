@@ -763,7 +763,7 @@ export default function SavesScreen() {
   }
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       {confirmDialogNode}
       <PageHeader
         icon={Save}

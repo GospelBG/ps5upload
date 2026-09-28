@@ -275,7 +275,7 @@ export default function GameHubScreen() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-6xl p-4 md:p-6">
+    <div className="app-page">
       {/* Header */}
       <header className="mb-6">
         <div className="mb-3 flex items-center gap-2">

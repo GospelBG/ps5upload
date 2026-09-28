@@ -89,7 +89,7 @@ export default function FAQScreen() {
   }, [sections, query]);
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <PageHeader
         icon={HelpCircle}
         title={tr("faq", undefined, "FAQ")}

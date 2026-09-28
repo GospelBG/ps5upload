@@ -274,7 +274,7 @@ export default function FpkgConvertScreen() {
   const noFiles = inspection !== null && inspection.files === 0;
 
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-4 p-4">
+    <div className="app-page flex flex-col gap-4">
       <PageHeader
         icon={PackagePlus}
         title={tr("fpkg_title", undefined, "Convert to FPKG")}
@@ -285,130 +285,138 @@ export default function FpkgConvertScreen() {
         )}
       />
 
-      <GameCard
-        source={source}
-        onSourceTyped={(v) => {
-          if (locked) return;
-          reset();
-          // The old check belongs to the old path: drop it until this one is checked.
-          latest.current.invalidate();
-          setInspection(null);
-          setEstimates(null);
-          setChecking(false);
-          setSource(v);
-          setPassword("");
-        }}
-        onCheck={() => void check(source)}
-        onBrowseFolder={() => void browse("folder")}
-        onBrowseImage={() => void browse("file")}
-        onRemotePick={chooseSource}
-        onBrowseConsole={canInstall ? () => void browseConsole() : undefined}
-        onView={
-          inspection && source.trim() && !isArchiveSource(source.trim())
-            ? () => usePackageViewer.getState().open(source.trim())
-            : undefined
-        }
-        canBrowse={canBrowse}
-        inspection={inspection}
-        checking={checking}
-        locked={locked}
-        dropActive={dropActive}
-        password={password}
-        onPassword={setPassword}
-      />
-
-      <OptionsCard
-        outputDir={outputDir}
-        onChangeOutput={() => void browseOutput()}
-        onOutputTyped={setOutputDir}
-        canBrowse={canBrowse}
-        compression={compression}
-        onCompression={setCompression}
-        estimates={estimates}
-        locked={locked}
-        plannedSize={inspection?.planned_size}
-        outputFree={inspection?.output_free}
-      />
-
-      <SwapJournals
-        deps={swapDeps}
-        hidden={locked}
-        shownTitle={pipeline.phase === "done" && pipeline.swap ? pipeline.swap.titleId : null}
-      />
-
-      {error && (
-        <Callout tone="error" title={tr("fpkg.error", undefined, "Conversion error")}>
-          {error}
-        </Callout>
-      )}
-
-      <RunCard
-        pipeline={pipeline}
-        installTask={installTask}
-        host={host}
-        canInstall={canInstall}
-        canConvert={!noFiles && !checking && source.trim() !== ""}
-        isImage={isImage}
-        deleteArmed={deleteArmed}
-        title={inspection?.title ?? null}
-        sourceBytes={inspection?.bytes ?? 0}
-        onConvert={() => run(false)}
-        onConvertInstall={() => run(true)}
-        onCompress={() => void compress(source.trim(), outputDir.trim() || undefined)}
-        onCancel={() => void cancel()}
-        onInstall={(method) => void retryInstall(host, method)}
-        onLaunch={onLaunch}
-        onShowFolder={() => {
-          if (pipeline.phase === "done") void openLocalPath(dirOf(pipeline.packagePath));
-        }}
-        onDelete={onDelete}
-        onAnother={onAnother}
-        replaces={source.trim().startsWith("ps5://")}
-        onViewPackage={() => {
-          if (pipeline.phase === "done") usePackageViewer.getState().open(pipeline.packagePath);
-        }}
-        onFinishReplace={(choice) =>
-          void finishReplace(choice).catch((e) => setError(e instanceof Error ? e.message : String(e)))
-        }
-      />
-
-      <QueueCard
-        items={queueItems}
-        running={queueRunning}
-        then={queueThen}
-        onThen={setQueueThen}
-        deleteAfter={queueDeleteAfter}
-        onDeleteAfter={setQueueDeleteAfter}
-        canInstall={canInstall}
-        canAddCurrent={!!source.trim() && !noFiles}
-        onAddCurrent={() => {
-          if (!queueAdd(source.trim())) {
-            setError(tr("cq_already", undefined, "This game is already in the queue."));
-          }
-        }}
-        onScanFolder={() =>
-          void (async () => {
-            const folder = !isTauriEnv()
-              ? await pickLocalPath({ mode: "folder", title: tr("batch_scan_pick", undefined, "Choose the folder that holds your games") })
-              : await pickPath({ mode: "folder", title: tr("batch_scan_pick", undefined, "Choose the folder that holds your games") });
-            if (!folder) return;
-            try {
-              for (const e of await scanChildren(folder)) {
-                const name = e.path.split(/[\\/]/).pop() ?? e.path;
-                const kind = classifyScanEntry(name, e.isDir);
-                if (kind === "folder" || kind === "image" || kind === "archive") queueAdd(e.path);
-              }
-            } catch (err) {
-              setError(err instanceof Error ? err.message : String(err));
+      {/* Wide windows: the game and its options on the left, building and the queue on
+          the right, so neither column is a long empty strip. */}
+      <div className="grid items-start gap-4 xl:grid-cols-2">
+        <div className="flex min-w-0 flex-col gap-4">
+          <GameCard
+            source={source}
+            onSourceTyped={(v) => {
+              if (locked) return;
+              reset();
+              // The old check belongs to the old path: drop it until this one is checked.
+              latest.current.invalidate();
+              setInspection(null);
+              setEstimates(null);
+              setChecking(false);
+              setSource(v);
+              setPassword("");
+            }}
+            onCheck={() => void check(source)}
+            onBrowseFolder={() => void browse("folder")}
+            onBrowseImage={() => void browse("file")}
+            onRemotePick={chooseSource}
+            onBrowseConsole={canInstall ? () => void browseConsole() : undefined}
+            onView={
+              inspection && source.trim() && !isArchiveSource(source.trim())
+                ? () => usePackageViewer.getState().open(source.trim())
+                : undefined
             }
-          })()
-        }
-        onStart={() => void useConvertQueue.getState().start()}
-        onStop={() => useConvertQueue.getState().stop()}
-        onRemove={(id) => useConvertQueue.getState().remove(id)}
-        onMove={(id, d) => useConvertQueue.getState().move(id, d)}
-        onClearFinished={() => useConvertQueue.getState().clearFinished()}
-      />
+            canBrowse={canBrowse}
+            inspection={inspection}
+            checking={checking}
+            locked={locked}
+            dropActive={dropActive}
+            password={password}
+            onPassword={setPassword}
+          />
+
+          <OptionsCard
+            outputDir={outputDir}
+            onChangeOutput={() => void browseOutput()}
+            onOutputTyped={setOutputDir}
+            canBrowse={canBrowse}
+            compression={compression}
+            onCompression={setCompression}
+            estimates={estimates}
+            locked={locked}
+            plannedSize={inspection?.planned_size}
+            outputFree={inspection?.output_free}
+          />
+        </div>
+        <div className="flex min-w-0 flex-col gap-4">
+
+          <SwapJournals
+            deps={swapDeps}
+            hidden={locked}
+            shownTitle={pipeline.phase === "done" && pipeline.swap ? pipeline.swap.titleId : null}
+          />
+
+          {error && (
+            <Callout tone="error" title={tr("fpkg.error", undefined, "Conversion error")}>
+              {error}
+            </Callout>
+          )}
+
+          <RunCard
+            pipeline={pipeline}
+            installTask={installTask}
+            host={host}
+            canInstall={canInstall}
+            canConvert={!noFiles && !checking && source.trim() !== ""}
+            isImage={isImage}
+            deleteArmed={deleteArmed}
+            title={inspection?.title ?? null}
+            sourceBytes={inspection?.bytes ?? 0}
+            onConvert={() => run(false)}
+            onConvertInstall={() => run(true)}
+            onCompress={() => void compress(source.trim(), outputDir.trim() || undefined)}
+            onCancel={() => void cancel()}
+            onInstall={(method) => void retryInstall(host, method)}
+            onLaunch={onLaunch}
+            onShowFolder={() => {
+              if (pipeline.phase === "done") void openLocalPath(dirOf(pipeline.packagePath));
+            }}
+            onDelete={onDelete}
+            onAnother={onAnother}
+            replaces={source.trim().startsWith("ps5://")}
+            onViewPackage={() => {
+              if (pipeline.phase === "done") usePackageViewer.getState().open(pipeline.packagePath);
+            }}
+            onFinishReplace={(choice) =>
+              void finishReplace(choice).catch((e) => setError(e instanceof Error ? e.message : String(e)))
+            }
+          />
+
+          <QueueCard
+            items={queueItems}
+            running={queueRunning}
+            then={queueThen}
+            onThen={setQueueThen}
+            deleteAfter={queueDeleteAfter}
+            onDeleteAfter={setQueueDeleteAfter}
+            canInstall={canInstall}
+            canAddCurrent={!!source.trim() && !noFiles}
+            onAddCurrent={() => {
+              if (!queueAdd(source.trim())) {
+                setError(tr("cq_already", undefined, "This game is already in the queue."));
+              }
+            }}
+            onScanFolder={() =>
+              void (async () => {
+                const folder = !isTauriEnv()
+                  ? await pickLocalPath({ mode: "folder", title: tr("batch_scan_pick", undefined, "Choose the folder that holds your games") })
+                  : await pickPath({ mode: "folder", title: tr("batch_scan_pick", undefined, "Choose the folder that holds your games") });
+                if (!folder) return;
+                try {
+                  for (const e of await scanChildren(folder)) {
+                    const name = e.path.split(/[\\/]/).pop() ?? e.path;
+                    const kind = classifyScanEntry(name, e.isDir);
+                    if (kind === "folder" || kind === "image" || kind === "archive") queueAdd(e.path);
+                  }
+                } catch (err) {
+                  setError(err instanceof Error ? err.message : String(err));
+                }
+              })()
+            }
+            onStart={() => void useConvertQueue.getState().start()}
+            onStop={() => useConvertQueue.getState().stop()}
+            onRemove={(id) => useConvertQueue.getState().remove(id)}
+            onMove={(id, d) => useConvertQueue.getState().move(id, d)}
+            onClearFinished={() => useConvertQueue.getState().clearFinished()}
+          />
+        </div>
+      </div>
 
       <details className="text-sm">
         <summary className="cursor-pointer text-[var(--color-muted)]">

@@ -68,7 +68,7 @@ export default function StatsScreen() {
   }
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <PageHeader
         icon={BarChart3}
         title={tr("stats_title", undefined, "Activity stats")}

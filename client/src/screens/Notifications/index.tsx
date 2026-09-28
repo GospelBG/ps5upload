@@ -110,7 +110,7 @@ export default function NotificationsScreen() {
   const unreadCount = items.filter((n) => !n.read).length;
 
   return (
-    <div className="mx-auto max-w-4xl space-y-4 p-4">
+    <div className="app-page space-y-4">
       <PageHeader
         icon={Bell}
         title={tr("ps5notif_title", undefined, "PS5 Notifications")}

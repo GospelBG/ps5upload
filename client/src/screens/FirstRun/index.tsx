@@ -329,7 +329,7 @@ export default function FirstRunScreen() {
   }
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <PageHeader
         icon={Sparkles}
         title={tr("first_run_title", undefined, "Set up your PS5")}

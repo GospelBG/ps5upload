@@ -592,7 +592,7 @@ export default function ConnectionScreen() {
   }
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <PageHeader
         icon={Plug}
         title={tr("connection_title", undefined, "Connect to your PS5")}

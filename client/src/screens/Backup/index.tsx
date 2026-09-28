@@ -218,7 +218,7 @@ export default function BackupScreen() {
   );
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <div className="mx-auto max-w-4xl space-y-4">
         <PageHeader
           icon={Archive}

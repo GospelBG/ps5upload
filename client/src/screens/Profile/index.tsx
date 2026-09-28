@@ -56,7 +56,7 @@ export default function ProfileScreen() {
   const addr = host?.trim() ? mgmtAddr(host) : "";
 
   return (
-    <div className="mx-auto max-w-3xl p-6">
+    <div className="app-page">
       <PageHeader
         icon={CircleUserRound}
         title={tr("profile.title", "Profile")}

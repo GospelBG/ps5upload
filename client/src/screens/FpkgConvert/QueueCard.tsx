@@ -53,11 +53,11 @@ export function QueueCard(p: QueueCardProps) {
               <Button size="sm" onClick={p.onStop}>
                 {tr("cq_stop", undefined, "Stop after this one")}
               </Button>
-            ) : (
-              <Button size="sm" variant="primary" disabled={pending === 0} onClick={p.onStart}>
+            ) : pending > 0 ? (
+              <Button size="sm" variant="primary" onClick={p.onStart}>
                 {tr("cq_start", { count: pending }, "Convert {count} queued")}
               </Button>
-            )}
+            ) : null}
             {finished && (
               <Button size="sm" variant="ghost" onClick={p.onClearFinished}>
                 {tr("cq_clear", undefined, "Clear finished")}

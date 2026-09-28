@@ -41,7 +41,7 @@ export default function FwSpoofScreen() {
   const swParts = (!fwUnknown && swVersionDisplay !== "—") ? swVersionDisplay.split(".").map(Number) : [];
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <ConnectionGate>
         <PageHeader
           icon={ShieldAlert}

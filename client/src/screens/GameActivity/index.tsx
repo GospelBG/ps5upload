@@ -115,7 +115,7 @@ export default function GameActivityScreen() {
   }, [refresh]);
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <ConnectionGate>
         <PageHeader
           icon={Activity}

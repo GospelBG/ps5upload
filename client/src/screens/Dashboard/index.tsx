@@ -59,7 +59,7 @@ export default function DashboardScreen() {
   const runningTitleIds = useRunningAppsStore((s) => s.titleIds);
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <PageHeader
         icon={LayoutDashboard}
         title={tr("dashboard_title", undefined, "Dashboard")}

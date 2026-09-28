@@ -325,7 +325,7 @@ export default function RemotePlayScreen() {
   }, [addr, refresh, guard]);
 
   return (
-    <div className="mx-auto max-w-4xl space-y-4 p-4">
+    <div className="app-page space-y-4">
       <PageHeader
         icon={MonitorPlay}
         title={tr("remotePlay_title", undefined, "Remote Play")}

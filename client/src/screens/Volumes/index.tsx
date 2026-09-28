@@ -141,7 +141,7 @@ export default function VolumesScreen() {
   }, [volumes]);
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       {confirmDialogNode}
       <PageHeader
         icon={HardDrive}

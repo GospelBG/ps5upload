@@ -378,7 +378,7 @@ export default function HardwareScreen() {
   // their safe 5s auto-poll above.
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <PageHeader
         icon={Cpu}
         title={tr("hardware_title", undefined, "Hardware")}

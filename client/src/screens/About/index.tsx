@@ -89,7 +89,7 @@ export default function AboutScreen() {
   }, []);
 
   return (
-    <div className="mx-auto max-w-5xl p-6">
+    <div className="app-page">
       {/* Hero — large logo, big type, version pill, one-line pitch,
           three primary links. All centered on narrow screens; the
           desktop two-column treatment lives below. */}

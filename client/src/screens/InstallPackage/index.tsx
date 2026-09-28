@@ -1282,7 +1282,7 @@ export default function InstallPackageScreen() {
   };
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <PackagePanel
         path={
           viewEntry

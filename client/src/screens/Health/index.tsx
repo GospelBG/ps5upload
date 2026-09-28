@@ -197,7 +197,7 @@ export default function HealthScreen() {
   const allClear = s ? s.fail === 0 && s.warn === 0 : false;
 
   return (
-    <div className="mx-auto max-w-4xl p-6">
+    <div className="app-page">
       <PageHeader
         icon={Stethoscope}
         title={tr("health_title", undefined, "Health Check")}

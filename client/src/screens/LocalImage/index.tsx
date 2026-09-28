@@ -101,7 +101,7 @@ export default function LocalImageScreen() {
   const unsupported = status && !status.supported;
 
   return (
-    <div className="mx-auto max-w-3xl p-6">
+    <div className="app-page">
       <PageHeader
         icon={HardDrive}
         title={tr("localimage_title", undefined, "Edit Game Image")}

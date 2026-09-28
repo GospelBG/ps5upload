@@ -205,7 +205,7 @@ export default function ConnectionsScreen() {
     browseServer(c, navigate, tr("conn_need_ps5", undefined, "Connect to a PS5 to install."));
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       {dialog}
       <PageHeader
         icon={Network}

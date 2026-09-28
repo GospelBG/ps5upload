@@ -1886,7 +1886,7 @@ export default function FileSystemScreen() {
   }, [volumes, path]);
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       {confirmDialogNode}
       {alertDialogNode}
       {promptDialogNode}

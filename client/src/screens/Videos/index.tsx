@@ -269,7 +269,7 @@ export default function VideosScreen() {
   );
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <PageHeader
         icon={VideoIcon}
         title={tr("videos_title", undefined, "Video clips")}

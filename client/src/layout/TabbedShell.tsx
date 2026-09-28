@@ -116,7 +116,7 @@ export default function TabbedShell<Id extends string>({
   const description = activeTabMeta.description;
 
   return (
-    <div className="flex h-full flex-col p-6">
+    <div className="app-page flex h-full flex-col">
       <PageHeader
         icon={IconForTitle}
         title={tr(titleKey, undefined, titleFallback)}

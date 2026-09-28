@@ -571,7 +571,7 @@ export default function SettingsScreen() {
   }, [syncFromBackend]);
 
   return (
-    <div className="p-6">
+    <div className="app-page">
       <PageHeader
         icon={SettingsIcon}
         title={tr("settings", undefined, "Settings")}

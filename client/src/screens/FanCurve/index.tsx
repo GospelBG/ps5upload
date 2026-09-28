@@ -222,7 +222,7 @@ export default function FanCurveScreen() {
     .join(" ");
 
   return (
-    <div className="mx-auto max-w-4xl space-y-4 p-4">
+    <div className="app-page space-y-4">
       <PageHeader
         icon={Fan}
         title={tr("fanCurve_title", undefined, "Fan Curve")}
