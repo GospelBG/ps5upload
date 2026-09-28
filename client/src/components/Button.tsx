@@ -113,7 +113,14 @@ export function Button({
           it costs nothing when there is room. Call sites that must never
           truncate should give the button room; see the action row in
           InstalledApps for how. */}
-      {children && <span className="truncate">{children}</span>}
+      {/* An icon passed as a child (not leftIcon) stays on the label's line: the
+          span is a block for truncation, and a block-level svg would otherwise
+          sit above the text. */}
+      {children && (
+        <span className="truncate [&>svg]:mr-1.5 [&>svg]:inline-block [&>svg]:align-[-0.15em]">
+          {children}
+        </span>
+      )}
       {!loading && rightIcon}
     </button>
   );
