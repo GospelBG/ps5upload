@@ -68,11 +68,14 @@ export default function FpkgConvertScreen() {
   const queueRunning = useConvertQueue((s) => s.running);
   const [queueThen, setQueueThen] = useState<ConvertThen>("keep");
   const [queueDeleteAfter, setQueueDeleteAfter] = useState(false);
+  // Per game, not remembered: the wrong language carried into the next game would be a surprise.
+  const [language, setLanguage] = useState("");
   const queueAdd = (src: string) =>
     useConvertQueue.getState().add({
       source: src,
       outputDir: outputDir.trim() || undefined,
       compression,
+      language: language || undefined,
       then: queueThen,
       host: queueThen !== "keep" && canInstall ? host : null,
       deleteAfterInstall: queueThen !== "keep" && queueDeleteAfter,
@@ -146,6 +149,7 @@ export default function FpkgConvertScreen() {
       setDeleteArmed(false);
       setSource(path);
       setPassword("");
+      setLanguage("");
       void check(path);
     },
     [check, reset],
@@ -228,7 +232,7 @@ export default function FpkgConvertScreen() {
     if (!source.trim()) return;
     setError(null);
     void start(
-      { source: source.trim(), outputDir: outputDir.trim() || undefined, compression },
+      { source: source.trim(), outputDir: outputDir.trim() || undefined, compression, language: language || undefined },
       { install, host: install ? host : null, password: password || undefined },
     );
   };
@@ -262,6 +266,7 @@ export default function FpkgConvertScreen() {
     latest.current.invalidate();
     setDeleteArmed(false);
     setSource("");
+    setLanguage("");
     setInspection(null);
     setEstimates(null);
     setChecking(false);
@@ -327,6 +332,8 @@ export default function FpkgConvertScreen() {
             onOutputTyped={setOutputDir}
             canBrowse={canBrowse}
             compression={compression}
+            language={language}
+            onLanguage={setLanguage}
             onCompression={setCompression}
             estimates={estimates}
             locked={locked}

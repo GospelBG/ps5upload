@@ -107,7 +107,7 @@ pub const PROTECTED: [(u32, &str, &str, u8); 3] = [
 ];
 
 /// The languages a generated PlayGo scenario names, in LibProsperoPkg's order.
-const SCENARIO_LANGUAGES: [&str; 31] = [
+pub const SCENARIO_LANGUAGES: [&str; 31] = [
     "ja-JP", "en-US", "fr-FR", "es-ES", "de-DE", "it-IT", "nl-NL", "pt-PT", "ru-RU", "ko-KR",
     "zh-Hant", "zh-Hans", "fi-FI", "sv-SE", "da-DK", "no-NO", "pl-PL", "pt-BR", "en-GB", "tr-TR",
     "es-419", "ar-AE", "fr-CA", "cs-CZ", "hu-HU", "el-GR", "ro-RO", "th-TH", "vi-VN", "id-ID",
@@ -119,29 +119,39 @@ const SCENARIO_LANGUAGES: [&str; 31] = [
 /// Without it the console logs `[PlayGoCore] ... not found PlayGoScenario json` at every launch,
 /// and Minecraft sat on a black screen with its main thread busy: it waits on PlayGo before
 /// drawing. LibProsperoPkg's packages carry this exact document and play.
-pub fn playgo_scenario_json() -> Vec<u8> {
-    let names = SCENARIO_LANGUAGES
+///
+/// `language` narrows it to one of [`SCENARIO_LANGUAGES`], as the default and the only language
+/// supported: a game that asks PlayGo which languages it has (Battlefield 6 imports
+/// `scePlayGoGetLanguageMask`) is then told that one. An unknown code is ignored.
+pub fn playgo_scenario_json(language: Option<&str>) -> Vec<u8> {
+    let chosen = language.and_then(|l| SCENARIO_LANGUAGES.iter().find(|k| **k == l));
+    let list: &[&str] = match chosen {
+        Some(l) => std::slice::from_ref(l),
+        None => &SCENARIO_LANGUAGES,
+    };
+    let default = chosen.copied().unwrap_or("en-US");
+    let names = list
         .iter()
         .map(|l| format!(r#""{l}":{{"title":"Scenario #0","description":"Scenario #0"}}"#))
         .collect::<Vec<_>>()
         .join(",");
-    let langs = SCENARIO_LANGUAGES
+    let langs = list
         .iter()
         .map(|l| format!(r#""{l}""#))
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        r#"{{"scenarioCount":1,"scenarioDefaultId":0,"scenarioDefaultLanguage":"en-US","scenarios":[{{"id":0,"type":"playmode",{names}}}],"chunkDefaultLanguage":"en-US","chunkSupportedLanguages":[{langs}]}}"#
+        r#"{{"scenarioCount":1,"scenarioDefaultId":0,"scenarioDefaultLanguage":"{default}","scenarios":[{{"id":0,"type":"playmode",{names}}}],"chunkDefaultLanguage":"{default}","chunkSupportedLanguages":[{langs}]}}"#
     )
     .into_bytes()
 }
 
 /// The PlayGo scenario entry; see [`playgo_scenario_json`].
-pub fn playgo_scenario_extra() -> ExtraEntry {
+pub fn playgo_scenario_extra(language: Option<&str>) -> ExtraEntry {
     ExtraEntry {
         id: crate::cnt::ids::PLAYGO_SCENARIO_JSON,
         name: "playgo-scenario.json",
-        data: playgo_scenario_json(),
+        data: playgo_scenario_json(language),
         key_index: None,
     }
 }
@@ -853,13 +863,36 @@ mod tests {
     /// The document LibProsperoPkg writes, byte for byte (its Minecraft package: 2,293 bytes).
     #[test]
     fn playgo_scenario_matches_the_reference() {
-        let json = playgo_scenario_json();
+        let json = playgo_scenario_json(None);
         assert_eq!(json.len(), 2293);
         let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(v["scenarioCount"], 1);
         assert_eq!(v["scenarios"][0]["type"], "playmode");
         assert_eq!(v["chunkSupportedLanguages"].as_array().unwrap().len(), 31);
         assert_eq!(v["scenarios"][0]["en-US"]["title"], "Scenario #0");
+    }
+
+    /// A chosen language narrows the package to it, the shape Sony's own scenarios take (Spider-Man
+    /// 2 lists its four): that language is the default and the only one supported.
+    #[test]
+    fn a_chosen_language_is_the_default_and_the_only_one() {
+        let v: serde_json::Value =
+            serde_json::from_slice(&playgo_scenario_json(Some("fr-FR"))).unwrap();
+        assert_eq!(v["scenarioDefaultLanguage"], "fr-FR");
+        assert_eq!(v["chunkDefaultLanguage"], "fr-FR");
+        assert_eq!(v["chunkSupportedLanguages"], serde_json::json!(["fr-FR"]));
+        let names: Vec<&String> = v["scenarios"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| k.contains('-'))
+            .collect();
+        assert_eq!(names, ["fr-FR"]);
+        // A code the console doesn't know leaves the package as it always was.
+        assert_eq!(
+            playgo_scenario_json(Some("xx-XX")),
+            playgo_scenario_json(None)
+        );
     }
 
     #[test]

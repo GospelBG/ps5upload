@@ -730,6 +730,7 @@ export async function browserInvoke<T>(
         name: args["name"],
         compression: args["compression"],
         firmware: args["firmware"],
+        language: args["language"],
       });
     }
     case "fpkg_estimate": {

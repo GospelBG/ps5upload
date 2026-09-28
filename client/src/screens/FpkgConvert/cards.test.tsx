@@ -69,6 +69,14 @@ describe("OptionsCard free space", () => {
     locked: false,
   };
 
+  it("offers every PlayGo language, by its own name", () => {
+    const out = renderToStaticMarkup(<OptionsCard {...props} language="de-DE" onLanguage={() => {}} />);
+    expect(out).toContain("Game language");
+    expect(out).toMatch(/<option value="">[^<]*As the game ships/);
+    expect(out).toMatch(/<option value="de-DE" selected="">Deutsch/);
+    expect((out.match(/<option value="[a-z]{2}-/g) ?? []).length).toBe(31);
+  });
+
   it("warns before the build when the output drive is short of room", () => {
     const low = renderToStaticMarkup(<OptionsCard {...props} plannedSize={100 * 2 ** 30} outputFree={50 * 2 ** 30} />);
     expect(low).toContain("Low on free space");

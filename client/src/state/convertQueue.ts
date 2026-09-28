@@ -18,6 +18,8 @@ export interface ConvertItem {
   outputDir?: string;
   compression: FpkgCompression;
   firmware?: string;
+  /** The one PlayGo language the package declares; every language when absent. */
+  language?: string;
   /** What to do with the package: keep it, or install it (streamed / uploaded first). */
   then: ConvertThen;
   /** The console to install on. */

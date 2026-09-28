@@ -1,7 +1,9 @@
-// Card ② Options: where the package goes (remembered) and how hard to compress it.
+// Card ② Options: where the package goes (remembered), how hard to compress it, and the one
+// language it declares when a game needs telling.
 
 import type { FpkgCompression, FpkgEstimate } from "../../api/fpkg";
 import { Button, Card } from "../../components";
+import { PLAYGO_LANGUAGES } from "../../lib/playgoLanguages";
 import { useTr } from "../../state/lang";
 import { CompressionTiles } from "./CompressionTiles";
 import { prettyBytes } from "./RunCard";
@@ -25,6 +27,9 @@ export interface OptionsCardProps {
   plannedSize?: number;
   /** Room on the output drive; absent where the platform does not say. */
   outputFree?: number | null;
+  /** The one language the package declares to PlayGo; "" keeps every language. */
+  language?: string;
+  onLanguage?: (code: string) => void;
 }
 
 export function OptionsCard(props: OptionsCardProps) {
@@ -83,6 +88,34 @@ export function OptionsCard(props: OptionsCardProps) {
             disabled={props.locked}
           />
         </div>
+        {props.onLanguage && (
+          <div className="flex flex-col gap-1">
+            <label htmlFor="fpkg-language" className="text-[var(--color-muted)]">
+              {tr("fpkg.language", undefined, "Game language")}
+            </label>
+            <select
+              id="fpkg-language"
+              className="rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1"
+              value={props.language ?? ""}
+              disabled={props.locked}
+              onChange={(e) => props.onLanguage?.(e.target.value)}
+            >
+              <option value="">{tr("fpkg.languageAll", undefined, "As the game ships (all languages)")}</option>
+              {PLAYGO_LANGUAGES.map(([code, name]) => (
+                <option key={code} value={code}>
+                  {name}
+                </option>
+              ))}
+            </select>
+            <div className="text-xs text-[var(--color-muted)]">
+              {tr(
+                "fpkg.languageHint",
+                undefined,
+                "Most games follow the console's language. Pick one only for a game that stays in English on a console set to another language: the package then tells the game that language is the one installed. The game has to include that language.",
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </Card>
   );

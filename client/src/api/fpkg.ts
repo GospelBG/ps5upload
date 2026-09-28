@@ -56,6 +56,8 @@ export interface FpkgBuildRequest {
   /** The package's minimum firmware, like "5.10"; the game's own when absent. A console older
    *  than the package's minimum refuses to install it. */
   firmware?: string;
+  /** The one PlayGo language the package declares (`de-DE`, …); every language when absent. */
+  language?: string;
 }
 
 export type FpkgCompression = "fast" | "balanced" | "smallest";
@@ -72,6 +74,7 @@ export const fpkg = {
       name: req.name,
       compression: req.compression,
       firmware: req.firmware,
+      language: req.language,
     }),
   /** Unpack a .zip / .7z / .rar into an unpack folder in `outputDir`, as a job; the job's
    *  `dest` is the game found inside. A RAR's password goes with it, never stored. */

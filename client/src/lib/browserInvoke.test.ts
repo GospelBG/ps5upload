@@ -196,6 +196,13 @@ describe("engine-backed commands the web UI depends on (#300)", () => {
     expect(calls[0].url).toBe(`${B}/api/ps5/cheats/list`);
   });
 
+  it("sends a Convert build's language to the engine", async () => {
+    const calls = captureFetch({ job_id: "j" });
+    await browserInvoke("fpkg_build", { source: "/g", language: "de-DE" });
+    expect(calls[0].url).toBe(`${B}/api/fpkg/build`);
+    expect(JSON.parse(String(calls[0].init.body))).toMatchObject({ source: "/g", language: "de-DE" });
+  });
+
   it("keeps since_seq=0 rather than dropping it as falsy", async () => {
     // Dropping it would make the engine replay the whole notification
     // backlog on every poll instead of returning only new rows.

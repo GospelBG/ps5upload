@@ -59,6 +59,9 @@ pub struct BuildRequest {
     /// How hard the Kraken encoder works: `PS5UPLOAD_FPKG_LEVEL` (`fast`, `balanced`,
     /// `smallest`) overrides the default, Balanced.
     pub level: crate::kraken::Level,
+    /// Narrows the package's PlayGo languages to this one (`fr-FR`, …; see
+    /// [`cnt_write::playgo_scenario_json`]). Absent, it declares all of them with `en-US` first.
+    pub language: Option<String>,
 }
 
 impl BuildRequest {
@@ -83,6 +86,7 @@ impl BuildRequest {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_default(),
+            language: None,
         }
     }
 }
@@ -392,7 +396,9 @@ fn build_mode(
     // The debug license the console's launch checks need (see `license`), generated for this
     // content id. A dump's own license files are never used: they belong to another console.
     extras.extend(cnt_write::license_extras(&content_id));
-    extras.push(cnt_write::playgo_scenario_extra());
+    extras.push(cnt_write::playgo_scenario_extra(
+        request.language.as_deref(),
+    ));
     // What the container now carries, the image leaves out (see `CONTAINER_ONLY`).
     let mut carried: std::collections::HashSet<&str> = cnt_write::PRESENTATION
         .iter()

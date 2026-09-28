@@ -25,7 +25,7 @@ async function build(item: ConvertItem) {
   // A console dump is swapped for its package inside the build (never installed beside it).
   const swap = item.source.startsWith("ps5://") && item.then !== "keep" && !!item.host;
   await conv.start(
-    { source: item.source, outputDir: item.outputDir, compression: item.compression, firmware: item.firmware },
+    { source: item.source, outputDir: item.outputDir, compression: item.compression, firmware: item.firmware, language: item.language },
     { install: swap, host: swap ? item.host : null, method: item.then === "upload" ? "upload" : "stream" },
   );
   await whenIdle();

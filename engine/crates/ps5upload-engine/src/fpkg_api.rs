@@ -61,6 +61,14 @@ pub(crate) struct BuildReq {
     /// `fast`, `balanced` (the default) or `smallest`: how hard the Kraken encoder works.
     #[serde(default)]
     compression: Option<String>,
+    /// A PlayGo language code (`fr-FR`, …) the package declares as its only one.
+    #[serde(default)]
+    language: Option<String>,
+}
+
+/// The language a build asked for, trimmed; none when blank.
+fn language_of(v: Option<String>) -> Option<String> {
+    v.map(|l| l.trim().to_string()).filter(|l| !l.is_empty())
 }
 
 /// Where packages go when the caller does not say: the user's Downloads folder, which is
@@ -339,6 +347,7 @@ pub(crate) async fn fpkg_build_handler(
             request.firmware =
                 min_firmware_of(&request_source, inspection.required_firmware.as_deref());
         }
+        request.language = language_of(req.language);
         if let Some(level) = req.compression.as_deref().and_then(|v| v.parse().ok()) {
             request.level = level;
         }
@@ -435,6 +444,17 @@ pub(crate) async fn fpkg_build_handler(
 #[cfg(test)]
 mod path_tests {
     use super::*;
+
+    #[test]
+    fn a_build_takes_the_language_it_was_asked_for() {
+        let req: BuildReq =
+            serde_json::from_str(r#"{"source":"/g","language":" fr-FR "}"#).unwrap();
+        assert_eq!(language_of(req.language).as_deref(), Some("fr-FR"));
+        let req: BuildReq = serde_json::from_str(r#"{"source":"/g","language":""}"#).unwrap();
+        assert_eq!(language_of(req.language), None);
+        let req: BuildReq = serde_json::from_str(r#"{"source":"/g"}"#).unwrap();
+        assert_eq!(language_of(req.language), None);
+    }
 
     #[test]
     fn expands_home_and_resolves_relative_output_paths() {
