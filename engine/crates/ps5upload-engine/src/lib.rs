@@ -1515,7 +1515,22 @@ async fn ps5_list_dir(
             .and_then(|inner| inner);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => json_err(StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            json_err(list_dir_error_status(&msg), msg).into_response()
+        }
+    }
+}
+
+/// A folder that isn't there is a 404, not a failing console: the payload answered, and said
+/// ENOENT (`…_errno_2`). Everything else stays 502. The body is the same either way, which is
+/// what the app reads.
+fn list_dir_error_status(msg: &str) -> StatusCode {
+    // `ends_with`, so errno 20 (ENOTDIR) and friends aren't read as 2.
+    if msg.trim_end().ends_with("_errno_2") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_GATEWAY
     }
 }
 
@@ -9378,6 +9393,30 @@ pub async fn serve_in_process(bind: &str, ps5_addr: String) -> anyhow::Result<()
         allow_ips: Vec::new(),
     })
     .await
+}
+
+#[cfg(test)]
+mod list_dir_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_folder_is_404_and_anything_else_stays_502() {
+        let missing = "payload rejected FS_LIST_DIR(/mnt/usb0/ps5upload/pkg_library): fs_list_dir_opendir_errno_2";
+        assert_eq!(list_dir_error_status(missing), StatusCode::NOT_FOUND);
+        // EACCES, errno 20 (ENOTDIR) and a dead link are not "not there".
+        assert_eq!(
+            list_dir_error_status("payload rejected FS_LIST_DIR(/x): fs_list_dir_opendir_errno_13"),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            list_dir_error_status("payload rejected FS_LIST_DIR(/x): fs_list_dir_opendir_errno_20"),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            list_dir_error_status("connect 192.168.86.99:9114: timed out"),
+            StatusCode::BAD_GATEWAY
+        );
+    }
 }
 
 #[cfg(test)]
