@@ -20,7 +20,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { isAndroid } from "../../lib/platform";
 import { pkgKindLabel } from "./pkgKind";
-import { pickLocalPath } from "../../state/localPicker";
+import { pickLocalPath, pickLocalPaths } from "../../state/localPicker";
 import { isTauriEnv, safeUnlisten } from "../../lib/tauriEnv";
 import { localFileSrc } from "../../lib/fileSrc";
 import { useShallow } from "zustand/react/shallow";
@@ -317,7 +317,7 @@ export default function UploadScreen() {
       // in-app browser, pointed at the engine's filesystem instead (see
       // api/localFs.ts).
       const selected = isAndroid() || !isTauriEnv()
-        ? await pickLocalPath({ mode: "file" })
+        ? await pickLocalPaths({ mode: "file" })
         : await openDialog({ directory: false, multiple: true });
       const list = Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [];
       if (list.length === 0) return;
@@ -346,7 +346,7 @@ export default function UploadScreen() {
       // Tauri): same in-app browser, pointed at the engine's own
       // filesystem instead — see handleChooseFile above.
       const selected = isAndroid() || !isTauriEnv()
-        ? await pickLocalPath({ mode: "folder" })
+        ? await pickLocalPaths({ mode: "folder" })
         : await openDialog({ directory: true, multiple: true });
       const list = Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [];
       if (list.length === 0) return;

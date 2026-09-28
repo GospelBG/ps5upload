@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { pickLocalPath, useLocalPickerStore } from "./localPicker";
+import { pickLocalPath, pickLocalPaths, useLocalPickerStore } from "./localPicker";
 
 beforeEach(() => {
   useLocalPickerStore.setState({ pending: null });
@@ -40,5 +40,21 @@ describe("localPicker store", () => {
     expect(useLocalPickerStore.getState().pending?.title).toBe("Pick a .pkg");
     useLocalPickerStore.getState().settle("/storage/emulated/0/game.pkg");
     await expect(p).resolves.toBe("/storage/emulated/0/game.pkg");
+  });
+
+  it("pickLocalPaths() asks for several and resolves every one picked", async () => {
+    const p = pickLocalPaths({ mode: "file" });
+    expect(useLocalPickerStore.getState().pending?.multiple).toBe(true);
+    useLocalPickerStore.getState().settleMany(["/g/a.pkg", "/g/b.pkg"]);
+    await expect(p).resolves.toEqual(["/g/a.pkg", "/g/b.pkg"]);
+  });
+
+  it("pickLocalPaths() resolves [] when cancelled, and one path from a single pick", async () => {
+    const cancelled = pickLocalPaths({ mode: "file" });
+    useLocalPickerStore.getState().settle(null);
+    await expect(cancelled).resolves.toEqual([]);
+    const one = pickLocalPaths({ mode: "folder" });
+    useLocalPickerStore.getState().settle("/g/Game");
+    await expect(one).resolves.toEqual(["/g/Game"]);
   });
 });

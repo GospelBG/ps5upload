@@ -17,6 +17,7 @@ import { firmwareLine, GameCard, type GameCardProps } from "./GameCard";
 import { MemoryRouter } from "react-router";
 import { OptionsCard } from "./OptionsCard";
 import { pendingJournals, SwapJournalsView } from "./SwapJournals";
+import { QueueCard } from "./QueueCard";
 
 const estimates = {
   fast: { bytes: 117e9, seconds: 900 },
@@ -175,3 +176,32 @@ describe("unfinished swaps", () => {
   });
 });
 
+describe("QueueCard adding", () => {
+  const noop = () => {};
+  const card = (onPickSeveral?: () => void) =>
+    renderToStaticMarkup(
+      <QueueCard
+        items={[]}
+        running={false}
+        then="keep"
+        onThen={noop}
+        deleteAfter={false}
+        onDeleteAfter={noop}
+        canInstall={false}
+        canAddCurrent={false}
+        onAddCurrent={noop}
+        onScanFolder={noop}
+        onPickSeveral={onPickSeveral}
+        onStart={noop}
+        onStop={noop}
+        onRemove={noop}
+        onMove={noop}
+        onClearFinished={noop}
+      />,
+    );
+
+  it("offers picking several images or archives at once", () => {
+    expect(card(noop)).toContain("Pick several…");
+    expect(card()).not.toContain("Pick several…");
+  });
+});

@@ -15,7 +15,7 @@ import { Callout, Card, PageHeader } from "../../components";
 import { transferAddr } from "../../lib/addr";
 import { createLatest } from "../../lib/latest";
 import { openLocalPath } from "../../lib/openLocalPath";
-import { pickPath } from "../../lib/pickPath";
+import { pickPath, pickPaths } from "../../lib/pickPath";
 import { isIOS } from "../../lib/platform";
 import { isTauriEnv } from "../../lib/tauriEnv";
 import { useWebviewDrop } from "../../lib/useWebviewDrop";
@@ -407,6 +407,16 @@ export default function FpkgConvertScreen() {
                 } catch (err) {
                   setError(err instanceof Error ? err.message : String(err));
                 }
+              })()
+            }
+            onPickSeveral={() =>
+              void (async () => {
+                const picked = await pickPaths({
+                  title: tr("fpkg.pickImage", undefined, "Choose a game image or archive"),
+                  filters: [{ name: "Game image or archive", extensions: ["exfat", "ffpkg", "ffpfsc", "zip", "7z", "rar"] }],
+                }).catch(() => [] as string[]);
+                const dupes = picked.filter((p) => !queueAdd(p)).length;
+                if (dupes) setError(tr("cq_already", undefined, "This game is already in the queue."));
               })()
             }
             onStart={() => void useConvertQueue.getState().start()}

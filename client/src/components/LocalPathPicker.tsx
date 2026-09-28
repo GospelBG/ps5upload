@@ -77,6 +77,11 @@ export interface PickerViewProps {
   onCancel: () => void;
   onRoot: (root: string) => void;
   onRequestAccess: () => void;
+  /** Several at once: pickable rows get a checkbox, kept across folders. */
+  multiple?: boolean;
+  selected?: string[];
+  onToggle?: (path: string) => void;
+  onAddSelected?: () => void;
 }
 
 function passes(name: string, filters?: { extensions: string[] }[]): boolean {
@@ -198,15 +203,28 @@ export function PickerView(p: PickerViewProps) {
                   {shown.map((e) => {
                     const selectable = e.is_dir || p.mode !== "folder";
                     const isPkg = !e.is_dir && e.name.toLowerCase().endsWith(".pkg");
+                    const tickable = p.multiple && (e.is_dir ? p.mode !== "file" : p.mode !== "folder");
                     return (
                       <li key={e.path} className="flex items-center">
+                        {tickable && (
+                          <input
+                            type="checkbox"
+                            className="ms-4 h-4 w-4 shrink-0"
+                            checked={p.selected?.includes(e.path) ?? false}
+                            onChange={() => p.onToggle?.(e.path)}
+                            aria-label={tr("batch_include", { name: e.name }, "Include {name}")}
+                          />
+                        )}
                         <button
                           type="button"
                           disabled={!selectable && !p.actions}
                           className="flex min-w-0 flex-1 items-center gap-3 px-4 py-3 text-left hover:bg-[var(--color-surface)] disabled:opacity-40"
                           onClick={() => {
                             if (e.is_dir) p.onOpenDir(e.path);
-                            else if (p.mode !== "folder" && !p.actions) p.onPickFile(e.path);
+                            else if (p.mode !== "folder" && !p.actions) {
+                              if (p.multiple) p.onToggle?.(e.path);
+                              else p.onPickFile(e.path);
+                            }
                           }}
                         >
                           {e.is_dir ? (
@@ -262,16 +280,35 @@ export function PickerView(p: PickerViewProps) {
               )}
             </div>
 
-            {p.mode !== "file" && !p.actions && (
-              <footer className="flex items-center gap-2 border-t border-[var(--color-border)] px-4 py-3">
-                <span className="flex-1 truncate text-xs text-[var(--color-muted)]">
-                  {tr("picker_use_this", undefined, "Use the open folder:")}{" "}
-                  <span className="font-medium text-[var(--color-text)]">{p.cwdLabel}</span>
+            {(p.mode !== "file" || p.multiple) && !p.actions && (
+              <footer className="flex flex-wrap items-center gap-2 border-t border-[var(--color-border)] px-4 py-3">
+                <span className="min-w-0 flex-1 truncate text-xs text-[var(--color-muted)]">
+                  {p.mode !== "file" ? (
+                    <>
+                      {tr("picker_use_this", undefined, "Use the open folder:")}{" "}
+                      <span className="font-medium text-[var(--color-text)]">{p.cwdLabel}</span>
+                    </>
+                  ) : (
+                    tr("picker_tick_hint", undefined, "Tick files in any folder, then add them together.")
+                  )}
                 </span>
-                <Button variant="primary" size="sm" onClick={p.onUseFolder}>
-                  <Check size={14} />
-                  {tr("picker_use_folder", undefined, "Use this folder")}
-                </Button>
+                {p.mode !== "file" && (
+                  <Button variant={p.multiple ? "secondary" : "primary"} size="sm" onClick={p.onUseFolder}>
+                    <Check size={14} />
+                    {tr("picker_use_folder", undefined, "Use this folder")}
+                  </Button>
+                )}
+                {p.multiple && (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    disabled={!p.selected?.length}
+                    onClick={p.onAddSelected}
+                  >
+                    <Check size={14} />
+                    {tr("picker_add_selected", { count: p.selected?.length ?? 0 }, "Add {count}")}
+                  </Button>
+                )}
               </footer>
             )}
           </>
@@ -324,6 +361,7 @@ export function LocalPathPicker() {
   const navigate = useNavigate();
   const pending = useLocalPickerStore((s) => s.pending);
   const settle = useLocalPickerStore((s) => s.settle);
+  const settleMany = useLocalPickerStore((s) => s.settleMany);
   const connections = useConnectionsStore((s) => s.connections);
 
   const source = pending?.source;
@@ -339,6 +377,8 @@ export function LocalPathPicker() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hint, setHint] = useState<string | null>(null);
+  /** A multi-pick's ticked paths, in the order ticked (raw, before the source prefix). */
+  const [selected, setSelected] = useState<string[]>([]);
 
   const loadDir = useCallback(
     async (path: string, more?: string) => {
@@ -425,6 +465,7 @@ export function LocalPathPicker() {
       setCwd(null);
       setEntries([]);
       setCursor(null);
+      setSelected([]);
       void begin();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -446,14 +487,13 @@ export function LocalPathPicker() {
   if (!pending) return null;
 
   const parent = cwd ? (connectionId || consoleHost ? serverParent(cwd) : parentOf(cwd)) : null;
-  const finish = (path: string) =>
-    settle(
-      consoleHost
-        ? consolePickResult(consoleHost, path)
-        : connectionId
-          ? remotePath(connectionId, path)
-          : path,
-    );
+  const resultOf = (path: string) =>
+    consoleHost
+      ? consolePickResult(consoleHost, path)
+      : connectionId
+        ? remotePath(connectionId, path)
+        : path;
+  const finish = (path: string) => settle(resultOf(path));
   const nameOf = (id: string) => connections.find((c) => c.id === id)?.name;
   const cwdLabel = cwd
     ? consoleHost
@@ -512,6 +552,12 @@ export function LocalPathPicker() {
       onCancel={() => settle(null)}
       onRoot={(r) => void loadDir(r)}
       onRequestAccess={() => void localFs.requestAccess().catch(() => {})}
+      multiple={!!pending.multiple}
+      selected={selected}
+      onToggle={(p) =>
+        setSelected((cur) => (cur.includes(p) ? cur.filter((x) => x !== p) : [...cur, p]))
+      }
+      onAddSelected={() => selected.length && settleMany(selected.map(resultOf))}
     />
   );
 }

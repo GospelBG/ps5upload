@@ -20,6 +20,8 @@ export interface QueueCardProps {
   canAddCurrent: boolean;
   onAddCurrent: () => void;
   onScanFolder: () => void;
+  /** Tick several images or archives in one picker. */
+  onPickSeveral?: () => void;
   onStart: () => void;
   onStop: () => void;
   onRemove: (id: string) => void;
@@ -99,6 +101,11 @@ export function QueueCard(p: QueueCardProps) {
           <Button size="sm" variant="ghost" leftIcon={<ListPlus size={14} />} onClick={p.onScanFolder}>
             {tr("batch_scan", undefined, "Add games from a folder…")}
           </Button>
+          {p.onPickSeveral && (
+            <Button size="sm" variant="ghost" leftIcon={<ListPlus size={14} />} onClick={p.onPickSeveral}>
+              {tr("cq_pick_several", undefined, "Pick several…")}
+            </Button>
+          )}
         </div>
 
         {p.items.length > 0 && (

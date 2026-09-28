@@ -11,7 +11,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import { isAndroid } from "./platform";
 import { isTauriEnv } from "./tauriEnv";
-import { pickLocalPath } from "../state/localPicker";
+import { pickLocalPath, pickLocalPaths } from "../state/localPicker";
 
 export interface PickPathOptions {
   /** "any" (in-app browser only): a file, or the open folder. */
@@ -48,19 +48,17 @@ export async function pickPath(opts: PickPathOptions): Promise<string | null> {
 }
 
 /**
- * Pick one OR MORE real file paths (desktop multi-select). Lets a user
- * build a list in one gesture — e.g. select several payloads to seed a
- * playlist. Android's in-app browser is single-select, so it yields at
- * most one path (drag-drop, the other multi-add route, is desktop-only
- * too). Returns [] if cancelled. Files only — multi-folder select isn't
- * a use case here.
+ * Pick one OR MORE real file paths. Lets a user build a list in one
+ * gesture — e.g. select several payloads to seed a playlist. The system
+ * dialog multi-selects on desktop; Android, the web build and a saved
+ * server tick rows in the in-app browser. Returns [] if cancelled. Files
+ * only — multi-folder select isn't a use case here.
  */
 export async function pickPaths(
   opts: Omit<PickPathOptions, "mode"> = {},
 ): Promise<string[]> {
-  if (isAndroid()) {
-    const one = await pickLocalPath({ mode: "file", title: opts.title });
-    return typeof one === "string" ? [one] : [];
+  if (opts.source || isAndroid() || !isTauriEnv()) {
+    return pickLocalPaths({ mode: "file", title: opts.title, filters: opts.filters, source: opts.source });
   }
   const sel = await openDialog({
     directory: false,

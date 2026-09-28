@@ -98,6 +98,31 @@ describe("picking a folder or an image", () => {
   });
 });
 
+describe("picking several", () => {
+  it("gives each pickable row a checkbox and counts the picks on the Add button", () => {
+    const out = html({
+      multiple: true,
+      selected: ["/games/a.pkg", "/games/b.pkg"],
+      entries: [dir("sub"), file("a.pkg"), file("b.pkg"), file("c.pkg")],
+    });
+    // Files are pickable in file mode; the folder only opens.
+    expect((out.match(/type="checkbox"/g) ?? []).length).toBe(3);
+    expect((out.match(/checked=""/g) ?? []).length).toBe(2);
+    expect(out).toContain("Add 2");
+  });
+
+  it("lets folders be ticked when picking folders", () => {
+    const out = html({ multiple: true, mode: "folder", selected: [], entries: [dir("g1"), dir("g2")] });
+    expect((out.match(/type="checkbox"/g) ?? []).length).toBe(2);
+    // Nothing ticked yet: the Add button waits.
+    expect(out).toMatch(/<button[^>]*disabled=""[^>]*>(?:(?!<\/button>).)*Add 0/);
+  });
+
+  it("stays a plain one-tap list when picking one", () => {
+    expect(html({ entries: [file("a.pkg")] })).not.toContain('type="checkbox"');
+  });
+});
+
 describe("the console as a source", () => {
   it("answers a pick on the PS5 as a ps5:// path on its host", () => {
     expect(consolePickResult("192.168.86.99:9113", "/data/homebrew/G.exfat")).toBe(
