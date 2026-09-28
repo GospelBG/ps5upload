@@ -13,6 +13,7 @@ import {
   X,
   Plus,
   type LucideIcon,
+  ListPlus,
 } from "lucide-react";
 import clsx from "clsx";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -21,7 +22,6 @@ import { isAndroid } from "../../lib/platform";
 import { pkgKindLabel } from "./pkgKind";
 import { pickLocalPath } from "../../state/localPicker";
 import { isTauriEnv, safeUnlisten } from "../../lib/tauriEnv";
-import { isInstallPackagePath } from "../../lib/pkgDropDedupe";
 import { localFileSrc } from "../../lib/fileSrc";
 import { useShallow } from "zustand/react/shallow";
 
@@ -91,6 +91,10 @@ import {
   pickBannerMode,
 } from "../../lib/uploadEta";
 import { buildUploadQueueItem, type UploadItemOptions } from "../../lib/uploadQueueItem";
+import { validateBatch } from "../../lib/uploadBatch";
+import { scanChildren } from "../../lib/folderScan";
+import { useUploadBatch, type BatchEntry, type BatchRow } from "../../state/uploadBatch";
+import { BatchReview } from "./BatchReview";
 import { resolveUploadDest } from "../../lib/uploadDest";
 import { QueuePanel } from "./QueuePanel";
 import { humanizePs5Error } from "../../lib/humanizeError";
@@ -103,6 +107,11 @@ import { useTr, type Translator } from "../../state/lang";
  *  Localized (takes the screen's `tr`) and, for archives, format-aware: it
  *  shows the actual `.zip` / `.7z` / `.rar` extension instead of a hardcoded
  *  ".zip / .7z" that was wrong for the other two formats. */
+/** A staged package's unique name parts, taken when it is queued (never during render). */
+function freshStamp(): [string, number] {
+  return [Math.random().toString(36).slice(2), Date.now()];
+}
+
 function detectedLabel(
   source: PickedSource,
   tr: Translator,
@@ -240,13 +249,22 @@ export default function UploadScreen() {
         setDropActive(false);
       } else if (e.payload.type === "drop") {
         setDropActive(false);
-        const first = e.payload.paths?.[0];
+        const paths = e.payload.paths ?? [];
+        const first = paths[0];
         if (!first) return;
-        // A .pkg is a package to INSTALL, not a blob to drop on a volume —
-        // AppShell's app-wide drop listener routes it to /install-package, so
-        // skip it here to avoid creating a stale plain-"file" source the user
-        // never asked for (it would upload the .pkg raw and never install it).
-        if (isInstallPackagePath(first)) return;
+        // Several at once (or onto a list already started) go to the review list; one is
+        // picked as always. A .pkg is a "pkg" source: uploaded, then installed.
+        if (paths.length > 1 || useUploadBatch.getState().rows.length > 0) {
+          const kinds = await Promise.all(paths.map((p) => pathKind(p)));
+          if (cancelled) return;
+          addToBatch(
+            paths
+              .map((p, i) => ({ path: p, isDir: kinds[i] === "folder", ok: kinds[i] === "folder" || kinds[i] === "file" }))
+              .filter((x) => x.ok)
+              .map(({ path, isDir }) => ({ path, isDir })),
+          );
+          return;
+        }
         const kind = await pathKind(first);
         if (cancelled) return;
         if (kind === "folder") await pickFolder(first);
@@ -267,6 +285,29 @@ export default function UploadScreen() {
     };
   }, [pickFile, pickFolder]);
 
+  /** Start or extend the review list; a single source picked before joins it. */
+  const addToBatch = (entries: BatchEntry[]) => {
+    const batch = useUploadBatch.getState();
+    const single = useUploadStore.getState().source;
+    if (batch.rows.length === 0 && single) {
+      batch.add([{ path: single.path, isDir: single.kind === "folder" || single.kind === "game-folder" }]);
+    }
+    useUploadStore.getState().reset();
+    batch.add(entries);
+  };
+
+  const handleScanFolder = async () => {
+    try {
+      const folder = isAndroid() || !isTauriEnv()
+        ? await pickLocalPath({ mode: "folder", title: tr("batch_scan_pick", undefined, "Choose the folder that holds your games") })
+        : await openDialog({ directory: true, multiple: false, title: tr("batch_scan_pick", undefined, "Choose the folder that holds your games") });
+      if (typeof folder !== "string") return;
+      addToBatch(await scanChildren(folder));
+    } catch (e) {
+      log.warn("upload", `folder scan failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
   const handleChooseFile = async () => {
     try {
       // Android: the native dialog returns content:// URIs the engine
@@ -277,11 +318,17 @@ export default function UploadScreen() {
       // api/localFs.ts).
       const selected = isAndroid() || !isTauriEnv()
         ? await pickLocalPath({ mode: "file" })
-        : await openDialog({ directory: false, multiple: false });
-      if (typeof selected !== "string") return;
+        : await openDialog({ directory: false, multiple: true });
+      const list = Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [];
+      if (list.length === 0) return;
+      if (list.length > 1 || useUploadBatch.getState().rows.length > 0) {
+        addToBatch(list.map((path) => ({ path, isDir: false })));
+        return;
+      }
+      const [one] = list;
       // .pkg is handled as a first-class "pkg" source by pickFile (it becomes a
       // queue item that uploads → installs → cleans up). No special redirect.
-      await pickFile(selected);
+      await pickFile(one);
     } catch (e) {
       // A picker/dialog throw would otherwise surface only as an uncategorized
       // unhandled rejection — log which gesture failed for the bug bundle.
@@ -300,8 +347,14 @@ export default function UploadScreen() {
       // filesystem instead — see handleChooseFile above.
       const selected = isAndroid() || !isTauriEnv()
         ? await pickLocalPath({ mode: "folder" })
-        : await openDialog({ directory: true, multiple: false });
-      if (typeof selected === "string") await pickFolder(selected);
+        : await openDialog({ directory: true, multiple: true });
+      const list = Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [];
+      if (list.length === 0) return;
+      if (list.length > 1 || useUploadBatch.getState().rows.length > 0) {
+        addToBatch(list.map((path) => ({ path, isDir: true })));
+        return;
+      }
+      await pickFolder(list[0]);
     } catch (e) {
       log.warn(
         "upload",
@@ -311,6 +364,7 @@ export default function UploadScreen() {
   };
 
   const host = useConnectionStore((s) => s.host);
+
   // Per-console one-shot phase: bind to THIS console's slot so switching tabs
   // shows the right upload (and a one-shot on another console never appears
   // here). phaseForHost falls back to the shared IDLE_PHASE singleton, so the
@@ -339,7 +393,13 @@ export default function UploadScreen() {
    *  don't bleed into the queued item. */
   /** The shared options every queued upload from this screen takes. Also tells the user when
    *  a package falls back to internal storage. */
-  const uploadItemOptions = (strategy: "overwrite" | "resume", hasPackage: boolean): UploadItemOptions => {
+  const uploadItemOptions = (
+    strategy: "overwrite" | "resume",
+    hasPackage: boolean,
+    /** A package's staged name is unique by these; a preview passes fixed ones. */
+    nonce: string,
+    now: number,
+  ): UploadItemOptions => {
     // The console's default package drive (Volumes screen), or internal storage when that
     // drive is not connected.
     const storage = pkgStorageFor(host ?? "", availableVolumes.length > 0 ? availableVolumes : null);
@@ -371,8 +431,8 @@ export default function UploadScreen() {
       installAfterUpload: settings.autoInstallAfterUpload,
       deletePkgAfterInstall: settings.autoRemoveAfterInstall,
       pkgDir: storage.dir,
-      nonce: Math.random().toString(36).slice(2),
-      now: Date.now(),
+      nonce,
+      now,
     };
   };
 
@@ -382,7 +442,11 @@ export default function UploadScreen() {
   const handleAddToQueue = (strategy: "overwrite" | "resume") => {
     if (!source || !host?.trim()) return;
     queueAdd(
-      buildUploadQueueItem(source, rarPassword, uploadItemOptions(strategy, source.kind === "pkg")),
+      buildUploadQueueItem(
+        source,
+        rarPassword,
+        uploadItemOptions(strategy, source.kind === "pkg", ...freshStamp()),
+      ),
     );
   };
 
@@ -592,6 +656,55 @@ export default function UploadScreen() {
     }
   };
 
+  // ── Several sources: the review list ──
+  const batchRows = useUploadBatch((s) => s.rows);
+  const batch = useUploadBatch.getState();
+  const [batchStrategy, setBatchStrategy] = useState<"overwrite" | "resume">("resume");
+  const queueItems = useUploadQueueStore((s) => s.items);
+  const hasBatchPkg = batchRows.some((r) => r.source?.kind === "pkg");
+  // The preview uses fixed name parts; the add below makes real ones.
+  const batchItemFor = (r: BatchRow, notify = false, nonce = r.id, now = 0) =>
+    r.source
+      ? buildUploadQueueItem(r.source, r.password, uploadItemOptions(batchStrategy, notify && hasBatchPkg, nonce, now))
+      : null;
+  const batchSizeFor = (r: BatchRow): number | null =>
+    r.size ??
+    r.source?.pkgInfo?.totalBytes ??
+    r.source?.zipInfo?.total_uncompressed ??
+    r.source?.meta?.total_size ??
+    null;
+  const included = batchRows.filter((r) => r.include && r.status !== "error");
+  const batchCheck = validateBatch(
+    included
+      .filter((r) => r.source || r.status === "needs-password")
+      .map((r) => ({
+        id: r.id,
+        sourcePath: r.path,
+        dest: batchItemFor(r)?.resolvedDest ?? r.path,
+        size: batchSizeFor(r),
+        needsPassword: r.status === "needs-password",
+      })),
+    queueItems
+      .filter((q) => (q.status === "pending" || q.status === "running") && hostOf(q.addr) === hostOf(host ?? ""))
+      .map((q) => ({ sourcePath: q.sourcePath, resolvedDest: q.resolvedDest })),
+    new Map(availableVolumes.map((v) => [v.path, volumeAllocatableBytes(v)] as [string, number | null])),
+  );
+  const toAdd = included.filter((r) => r.source && r.status === "ready" && !batchCheck.skip.has(r.id));
+  const batchReady =
+    !!host?.trim() && toAdd.length > 0 && !batchCheck.blocked && included.every((r) => r.status !== "inspecting");
+  const addBatch = (startNow: boolean) => {
+    if (!batchReady) return;
+    const now = Date.now();
+    toAdd.forEach((r, i) => {
+      const item = batchItemFor(r, i === 0, `${r.id}${Math.random().toString(36).slice(2, 6)}`, now);
+      if (item) queueAdd(item);
+    });
+    batch.clear();
+    if (startNow && host) void queueStartHost(hostOf(host));
+  };
+  const batchKindLabel = (r: BatchRow) =>
+    r.source ? detectedLabel(r.source, tr).label : r.isDir ? tr("upload_kind_folder", "Folder") : "";
+
   return (
     <div className="p-6">
       {pending && (
@@ -621,11 +734,65 @@ export default function UploadScreen() {
         dropActive={dropActive}
         onFile={handleChooseFile}
         onFolder={handleChooseFolder}
-        onRemoteFile={(p) => void pickFile(p)}
-        onRemoteFolder={(p) => void pickFolder(p)}
+        onRemoteFile={(p) => (batchRows.length > 0 ? addToBatch([{ path: p, isDir: false }]) : void pickFile(p))}
+        onRemoteFolder={(p) => (batchRows.length > 0 ? addToBatch([{ path: p, isDir: true }]) : void pickFolder(p))}
+        onScanFolder={() => void handleScanFolder()}
       />
 
-      {source && (
+      {batchRows.length > 0 && (
+        <BatchReview
+          rows={batchRows}
+          check={batchCheck}
+          destFor={(r) => batchItemFor(r)?.resolvedDest ?? null}
+          sizeFor={batchSizeFor}
+          kindLabel={batchKindLabel}
+          destination={
+            <DestinationCard
+              volume={destinationVolume}
+              subpath={destinationSubpath}
+              onChange={setDestination}
+              resolvedDest={`${destinationVolume ?? "/data"}/${destinationSubpath.replace(/^\/+|\/+$/g, "")}/…`}
+              availableVolumes={availableVolumes}
+            />
+          }
+          strategy={batchStrategy}
+          onStrategy={setBatchStrategy}
+          options={
+            <>
+              {batchRows.some((r) => r.source?.kind === "image") && (
+                <Toggle
+                  checked={mountAfterUpload}
+                  onChange={setMountAfterUpload}
+                  label={tr("batch_mount", undefined, "Mount images after upload")}
+                />
+              )}
+              {batchRows.some((r) => r.source?.kind === "game-folder") && (
+                <Toggle
+                  checked={registerAfterUpload}
+                  onChange={setRegisterAfterUpload}
+                  label={tr("batch_register", undefined, "Add game folders to the home screen")}
+                />
+              )}
+              {hasBatchPkg && (
+                <Toggle
+                  checked={useInstallSettingsStore.getState().autoInstallAfterUpload}
+                  onChange={(v) => useInstallSettingsStore.getState().setAutoInstallAfterUpload(v)}
+                  label={tr("batch_install", undefined, "Install packages after upload")}
+                />
+              )}
+            </>
+          }
+          addCount={toAdd.length}
+          canAdd={batchReady}
+          onAdd={addBatch}
+          onRemove={(id) => batch.remove(id)}
+          onInclude={(id, v) => batch.setInclude(id, v)}
+          onPassword={(id, pw) => batch.setPassword(id, pw)}
+          onClear={() => batch.clear()}
+        />
+      )}
+
+      {source && batchRows.length === 0 && (
         <Step2Options
           source={source}
           detecting={detecting}
@@ -683,6 +850,7 @@ function Step1Picker({
   onFolder,
   onRemoteFile,
   onRemoteFolder,
+  onScanFolder,
 }: {
   active: boolean;
   dropActive: boolean;
@@ -690,6 +858,8 @@ function Step1Picker({
   onFolder: () => void;
   onRemoteFile: (path: string) => void;
   onRemoteFolder: (path: string) => void;
+  /** Add a folder's games (its immediate children) to the review list. */
+  onScanFolder: () => void;
 }) {
   const tr = useTr();
   return (
@@ -739,6 +909,9 @@ function Step1Picker({
           onMainClick={onFolder}
           onPick={onRemoteFolder}
         />
+        <Button variant="ghost" leftIcon={<ListPlus size={14} />} onClick={onScanFolder}>
+          {tr("batch_scan", undefined, "Add games from a folder…")}
+        </Button>
       </div>
       <p className="mx-auto mt-3 max-w-md text-xs text-[var(--color-muted)]">
         {tr(
