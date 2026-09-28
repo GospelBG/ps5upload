@@ -1127,7 +1127,9 @@ pub fn pkg_entries(path: &Path) -> Result<Vec<PkgEntryInfo>, PkgError> {
     f.seek(SeekFrom::Start(base + table as u64))?;
     f.read_exact(&mut buf)?;
     let mut entries: Vec<(PkgEntryInfo, u32)> = buf
-        .chunks_exact(0x20)
+        .as_chunks::<0x20>()
+        .0
+        .iter()
         .map(|e| {
             let be = |i: usize| u32::from_be_bytes([e[i], e[i + 1], e[i + 2], e[i + 3]]);
             (
