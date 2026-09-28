@@ -1868,48 +1868,52 @@ describe("uploadInstall (Convert's Upload & install)", () => {
     expect(vi.mocked(pkgInstall)).not.toHaveBeenCalled();
   });
 
+  const mockSuccessfulInstall = () => {
+      useInstallSettingsStore.setState({ autoRemoveAfterInstall: true });
+      vi.mocked(pkgInstallStatus).mockResolvedValue({
+        job: "job1",
+        ps5_addr: host,
+        content_id: head.head.content_id,
+        title_id: "CUSA33334",
+        phase: "done",
+        route: "loopback",
+        verdict: "installed",
+        code: 0,
+        hint: null,
+        reason: null,
+        metrics: {
+          total_bytes: 8_192,
+          served_bytes: 8_192,
+          throughput_mbps: 0,
+          phase_ms: {},
+          retries: 0,
+          sony_rc: 0,
+        },
+        app_ver_before: null,
+        app_ver_after: null,
+        patch_verdict: null,
+        shortened: false,
+        started_at: 0,
+        updated_at: 0,
+      } as InstallStatus);
+      vi.mocked(fsListDir).mockImplementation(async () => [
+        {
+          name: "UP0000-CUSA33334_00-TEST000000000000.pkg",
+          kind: "file",
+          size: 8_192,
+        },
+      ] as never);
+      vi.mocked(invoke).mockImplementation(async (command: unknown) => {
+        if (command === "pkg_metadata_split") return head;
+        if (command === "transfer_file") return { job_id: "t1" };
+        if (command === "job_status")
+          return { status: "done", bytes_sent: 8_192, total_bytes: 8_192 };
+        return {};
+      });
+  };
+
   it("reports the install as done even when auto-remove drops the row", async () => {
-    useInstallSettingsStore.setState({ autoRemoveAfterInstall: true });
-    vi.mocked(pkgInstallStatus).mockResolvedValue({
-      job: "job1",
-      ps5_addr: host,
-      content_id: head.head.content_id,
-      title_id: "CUSA33334",
-      phase: "done",
-      route: "loopback",
-      verdict: "installed",
-      code: 0,
-      hint: null,
-      reason: null,
-      metrics: {
-        total_bytes: 8_192,
-        served_bytes: 8_192,
-        throughput_mbps: 0,
-        phase_ms: {},
-        retries: 0,
-        sony_rc: 0,
-      },
-      app_ver_before: null,
-      app_ver_after: null,
-      patch_verdict: null,
-      shortened: false,
-      started_at: 0,
-      updated_at: 0,
-    } as InstallStatus);
-    vi.mocked(fsListDir).mockImplementation(async () => [
-      {
-        name: "UP0000-CUSA33334_00-TEST000000000000.pkg",
-        kind: "file",
-        size: 8_192,
-      },
-    ] as never);
-    vi.mocked(invoke).mockImplementation(async (command: unknown) => {
-      if (command === "pkg_metadata_split") return head;
-      if (command === "transfer_file") return { job_id: "t1" };
-      if (command === "job_status")
-        return { status: "done", bytes_sent: 8_192, total_bytes: 8_192 };
-      return {};
-    });
+    mockSuccessfulInstall();
     let dest = "";
     const r = await pkgLibraryStore(host)
       .getState()
@@ -1921,6 +1925,26 @@ describe("uploadInstall (Convert's Upload & install)", () => {
         .getState()
         .entries.some((e) => e.path === dest),
     ).toBe(false);
+  }, 15_000);
+
+  it("install() resolves with that install's own result", async () => {
+    mockSuccessfulInstall();
+    const store = pkgLibraryStore(host).getState();
+    let dest = "";
+    await store.addAndUpload(localPath, host, {
+      installAfterUpload: false,
+      onDest: (d) => (dest = d),
+    });
+    // A stale failure on the row must not leak into the new install's result.
+    pkgLibraryStore(host).setState({
+      entries: pkgLibraryStore(host)
+        .getState()
+        .entries.map((e) =>
+          e.path === dest ? { ...e, lastResult: { ok: false, message: "old", at: 0 } as never } : e,
+        ),
+    });
+    const r = await pkgLibraryStore(host).getState().install(dest, host);
+    expect(r).toMatchObject({ ok: true });
   }, 15_000);
 
   it("refuses while another install holds the lock, without uploading", async () => {

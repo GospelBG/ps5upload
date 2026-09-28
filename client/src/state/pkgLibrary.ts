@@ -962,7 +962,7 @@ interface PkgLibraryState {
   ) => Promise<void>;
   /** Queue an install of a staged library row on this console's queue and
    *  wait for it. */
-  install: (path: string, host: string) => Promise<void>;
+  install: (path: string, host: string) => Promise<InstallResult>;
   // ── Executors: run ONE install now. Only the console queue calls these
   // (through the executor registered at the bottom of this file); the public
   // methods above and below queue instead. An executor that needs another
@@ -2152,7 +2152,7 @@ const pkgAddsInFlight = new Set<string>();
  * `host` (it matches this instance's console) and uses it for addresses.
  */
 const makePkgLibraryStore = () =>
-  createStore<PkgLibraryState>((set, get, api) => ({
+  createStore<PkgLibraryState>((set, get) => ({
     entries: [],
     loading: false,
     error: null,
@@ -2574,25 +2574,13 @@ const makePkgLibraryStore = () =>
       if (staged.lastResult && !staged.lastResult.ok) {
         return { ok: false, message: staged.lastResult.message };
       }
-      // A successful install with auto-remove on drops the row, so catch the
-      // result as it is written rather than reading the row afterwards.
-      let result: PkgEntry["lastResult"];
-      const unsubscribe = api.subscribe((s) => {
-        const e = s.entries.find((x) => x.path === dest);
-        if (e?.lastResult) result = e.lastResult;
-      });
-      try {
-        await get().install(dest, host);
-      } finally {
-        unsubscribe();
-      }
-      if (result?.ok) return { ok: true };
+      // The install's own result — the row may be gone (auto-remove) or still
+      // hold an earlier attempt's result.
+      const result = await get().install(dest, host);
+      if (result.ok) return { ok: true };
       return {
         ok: false,
-        message:
-          result?.message ??
-          get().error ??
-          "The install did not finish.",
+        message: result.message ?? get().error ?? "The install did not finish.",
       };
     },
 
@@ -2756,9 +2744,9 @@ const makePkgLibraryStore = () =>
     },
 
     async install(path, host) {
-      if (!host?.trim()) return;
+      if (!host?.trim()) return { ok: false, message: "No PS5 host selected." };
       const entry = get().entries.find((e) => e.path === path);
-      await enqueueInstall({
+      return enqueueInstall({
         host,
         request: { via: "library", path },
         displayName: entry?.title || entry?.contentId || basenameOf(path),
@@ -3427,8 +3415,17 @@ const makePkgLibraryStore = () =>
           ? { via: "link", url: source.remoteUrl, mode: "stream", insecureTls: false }
           : { via: "stream", source };
       // Convert follows the install's task: hand it the id once the queue runs it.
-      if (opts?.onTask) streamTaskCallbacks.set(installRequestKey(request), opts.onTask);
-      return enqueueInstall({ host, request, displayName: name }).done;
+      // A duplicate request joins the queued one and keeps its callback.
+      const key = installRequestKey(request);
+      const onTask = opts?.onTask;
+      const owns = !!onTask && !streamTaskCallbacks.has(key);
+      if (owns) streamTaskCallbacks.set(key, onTask);
+      try {
+        return await enqueueInstall({ host, request, displayName: name }).done;
+      } finally {
+        // Removed without running (Stop, Clear, refused): don't leak it.
+        if (owns && streamTaskCallbacks.get(key) === onTask) streamTaskCallbacks.delete(key);
+      }
     },
 
     async installExternal(pkg, host) {
