@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { PackagePanel } from "../../components/PackagePanel";
 import {
   Upload as UploadIcon,
   FolderOpen,
@@ -710,6 +711,7 @@ export default function UploadScreen() {
           onRemoveExclude={removeExclude}
           onUpload={handleUpload}
           onAddToQueue={handleAddToQueue}
+          consoleHost={host?.trim() ? host : null}
         />
       )}
 
@@ -828,6 +830,8 @@ function Step2Options(props: {
   onRemoveExclude: (p: string) => void;
   onUpload: () => void;
   onAddToQueue: (strategy: "overwrite" | "resume") => void;
+  /** The console being uploaded to, for the package viewer's checks. */
+  consoleHost: string | null;
 }) {
   const {
     source,
@@ -859,8 +863,11 @@ function Step2Options(props: {
     onRemoveExclude,
     onUpload,
     onAddToQueue,
+    consoleHost,
     onQueueAllParts,
   } = props;
+  // The .pkg source is open in the package viewer.
+  const [viewingPkg, setViewingPkg] = useState(false);
   const tr = useTr();
 
   // Multi-part archive detection. `Game.part01.zip` … `Game.part06.zip` are
@@ -1306,7 +1313,27 @@ function Step2Options(props: {
           itself after upload — show the finisher summary instead of the
           volume/bandwidth/excludes config that doesn't apply. */}
       {source.kind === "pkg" ? (
-        <PkgFinisherCard pkgInfo={source.pkgInfo ?? null} />
+        <>
+          <PkgFinisherCard
+            pkgInfo={source.pkgInfo ?? null}
+            onView={isRemotePath(source.path) ? undefined : () => setViewingPkg(true)}
+          />
+          <PackagePanel
+            path={viewingPkg ? source.path : null}
+            host={consoleHost}
+            onClose={() => setViewingPkg(false)}
+            actions={[
+              {
+                label: tr("upload_add_to_queue", undefined, "Add to queue"),
+                primary: true,
+                onClick: () => {
+                  setViewingPkg(false);
+                  onAddToQueue("overwrite");
+                },
+              },
+            ]}
+          />
+        </>
       ) : (
         <>
           <DestinationCard
@@ -2626,7 +2653,14 @@ function RarSourceCard() {
  *  the upload→install→cleanup behavior, with the install/auto-delete toggles
  *  (shared with the Install Package screen's settings). The destination is
  *  fixed (the package library) so there's no volume/path picker. */
-function PkgFinisherCard({ pkgInfo }: { pkgInfo: PkgSourceInfo | null }) {
+function PkgFinisherCard({
+  pkgInfo,
+  onView,
+}: {
+  pkgInfo: PkgSourceInfo | null;
+  /** Open the package viewer on this package (a file on this computer). */
+  onView?: () => void;
+}) {
   const tr = useTr();
   const autoInstall = useInstallSettingsStore((s) => s.autoInstallAfterUpload);
   const setAutoInstall = useInstallSettingsStore(
@@ -2644,11 +2678,22 @@ function PkgFinisherCard({ pkgInfo }: { pkgInfo: PkgSourceInfo | null }) {
         {tr("upload_pkg_card_title", "Package install")}
       </div>
       {label && (
-        <div className="mb-2 truncate text-xs text-[var(--color-muted)]">
-          {label}
-          {pkgInfo && pkgInfo.totalBytes > 0 ? (
-            <> · {formatBytes(pkgInfo.totalBytes)}</>
-          ) : null}
+        <div className="mb-2 flex min-w-0 items-center gap-2 text-xs text-[var(--color-muted)]">
+          <span className="truncate">
+            {label}
+            {pkgInfo && pkgInfo.totalBytes > 0 ? (
+              <> · {formatBytes(pkgInfo.totalBytes)}</>
+            ) : null}
+          </span>
+          {onView && (
+            <button
+              type="button"
+              onClick={onView}
+              className="shrink-0 rounded px-1 text-[var(--color-accent)] hover:underline"
+            >
+              {tr("viewer_open", undefined, "View details")}
+            </button>
+          )}
         </div>
       )}
       <p className="mb-3 text-xs text-[var(--color-muted)]">

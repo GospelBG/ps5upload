@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { isRemotePath } from "../../lib/remotePath";
+import { PackagePanel } from "../../components/PackagePanel";
 import { QueuePanel } from "../Upload/QueuePanel";
 import { volumeOfPkgPath } from "../../lib/pkgStorage";
 import { useLocation, useNavigate } from "react-router";
@@ -100,6 +102,7 @@ function PkgRow({
   onSelectAlternative,
   onInstall,
   onDelete,
+  onView,
 }: {
   entry: PkgEntry;
   host: string;
@@ -111,6 +114,8 @@ function PkgRow({
   onSelectAlternative?: () => void;
   onInstall: () => void;
   onDelete: () => void;
+  /** Open the package viewer on this row's original file (when known). */
+  onView?: () => void;
 }) {
   const tr = useTr();
   const navigate = useNavigate();
@@ -294,6 +299,15 @@ function PkgRow({
                     {tr("pkglib.meta.source", undefined, "Source:")}
                   </span>
                   <span className="truncate font-mono">{entry.sourcePath}</span>
+                  {onView && (
+                    <button
+                      type="button"
+                      onClick={onView}
+                      className="ml-1 shrink-0 rounded px-1 text-[var(--color-accent)] hover:underline"
+                    >
+                      {tr("viewer_open", undefined, "View details")}
+                    </button>
+                  )}
                 </div>
               )}
               {entry.uploadedAt && (
@@ -533,6 +547,8 @@ export default function InstallPackageScreen() {
     Map<string, InstalledPkgArtifact[]>
   >(() => new Map());
   const [pickError, setPickError] = useState<string | null>(null);
+  // The row whose original file is open in the package viewer.
+  const [viewEntry, setViewEntry] = useState<PkgEntry | null>(null);
   /** Terminal outcome of the last stream install, shown IN THIS VIEW.
    *
    *  A streamed package is a path on the PC, not a staging-library row, so it
@@ -1207,12 +1223,37 @@ export default function InstallPackageScreen() {
         }
         onInstall={() => void handleInstall(entry)}
         onDelete={() => void handleDelete(entry)}
+        onView={
+          entry.sourcePath && !isRemotePath(entry.sourcePath)
+            ? () => setViewEntry(entry)
+            : undefined
+        }
       />
     );
   };
 
   return (
     <div className="p-6">
+      <PackagePanel
+        path={viewEntry?.sourcePath ?? null}
+        host={host}
+        onClose={() => setViewEntry(null)}
+        actions={
+          viewEntry
+            ? [
+                {
+                  label: tr("pkglib.install", undefined, "Install"),
+                  primary: true,
+                  onClick: () => {
+                    const e = viewEntry;
+                    setViewEntry(null);
+                    void handleInstall(e);
+                  },
+                },
+              ]
+            : []
+        }
+      />
       <PageHeader
         icon={PackageOpen}
         title={tr("install.title", "Install Package")}
