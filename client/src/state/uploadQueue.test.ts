@@ -67,6 +67,11 @@ import {
 } from "./uploadQueue";
 import { useUploadSettingsStore } from "./uploadSettings";
 import { runPkgInstall } from "./pkgLibrary";
+import { registerInstallExecutor, type InstallResult } from "./consoleQueueBridge";
+import { sameInstall } from "./uploadQueue";
+
+// The store before any test stubs its actions (some blocks replace startHost).
+const pristineQueue = useUploadQueueStore.getState();
 
 const mockedJobStatus = vi.mocked(jobStatus);
 const mockedStartFile = vi.mocked(startTransferFile);
@@ -1136,5 +1141,125 @@ describe("resumeFailedRecoverable", () => {
     expect(n).toBe(0);
     expect(byId(id).status).toBe("failed");
     expect(startHost).not.toHaveBeenCalled();
+  });
+});
+
+describe("install items", () => {
+  const host = "10.0.0.2";
+  let calls: string[];
+  let gate: Map<string, (r: InstallResult) => void>;
+
+  beforeEach(() => {
+    calls = [];
+    gate = new Map();
+    registerInstallExecutor(
+      (req) =>
+        new Promise<InstallResult>((resolve) => {
+          const key =
+            req.via === "stream" ? req.source : req.via === "library" ? req.path : req.via;
+          calls.push(key);
+          gate.set(key, resolve);
+        }),
+    );
+    // Earlier blocks leave fake timers, live drain loops and mocks behind.
+    vi.useRealTimers();
+    useUploadQueueStore.getState().stop();
+    mockedEnsurePayload.mockReset().mockResolvedValue(undefined as never);
+    useUploadQueueStore.setState({
+      ...pristineQueue,
+      items: [],
+      runningHosts: {},
+      running: false,
+      continueOnFailure: true,
+      loaded: true,
+    });
+  });
+  afterEach(() => {
+    useUploadQueueStore.getState().stop();
+  });
+
+  const waitFor = async (cond: () => boolean) => {
+    for (let i = 0; i < 400 && !cond(); i++) await new Promise((r) => setTimeout(r, 5));
+    expect(cond()).toBe(true);
+  };
+
+  it("runs an install item and resolves its waiter with the result", async () => {
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host,
+      request: { via: "stream", source: "/games/a.pkg" },
+      displayName: "A",
+    });
+    await waitFor(() => calls.length === 1);
+    gate.get("/games/a.pkg")!({ ok: true });
+    await expect(q.done).resolves.toEqual({ ok: true });
+    await waitFor(
+      () => useUploadQueueStore.getState().items.find((i) => i.id === q.id)?.status === "done",
+    );
+  });
+
+  it("[RF 3] a second install on the same console waits for the first", async () => {
+    const a = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "stream", source: "/a.pkg" }, displayName: "A",
+    });
+    const b = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "library", path: "/staged/b.pkg" }, displayName: "B",
+    });
+    await waitFor(() => calls.length === 1);
+    expect(calls).toEqual(["/a.pkg"]);
+    gate.get("/a.pkg")!({ ok: true });
+    await a.done;
+    await waitFor(() => calls.length === 2);
+    gate.get("/staged/b.pkg")!({ ok: false, message: "rejected" });
+    await expect(b.done).resolves.toEqual({ ok: false, message: "rejected" });
+  });
+
+  it("orders installs base → update → DLC by category", async () => {
+    const s = useUploadQueueStore.getState();
+    // Queue all three while the console is held by a first install, so the
+    // drain rule (not add order) decides what runs next.
+    const hold = s.enqueueInstall({ host, request: { via: "stream", source: "/hold.pkg" }, displayName: "H" });
+    await waitFor(() => calls.length === 1);
+    const dlc = s.enqueueInstall({ host, request: { via: "stream", source: "/dlc.pkg" }, displayName: "D", category: "ac" });
+    const upd = s.enqueueInstall({ host, request: { via: "stream", source: "/upd.pkg" }, displayName: "U", category: "gp" });
+    const base = s.enqueueInstall({ host, request: { via: "stream", source: "/base.pkg" }, displayName: "B", category: "gd" });
+    gate.get("/hold.pkg")!({ ok: true });
+    await hold.done;
+    for (const key of ["/base.pkg", "/upd.pkg", "/dlc.pkg"]) {
+      await waitFor(() => gate.has(key));
+      gate.get(key)!({ ok: true });
+    }
+    await Promise.all([dlc.done, upd.done, base.done]);
+    expect(calls).toEqual(["/hold.pkg", "/base.pkg", "/upd.pkg", "/dlc.pkg"]);
+  });
+
+  it("refuses the same install queued twice on one console", () => {
+    const s = useUploadQueueStore.getState();
+    s.enqueueInstall({ host, request: { via: "stream", source: "/x.pkg" }, displayName: "X" });
+    const again = s.enqueueInstall({ host, request: { via: "stream", source: "/x.pkg" }, displayName: "X" });
+    return expect(again.done).resolves.toMatchObject({
+      ok: false,
+      message: expect.stringMatching(/already in the queue/),
+    });
+  });
+
+  it("never auto-recovers an install item", async () => {
+    useUploadSettingsStore.setState({ autoResume: true });
+    registerInstallExecutor(async () => {
+      throw new Error("connection reset");
+    });
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "library", path: "/p.pkg" }, displayName: "P",
+    });
+    await expect(q.done).resolves.toMatchObject({ ok: false, message: "connection reset" });
+    expect(useUploadQueueStore.getState().items.find((i) => i.id === q.id)?.status).toBe("failed");
+  });
+
+  it("sameInstall matches on request identity, not display name", () => {
+    const item = {
+      sourceKind: "install", addr: "10.0.0.2:9113",
+      install: { via: "stream", source: "/x.pkg" }, status: "pending",
+    } as unknown as QueueItem;
+    expect(sameInstall(item, { host: "10.0.0.2", request: { via: "stream", source: "/x.pkg" }, displayName: "other" })).toBe(true);
+    expect(sameInstall(item, { host: "10.0.0.3", request: { via: "stream", source: "/x.pkg" }, displayName: "X" })).toBe(false);
   });
 });

@@ -56,6 +56,15 @@ import { hostOf, mgmtAddr } from "../lib/addr";
 import { log } from "./logs";
 import { isRemotePath } from "../lib/remotePath";
 import { releaseCopy } from "../lib/materialize";
+import {
+  getInstallExecutor,
+  registerInstallEnqueuer,
+  type EnqueueInstallInput,
+  type EnqueuedInstall,
+  type InstallRequest,
+  type InstallResult,
+} from "./consoleQueueBridge";
+import { PS5_PAYLOAD_PORT } from "./connection";
 import { ensurePayloadCurrent } from "../lib/ensurePayloadCurrent";
 import { effectiveUploadStreams } from "../lib/uploadStreams";
 import {
@@ -102,13 +111,16 @@ const INTER_JOB_SETTLE_MS = 1500;
 
 export type QueueItemStatus = "pending" | "running" | "done" | "failed";
 
+/** What a queue item does: an upload of some source kind, or an install. */
+export type QueueSourceKind = SourceKind | "install";
+
 /** One queued upload. The shape is whatever the Upload screen
  *  captures at "Add to queue" time — source path, destination,
  *  strategy, exclude rules — plus runtime status that the runner
  *  updates as it processes the item. */
 export interface QueueItem {
   id: string;
-  sourceKind: SourceKind;
+  sourceKind: QueueSourceKind;
   sourcePath: string;
   /** Display-only basename so the list row doesn't re-derive it on
    *  every render. */
@@ -152,6 +164,9 @@ export interface QueueItem {
    *  upload + space and can't apply). Null/absent for non-pkg or headerless
    *  items; the runner then falls back to the staged dest path. */
   category?: string | null;
+  /** Install-only: what to install and from where. A link is never persisted
+   *  (see scheduleSave), so a restored item without it is dropped on hydrate. */
+  install?: InstallRequest;
   /** Pkg-only: run the installer once the .pkg upload commits (default on —
    *  staging a pkg exists to install it). Mirrors installSettings, captured at
    *  add time so toggling the default mid-queue doesn't disturb queued rows. */
@@ -252,6 +267,7 @@ export type AddQueueItem = Pick<
   | "category"
   | "installAfterUpload"
   | "deletePkgAfterInstall"
+  | "install"
 >;
 
 interface QueueState {
@@ -278,6 +294,10 @@ interface QueueState {
 
   hydrate: () => Promise<void>;
   add: (item: AddQueueItem) => void;
+  /** Queue an install on its console and start that console. `done` resolves
+   *  when the item finishes or is removed; a duplicate resolves at once with
+   *  ok:false. */
+  enqueueInstall: (input: EnqueueInstallInput) => EnqueuedInstall;
   remove: (id: string) => void;
   /** Cancel a single item and drop it from the queue. If it's the one
    *  actively uploading, its in-flight engine job is aborted (at the next
@@ -356,7 +376,7 @@ export function distinctPendingHosts(items: QueueItem[]): string[] {
  *  persisted items that predate the `category` field. Non-pkg items and base
  *  games share priority 0 and keep their add-order. Exported for tests. */
 export function installOrderPriority(it: QueueItem): number {
-  if (it.sourceKind !== "pkg") return 0;
+  if (it.sourceKind !== "pkg" && it.sourceKind !== "install") return 0;
   const cat = it.category;
   if (cat === "gp") return 1;
   if (cat === "ac") return 2;
@@ -365,6 +385,38 @@ export function installOrderPriority(it: QueueItem): number {
   if (/\/updates\/[^/]*$/.test(it.resolvedDest)) return 1;
   if (/\/dlc\/[^/]*$/.test(it.resolvedDest)) return 2;
   return 0;
+}
+
+/** The same install already waiting or running on the same console. Matched on
+ *  the source (file, on-console path, link), not the content id: two files with
+ *  one content id are legitimate (same-version variants, a deliberate reinstall). */
+export function sameInstall(it: QueueItem, input: EnqueueInstallInput): boolean {
+  if (it.sourceKind !== "install" || !it.install) return false;
+  if (it.status !== "pending" && it.status !== "running") return false;
+  if (hostOf(it.addr) !== hostOf(input.host)) return false;
+  return installKey(it.install) === installKey(input.request);
+}
+
+function installKey(r: InstallRequest): string {
+  switch (r.via) {
+    case "library":
+    case "console-path":
+      return `ps5:${r.path}`;
+    case "external":
+      return `ps5:${r.pkg.path}`;
+    case "stream":
+      return `pc:${r.source}`;
+    case "link":
+      return `url:${r.url}`;
+  }
+}
+
+/** A finished install whose verdict was "not installed". Carries the result so
+ *  the drain loop can hand it to the waiter unchanged. */
+class InstallItemError extends Error {
+  constructor(readonly result: InstallResult) {
+    super(result.message || "The install didn't complete.");
+  }
 }
 
 /** The next pending item to run for `host` (port-stripped match), or null.
@@ -433,6 +485,50 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     }, SAVE_DEBOUNCE_MS);
   };
 
+  /** Callers awaiting an install item's outcome. In memory only: after a
+   *  restart nobody is waiting, and the row itself shows the result. */
+  const waiters = new Map<string, (r: InstallResult) => void>();
+  const settle = (id: string, r: InstallResult) => {
+    const w = waiters.get(id);
+    if (w) {
+      waiters.delete(id);
+      w(r);
+    }
+  };
+
+  /** Run an install item through the executor pkgLibrary registered. Throws
+   *  InstallItemError when the install finished but didn't install. */
+  const runInstallItem = async (item: QueueItem, isLive: () => boolean) => {
+    const exec = getInstallExecutor();
+    if (!exec || !item.install) {
+      throw new Error("This install can't run: its details were not kept.");
+    }
+    set((s) => ({
+      items: patchItem(s.items, item.id, { installPhase: "installing", installPct: 0 }),
+    }));
+    const r = await exec(item.install, hostOf(item.addr), {
+      onProgress: (pct) => {
+        if (isLive()) {
+          set((s) => ({ items: patchItem(s.items, item.id, { installPct: pct }) }));
+        }
+      },
+      onStatus: () => {},
+    });
+    if (!r.ok) throw new InstallItemError(r);
+    settle(item.id, r);
+    return {
+      bytesSent: 0,
+      bytesPerSec: 0,
+      mountedAt: null,
+      mountWarnings: r.mayNotLaunch
+        ? ["Installed, but it may not launch on this firmware."]
+        : [],
+      registeredAs: null,
+      installPhase: (r.mayNotLaunch ? "warn" : "done") as QueueItem["installPhase"],
+      installedTitle: item.displayName,
+    };
+  };
+
   /** Run a single queued item to terminal state. Returns when the
    *  engine job hits done; throws on failure (caller decides whether
    *  to continue or stop). The poll loop re-checks `isLive()` after
@@ -450,6 +546,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     installPhase: QueueItem["installPhase"];
     installedTitle: string | null;
   }> => {
+    if (item.sourceKind === "install") return runInstallItem(item, isLive);
     const isFolder =
       item.sourceKind === "folder" || item.sourceKind === "game-folder";
     const isArchive = item.sourceKind === "archive";
@@ -1054,7 +1151,11 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             e instanceof UploadJobError ? (e.detail ?? null) : null;
 
           const autoResume = useUploadSettingsStore.getState().autoResume;
+          // An install is never re-run by itself: a repeated patch install
+          // can wipe the base game. Only uploads auto-recover.
+          const isInstall = next.sourceKind === "install";
           const canRecover =
+            !isInstall &&
             autoResume &&
             recoverAttempt < MAX_AUTO_RECOVER_ATTEMPTS &&
             shouldAutoRecover(e, reason, message);
@@ -1070,9 +1171,16 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
                 errorReason: reason,
                 errorDetail: detail,
                 completedAt: Date.now(),
+                ...(isInstall ? { installPhase: "error" as const } : {}),
               }),
             }));
             scheduleSave();
+            if (isInstall) {
+              settle(
+                next.id,
+                e instanceof InstallItemError ? e.result : { ok: false, message },
+              );
+            }
             if (!shouldContinueAfterFailure(get().continueOnFailure)) {
               break drain; // hard stop: tear down this console's loop
             }
@@ -1231,6 +1339,41 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           persistenceError: `The saved upload queue could not be loaded: ${message}. The original queue file was left untouched.`,
         });
       }
+    },
+
+    enqueueInstall(input) {
+      const existing = get().items.find((it) => sameInstall(it, input));
+      if (existing) {
+        return {
+          id: existing.id,
+          done: Promise.resolve({
+            ok: false,
+            message: `${input.displayName} is already in the queue.`,
+          }),
+        };
+      }
+      const bare = hostOf(input.host);
+      get().add({
+        sourceKind: "install",
+        sourcePath: installKey(input.request),
+        displayName: input.displayName,
+        resolvedDest: "",
+        addr: `${bare}:${PS5_PAYLOAD_PORT}`,
+        strategy: "overwrite",
+        reconcileMode: "fast",
+        excludes: [],
+        mountAfterUpload: false,
+        mountReadOnly: true,
+        registerAfterUpload: false,
+        contentId: input.contentId ?? null,
+        category: input.category ?? null,
+        install: input.request,
+      });
+      const items = get().items;
+      const added = items[items.length - 1];
+      const done = new Promise<InstallResult>((resolve) => waiters.set(added.id, resolve));
+      void get().startHost(bare);
+      return { id: added.id, done };
     },
 
     add(input) {
@@ -1528,6 +1671,9 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     },
   };
 });
+
+// pkgLibrary queues installs through the bridge (it can't import this module).
+registerInstallEnqueuer((input) => useUploadQueueStore.getState().enqueueInstall(input));
 
 /** Post-install settle. A main-payload install briefly destabilises SceShellUI
  *  (the screen-black blip) and the connection recovers a beat later; starting
