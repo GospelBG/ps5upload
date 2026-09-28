@@ -8685,12 +8685,14 @@ async fn bug_report_bundle_handler(Json(req): Json<BugBundleReq>) -> axum::respo
 /// drains in-flight requests up to the cap, then returns. Replaces
 /// a `process::exit(0)` torn-down hard exit that left in-flight
 /// transfers / pkg-host streams dropped abruptly.
-static SHUTDOWN: tokio::sync::OnceCell<tokio::sync::Notify> = tokio::sync::OnceCell::const_new();
+///
+/// `notify_one` stores a permit when nothing waits yet, so a parent that dies while the server
+/// is still starting (before this future is polled) is not missed; `notify_waiters` dropped it
+/// and left only the 10 s hard exit.
+static SHUTDOWN: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 async fn shutdown_signal() {
-    let notify = SHUTDOWN
-        .get_or_init(|| async { tokio::sync::Notify::new() })
-        .await;
+    let notify = &SHUTDOWN;
     // Race the cooperative notify with platform signal handlers so
     // both manual `kill` and parent-death paths get clean drain.
     //
@@ -8710,10 +8712,10 @@ async fn shutdown_signal() {
                 tokio::select! {
                     _ = notify.notified() => {}
                     _ = sigterm.recv() => {
-                        eprintln!("[ps5upload-engine] SIGTERM — shutting down");
+                        stderr_quiet("[ps5upload-engine] SIGTERM — shutting down");
                     }
                     _ = sigint.recv() => {
-                        eprintln!("[ps5upload-engine] SIGINT — shutting down");
+                        stderr_quiet("[ps5upload-engine] SIGINT — shutting down");
                     }
                 }
             }
@@ -8732,16 +8734,22 @@ async fn shutdown_signal() {
         tokio::select! {
             _ = notify.notified() => {}
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("[ps5upload-engine] Ctrl-C — shutting down");
+                stderr_quiet("[ps5upload-engine] Ctrl-C — shutting down");
             }
         }
     }
 }
 
 fn trigger_shutdown() {
-    if let Some(notify) = SHUTDOWN.get() {
-        notify.notify_waiters();
-    }
+    SHUTDOWN.notify_one();
+}
+
+/// Print to stderr without panicking. `eprintln!` panics when stderr is a closed pipe, which is
+/// exactly the state a dead desktop parent leaves behind (it was reading our stderr): the
+/// parent-watch thread died on its first message and the engine lived on, holding its port.
+fn stderr_quiet(msg: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{msg}");
 }
 
 fn spawn_parent_watcher() {
@@ -8755,34 +8763,26 @@ fn spawn_parent_watcher() {
         // end was closed → parent died, however that happened).
         let mut buf = [0u8; 64];
         let mut stdin = std::io::stdin().lock();
-        loop {
+        let why = loop {
             match stdin.read(&mut buf) {
-                Ok(0) => {
-                    eprintln!(
-                        "[engine] parent process died (stdin EOF); draining in-flight requests then exiting",
-                    );
-                    trigger_shutdown();
-                    // Belt-and-braces watchdog: if axum's
-                    // graceful-shutdown drain takes longer than
-                    // 10 seconds (e.g. a stuck pkg-host range read),
-                    // hard-exit so we don't keep the port held by a
-                    // zombie engine after the parent is gone.
-                    std::thread::sleep(std::time::Duration::from_secs(10));
-                    eprintln!("[engine] graceful shutdown timed out; hard exit");
-                    std::process::exit(0);
-                }
+                Ok(0) => break "parent process died (stdin EOF)".to_string(),
                 Ok(_) => continue,
-                Err(e) => {
-                    eprintln!(
-                        "[engine] parent-watch stdin read error: {e}; draining in-flight requests then exiting",
-                    );
-                    trigger_shutdown();
-                    std::thread::sleep(std::time::Duration::from_secs(10));
-                    eprintln!("[engine] graceful shutdown timed out; hard exit");
-                    std::process::exit(0);
-                }
+                Err(e) => break format!("parent-watch stdin read error: {e}"),
             }
-        }
+        };
+        // Shut down first: the parent that read our stderr is usually gone, so nothing
+        // printed from here on may be able to stop this thread.
+        trigger_shutdown();
+        stderr_quiet(&format!(
+            "[engine] {why}; draining in-flight requests then exiting"
+        ));
+        // Belt-and-braces watchdog: if axum's graceful-shutdown drain takes
+        // longer than 10 seconds (e.g. a stuck pkg-host range read), hard-exit
+        // so we don't keep the port held by a zombie engine after the parent
+        // is gone.
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        stderr_quiet("[engine] graceful shutdown timed out; hard exit");
+        std::process::exit(0);
     });
 }
 
@@ -9263,7 +9263,7 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         }
     };
     // Graceful shutdown: when the parent-watcher fires (stdin EOF), the
-    // SHUTDOWN OnceCell-guarded Notify wakes this future, axum stops
+    // SHUTDOWN Notify wakes this future, axum stops
     // accepting new connections, drains in-flight ones, then returns.
     // The 10-second watchdog in spawn_parent_watcher is the hard ceiling
     // — if a stuck request blocks the drain (rare; only for pkg-host
