@@ -109,6 +109,8 @@ describe("picking several", () => {
     expect((out.match(/type="checkbox"/g) ?? []).length).toBe(3);
     expect((out.match(/checked=""/g) ?? []).length).toBe(2);
     expect(out).toContain("Add 2");
+    // The hint wraps on a phone rather than being cut off mid-word.
+    expect(out).toMatch(/<span class="(?:(?!truncate)[^"])*">Tick files in any folder/);
   });
 
   it("lets folders be ticked when picking folders", () => {

@@ -282,7 +282,9 @@ export function PickerView(p: PickerViewProps) {
 
             {(p.mode !== "file" || p.multiple) && !p.actions && (
               <footer className="flex flex-wrap items-center gap-2 border-t border-[var(--color-border)] px-4 py-3">
-                <span className="min-w-0 flex-1 truncate text-xs text-[var(--color-muted)]">
+                <span
+                  className={`min-w-0 flex-1 text-xs text-[var(--color-muted)] ${p.mode !== "file" ? "truncate" : ""}`}
+                >
                   {p.mode !== "file" ? (
                     <>
                       {tr("picker_use_this", undefined, "Use the open folder:")}{" "}
