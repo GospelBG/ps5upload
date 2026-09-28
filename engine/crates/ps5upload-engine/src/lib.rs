@@ -544,11 +544,8 @@ async fn log_requests(req: Request, next: Next) -> axum::response::Response {
                  {suppressed} identical repeat(s) not logged"
             );
         }
-        log_dedup::LogAction::Recovered { suppressed } => {
-            log_warn!(
-                "{method} {path} -> {status} — recovered after {suppressed} \
-                 failure(s)"
-            );
+        log_dedup::LogAction::Recovered { failures } => {
+            log_warn!("{method} {path} -> {status} — recovered after {failures} failure(s)");
         }
         log_dedup::LogAction::Quiet => {}
     }

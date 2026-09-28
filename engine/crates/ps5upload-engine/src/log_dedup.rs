@@ -26,6 +26,8 @@ pub const REPEAT_AFTER: Duration = Duration::from_secs(60);
 struct FailState {
     /// Failures seen since the last time we logged this key.
     suppressed: u64,
+    /// Every failure of this outage, logged or not.
+    failures: u64,
     last_logged: Instant,
 }
 
@@ -35,8 +37,8 @@ pub enum LogAction {
     /// Log it as a warning. `suppressed` is how many identical failures
     /// went unlogged since the last warning (0 for a first failure).
     Warn { suppressed: u64 },
-    /// A previously-failing endpoint answered again.
-    Recovered { suppressed: u64 },
+    /// A previously-failing endpoint answered again after `failures` failures.
+    Recovered { failures: u64 },
     /// Say nothing; this is more of what we already reported.
     Quiet,
 }
@@ -64,12 +66,14 @@ impl FailureLog {
                         key.to_string(),
                         FailState {
                             suppressed: 0,
+                            failures: 1,
                             last_logged: now,
                         },
                     );
                     LogAction::Warn { suppressed: 0 }
                 }
                 Some(st) => {
+                    st.failures += 1;
                     if now.duration_since(st.last_logged) >= REPEAT_AFTER {
                         let suppressed = st.suppressed;
                         st.suppressed = 0;
@@ -85,7 +89,7 @@ impl FailureLog {
             // Success. Only interesting if it follows a failure.
             match self.seen.remove(key) {
                 Some(st) => LogAction::Recovered {
-                    suppressed: st.suppressed,
+                    failures: st.failures,
                 },
                 None => LogAction::Quiet,
             }
@@ -152,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_is_reported_with_what_was_suppressed() {
+    fn recovery_counts_every_failure_of_the_outage() {
         let mut f = FailureLog::new();
         let t0 = Instant::now();
         f.observe("k", true, t0);
@@ -161,7 +165,19 @@ mod tests {
         }
         assert_eq!(
             f.observe("k", false, at(t0, 10)),
-            LogAction::Recovered { suppressed: 9 }
+            LogAction::Recovered { failures: 10 }
+        );
+    }
+
+    #[test]
+    fn a_single_failure_recovers_as_one_not_zero() {
+        // The log read "recovered after 0 failure(s)" right after a logged 502.
+        let mut f = FailureLog::new();
+        let t0 = Instant::now();
+        f.observe("k", true, t0);
+        assert_eq!(
+            f.observe("k", false, at(t0, 1)),
+            LogAction::Recovered { failures: 1 }
         );
     }
 
