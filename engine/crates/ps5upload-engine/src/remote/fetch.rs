@@ -228,10 +228,15 @@ pub(crate) async fn start_fetch(r: Arc<Remote>, deps: FetchDeps, body: FetchBody
         .unwrap_or("server")
         .to_string();
     let dest = dest_dir.join(&name);
-    if dest.exists() {
+    // The copy and a RAR set's other volumes alike: never write over (and later delete) a file
+    // that was already there.
+    if let Some(taken) = std::iter::once(dest.clone())
+        .chain(siblings.iter().map(|(_, e)| dest_dir.join(&e.name)))
+        .find(|p| p.exists())
+    {
         return err(
             StatusCode::CONFLICT,
-            format!("{} already exists", dest.display()),
+            format!("{} already exists", taken.display()),
         );
     }
 
@@ -826,5 +831,32 @@ mod tests {
         for v in ["g.part1.rar", "g.part2.rar", "g.part3.rar"] {
             assert!(!dest_dir.join(v).exists(), "{v}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_rar_volume_already_in_the_folder_is_never_overwritten() {
+        let (r, id) = setup(&[("/dl/g.part1.rar", b"one"), ("/dl/g.part2.rar", b"two")]);
+        let (d, _jobs) = deps(plenty);
+        let dest_dir = crate::remote::store::test_dir();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(dest_dir.join("g.part2.rar"), b"mine").unwrap();
+        let (code, out) = json_of(
+            start_fetch(
+                Arc::clone(&r),
+                d,
+                FetchBody {
+                    path: format!("remote://{id}/dl/g.part1.rar"),
+                    dest_dir: Some(dest_dir.display().to_string()),
+                },
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{out}");
+        assert_eq!(
+            std::fs::read(dest_dir.join("g.part2.rar")).unwrap(),
+            b"mine"
+        );
+        assert!(!dest_dir.join("g.part1.rar").exists());
     }
 }
