@@ -10,6 +10,7 @@ import {
   gameIconDataUrl,
 } from "../api/ps5";
 import { transferAddr } from "../lib/addr";
+import { iconTitleId } from "../lib/titleId";
 import { useImageRetry } from "../lib/useImageRetry";
 
 /**
@@ -51,11 +52,14 @@ export function GameIcon({
   className?: string;
 }) {
   const hostReady = !!host.trim();
+  // A folder named after a title but not exactly it (a save backup `PPSA17221.bak`) shows that
+  // title's icon; a name that isn't a title id at all skips the console lookup.
+  const iconId = titleId ? iconTitleId(titleId) : null;
   // Ordered candidate list: local appmeta → local game folder → external cover.
   // Filtering nulls here means the fallback chain naturally skips sources we
   // don't have rather than rendering a broken <img>.
   const candidates = [
-    hostReady && titleId ? appIconUrl(transferAddr(host), titleId) : null,
+    hostReady && iconId ? appIconUrl(transferAddr(host), iconId) : null,
     hostReady && gamePath ? gameIconUrl(transferAddr(host), gamePath) : null,
     fallbackSrc || null,
   ].filter((s): s is string => !!s);
@@ -79,19 +83,19 @@ export function GameIcon({
     // Whichever console-served source this attempt is on, if the session
     // already holds its bytes there is nothing to fetch.
     cached:
-      idx === 0 && hostReady && titleId
-        ? cachedAppIcon(transferAddr(host), titleId)
-        : idx === (titleId && hostReady ? 1 : 0) && hostReady && gamePath
+      idx === 0 && hostReady && iconId
+        ? cachedAppIcon(transferAddr(host), iconId)
+        : idx === (iconId && hostReady ? 1 : 0) && hostReady && gamePath
           ? cachedGameIcon(transferAddr(host), gamePath)
           : undefined,
     fallbackLoader: () =>
-      idx === 0 && hostReady && titleId
-        ? appIconDataUrl(transferAddr(host), titleId)
-        : idx === (titleId && hostReady ? 1 : 0) && hostReady && gamePath
+      idx === 0 && hostReady && iconId
+        ? appIconDataUrl(transferAddr(host), iconId)
+        : idx === (iconId && hostReady ? 1 : 0) && hostReady && gamePath
           ? gameIconDataUrl(transferAddr(host), gamePath)
           : Promise.resolve(null),
   });
-  const advance = useCallback(() => setIdx((i) => i + 1), []);
+  const advance = useCallback(() => setIdx((i) => i + 1), [setIdx]);
   useEffect(() => {
     if (failed) advance();
   }, [failed, advance]);

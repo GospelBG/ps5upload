@@ -45,6 +45,7 @@ import { useConfirm } from "../../components/ConfirmDialog";
 import { useTr } from "../../state/lang";
 import { startTransferDownload } from "../../api/ps5";
 import { formatBytes } from "../../lib/format";
+import { iconTitleId } from "../../lib/titleId";
 import { useTitleInfo } from "../../lib/useTitleInfo";
 import { mgmtAddr } from "../../lib/addr";
 import { useStaleHostGuard } from "../../lib/staleHostGuard";
@@ -1011,7 +1012,8 @@ function SaveGroupHeader({
 }) {
   const tr = useTr();
   const navigate = useNavigate();
-  const info = useTitleInfo(titleId);
+  // A backup folder (`PPSA17221.bak`) is named after its game: show that game's name.
+  const info = useTitleInfo(iconTitleId(titleId) ?? titleId);
   return (
     <header className="mb-2 flex items-center gap-2">
       {/* Game cover from /user/appmeta/<id>/icon0.png (readable), not the
