@@ -120,6 +120,14 @@ describe("picking several", () => {
     expect(out).toMatch(/<button[^>]*disabled=""[^>]*>(?:(?!<\/button>).)*Add 0/);
   });
 
+  it("offers only Add once folders are ticked, so the ticks are never dropped", () => {
+    const none = html({ multiple: true, mode: "folder", selected: [], entries: [dir("g1")] });
+    expect(none).toContain("Use this folder");
+    const some = html({ multiple: true, mode: "folder", selected: ["/games/g1"], entries: [dir("g1")] });
+    expect(some).not.toContain("Use this folder");
+    expect(some).toContain("Add 1");
+  });
+
   it("stays a plain one-tap list when picking one", () => {
     expect(html({ entries: [file("a.pkg")] })).not.toContain('type="checkbox"');
   });

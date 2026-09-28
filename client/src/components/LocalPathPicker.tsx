@@ -294,7 +294,8 @@ export function PickerView(p: PickerViewProps) {
                     tr("picker_tick_hint", undefined, "Tick files in any folder, then add them together.")
                   )}
                 </span>
-                {p.mode !== "file" && (
+                {/* With folders ticked, "Use this folder" would drop them: Add is the one action. */}
+                {p.mode !== "file" && !(p.multiple && p.selected?.length) && (
                   <Button variant={p.multiple ? "secondary" : "primary"} size="sm" onClick={p.onUseFolder}>
                     <Check size={14} />
                     {tr("picker_use_folder", undefined, "Use this folder")}
