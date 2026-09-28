@@ -18,6 +18,8 @@ import { localFs } from "../api/localFs";
 import { remoteApi, RemoteApiError } from "../api/remote";
 import { parentOf, fmtSize } from "../lib/pathBrowser";
 import { displayPath, remotePath } from "../lib/remotePath";
+import { hostOf, transferAddr } from "../lib/addr";
+import { fsListDir } from "../api/ps5";
 import { useConnectionsStore } from "../state/connections";
 import { useLocalPickerStore } from "../state/localPicker";
 import { useTr } from "../state/lang";
@@ -44,7 +46,7 @@ export interface PickerEntry {
 
 export interface PickerViewProps {
   title: string;
-  mode: "file" | "folder";
+  mode: "file" | "folder" | "any";
   entries: PickerEntry[];
   cwdLabel: string;
   canGoUp: boolean;
@@ -190,7 +192,7 @@ export function PickerView(p: PickerViewProps) {
               ) : (
                 <ul>
                   {shown.map((e) => {
-                    const selectable = e.is_dir || p.mode === "file";
+                    const selectable = e.is_dir || p.mode !== "folder";
                     const isPkg = !e.is_dir && e.name.toLowerCase().endsWith(".pkg");
                     return (
                       <li key={e.path} className="flex items-center">
@@ -200,7 +202,7 @@ export function PickerView(p: PickerViewProps) {
                           className="flex min-w-0 flex-1 items-center gap-3 px-4 py-3 text-left hover:bg-[var(--color-surface)] disabled:opacity-40"
                           onClick={() => {
                             if (e.is_dir) p.onOpenDir(e.path);
-                            else if (p.mode === "file" && !p.actions) p.onPickFile(e.path);
+                            else if (p.mode !== "folder" && !p.actions) p.onPickFile(e.path);
                           }}
                         >
                           {e.is_dir ? (
@@ -250,7 +252,7 @@ export function PickerView(p: PickerViewProps) {
               )}
             </div>
 
-            {p.mode === "folder" && !p.actions && (
+            {p.mode !== "file" && !p.actions && (
               <footer className="flex items-center gap-2 border-t border-[var(--color-border)] px-4 py-3">
                 <span className="flex-1 truncate text-xs text-[var(--color-muted)]">
                   {tr("picker_use_this", undefined, "Use the open folder:")}{" "}
@@ -295,6 +297,14 @@ function serverParent(path: string): string | null {
   return i <= 0 ? "/" : t.slice(0, i);
 }
 
+/** Where a game can live on the console: internal storage and the external drives. */
+const CONSOLE_ROOTS = ["/data", "/mnt/ext0", "/mnt/ext1", "/mnt/usb0", "/mnt/usb1"];
+
+/** A pick on the console, as the converter reads it: `ps5://<host><path>`. */
+export function consolePickResult(host: string, path: string): string {
+  return `ps5://${hostOf(host)}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
 function joinServer(dir: string, name: string): string {
   return `${dir.replace(/\/+$/, "")}/${name}`;
 }
@@ -307,7 +317,8 @@ export function LocalPathPicker() {
   const connections = useConnectionsStore((s) => s.connections);
 
   const source = pending?.source;
-  const connectionId = source && source !== "local" ? source.connectionId : null;
+  const connectionId = source && source !== "local" && "connectionId" in source ? source.connectionId : null;
+  const consoleHost = source && source !== "local" && "console" in source ? source.console : null;
   const connection = connectionId ? connections.find((c) => c.id === connectionId) : undefined;
 
   const [granted, setGranted] = useState<boolean | null>(null);
@@ -325,7 +336,18 @@ export function LocalPathPicker() {
       setError(null);
       setHint(null);
       try {
-        if (connectionId) {
+        if (consoleHost) {
+          const list = await fsListDir(transferAddr(consoleHost), path);
+          setEntries(
+            list.map((e) => ({
+              name: e.name,
+              path: joinServer(path, e.name),
+              is_dir: e.kind === "dir",
+              size: e.size ?? 0,
+            })),
+          );
+          setCursor(null);
+        } else if (connectionId) {
           const page = await remoteApi.listDir(remotePath(connectionId, path), more);
           const list = page.entries.map((e) => ({
             name: e.name,
@@ -349,13 +371,19 @@ export function LocalPathPicker() {
         setLoading(false);
       }
     },
-    [connectionId],
+    [connectionId, consoleHost],
   );
 
   const begin = useCallback(async () => {
     setError(null);
     setHint(null);
     setLoading(true);
+    if (consoleHost) {
+      setGranted(true);
+      setRoots(CONSOLE_ROOTS);
+      await loadDir(CONSOLE_ROOTS[0]);
+      return;
+    }
     if (connectionId) {
       setGranted(true);
       const start = readLastDir(connectionId) || connection?.start_path || "/";
@@ -379,7 +407,7 @@ export function LocalPathPicker() {
       setGranted(true); // don't trap the user on a probe failure
       setLoading(false);
     }
-  }, [connectionId, connection?.start_path, loadDir]);
+  }, [connectionId, consoleHost, connection?.start_path, loadDir]);
 
   // Each time a new request opens, (re)start the browser.
   useEffect(() => {
@@ -407,13 +435,22 @@ export function LocalPathPicker() {
 
   if (!pending) return null;
 
-  const parent = cwd ? (connectionId ? serverParent(cwd) : parentOf(cwd)) : null;
-  const finish = (path: string) => settle(connectionId ? remotePath(connectionId, path) : path);
+  const parent = cwd ? (connectionId || consoleHost ? serverParent(cwd) : parentOf(cwd)) : null;
+  const finish = (path: string) =>
+    settle(
+      consoleHost
+        ? consolePickResult(consoleHost, path)
+        : connectionId
+          ? remotePath(connectionId, path)
+          : path,
+    );
   const nameOf = (id: string) => connections.find((c) => c.id === id)?.name;
   const cwdLabel = cwd
-    ? connectionId
-      ? displayPath(remotePath(connectionId, cwd), nameOf)
-      : cwd
+    ? consoleHost
+      ? `PS5 › ${cwd}`
+      : connectionId
+        ? displayPath(remotePath(connectionId, cwd), nameOf)
+        : cwd
     : "…";
 
   return (

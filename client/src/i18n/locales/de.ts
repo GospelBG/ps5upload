@@ -3220,7 +3220,11 @@ helper_mismatch_go: "Helfer neu laden",
 "fpkg.archivePassword": "Archiv-Passwort",
 "fpkg.archivePasswordHint": "Nur für ein passwortgeschütztes .rar. Es wird nicht gespeichert.",
 "fpkg.aboutArchives": "Ebenfalls möglich: ein .ffpfsc-Image, das über das Image darin gelesen wird, und ein .zip-, .7z- oder .rar-Archiv, das zuerst in den Ausgabeordner entpackt wird. Nur .rar-Archive dürfen ein Passwort haben.",
-"fpkg.remoteSource": "auf einem Server. Sie wird beim Start auf diesen Computer kopiert.",
+"fpkg.remoteSource": "auf einem Server. Er wird während der Konvertierung direkt von dort gelesen; nichts wird auf diesen Computer kopiert.",
+"fpkg.remoteArchive": "ein Archiv auf einem Server. Es wird beim Start hierher kopiert und entpackt; beides wird nach dem Lauf entfernt.",
+"fpkg.browseConsole": "Auf der PS5…",
+"fpkg.pickConsole": "Spielordner oder Image auf der PS5 wählen",
+"fpkg.consoleSource": "auf der PS5. Er wird während der Konvertierung über den FTP-Server der Konsole (ftpsrv) von dort gelesen; vorher wird nichts kopiert.",
 };
 
 export default de;

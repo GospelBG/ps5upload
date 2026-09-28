@@ -36,7 +36,11 @@ const WEIGHT: Record<PipelineStage, number> = {
 
 function stagesFor(mode: PipelineMode, source: string): readonly PipelineStage[] {
   const copy: PipelineStage[] = [];
-  if (mode !== "install" && isRemotePath(source)) copy.push("copy");
+  // A build reads a server folder or image in place; a server archive, or an image being
+  // compressed (which reads local disk), is copied first.
+  if (mode !== "install" && isRemotePath(source) && (isArchiveSource(source) || mode === "ffpfsc")) {
+    copy.push("copy");
+  }
   if (mode !== "install" && isArchiveSource(source)) copy.push("extract");
   switch (mode) {
     case "convert-install":

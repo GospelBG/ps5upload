@@ -383,64 +383,48 @@ describe("fpkg pipeline", () => {
     expect(await commandTask(first, "cancel")).toBe(false);
   });
 
-  it("copies a server source first, builds the copy, then removes the copy", async () => {
-    jobStatus
-      .mockResolvedValueOnce({ status: "running", bytes_sent: 5, total_bytes: 10 })
-      .mockResolvedValueOnce({ status: "done", dest: "/out/.ps5upload-source/a", bytes_sent: 10 })
-      .mockResolvedValueOnce({ status: "done", dest: "/out/a.pkg", bytes_sent: 1 });
+  it("builds a server folder in place, with no copy", async () => {
+    jobStatus.mockResolvedValueOnce({ status: "done", dest: "/out/a.pkg", bytes_sent: 1 });
     await useFpkgConversion
       .getState()
       .start({ source: "remote://nas-1/games/a", outputDir: "/out" }, { install: false, host: null });
-    expect(useFpkgConversion.getState().pipeline).toMatchObject({ phase: "running", stage: "copy" });
-    expect(remoteFetch).toHaveBeenCalledWith(
-      "remote://nas-1/games/a",
-      expect.stringMatching(/^\/out\/\.ps5upload-source\/[a-z0-9]+$/),
-    );
-    await tick();
-    await tick();
+    expect(useFpkgConversion.getState().pipeline).toMatchObject({ phase: "running", stage: "check" });
+    expect(remoteFetch).not.toHaveBeenCalled();
     expect(build).toHaveBeenCalledWith(
-      expect.objectContaining({ source: "/out/.ps5upload-source/a", outputDir: "/out" }),
+      expect.objectContaining({ source: "remote://nas-1/games/a", outputDir: "/out" }),
     );
     await tick();
-    expect(useFpkgConversion.getState().pipeline).toMatchObject({
-      phase: "done",
-      source: "remote://nas-1/games/a",
-    });
-    expect(cleanupFetched).toHaveBeenCalledWith("/out/.ps5upload-source/a");
+    expect(useFpkgConversion.getState().pipeline).toMatchObject({ phase: "done", packagePath: "/out/a.pkg" });
+    expect(cleanupFetched).not.toHaveBeenCalled();
   });
 
-  it("fails at the copy when the server copy fails, and keeps nothing to clean", async () => {
+  it("fails at the copy when a server archive's copy fails, and keeps nothing to clean", async () => {
     jobStatus.mockResolvedValueOnce({ status: "failed", error: "Can't reach 10.0.0.9" });
     await useFpkgConversion
       .getState()
-      .start({ source: "remote://nas-1/games/a", outputDir: "/out" }, { install: false, host: null });
+      .start({ source: "remote://nas-1/dl/a.zip", outputDir: "/out" }, { install: false, host: null });
     await tick();
     expect(useFpkgConversion.getState().pipeline).toMatchObject({
       phase: "failed",
       stage: "copy",
       message: "Can't reach 10.0.0.9",
     });
+    expect(extract).not.toHaveBeenCalled();
     expect(build).not.toHaveBeenCalled();
   });
 
-  it("copies each server run into its own folder and drops the copy when the build fails", async () => {
-    jobStatus
-      .mockResolvedValueOnce({ status: "done", dest: "/out/.ps5upload-source/r1/a", bytes_sent: 1 })
-      .mockResolvedValueOnce({ status: "failed", error: "disk full" });
+  it("copies each server archive into its own folder", async () => {
+    jobStatus.mockResolvedValue({ status: "failed", error: "x" });
     await useFpkgConversion
       .getState()
-      .start({ source: "remote://nas-1/games/a", outputDir: "/out" }, { install: false, host: null });
+      .start({ source: "remote://nas-1/dl/a.zip", outputDir: "/out" }, { install: false, host: null });
     await tick();
-    await tick();
-    expect(useFpkgConversion.getState().pipeline).toMatchObject({ phase: "failed", message: "disk full" });
-    expect(cleanupFetched).toHaveBeenCalledWith("/out/.ps5upload-source/r1/a");
     const first = remoteFetch.mock.calls[0][1] as string;
     useFpkgConversion.setState({ pipeline: { phase: "idle" } });
     remoteFetch.mockClear();
-    jobStatus.mockResolvedValueOnce({ status: "failed", error: "x" });
     await useFpkgConversion
       .getState()
-      .start({ source: "remote://nas-1/games/a", outputDir: "/out" }, { install: false, host: null });
+      .start({ source: "remote://nas-1/dl/a.zip", outputDir: "/out" }, { install: false, host: null });
     const second = remoteFetch.mock.calls[0][1] as string;
     expect(first.startsWith("/out/.ps5upload-source/")).toBe(true);
     expect(second).not.toBe(first);
@@ -511,4 +495,12 @@ describe("fpkg pipeline", () => {
     expect(p.phase === "failed" && p.message).not.toMatch(/rar_password/);
     expect(build).not.toHaveBeenCalled();
   });
+
+  it("copies a server image before compressing it (compression reads local disk)", async () => {
+    jobStatus.mockResolvedValueOnce({ status: "failed", error: "x" });
+    await useFpkgConversion.getState().compress("remote://nas-1/g.exfat", "/out");
+    expect(useFpkgConversion.getState().pipeline).toMatchObject({ stage: "copy" });
+    expect(remoteFetch).toHaveBeenCalled();
+  });
 });
+

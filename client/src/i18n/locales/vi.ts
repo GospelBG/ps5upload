@@ -3214,7 +3214,11 @@ helper_mismatch_go: "Tải lại trợ giúp",
 "fpkg.archivePassword": "Mật khẩu tệp nén",
 "fpkg.archivePasswordHint": "Chỉ dành cho tệp .rar có mật khẩu. Mật khẩu không được lưu.",
 "fpkg.aboutArchives": "Cũng được chấp nhận: image .ffpfsc, được đọc qua image bên trong, và tệp nén .zip, .7z hoặc .rar, được giải nén vào thư mục đầu ra trước. Chỉ tệp .rar mới có thể có mật khẩu.",
-"fpkg.remoteSource": "trên một máy chủ. Nó được sao chép vào máy tính này khi bạn bắt đầu.",
+"fpkg.remoteSource": "trên máy chủ. Được đọc trực tiếp từ đó trong khi chuyển đổi; không có gì được sao chép về máy này.",
+"fpkg.remoteArchive": "một tệp nén trên máy chủ. Khi bắt đầu, tệp được sao chép về đây và giải nén, cả hai sẽ bị xóa khi hoàn tất.",
+"fpkg.browseConsole": "Trên PS5…",
+"fpkg.pickConsole": "Chọn thư mục hoặc image game trên PS5",
+"fpkg.consoleSource": "trên PS5. Được đọc từ đó qua máy chủ FTP của máy (ftpsrv) trong khi chuyển đổi; không sao chép trước.",
 };
 
 export default vi;

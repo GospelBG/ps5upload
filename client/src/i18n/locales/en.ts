@@ -3571,7 +3571,11 @@ v5_qa_connect_server: "Connect a server",
 "fpkg.archivePassword": "Archive password",
 "fpkg.archivePasswordHint": "Only for a password-protected .rar. It is not saved.",
 "fpkg.aboutArchives": "Also accepted: a .ffpfsc image, read through the image inside it, and a .zip, .7z or .rar archive, unpacked into the output folder first. Only .rar archives can have a password.",
-"fpkg.remoteSource": "on a server. It is copied to this computer when you start.",
+"fpkg.remoteSource": "on a server. It is read from there while it converts; nothing is copied to this computer.",
+"fpkg.remoteArchive": "an archive on a server. It is copied here and unpacked when you start, and both are removed when the run ends.",
+"fpkg.browseConsole": "On the PS5…",
+"fpkg.pickConsole": "Choose a game folder or image on the PS5",
+"fpkg.consoleSource": "on the PS5. It is read from there through the console's FTP server (ftpsrv) while it converts; nothing is copied first.",
 };
 
 export default en;

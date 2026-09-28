@@ -3159,7 +3159,11 @@ helper_mismatch_go: "Recargar asistente",
 "fpkg.archivePassword": "Contraseña del archivo",
 "fpkg.archivePasswordHint": "Solo para un .rar protegido con contraseña. No se guarda.",
 "fpkg.aboutArchives": "También se aceptan: una imagen .ffpfsc, que se lee a través de la imagen que contiene, y un archivo .zip, .7z o .rar, que primero se descomprime en la carpeta de salida. Solo los .rar pueden tener contraseña.",
-"fpkg.remoteSource": "en un servidor. Se copia a este equipo al empezar.",
+"fpkg.remoteSource": "en un servidor. Se lee desde allí mientras se convierte; no se copia nada a este equipo.",
+"fpkg.remoteArchive": "un archivo comprimido en un servidor. Al empezar se copia aquí y se descomprime, y ambos se eliminan al terminar.",
+"fpkg.browseConsole": "En la PS5…",
+"fpkg.pickConsole": "Elige una carpeta o imagen de juego en la PS5",
+"fpkg.consoleSource": "en la PS5. Se lee desde allí a través del servidor FTP de la consola (ftpsrv) mientras se convierte; no se copia nada antes.",
 };
 
 export default es;

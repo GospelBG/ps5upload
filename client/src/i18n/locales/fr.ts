@@ -3249,7 +3249,11 @@ helper_mismatch_go: "Recharger l'assistant",
 "fpkg.archivePassword": "Mot de passe de l'archive",
 "fpkg.archivePasswordHint": "Uniquement pour un .rar protégé par mot de passe. Il n'est pas enregistré.",
 "fpkg.aboutArchives": "Également acceptés : une image .ffpfsc, lue via l'image qu'elle contient, et une archive .zip, .7z ou .rar, d'abord décompressée dans le dossier de sortie. Seules les archives .rar peuvent avoir un mot de passe.",
-"fpkg.remoteSource": "sur un serveur. Elle est copiée sur cet ordinateur au démarrage.",
+"fpkg.remoteSource": "sur un serveur. Il est lu directement là-bas pendant la conversion ; rien n'est copié sur cet ordinateur.",
+"fpkg.remoteArchive": "une archive sur un serveur. Au démarrage, elle est copiée ici puis décompressée ; les deux sont supprimées à la fin.",
+"fpkg.browseConsole": "Sur la PS5…",
+"fpkg.pickConsole": "Choisir un dossier ou une image de jeu sur la PS5",
+"fpkg.consoleSource": "sur la PS5. Il est lu là-bas via le serveur FTP de la console (ftpsrv) pendant la conversion ; rien n'est copié avant.",
 };
 
 export default fr;

@@ -74,6 +74,10 @@ pub(crate) fn default_output_dir() -> PathBuf {
 
 pub(crate) fn resolve_engine_path(raw: &str) -> PathBuf {
     let raw = raw.trim();
+    // A saved server's path is read through the server, never this machine's disk.
+    if raw.starts_with("remote://") || raw.starts_with("ps5://") {
+        return PathBuf::from(raw);
+    }
     let expanded = if raw == "~" || raw.starts_with("~/") {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)

@@ -3219,7 +3219,11 @@ helper_mismatch_go: "Yardımcıyı yükle",
 "fpkg.archivePassword": "Arşiv parolası",
 "fpkg.archivePasswordHint": "Yalnızca parolalı bir .rar için. Kaydedilmez.",
 "fpkg.aboutArchives": "Ayrıca kabul edilir: içindeki imaj üzerinden okunan bir .ffpfsc imajı ve önce çıktı klasörüne açılan bir .zip, .7z veya .rar arşivi. Yalnızca .rar arşivleri parolalı olabilir.",
-"fpkg.remoteSource": "bir sunucuda. Başladığında bu bilgisayara kopyalanır.",
+"fpkg.remoteSource": "bir sunucuda. Dönüştürme sırasında doğrudan oradan okunur; bu bilgisayara hiçbir şey kopyalanmaz.",
+"fpkg.remoteArchive": "bir sunucudaki arşiv. Başlattığınızda buraya kopyalanıp açılır; iş bitince ikisi de silinir.",
+"fpkg.browseConsole": "PS5'te…",
+"fpkg.pickConsole": "PS5'te bir oyun klasörü veya imajı seçin",
+"fpkg.consoleSource": "PS5'te. Dönüştürme sırasında konsolun FTP sunucusu (ftpsrv) üzerinden oradan okunur; önceden hiçbir şey kopyalanmaz.",
 };
 
 export default tr;

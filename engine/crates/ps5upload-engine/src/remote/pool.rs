@@ -270,11 +270,19 @@ pub fn scrub(e: RemoteError, secret: &Secret) -> RemoteError {
 pub(crate) mod testing {
     use super::*;
 
-    /// Make `global()` serve an in-memory server holding `files` (first caller wins; later
-    /// callers get the same one). For tests that drive the engine's HTTP handlers.
+    /// Make `global()` serve an in-memory server, and add `files` to it. Tests in one binary
+    /// share the server, so each caller's files are merged in rather than the first caller's
+    /// set winning. For tests that drive the engine's HTTP handlers.
     pub fn install_global(files: &[(&str, &[u8])]) -> Arc<Remote> {
-        let r = remote_with(crate::remote::MemFs::new(files), None);
-        let _ = GLOBAL.set(Ok(Arc::clone(&r)));
+        static SHARED: std::sync::OnceLock<crate::remote::MemFs> = std::sync::OnceLock::new();
+        let mem = SHARED.get_or_init(|| {
+            let fs = crate::remote::MemFs::new(&[]);
+            let handle = fs.share();
+            let r = remote_with(fs, None);
+            let _ = GLOBAL.set(Ok(r));
+            handle
+        });
+        mem.add(files);
         global().unwrap()
     }
     use crate::remote::MemFs;

@@ -3165,7 +3165,11 @@ helper_mismatch_go: "重新加载助手",
 "fpkg.archivePassword": "压缩包密码",
 "fpkg.archivePasswordHint": "仅用于有密码的 .rar，不会保存。",
 "fpkg.aboutArchives": "也可以使用：.ffpfsc 镜像（读取其中的镜像），以及 .zip、.7z 或 .rar 压缩包（先解压到输出文件夹）。只有 .rar 压缩包可以带密码。",
-"fpkg.remoteSource": "位于服务器上。开始时会复制到这台电脑。",
+"fpkg.remoteSource": "（位于服务器）。转换时直接从服务器读取，不会复制到这台电脑。",
+"fpkg.remoteArchive": "（服务器上的压缩包）。开始时会复制到本机并解压，运行结束后两者都会删除。",
+"fpkg.browseConsole": "PS5 上…",
+"fpkg.pickConsole": "选择 PS5 上的游戏文件夹或镜像",
+"fpkg.consoleSource": "（位于 PS5）。转换时通过主机的 FTP 服务器（ftpsrv）直接读取，不会先复制。",
 };
 
 export default zh_CN;

@@ -6,7 +6,6 @@
 // remembered options, and hands every action the exact package the run names.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { isRemotePath } from "../../lib/remotePath";
 
 import { PackagePlus } from "lucide-react";
 
@@ -80,9 +79,9 @@ export default function FpkgConvertScreen() {
   const check = useCallback(
     async (path: string) => {
       if (!path.trim()) return;
-      // A game on a saved server is read when the run copies it here, and an archive when the
-      // run unpacks it; looking inside either now would mean doing that twice.
-      if (isRemotePath(path.trim()) || isArchiveSource(path.trim())) {
+      // An archive is looked inside when the run unpacks it; doing it now would mean unpacking
+      // it twice. A game on a saved server is inspected in place, like one here.
+      if (isArchiveSource(path.trim())) {
         latest.current.begin();
         setInspection(null);
         setEstimates(null);
@@ -170,6 +169,17 @@ export default function FpkgConvertScreen() {
     [chooseSource, tr],
   );
 
+  /** A dump on the console, read in place over its FTP server. */
+  const browseConsole = useCallback(async () => {
+    const picked = await pickPath({
+      mode: "any",
+      title: tr("fpkg.pickConsole", undefined, "Choose a game folder or image on the PS5"),
+      filters: [{ name: "Game image", extensions: ["exfat", "ffpkg", "ffpfsc"] }],
+      source: { console: host },
+    });
+    if (picked) chooseSource(picked);
+  }, [chooseSource, host, tr]);
+
   const browseOutput = useCallback(async () => {
     try {
       const picked = !isTauriEnv()
@@ -225,7 +235,9 @@ export default function FpkgConvertScreen() {
     setError(null);
   };
 
-  const isImage = /\.(exfat|ffpkg)$/i.test(source.trim());
+  // An image here or on a saved server can also become a .ffpfsc; one on the console is
+  // converted in place only.
+  const isImage = /\.(exfat|ffpkg)$/i.test(source.trim()) && !source.startsWith("ps5://");
   const noFiles = inspection !== null && inspection.files === 0;
 
   return (
@@ -257,6 +269,7 @@ export default function FpkgConvertScreen() {
         onBrowseFolder={() => void browse("folder")}
         onBrowseImage={() => void browse("file")}
         onRemotePick={chooseSource}
+        onBrowseConsole={canInstall ? () => void browseConsole() : undefined}
         canBrowse={canBrowse}
         inspection={inspection}
         checking={checking}

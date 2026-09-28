@@ -89,6 +89,9 @@ impl SourceTree for FolderSource {
 
 /// Open whatever `path` names as a source tree.
 pub fn open(path: &Path) -> Result<Box<dyn SourceTree>> {
+    if crate::remote_source::is_remote(path) {
+        return crate::remote_source::open_path(path);
+    }
     if path.is_dir() {
         return Ok(Box::new(FolderSource::open(path)?));
     }
@@ -108,24 +111,30 @@ pub fn open(path: &Path) -> Result<Box<dyn SourceTree>> {
     }
 }
 
-/// The image inside a `.ffpfsc`, read through its container. The inner file's name says
-/// which filesystem it holds; an unnamed one is tried as exFAT, then UFS2.
+/// The image inside a `.ffpfsc`, read through its container.
 fn open_ffpfsc(path: &Path) -> Result<Box<dyn SourceTree>> {
+    let open = || -> Result<Box<dyn crate::ReadSeek>> { Ok(Box::new(std::fs::File::open(path)?)) };
+    ffpfsc_tree(&open, &format!("ffpfsc {}", path.display()))
+}
+
+/// The image inside a `.ffpfsc` whose bytes `open` gives (each call a fresh reader). The inner
+/// file's name says which filesystem it holds; an unnamed one is tried as exFAT, then UFS2.
+pub(crate) fn ffpfsc_tree(
+    open: &dyn Fn() -> Result<Box<dyn crate::ReadSeek>>,
+    label: &str,
+) -> Result<Box<dyn SourceTree>> {
     use crate::pfsc_reader::PfscReader;
-    let reader = PfscReader::open(path)
-        .map_err(|e| crate::Error::Format(format!("{}: {e}", path.display())))?;
-    let inner = reader.inner_name().to_ascii_lowercase();
-    let label = format!("ffpfsc {} ({})", path.display(), reader.inner_name());
-    let exfat = |r: PfscReader| -> Result<Box<dyn SourceTree>> {
-        let len = r.len();
-        let volume =
-            crate::exfat::ExFat::from_file(crate::PkgFile::from_reader(Box::new(r), len), &label)?;
-        Ok(Box::new(crate::exfat::ExFatSource::from_volume(
-            volume,
-            label.clone(),
-        )?))
+    let pfsc = |r: Box<dyn crate::ReadSeek>| {
+        PfscReader::new(r).map_err(|e| crate::Error::Format(format!("{label}: {e}")))
     };
-    let ufs2 = |r: PfscReader| -> Result<Box<dyn SourceTree>> {
+    let reader = pfsc(open()?)?;
+    let inner = reader.inner_name().to_ascii_lowercase();
+    let label = format!("{label} ({})", reader.inner_name());
+    let exfat = |r: PfscReader<Box<dyn crate::ReadSeek>>| {
+        let len = r.len();
+        crate::remote_source::exfat_tree(Box::new(r), len, label.clone())
+    };
+    let ufs2 = |r: PfscReader<Box<dyn crate::ReadSeek>>| -> Result<Box<dyn SourceTree>> {
         Ok(Box::new(crate::ufs2_source::Ufs2Source::from_reader(
             Box::new(r),
             label.clone(),
@@ -139,10 +148,9 @@ fn open_ffpfsc(path: &Path) -> Result<Box<dyn SourceTree>> {
     }
     match exfat(reader) {
         Ok(tree) => Ok(tree),
-        Err(first) => ufs2(PfscReader::open(path)?).map_err(|_| {
+        Err(first) => ufs2(pfsc(open()?)?).map_err(|_| {
             crate::Error::Format(format!(
-                "{}: the image inside is neither exFAT nor UFS2 ({first})",
-                path.display()
+                "{label}: the image inside is neither exFAT nor UFS2 ({first})"
             ))
         }),
     }

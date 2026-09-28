@@ -165,6 +165,22 @@ impl SourceFs for RemoteSourceFs {
     }
 }
 
+/// `file` read sequentially (with seeks) through the read-ahead buffer. Blocks on `handle`,
+/// so call it from a blocking thread.
+pub(crate) fn read_ahead(
+    handle: tokio::runtime::Handle,
+    file: Arc<dyn RemoteFile>,
+) -> Box<dyn ReadSeek> {
+    Box::new(Reader {
+        handle,
+        size: file.size(),
+        file,
+        pos: 0,
+        buf: Vec::new(),
+        buf_start: 0,
+    })
+}
+
 /// A server file read sequentially (with seeks) through a read-ahead buffer.
 struct Reader {
     handle: tokio::runtime::Handle,

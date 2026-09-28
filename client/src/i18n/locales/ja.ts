@@ -3254,7 +3254,11 @@ helper_mismatch_go: "ヘルパーを再読み込み",
 "fpkg.archivePassword": "アーカイブのパスワード",
 "fpkg.archivePasswordHint": "パスワード付き .rar のときだけ入力します。保存されません。",
 "fpkg.aboutArchives": ".ffpfsc イメージ（中のイメージを読み取ります）と、.zip・.7z・.rar アーカイブ（先に出力フォルダーへ展開します）も使えます。パスワードを付けられるのは .rar だけです。",
-"fpkg.remoteSource": "（サーバー上）。開始時にこのコンピューターへコピーされます。",
+"fpkg.remoteSource": "（サーバー上）。変換中はサーバーから直接読み取り、このコンピューターには何もコピーしません。",
+"fpkg.remoteArchive": "（サーバー上のアーカイブ）。開始時にこのコンピューターへコピーして展開し、終了時にどちらも削除します。",
+"fpkg.browseConsole": "PS5 から…",
+"fpkg.pickConsole": "PS5 上のゲームフォルダーまたはイメージを選択",
+"fpkg.consoleSource": "（PS5 上）。変換中は本体の FTP サーバー（ftpsrv）経由で直接読み取り、事前のコピーはしません。",
 };
 
 export default ja;

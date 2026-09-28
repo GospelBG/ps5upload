@@ -3247,7 +3247,11 @@ helper_mismatch_go: "Recarregar auxiliar",
 "fpkg.archivePassword": "Senha do arquivo compactado",
 "fpkg.archivePasswordHint": "Só para um .rar protegido por senha. Ela não é salva.",
 "fpkg.aboutArchives": "Também são aceitos: uma imagem .ffpfsc, lida pela imagem que ela contém, e um arquivo .zip, .7z ou .rar, descompactado antes na pasta de saída. Só arquivos .rar podem ter senha.",
-"fpkg.remoteSource": "em um servidor. Ela é copiada para este computador quando você começa.",
+"fpkg.remoteSource": "em um servidor. Ele é lido de lá durante a conversão; nada é copiado para este computador.",
+"fpkg.remoteArchive": "um arquivo compactado em um servidor. Ao iniciar, ele é copiado para cá e descompactado, e ambos são removidos quando a execução termina.",
+"fpkg.browseConsole": "No PS5…",
+"fpkg.pickConsole": "Escolha uma pasta ou imagem de jogo no PS5",
+"fpkg.consoleSource": "no PS5. Ele é lido de lá pelo servidor FTP do console (ftpsrv) durante a conversão; nada é copiado antes.",
 };
 
 export default pt_BR;

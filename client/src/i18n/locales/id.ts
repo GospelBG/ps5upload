@@ -3221,7 +3221,11 @@ helper_mismatch_go: "Muat ulang helper",
 "fpkg.archivePassword": "Kata sandi arsip",
 "fpkg.archivePasswordHint": "Hanya untuk .rar yang dilindungi kata sandi. Tidak disimpan.",
 "fpkg.aboutArchives": "Juga diterima: image .ffpfsc, dibaca melalui image di dalamnya, serta arsip .zip, .7z, atau .rar, yang lebih dulu diekstrak ke folder output. Hanya arsip .rar yang boleh berkata sandi.",
-"fpkg.remoteSource": "di server. Disalin ke komputer ini saat kamu mulai.",
+"fpkg.remoteSource": "di server. Dibaca langsung dari sana selama konversi; tidak ada yang disalin ke komputer ini.",
+"fpkg.remoteArchive": "arsip di server. Saat dimulai, arsip disalin ke sini lalu diekstrak, dan keduanya dihapus saat proses selesai.",
+"fpkg.browseConsole": "Di PS5…",
+"fpkg.pickConsole": "Pilih folder atau image game di PS5",
+"fpkg.consoleSource": "di PS5. Dibaca dari sana lewat server FTP konsol (ftpsrv) selama konversi; tidak ada yang disalin lebih dulu.",
 };
 
 export default id;

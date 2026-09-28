@@ -421,8 +421,15 @@ async function extractArchive(archive: string, outputDir: string | undefined, pa
   }
 }
 
+/** A source that needs this run's own stages before the build: a server archive is copied
+ *  here (unpacking needs a local file), and any archive is unpacked. A server folder or image
+ *  needs neither: the engine reads it in place. */
+function needsPrep(source: string): boolean {
+  return isArchiveSource(source);
+}
+
 /** Get a source ready for the build, as stages of this run (each with progress and Cancel):
- *  a server source is copied into the output folder, an archive is unpacked there. Then start
+ *  a server archive is copied into the output folder, an archive is unpacked there. Then start
  *  the job `startJob` makes on what that left. */
 async function prepareThenStart(
   source: string,
@@ -510,7 +517,7 @@ export const useFpkgConversion = create<ConversionState>((set, get) => ({
   start: async (req, { install, host, method = "stream", password }) => {
     const then = install ? method : null;
     if (get().pipeline.phase === "running") return;
-    if (isRemotePath(req.source) || isArchiveSource(req.source)) {
+    if (needsPrep(req.source)) {
       beginRun(
         install ? "convert-install" : "convert",
         req.source,
@@ -538,8 +545,10 @@ export const useFpkgConversion = create<ConversionState>((set, get) => ({
 
   compress: async (source, outputDir) => {
     if (get().pipeline.phase === "running") return;
-    if (isRemotePath(source)) {
-      beginRun("ffpfsc", source, null, "copy");
+    // Compressing reads the image from this machine's disk, so a server image is copied
+    // first (unlike a build, which reads it in place).
+    if (isRemotePath(source) || isArchiveSource(source)) {
+      beginRun("ffpfsc", source, null, isRemotePath(source) ? "copy" : "extract");
       void prepareThenStart(source, outputDir, (local) => fpkg.compress(local, outputDir), null);
       return;
     }

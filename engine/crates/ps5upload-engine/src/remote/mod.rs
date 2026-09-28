@@ -96,6 +96,25 @@ impl MemFs {
         }
     }
 
+    /// Add (or replace) files after construction; tests sharing one server each add their own.
+    #[cfg(test)]
+    pub fn add(&self, files: &[(&str, &[u8])]) {
+        let mut map = self.files.lock().unwrap();
+        for (p, b) in files {
+            map.insert(normal(p), b.to_vec());
+        }
+    }
+
+    /// A handle on the same tree, for adding files once this one is owned elsewhere.
+    #[cfg(test)]
+    pub fn share(&self) -> Self {
+        Self {
+            files: Arc::clone(&self.files),
+            fail_reads: Arc::new(AtomicUsize::new(0)),
+            fail_lists: AtomicUsize::new(0),
+        }
+    }
+
     /// The next `n` listings fail, as a dropped session would.
     pub fn fail_next_lists(&self, n: usize) {
         self.fail_lists.store(n, Ordering::SeqCst);

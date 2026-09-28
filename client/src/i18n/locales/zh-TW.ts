@@ -3160,7 +3160,11 @@ helper_mismatch_go: "重新載入小幫手",
 "fpkg.archivePassword": "壓縮檔密碼",
 "fpkg.archivePasswordHint": "僅用於有密碼的 .rar，不會儲存。",
 "fpkg.aboutArchives": "也可以使用：.ffpfsc 映像檔（讀取其中的映像檔），以及 .zip、.7z 或 .rar 壓縮檔（先解壓縮到輸出資料夾）。只有 .rar 壓縮檔可以設定密碼。",
-"fpkg.remoteSource": "位於伺服器上。開始時會複製到這台電腦。",
+"fpkg.remoteSource": "（位於伺服器）。轉換時直接從伺服器讀取，不會複製到這台電腦。",
+"fpkg.remoteArchive": "（伺服器上的壓縮檔）。開始時會複製到本機並解壓縮，執行結束後兩者都會刪除。",
+"fpkg.browseConsole": "PS5 上…",
+"fpkg.pickConsole": "選擇 PS5 上的遊戲資料夾或映像檔",
+"fpkg.consoleSource": "（位於 PS5）。轉換時透過主機的 FTP 伺服器（ftpsrv）直接讀取，不會先複製。",
 };
 
 export default zh_TW;

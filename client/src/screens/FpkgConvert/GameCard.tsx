@@ -1,9 +1,9 @@
 // Card ① Game: where the game comes from (drop, pick or type), and what the check found.
 
-import { FolderInput } from "lucide-react";
+import { FolderInput, Gamepad2 } from "lucide-react";
 
 import type { FpkgInspection } from "../../api/fpkg";
-import { Card, Input } from "../../components";
+import { Button, Card, Input } from "../../components";
 import { BrowseButton, PathLabel } from "../../components/BrowseButton";
 import { isRemotePath } from "../../lib/remotePath";
 import { isArchiveSource } from "../../state/fpkgConversion";
@@ -47,6 +47,8 @@ export interface GameCardProps {
   onBrowseImage: () => void;
   /** A folder or image picked on a saved server. */
   onRemotePick: (path: string) => void;
+  /** Browse the connected console for a game; absent when no console answers. */
+  onBrowseConsole?: () => void;
   canBrowse: boolean;
   inspection: FpkgInspection | null;
   checking: boolean;
@@ -100,6 +102,17 @@ export function GameCard(props: GameCardProps) {
                 onMainClick={props.onBrowseImage}
                 onPick={props.onRemotePick}
               />
+              {props.onBrowseConsole && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  leftIcon={<Gamepad2 size={14} />}
+                  disabled={props.locked || props.checking}
+                  onClick={props.onBrowseConsole}
+                >
+                  {tr("fpkg.browseConsole", undefined, "On the PS5…")}
+                </Button>
+              )}
             </div>
           )}
         </div>
@@ -125,11 +138,17 @@ export function GameCard(props: GameCardProps) {
             <PathLabel path={props.source} />
             <span>
               {"— "}
-              {tr(
-                "fpkg.remoteSource",
-                undefined,
-                "on a server. It is copied to this computer when you start.",
-              )}
+              {isArchiveSource(props.source)
+                ? tr(
+                    "fpkg.remoteArchive",
+                    undefined,
+                    "an archive on a server. It is copied here and unpacked when you start, and both are removed when the run ends.",
+                  )
+                : tr(
+                    "fpkg.remoteSource",
+                    undefined,
+                    "on a server. It is read from there while it converts; nothing is copied to this computer.",
+                  )}
             </span>
           </div>
         )}
@@ -142,6 +161,21 @@ export function GameCard(props: GameCardProps) {
                 "fpkg.archiveSource",
                 undefined,
                 "an archive. It is unpacked into the output folder when you start, and removed when the run ends.",
+              )}
+            </span>
+          </div>
+        )}
+        {props.source.startsWith("ps5://") && !props.locked && (
+          <div className="flex items-center gap-1 text-sm text-[var(--color-muted)]">
+            <span className="truncate font-medium text-[var(--color-text)]">
+              {props.source.replace(/^ps5:\/\/[^/]+/, "PS5 ")}
+            </span>
+            <span>
+              {"— "}
+              {tr(
+                "fpkg.consoleSource",
+                undefined,
+                "on the PS5. It is read from there through the console's FTP server (ftpsrv) while it converts; nothing is copied first.",
               )}
             </span>
           </div>

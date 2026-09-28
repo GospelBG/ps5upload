@@ -29,6 +29,7 @@ pub mod pfsc_reader;
 pub mod pfsimage;
 pub mod plan;
 pub mod playgo;
+pub mod remote_source;
 pub mod rsa;
 pub mod sdk_rules;
 pub mod self_repair;

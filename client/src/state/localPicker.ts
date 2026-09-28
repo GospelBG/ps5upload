@@ -13,13 +13,15 @@
 import { create } from "zustand";
 
 export interface LocalPickOptions {
-  mode: "file" | "folder";
+  /** "any": pick a file, or use the open folder (a game is either). */
+  mode: "file" | "folder" | "any";
   /** Optional modal title override. */
   title?: string;
   /** Only show files with these extensions (folders are always shown). */
   filters?: { name: string; extensions: string[] }[];
-  /** A saved server to browse instead of this device. Resolves with a `remote://` path. */
-  source?: "local" | { connectionId: string };
+  /** A saved server to browse instead of this device (resolves with a `remote://` path), or
+   *  the console at `console` (resolves with a `ps5://` path). */
+  source?: "local" | { connectionId: string } | { console: string };
   /** Opened to look around (Connections → Browse): each file row gets Install / Send to PS5. */
   actions?: { onInstall: (path: string) => void; onSend: (path: string) => void };
 }

@@ -103,12 +103,26 @@ describe("stageRows", () => {
     expect(overallProgress(stageRows({ phase: "idle" }, null))).toBe(0);
   });
 
-  it("lists the copy first for a game on a saved server", () => {
-    const rows = stageRows(
-      { phase: "running", ...base, source: "remote://nas-1/g", mode: "convert", stage: "copy", stageDone: 5, stageTotal: 10, stageMs: {} },
+  it("reads a server folder in place, and copies then unpacks a server archive", () => {
+    const folder = stageRows(
+      { phase: "running", ...base, source: "remote://nas-1/g", mode: "convert", stage: "check", stageDone: 0, stageTotal: 0, stageMs: {} },
       null,
     );
-    expect(rows.map((r) => r.stage)).toEqual(["copy", "check", "plan", "compress", "write", "verify"]);
+    expect(folder.map((r) => r.stage)).toEqual(["check", "plan", "compress", "write", "verify"]);
+    const rows = stageRows(
+      { phase: "running", ...base, source: "remote://nas-1/g.zip", mode: "convert", stage: "copy", stageDone: 5, stageTotal: 10, stageMs: {} },
+      null,
+    );
+    expect(rows.map((r) => r.stage)).toEqual(["copy", "extract", "check", "plan", "compress", "write", "verify"]);
     expect(rows[0]).toMatchObject({ state: "active", done: 5, total: 10 });
   });
+
+  it("lists the copy for compressing a server image", () => {
+    const rows = stageRows(
+      { phase: "running", ...base, source: "remote://nas-1/g.exfat", mode: "ffpfsc", stage: "copy", stageDone: 0, stageTotal: 0, stageMs: {} },
+      null,
+    );
+    expect(rows[0]).toMatchObject({ stage: "copy", state: "active" });
+  });
 });
+

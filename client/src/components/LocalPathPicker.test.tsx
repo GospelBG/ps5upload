@@ -10,7 +10,7 @@ vi.mock("../state/lang", () => ({
     },
 }));
 
-import { PickerView, type PickerViewProps } from "./LocalPathPicker";
+import { consolePickResult, PickerView, type PickerViewProps } from "./LocalPathPicker";
 
 // No DOM here: render to markup and check what a user would see and could press.
 const noop = () => {};
@@ -86,5 +86,23 @@ describe("the in-app picker", () => {
 
   it("names where it is, by server", () => {
     expect(html({ cwdLabel: "NAS › games" })).toContain("NAS › games");
+  });
+});
+
+describe("picking a folder or an image", () => {
+  it("offers files and the open folder in one browser", () => {
+    const out = html({ mode: "any", entries: [dir("g"), file("PPSA01234.exfat")], remote: false });
+    expect(out).toContain("Use this folder");
+    // The image row is a live button, not a disabled one.
+    expect(out).toMatch(/<button type="button" class="[^"]*"[^>]*>(?:(?!disabled).)*PPSA01234\.exfat/);
+  });
+});
+
+describe("the console as a source", () => {
+  it("answers a pick on the PS5 as a ps5:// path on its host", () => {
+    expect(consolePickResult("192.168.86.99:9113", "/data/homebrew/G.exfat")).toBe(
+      "ps5://192.168.86.99/data/homebrew/G.exfat",
+    );
+    expect(consolePickResult("10.0.0.2", "/")).toBe("ps5://10.0.0.2/");
   });
 });

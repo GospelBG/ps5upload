@@ -3508,7 +3508,11 @@ helper_mismatch_go: "Załaduj pomocnika",
 "fpkg.archivePassword": "Hasło archiwum",
 "fpkg.archivePasswordHint": "Tylko dla archiwum .rar chronionego hasłem. Nie jest zapisywane.",
 "fpkg.aboutArchives": "Akceptowane są też: obraz .ffpfsc, odczytywany przez obraz w jego wnętrzu, oraz archiwum .zip, .7z lub .rar, najpierw rozpakowywane do folderu wyjściowego. Hasło może mieć tylko archiwum .rar.",
-"fpkg.remoteSource": "na serwerze. Po rozpoczęciu zostanie skopiowane na ten komputer.",
+"fpkg.remoteSource": "na serwerze. Podczas konwersji jest czytany prosto stamtąd; nic nie jest kopiowane na ten komputer.",
+"fpkg.remoteArchive": "archiwum na serwerze. Po starcie jest kopiowane tutaj i rozpakowywane, a po zakończeniu oba są usuwane.",
+"fpkg.browseConsole": "Na PS5…",
+"fpkg.pickConsole": "Wybierz folder lub obraz gry na PS5",
+"fpkg.consoleSource": "na PS5. Podczas konwersji jest czytany stamtąd przez serwer FTP konsoli (ftpsrv); nic nie jest wcześniej kopiowane.",
 };
 
 export default pl;

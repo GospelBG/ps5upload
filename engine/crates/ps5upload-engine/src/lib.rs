@@ -38,6 +38,7 @@ mod engine_log;
 mod fakelibs_api;
 mod fpkg_api;
 mod fpkg_firmware;
+mod fpkg_remote;
 mod icon_cache;
 mod inspect;
 mod install;
@@ -8814,6 +8815,8 @@ pub struct EngineConfig {
 /// graceful shutdown. Behavior is identical to the former `main`; the
 /// `EngineConfig` flags select desktop-sidecar vs. in-process behavior.
 async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
+    // Convert (and the package viewer) read games on saved servers and the console in place.
+    fpkg_remote::register();
     if cfg.parent_watch {
         spawn_parent_watcher();
     }

@@ -14,12 +14,14 @@ import { isTauriEnv } from "./tauriEnv";
 import { pickLocalPath } from "../state/localPicker";
 
 export interface PickPathOptions {
-  mode: "file" | "folder";
+  /** "any" (in-app browser only): a file, or the open folder. */
+  mode: "file" | "folder" | "any";
   title?: string;
   /** File-type filters (the system dialog's, and the in-app browser's). */
   filters?: { name: string; extensions: string[] }[];
-  /** A saved server to browse instead of this computer; resolves with a `remote://` path. */
-  source?: { connectionId: string };
+  /** A saved server to browse instead of this computer (resolves with a `remote://` path), or
+   *  the console (a `ps5://` path). */
+  source?: { connectionId: string } | { console: string };
 }
 
 /** Pick a single real path, or null if cancelled. */
@@ -27,7 +29,7 @@ export async function pickPath(opts: PickPathOptions): Promise<string | null> {
   // A server, Android, and the web build all browse in-app: the web build has no system
   // dialog, and the one it could show would browse the wrong machine (the browser's, not the
   // engine's).
-  if (opts.source || isAndroid() || !isTauriEnv()) {
+  if (opts.source || opts.mode === "any" || isAndroid() || !isTauriEnv()) {
     return pickLocalPath({
       mode: opts.mode,
       title: opts.title,
@@ -38,6 +40,7 @@ export async function pickPath(opts: PickPathOptions): Promise<string | null> {
   const sel = await openDialog({
     directory: opts.mode === "folder",
     multiple: false,
+    // (mode "any" never reaches the system dialog: it browses in-app, above.)
     title: opts.title,
     filters: opts.filters,
   });

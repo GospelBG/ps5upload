@@ -3577,7 +3577,11 @@ task_recheck: "Újraellenőrzés",
 "fpkg.archivePassword": "Archívum jelszava",
 "fpkg.archivePasswordHint": "Csak jelszóval védett .rar esetén. Nem mentjük el.",
 "fpkg.aboutArchives": "Ezeket is elfogadja: .ffpfsc képfájlt, amelyet a benne lévő képen keresztül olvas, valamint .zip, .7z vagy .rar archívumot, amelyet előbb a kimeneti mappába csomagol ki. Csak a .rar archívumnak lehet jelszava.",
-"fpkg.remoteSource": "egy kiszolgálón. Indításkor erre a számítógépre másolódik.",
+"fpkg.remoteSource": "egy szerveren. Konvertálás közben közvetlenül onnan olvassuk; semmi sem másolódik erre a gépre.",
+"fpkg.remoteArchive": "egy archívum egy szerveren. Indításkor ide másoljuk és kicsomagoljuk, a futás végén mindkettő törlődik.",
+"fpkg.browseConsole": "A PS5-ön…",
+"fpkg.pickConsole": "Válassz játékmappát vagy képfájlt a PS5-ön",
+"fpkg.consoleSource": "a PS5-ön. Konvertálás közben a konzol FTP-szerverén (ftpsrv) át onnan olvassuk; előtte semmi sem másolódik.",
 };
 
 export default hu;

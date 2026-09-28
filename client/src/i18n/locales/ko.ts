@@ -3250,7 +3250,11 @@ helper_mismatch_go: "헬퍼 다시 불러오기",
 "fpkg.archivePassword": "압축 파일 비밀번호",
 "fpkg.archivePasswordHint": "비밀번호가 걸린 .rar에만 필요합니다. 저장되지 않습니다.",
 "fpkg.aboutArchives": ".ffpfsc 이미지(안에 든 이미지를 읽음)와 .zip, .7z, .rar 압축 파일(먼저 출력 폴더에 압축을 풂)도 사용할 수 있습니다. 비밀번호는 .rar만 지원합니다.",
-"fpkg.remoteSource": "(서버에 있음). 시작하면 이 컴퓨터로 복사됩니다.",
+"fpkg.remoteSource": "서버에 있습니다. 변환하는 동안 서버에서 바로 읽으며, 이 컴퓨터로 복사하지 않습니다.",
+"fpkg.remoteArchive": "서버에 있는 압축 파일입니다. 시작하면 여기로 복사해 압축을 풀고, 작업이 끝나면 둘 다 삭제합니다.",
+"fpkg.browseConsole": "PS5에서…",
+"fpkg.pickConsole": "PS5에 있는 게임 폴더나 이미지 선택",
+"fpkg.consoleSource": "PS5에 있습니다. 변환하는 동안 본체의 FTP 서버(ftpsrv)를 통해 바로 읽으며, 미리 복사하지 않습니다.",
 };
 
 export default ko;
