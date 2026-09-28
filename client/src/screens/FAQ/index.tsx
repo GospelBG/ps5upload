@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { invoke } from "../../lib/invokeLogged";
+import { loadBundledDoc } from "../../lib/bundledDoc";
 import { HelpCircle, Search, X } from "lucide-react";
 
 import {
@@ -67,7 +67,7 @@ export default function FAQScreen() {
     (async () => {
       try {
         setError(null);
-        const content = await invoke<string>("faq_load");
+        const content = await loadBundledDoc("faq");
         setRaw(content);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);

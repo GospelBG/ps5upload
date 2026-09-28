@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "../../lib/invokeLogged";
+import { loadBundledDoc } from "../../lib/bundledDoc";
 import { Sparkles, ExternalLink } from "lucide-react";
 import { openExternalUrl as openExternal } from "../../lib/openExternalUrl";
 
@@ -30,7 +30,7 @@ export default function ChangelogScreen() {
   useEffect(() => {
     (async () => {
       try {
-        const content = await invoke<string>("changelog_load");
+        const content = await loadBundledDoc("changelog");
         setRaw(content);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);

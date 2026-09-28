@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "../lib/invokeLogged";
 import { isAndroid } from "../lib/platform";
+import { isTauriEnv } from "../lib/tauriEnv";
 import {
   screenWakeSupported,
   setScreenWakeReason,
@@ -41,6 +42,13 @@ export const useKeepAwakeStore = create<KeepAwakeState>((set, get) => ({
   lastError: null,
 
   async setEnabled(on) {
+    // The browser build: keeping a computer awake is an OS power assertion on
+    // the machine running the app, which a web page can't make. Say so, don't
+    // surface the native command's error.
+    if (!isTauriEnv()) {
+      set({ supported: false, lastError: null });
+      return;
+    }
     // Android: the Rust inhibitor is a no-op here (keep_awake.rs has no
     // Android arm), so drive a screen wake lock instead — and report
     // `supported` from the WebView API, not the backend. Kept entirely
@@ -72,6 +80,10 @@ export const useKeepAwakeStore = create<KeepAwakeState>((set, get) => ({
   },
 
   async syncFromBackend() {
+    if (!isTauriEnv()) {
+      set({ supported: false, lastError: null });
+      return;
+    }
     // Android: no backend state to read. Re-apply the persisted manual
     // preference (a screen wake lock doesn't survive an app restart) and
     // report support from the WebView.

@@ -5,6 +5,7 @@ import { useConnectionStore, EMPTY_HOST_RUNTIME } from "../state/connection";
 import { parsePS5Firmware } from "../lib/ps5Firmware";
 import { useTr } from "../state/lang";
 import { captureAppScreenshot } from "../lib/captureScreenshot";
+import { isTauriEnv } from "../lib/tauriEnv";
 import {
   useRosterStore,
   useActiveProfile,
@@ -161,7 +162,8 @@ export default function StatusBar() {
       <div className="ms-auto flex items-center gap-3">
         <ActivityStatusSlot />
         <KeepAwakeIndicator />
-        <CaptureButton />
+        {/* Saving a capture is native; the web build's Bug Report attaches files instead. */}
+        {isTauriEnv() && <CaptureButton />}
       </div>
     </div>
   );
