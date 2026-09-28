@@ -30,6 +30,10 @@ import { GameCard } from "./GameCard";
 import { OptionsCard } from "./OptionsCard";
 import { RunCard } from "./RunCard";
 import { SwapJournals } from "./SwapJournals";
+import { QueueCard } from "./QueueCard";
+import { useConvertQueue, type ConvertThen } from "../../state/convertQueue";
+import { scanChildren } from "../../lib/folderScan";
+import { classifyScanEntry } from "../../lib/uploadBatch";
 import { usePackageViewer } from "../../state/packageViewer";
 import { consoleSwapDeps } from "../../lib/dumpSwapConsole";
 
@@ -60,6 +64,19 @@ export default function FpkgConvertScreen() {
   const reset = useFpkgConversion((s) => s.reset);
   const deletePackage = useFpkgConversion((s) => s.deletePackage);
   const finishReplace = useFpkgConversion((s) => s.finishReplace);
+  const queueItems = useConvertQueue((s) => s.items);
+  const queueRunning = useConvertQueue((s) => s.running);
+  const [queueThen, setQueueThen] = useState<ConvertThen>("keep");
+  const [queueDeleteAfter, setQueueDeleteAfter] = useState(false);
+  const queueAdd = (src: string) =>
+    useConvertQueue.getState().add({
+      source: src,
+      outputDir: outputDir.trim() || undefined,
+      compression,
+      then: queueThen,
+      host: queueThen !== "keep" && canInstall ? host : null,
+      deleteAfterInstall: queueThen !== "keep" && queueDeleteAfter,
+    });
   // The console's swap journals are read through these; one set per console.
   const swapDeps = useMemo(() => (canInstall ? consoleSwapDeps(host) : null), [canInstall, host]);
   const installTaskId = pipeline.phase === "running" ? pipeline.installTaskId : null;
@@ -353,6 +370,44 @@ export default function FpkgConvertScreen() {
         onFinishReplace={(choice) =>
           void finishReplace(choice).catch((e) => setError(e instanceof Error ? e.message : String(e)))
         }
+      />
+
+      <QueueCard
+        items={queueItems}
+        running={queueRunning}
+        then={queueThen}
+        onThen={setQueueThen}
+        deleteAfter={queueDeleteAfter}
+        onDeleteAfter={setQueueDeleteAfter}
+        canInstall={canInstall}
+        canAddCurrent={!!source.trim() && !noFiles}
+        onAddCurrent={() => {
+          if (!queueAdd(source.trim())) {
+            setError(tr("cq_already", undefined, "This game is already in the queue."));
+          }
+        }}
+        onScanFolder={() =>
+          void (async () => {
+            const folder = !isTauriEnv()
+              ? await pickLocalPath({ mode: "folder", title: tr("batch_scan_pick", undefined, "Choose the folder that holds your games") })
+              : await pickPath({ mode: "folder", title: tr("batch_scan_pick", undefined, "Choose the folder that holds your games") });
+            if (!folder) return;
+            try {
+              for (const e of await scanChildren(folder)) {
+                const name = e.path.split(/[\\/]/).pop() ?? e.path;
+                const kind = classifyScanEntry(name, e.isDir);
+                if (kind === "folder" || kind === "image" || kind === "archive") queueAdd(e.path);
+              }
+            } catch (err) {
+              setError(err instanceof Error ? err.message : String(err));
+            }
+          })()
+        }
+        onStart={() => void useConvertQueue.getState().start()}
+        onStop={() => useConvertQueue.getState().stop()}
+        onRemove={(id) => useConvertQueue.getState().remove(id)}
+        onMove={(id, d) => useConvertQueue.getState().move(id, d)}
+        onClearFinished={() => useConvertQueue.getState().clearFinished()}
       />
 
       <details className="text-sm">

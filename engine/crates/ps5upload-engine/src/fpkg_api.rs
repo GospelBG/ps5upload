@@ -307,6 +307,23 @@ pub(crate) async fn fpkg_build_handler(
         }
     });
 
+    // The file this build writes: a leftover of an interrupted one goes, and this one is
+    // marked as being written until the build ends.
+    let stem = req
+        .name
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .or_else(|| req.content_id.clone().filter(|c| !c.trim().is_empty()))
+        .or_else(|| inspection.content_id.clone());
+    let partial = stem.map(|stem| {
+        let p = clear_stale_partial(&out, &stem);
+        active_partials()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(p.clone());
+        p
+    });
+
     let state_for_job = state.clone();
     let request_source = source_path.clone();
     tokio::task::spawn_blocking(move || {
@@ -344,6 +361,12 @@ pub(crate) async fn fpkg_build_handler(
             crate::engine_log::record("info", format!("fpkg: {line}"));
         };
         let outcome = build::build_controlled(&request, &mut phase, &mut control);
+        if let Some(p) = &partial {
+            active_partials()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(p);
+        }
         let completed_at_ms = now_ms();
         ticker.abort();
         match outcome {
@@ -614,6 +637,28 @@ pub(crate) async fn ffpfsc_compress_handler(
         }),
     )
         .into_response()
+}
+
+/// Package files being written by a build in this engine (`<stem>.pkg.partial`).
+fn active_partials() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+/// A `.pkg.partial` left by a build that is not running any more (the app closed, the engine
+/// died) is removed, so the rebuild the queue starts is not refused as "output already exists".
+/// One this engine is writing is never touched. Returns the partial's path.
+fn clear_stale_partial(out: &Path, stem: &str) -> PathBuf {
+    let partial = out.join(format!("{stem}.pkg.partial"));
+    let writing = active_partials()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&partial);
+    if !writing && partial.is_file() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    partial
 }
 
 /// Prefix of the folders archives are unpacked into, inside the output folder.
@@ -887,6 +932,27 @@ pub(crate) async fn fpkg_extract_cleanup_handler(
 #[cfg(test)]
 mod extract_tests {
     use super::*;
+
+    #[test]
+    fn a_leftover_partial_goes_but_one_being_written_stays() {
+        let out = std::env::temp_dir().join(format!("ps5upload-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("A.pkg.partial"), b"x").unwrap();
+        std::fs::write(out.join("B.pkg.partial"), b"x").unwrap();
+        active_partials()
+            .lock()
+            .unwrap()
+            .insert(out.join("B.pkg.partial"));
+        clear_stale_partial(&out, "A");
+        clear_stale_partial(&out, "B");
+        assert!(!out.join("A.pkg.partial").exists());
+        assert!(out.join("B.pkg.partial").exists());
+        active_partials()
+            .lock()
+            .unwrap()
+            .remove(&out.join("B.pkg.partial"));
+    }
 
     #[test]
     fn space_for_the_files_and_then_the_package() {

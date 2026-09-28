@@ -78,6 +78,10 @@ import { localFs } from "../api/localFs";
 import { getAppVersion } from "../lib/appVersion";
 import { GlobalPackageViewer } from "../components/GlobalPackageViewer";
 import { dropTarget, usePackageViewer } from "../state/packageViewer";
+import { installConvertRunner } from "../lib/convertQueueRunner";
+
+// The Convert queue builds through the Convert pipeline wherever the user is in the app.
+installConvertRunner();
 
 /** Background status polling for the engine + payload dots in the
  *  status bar. Runs for the lifetime of the app so the indicators
