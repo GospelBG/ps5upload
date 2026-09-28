@@ -1637,3 +1637,17 @@ describe("libraryInstallStates", () => {
     expect(m.has("/lib/d.pkg")).toBe(false);
   });
 });
+
+describe("failedStreamInstallIds", () => {
+  it("finds only failed stream installs of that source", async () => {
+    const { failedStreamInstallIds } = await import("./uploadQueue");
+    const row = (id: string, status: string, source: string) =>
+      ({ id, status, sourceKind: "install", install: { via: "stream", source } }) as never;
+    const items = [
+      row("a", "failed", "/staged/x.pkg"),
+      row("b", "pending", "/staged/x.pkg"),
+      row("c", "failed", "/staged/y.pkg"),
+    ];
+    expect(failedStreamInstallIds(items, "/staged/x.pkg")).toEqual(["a"]);
+  });
+});

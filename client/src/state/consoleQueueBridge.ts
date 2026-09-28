@@ -91,6 +91,8 @@ export interface PkgQueueApi {
   /** Call `cb` now and on every change of item `id`; null once it is gone.
    *  Returns an unsubscribe. */
   watch: (id: string, cb: (p: QueueItemProgress | null) => void) => () => void;
+  /** Drop item `id` (a no-op once it is gone). */
+  remove: (id: string) => void;
 }
 
 let pkgQueueApi: PkgQueueApi | null = null;

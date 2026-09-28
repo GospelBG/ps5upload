@@ -2475,7 +2475,12 @@ const makePkgLibraryStore = () =>
                     bytesPerSec: q.bytesPerSec,
                   });
                 else if (q.status === "done") finish({ ok: true });
-                else finish({ ok: false, message: q.error ?? "upload failed" });
+                else {
+                  // The row here shows the failure; a queue row with its own
+                  // Retry would stage a copy nothing is waiting for.
+                  finish({ ok: false, message: q.error ?? "upload failed" });
+                  pkgQueue().remove(id);
+                }
               });
               // watch() reports at once, so the item may already be finished.
               if (finished) unsub();

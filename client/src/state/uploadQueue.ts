@@ -400,6 +400,20 @@ export function installOrderPriority(it: QueueItem): number {
 
 /** A console's library installs that are waiting or running, by staged path:
  *  Install Package shows these on the library rows (and blocks Delete). */
+/** Failed stream installs of `source` — the browser build deletes that staged
+ *  copy after a failure, so these rows could never be retried. */
+export function failedStreamInstallIds(items: QueueItem[], source: string): string[] {
+  return items
+    .filter(
+      (it) =>
+        it.status === "failed" &&
+        it.sourceKind === "install" &&
+        it.install?.via === "stream" &&
+        it.install.source === source,
+    )
+    .map((it) => it.id);
+}
+
 export function libraryInstallStates(
   items: QueueItem[],
   host: string,
@@ -1921,6 +1935,9 @@ registerPkgQueueApi({
     return useUploadQueueStore.subscribe((s, prev) => {
       if (s.items !== prev.items) cb(view(s.items));
     });
+  },
+  remove(id) {
+    useUploadQueueStore.getState().remove(id);
   },
 });
 

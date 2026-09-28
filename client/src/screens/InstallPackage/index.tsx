@@ -1,5 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { libraryInstallStates, useUploadQueueStore } from "../../state/uploadQueue";
+import {
+  failedStreamInstallIds,
+  libraryInstallStates,
+  useUploadQueueStore,
+} from "../../state/uploadQueue";
 import { isRemotePath } from "../../lib/remotePath";
 import { PackagePanel } from "../../components/PackagePanel";
 import { QueuePanel } from "../Upload/QueuePanel";
@@ -789,9 +793,19 @@ export default function InstallPackageScreen() {
   // install when you don't want to wait out the staging upload (or don't
   // have the disk space for it). Shares the `installing` lock with the
   // regular install flow.
-  async function runStreamInstall(sourcePath: string, streamName: string) {
+  async function runStreamInstall(
+    sourcePath: string,
+    streamName: string,
+    opts?: { ephemeral?: boolean },
+  ) {
     setStreamResult(null);
     const r = await installStream(sourcePath, host);
+    if (!r.ok && opts?.ephemeral) {
+      // The staged copy is deleted once this returns: its failed row could
+      // never be retried, so drop it and don't point at it.
+      const q = useUploadQueueStore.getState();
+      for (const id of failedStreamInstallIds(q.items, sourcePath)) q.remove(id);
+    }
     setStreamResult({
       ok: !!r.ok,
       // The engine resolves a stream install to done|failed synchronously, so
@@ -815,7 +829,7 @@ export default function InstallPackageScreen() {
       // The PS5 couldn't fetch from this computer: its row in the Queue below
       // offers Retry via upload, which copies the file to the PS5 first.
       setPickError(
-        r.stagedFallbackRecommended
+        r.stagedFallbackRecommended && !opts?.ephemeral
           ? `${r.message} ${tr(
               "pkglib.stream.retry_via_upload_hint",
               undefined,
@@ -832,7 +846,7 @@ export default function InstallPackageScreen() {
     try {
       const staged = await stageBrowserPkg(file);
       uploadId = staged.uploadId;
-      await runStreamInstall(staged.path, staged.filename || file.name);
+      await runStreamInstall(staged.path, staged.filename || file.name, { ephemeral: true });
     } catch (e) {
       setPickError(`${e}`);
     } finally {

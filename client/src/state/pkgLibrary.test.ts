@@ -2188,5 +2188,7 @@ describe("Install Package uploads use the console queue", () => {
     await pkgLibraryStore(host).getState().addAndUpload("/g/a.pkg", host);
     expect(pkgLibraryStore(host).getState().error).toMatch(/connection refused/);
     expect(useUploadQueueStore.getState().items.some((i) => i.sourceKind === "install")).toBe(false);
+    // The failure is shown on Install Package; no orphan upload row stays queued.
+    expect(useUploadQueueStore.getState().items.some((i) => i.sourcePath === "/g/a.pkg")).toBe(false);
   });
 });
