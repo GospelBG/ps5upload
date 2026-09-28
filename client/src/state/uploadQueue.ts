@@ -398,6 +398,13 @@ export function installOrderPriority(it: QueueItem): number {
   return 0;
 }
 
+/** Whether a queue item is an upload the activity bar and task list should
+ *  show as one. An install item's executor registers its own task, so
+ *  mirroring it too would show every install twice, once as an "Upload". */
+export function isUploadItem(it: QueueItem): boolean {
+  return it.sourceKind !== "install";
+}
+
 /** The same install already waiting or running on the same console. Matched on
  *  the source (file, on-console path, link), not the content id: two files with
  *  one content id are legitimate (same-version variants, a deliberate reinstall). */

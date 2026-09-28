@@ -1339,6 +1339,10 @@ export default function InstallPackageScreen() {
         }
       />
 
+      {/* This console's queue first: what is installing or waiting is the
+          thing you came back to this screen to see. */}
+      {hostReady && <QueuePanel host={host} />}
+
       <ConnectionGate require="payload">
         <div className="mb-4 rounded-md border border-[var(--color-border)] bg-[var(--color-surface-2)] p-3">
           <label htmlFor="pkg-remote-url" className="block text-sm font-medium text-[var(--color-text)]">
@@ -1579,9 +1583,6 @@ export default function InstallPackageScreen() {
             </div>
           </div>
         )}
-
-        {/* This console's queue: installs and uploads waiting or running. */}
-        {hostReady && <QueuePanel host={host} />}
 
         {hostReady && <ExternalPackages host={host} />}
 

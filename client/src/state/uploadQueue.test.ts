@@ -69,7 +69,7 @@ import {
 import { useUploadSettingsStore } from "./uploadSettings";
 import { runPkgInstall, pkgLibraryStore } from "./pkgLibrary";
 import { registerInstallExecutor, type InstallResult } from "./consoleQueueBridge";
-import { sameInstall } from "./uploadQueue";
+import { isUploadItem, sameInstall } from "./uploadQueue";
 
 // The store before any test stubs its actions (some blocks replace startHost).
 const pristineQueue = useUploadQueueStore.getState();
@@ -1443,5 +1443,13 @@ describe("Retry via upload", () => {
     });
     await q.done;
     expect(useUploadQueueStore.getState().items.find((i) => i.id === q.id)?.fallbackToUpload).toBeFalsy();
+  });
+});
+
+describe("isUploadItem", () => {
+  it("is false for an install item, which reports its own task", () => {
+    expect(isUploadItem({ sourceKind: "install" } as QueueItem)).toBe(false);
+    expect(isUploadItem({ sourceKind: "pkg" } as QueueItem)).toBe(true);
+    expect(isUploadItem({ sourceKind: "folder" } as QueueItem)).toBe(true);
   });
 });

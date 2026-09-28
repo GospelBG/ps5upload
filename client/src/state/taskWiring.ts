@@ -27,7 +27,7 @@ import {
 } from "./fsBulkOp";
 import { installLibraryTaskBridge } from "./libraryTaskBridge";
 import { useTransferStore, IDLE_PHASE } from "./transfer";
-import { useUploadQueueStore } from "./uploadQueue";
+import { isUploadItem, useUploadQueueStore } from "./uploadQueue";
 import { useTaskStore, type TaskKind } from "./tasks";
 import { hostOf } from "../lib/addr";
 
@@ -143,6 +143,7 @@ export function installTaskWiring() {
     if (state.items === prev.items) return;
     const prevById = new Map(prev.items.map((it) => [it.id, it]));
     for (const item of state.items) {
+      if (!isUploadItem(item)) continue;
       const prevItem = prevById.get(item.id);
       const wasRunning = prevItem?.status === "running";
       const isRunning = item.status === "running";
