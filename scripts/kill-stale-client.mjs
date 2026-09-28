@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Best-effort cleanup of stale ps5upload-desktop / ps5upload-engine processes
-// plus any Vite dev server holding :1420. Invoked as a `make run-client`
+// Best-effort cleanup of a stale ps5upload-desktop, an engine still holding the
+// app's port (19113), and a Vite dev server holding :1420. Engines elsewhere are
+// left alone (see stale-client-lib.mjs). Invoked as a `make run-client`
 // dependency so a previously mis-terminated session doesn't fail the next
 // launch with "Port 1420 already in use" or two engines fighting for ports.
 //
@@ -15,6 +16,8 @@
 
 import { execSync } from 'node:child_process';
 
+import { APP_ENGINE_PORT, staleEnginePids } from './stale-client-lib.mjs';
+
 const isWin = process.platform === 'win32';
 const PORT = 1420;
 
@@ -26,12 +29,12 @@ function silent(cmd) {
   try { execSync(cmd, { stdio: 'ignore' }); } catch { /* expected: no match */ }
 }
 
+// The dev app itself. Its engine exits with it (the engine's parent watch); an
+// engine is NOT killed by name here — see stale-client-lib.mjs.
 if (isWin) {
   silent('taskkill /IM ps5upload-desktop.exe /F');
-  silent('taskkill /IM ps5upload-engine.exe /F');
 } else {
   silent("pkill -f '[p]s5upload-desktop'");
-  silent("pkill -f '[p]s5upload-engine'");
 }
 
 function pidsOnPort(port) {
@@ -46,7 +49,7 @@ function pidsOnPort(port) {
       }
       return [...pids];
     }
-    const out = run(`lsof -ti :${port}`);
+    const out = run(`lsof -ti tcp:${port} -sTCP:LISTEN`);
     return out.trim().split(/\s+/).filter(Boolean);
   } catch {
     return [];
@@ -66,6 +69,26 @@ function looksLikeOurVite(pid) {
   } catch {
     return false;
   }
+}
+
+function commandOf(pid) {
+  try {
+    if (isWin) {
+      return run(
+        `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine"`,
+      ).trim();
+    }
+    return run(`ps -o command= -p ${pid}`).trim();
+  } catch {
+    return '';
+  }
+}
+
+// Only an engine still holding the app's port (an orphan the app can't bind past).
+const listeners = pidsOnPort(APP_ENGINE_PORT).map((pid) => ({ pid, command: commandOf(pid) }));
+for (const pid of staleEnginePids(listeners)) {
+  silent(isWin ? `taskkill /PID ${pid} /F` : `kill ${pid}`);
+  console.log(`✓ stopped the stale engine on :${APP_ENGINE_PORT} (pid ${pid})`);
 }
 
 for (const pid of pidsOnPort(PORT)) {

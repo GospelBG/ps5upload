@@ -149,6 +149,9 @@ const psFiles = files.filter((f) => /\.ps1$/i.test(f));
 let ok = true;
 ok = checkSdkPin() && ok;
 for (const f of nodeFiles) ok = run(path.relative(repoRoot, f), "node", ["--check", f]) && ok;
+// Scripts with logic worth pinning carry a node:test file beside them.
+const nodeTests = nodeFiles.filter((f) => f.endsWith(".test.mjs"));
+if (nodeTests.length) ok = run("node --test", "node", ["--test", ...nodeTests]) && ok;
 if (hasCommand("bash")) {
   for (const f of shellFiles) ok = run(path.relative(repoRoot, f), "bash", ["-n", f]) && ok;
 } else if (shellFiles.length > 0) {
