@@ -1439,7 +1439,13 @@ function Step2Options(props: {
                   )
                 : undefined
           }
-          className="rounded-md bg-[var(--color-accent)] px-6 py-2 text-sm font-medium text-[var(--color-accent-contrast)] disabled:opacity-50"
+          className={
+            // For a package, Stream & install (on its card) is the main
+            // action; uploading it first is the fallback.
+            source.kind === "pkg"
+              ? "rounded-md border border-[var(--color-border)] bg-[var(--color-surface-raised)] px-6 py-2 text-sm font-medium text-[var(--color-text)] hover:bg-[var(--color-surface-3)] disabled:opacity-50"
+              : "rounded-md bg-[var(--color-accent)] px-6 py-2 text-sm font-medium text-[var(--color-accent-contrast)] disabled:opacity-50"
+          }
         >
           {preflightBusy
             ? tr("upload_checking", "Checking…")
@@ -1447,7 +1453,9 @@ function Step2Options(props: {
               ? transferPhase.kind === "starting"
                 ? tr("upload_starting", "Starting…")
                 : tr("upload_uploading", "Uploading…")
-              : tr("upload_now", "Upload")}
+              : source.kind === "pkg"
+                ? tr("install.uploadInstall", "Upload & install")
+                : tr("upload_now", "Upload")}
         </button>
       </div>
       {preflightError && (
