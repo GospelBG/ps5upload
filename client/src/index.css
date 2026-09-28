@@ -425,10 +425,6 @@ body {
   box-sizing: border-box;
 }
 
-button {
-  font: inherit;
-}
-
 ::selection {
   background: var(--color-accent);
   color: var(--color-accent-contrast);
