@@ -387,11 +387,21 @@ mod tests {
         let addr = l.local_addr().unwrap().to_string();
         let h = thread::spawn(move || {
             let (mut s, _) = l.accept().unwrap();
+            // Read the whole request line, as the daemon does: a request that arrives in two
+            // segments, answered after the first, left bytes unread, and closing over unread
+            // bytes resets the connection before the client reads the reply (a flake).
+            let mut got = Vec::new();
             let mut buf = [0u8; 512];
-            let n = s.read(&mut buf).unwrap();
+            while !got.contains(&b'\n') {
+                let n = s.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
             let _ = s.write_all(reply.as_bytes());
             let _ = s.write_all(b"\n");
-            String::from_utf8_lossy(&buf[..n]).to_string()
+            String::from_utf8_lossy(&got).to_string()
         });
         (addr, h)
     }
@@ -428,10 +438,17 @@ mod tests {
                         // WouldBlock and the request went unrecorded (a flake).
                         s.set_nonblocking(false).ok();
                         s.set_read_timeout(Some(Duration::from_millis(200))).ok();
+                        // The whole request line (see fake_once).
+                        let mut got = Vec::new();
                         let mut buf = [0u8; 512];
-                        let n = s.read(&mut buf).unwrap_or(0);
-                        if n > 0 {
-                            let line = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+                        while !got.contains(&b'\n') {
+                            match s.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => got.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        if !got.is_empty() {
+                            let line = String::from_utf8_lossy(&got).trim().to_string();
                             reqs2.lock().unwrap().push(line);
                         }
                         let _ = s.write_all(reply.as_bytes());
