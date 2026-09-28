@@ -953,6 +953,11 @@ test-payload: payload
 		$(PAYLOAD_DIR)/tests/cross_device_selftest.c
 	@/tmp/ps5upload-cross-device-selftest
 	@echo "✓ cross-mount renames are refused before they can panic the kernel"
+	@echo "Running single-file resume open self-test (host build)..."
+	@cc -O2 -Wall -Wextra -Werror -o /tmp/ps5upload-direct-open-selftest \
+		$(PAYLOAD_DIR)/tests/direct_open_selftest.c
+	@/tmp/ps5upload-direct-open-selftest
+	@echo "✓ a resumed single-file upload writes where the acknowledged bytes end"
 	@echo "Running Remote Play registry-key self-test (host build)..."
 	@cc -O2 -Wall -Wextra -Werror -o /tmp/ps5upload-rp-keys-selftest \
 		$(PAYLOAD_DIR)/tests/rp_keys_selftest.c

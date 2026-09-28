@@ -29,6 +29,7 @@
 #include <fts.h>
 #include <fnmatch.h>
 #include <regex.h>
+#include "direct_open.h"
 #include "config.h"
 #include "commit_apply.h"
 #include "runtime.h"
@@ -3547,27 +3548,23 @@ static int runtime_write_shard_persistent(runtime_tx_entry_t *entry,
      *      spawn the writer thread.
      *
      *   2. Resume scenario (is_first_shard=0, direct_fd_open=0):
-     *      pre-2.2.28 this case fell into the sync-write path with
-     *      direct_fd=-1 → write_full(-1, ...) failed EBADF and resume
-     *      of single-file direct uploads was broken end-to-end. Fix:
-     *      reopen with O_APPEND so every write lands at end-of-file,
-     *      preserving the bytes from shards 1..N already on disk
-     *      (ephemeral release intentionally keeps the tmp file). We
+     *      reopen WITHOUT truncating and seek to the acknowledged byte
+     *      count (entry->bytes_received, restored from the journal), so
+     *      the resumed shards land right after the bytes already on disk
+     *      (ephemeral release intentionally keeps the tmp file). This was
+     *      O_APPEND until the fix in direct_open.h: the fresh path
+     *      pre-sizes the tmp to the full transfer, so appending wrote past
+     *      its end and COMMIT refused the file with size_mismatch. We
      *      do NOT spawn the writer thread on resume — the producer/
      *      consumer pattern reuses an in-memory state machine that
      *      doesn't survive ephemeral teardown, and a one-shot resume
      *      is rarely throughput-critical anyway (sync fd write is
      *      enough to drain a few MB of pending data). */
     if (!entry->direct_fd_open) {
-        int flags = O_WRONLY | O_CREAT;
         int is_resume_open = !is_first_shard;
-        if (is_resume_open) {
-            flags |= O_APPEND;
-        } else {
-            flags |= O_TRUNC;
-        }
+        direct_open_plan_t plan = direct_open_plan(is_first_shard, entry->bytes_received);
         uint64_t t_open_start = now_us();
-        int fd = open(entry->tmp_path, flags, 0777);
+        int fd = direct_open_for_shard(entry->tmp_path, plan);
         if (fd >= 0) (void)fchmod(fd, 0777);
         if (fd < 0) {
             /* (2.9.0) Drain-then-FAIL — see runtime_write_shard_to_path
