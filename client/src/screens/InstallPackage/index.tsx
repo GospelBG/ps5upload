@@ -787,7 +787,7 @@ export default function InstallPackageScreen() {
     }
   }
 
-  // Stream-install (beta, #81): pick a single PC-side .pkg and install it
+  // Stream & install (#81): pick a single PC-side .pkg and install it
   // WITHOUT staging it on the PS5 first — the engine serves the file over
   // HTTP and the DPI daemon pulls it directly. Useful for a quick one-shot
   // install when you don't want to wait out the staging upload (or don't

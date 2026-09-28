@@ -23,16 +23,16 @@
 
 - **One way to install any package.** PS4 `.pkg` and PS5 fake packages —
   base games, updates and DLC — install through ps5upload's own on-console
-  installer, whether you **Stream install** straight from your PC (nothing
+  installer, whether you **Stream & install** straight from your PC (nothing
   copied to the PS5), **Upload & install** (copied first, kept for
   reinstalls), or install from a NAS, a USB drive or a download link. Every
   route shows the same live progress, only says "installed" once the console
   has the whole package, checks that an update really raised the game's
   version, and never wipes your base game.
-- **Turn a game into an installable PS5 package.** **Convert to FPKG** (beta)
+- **Turn a game into an installable PS5 package.** **Convert to FPKG**
   builds a fake package from a decrypted game folder or an `.exfat` / `.ffpkg`
   image, on your computer, compressed the way Sony's own packages are — then
-  installs it with Stream install or Upload & install in one click.
+  installs it with Stream & install or Upload & install in one click.
 - **Sleep, wake and power from your desk.** Put the PS5 in rest mode, reboot
   or shut it down, and **wake it back up over the network** — even straight
   into your signed-in user with Wake & sign in. The app keeps the console and
@@ -131,7 +131,7 @@
   playlist step can pull straight from a repo at run time so you don't
   keep a pile of `.elf` files on your PC.
 - **Install packages** — install a PS4 `.pkg` or PS5 fake package two ways:
-  **Stream install** sends it straight from your PC (nothing is copied to
+  **Stream & install** sends it straight from your PC (nothing is copied to
   the PS5 first — handy when console storage is tight), and **Upload &
   install** copies it to the PS5's package library first, where it stays so
   you can **Install**, **Reinstall** or **Delete** it later without
@@ -142,10 +142,10 @@
   and the result checks out — an update that didn't raise the game's version
   is reported, not called a success. Base, update and DLC installs verified
   on FW 5.10.
-- **Convert to FPKG (beta)** — turn a decrypted game folder or an `.exfat` /
+- **Convert to FPKG** — turn a decrypted game folder or an `.exfat` /
   `.ffpkg` image into an installable fake package on your computer, with the
-  same compression Sony's packages use, then install it with Stream install
-  or Upload & install. Enable it under Settings → Beta features.
+  same compression Sony's packages use, then install it with Stream & install
+  or Upload & install.
 - **Web browser access** — run the engine (or the official Docker image)
   and manage your PS5 from any browser on the LAN, the full app served
   over HTTP. No desktop install needed on that machine. Unauthenticated —
@@ -430,7 +430,7 @@ port 9021 — a third-party component, not part of ps5upload.
   ps5upload connects and then drops after a few seconds. Loading elfldr
   once from PLDMGR and then sending ps5upload again also fixes it.
 
-**Q: Stream install fails before the PS5 downloads anything?**
+**Q: Stream & install fails before the PS5 downloads anything?**
 * The PS5 pulls the package from your computer, so it has to be able to
   reach it. Allow ps5upload through your computer's firewall (on Windows,
   for both Private and Public networks), keep the computer and the PS5 on

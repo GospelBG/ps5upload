@@ -992,7 +992,7 @@ interface PkgLibraryState {
     host: string,
     opts?: { onDest?: (destPath: string) => void },
   ) => Promise<{ ok: boolean; message?: string }>;
-  /** Stream-install (beta, #81) a local PC-side `.pkg` WITHOUT uploading it
+  /** Stream & install (#81) a local PC-side `.pkg` WITHOUT uploading it
    *  to PS5 staging first. The engine serves the file over HTTP at
    *  `/pkg-host/{session}/` and the DPI daemon pulls it directly. Saves the
    *  staging upload (and the disk space) for the quick-install case. The

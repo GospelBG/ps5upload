@@ -68,6 +68,7 @@ import { useConnectionStore } from "../../state/connection";
 import { useEngineStore, DEFAULT_ENGINE_URL } from "../../state/engine";
 import { useSaveSettingsStore, DEFAULT_SAVE_PATH } from "../../state/saveSettings";
 import { useBetaFeaturesStore } from "../../state/betaFeatures";
+import { hasBetaItems } from "../../layout/navItems";
 import { useRestAfterUploadStore } from "../../state/restAfterUpload";
 import { userConfigPath, resetAllAppData } from "../../state/userConfig";
 import { useUpdateStore, type UpdatePhase } from "../../state/update";
@@ -1001,26 +1002,32 @@ export default function SettingsScreen() {
           <BugReportLink />
         </Section>
 
-        <GroupHeading>
-          {tr("settings_group_beta", undefined, "Beta features")}
-        </GroupHeading>
+        {/* Only while something is in beta: a switch that reveals nothing
+            reads as broken. */}
+        {hasBetaItems() && (
+          <>
+            <GroupHeading>
+              {tr("settings_group_beta", undefined, "Beta features")}
+            </GroupHeading>
 
-        <Section title={tr("settings_card_beta", undefined, "Beta features")} full>
-          <Toggle
-            checked={betaFeatures}
-            onChange={(on) => setBetaFeatures(on)}
-            label={tr(
-              "beta_features_label",
-              undefined,
-              "Show features that are still being finished",
-            )}
-            hint={tr(
-              "beta_features_hint",
-              undefined,
-              "Adds work-in-progress screens to the sidebar when there are any. These are usable but not yet reliable, and may change or be removed.",
-            )}
-          />
-        </Section>
+            <Section title={tr("settings_card_beta", undefined, "Beta features")} full>
+              <Toggle
+                checked={betaFeatures}
+                onChange={(on) => setBetaFeatures(on)}
+                label={tr(
+                  "beta_features_label",
+                  undefined,
+                  "Show features that are still being finished",
+                )}
+                hint={tr(
+                  "beta_features_hint",
+                  undefined,
+                  "Adds work-in-progress screens to the sidebar when there are any. These are usable but not yet reliable, and may change or be removed.",
+                )}
+              />
+            </Section>
+          </>
+        )}
 
         <GroupHeading>
           {tr("settings_group_automation", undefined, "Automation")}

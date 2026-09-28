@@ -315,6 +315,11 @@ export const PERMANENT_NAV_ITEMS: readonly NavItem[] = [
 /** Whether an item is currently visible. Beta items stay hidden until the
  *  user turns them on, which is what keeps a half-finished screen out of a
  *  sidebar that the user never asked to be a test bench. */
+/** Whether any screen is in beta — Settings only offers the switch then. */
+export function hasBetaItems(items: NavItem[] = NAV_ITEMS): boolean {
+  return items.some((i) => i.beta);
+}
+
 export function navItemVisible(item: NavItem, betaEnabled: boolean): boolean {
   return !item.beta || betaEnabled;
 }

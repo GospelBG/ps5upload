@@ -322,3 +322,14 @@ describe("Convert to FPKG", () => {
     expect(APP).not.toMatch(/BetaRoute/);
   });
 });
+
+// A switch that reveals nothing is a dead control: Settings shows it only while
+// something is actually in beta.
+describe("hasBetaItems", () => {
+  it("is false when no screen is in beta", async () => {
+    const { hasBetaItems } = await import("./navItems");
+    expect(hasBetaItems([{ to: "/a", beta: false } as never])).toBe(false);
+    expect(hasBetaItems([{ to: "/a", beta: true } as never])).toBe(true);
+    expect(hasBetaItems()).toBe(NAV_ITEMS.some((i) => i.beta));
+  });
+});
