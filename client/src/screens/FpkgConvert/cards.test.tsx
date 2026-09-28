@@ -16,6 +16,7 @@ import { CompressionTiles } from "./CompressionTiles";
 import { firmwareLine, GameCard, type GameCardProps } from "./GameCard";
 import { MemoryRouter } from "react-router";
 import { OptionsCard } from "./OptionsCard";
+import { pendingJournals, SwapJournalsView } from "./SwapJournals";
 
 const estimates = {
   fast: { bytes: 117e9, seconds: 900 },
@@ -138,3 +139,39 @@ describe("GameCard archive source", () => {
     expect(folder).not.toContain("unpacked");
   });
 });
+
+describe("unfinished swaps", () => {
+  const j = (step: "installing" | "installed") => ({
+    v: 1 as const,
+    titleId: "PPSA30528",
+    dump: "/data/homebrew/G.exfat",
+    parked: "/data/ps5upload/parked/G.exfat",
+    packagePath: "/out/a.pkg",
+    step,
+    at: 0,
+  });
+
+  it("offers to put back a dump whose install never finished", () => {
+    const out = renderToStaticMarkup(
+      <SwapJournalsView journals={[j("installing")]} busy={null} onRollback={() => {}} onFinish={() => {}} />,
+    );
+    expect(out).toContain("/data/ps5upload/parked/G.exfat");
+    expect(out).toContain("Put the dump back");
+    expect(out).not.toContain("Delete the old dump");
+  });
+
+  it("offers delete or keep once the package installed", () => {
+    const out = renderToStaticMarkup(
+      <SwapJournalsView journals={[j("installed")]} busy={null} onRollback={() => {}} onFinish={() => {}} />,
+    );
+    expect(out).toContain("Delete the old dump");
+    expect(out).toContain("Keep it parked");
+    expect(out).not.toContain("Put the dump back");
+  });
+
+  it("leaves out the swap the result card already shows", () => {
+    expect(pendingJournals([j("installed")], "PPSA30528")).toEqual([]);
+    expect(pendingJournals([j("installed")], null)).toHaveLength(1);
+  });
+});
+

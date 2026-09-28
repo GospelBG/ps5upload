@@ -13,6 +13,8 @@ import { useTaskStore } from "./tasks";
 import { remoteApi } from "../api/remote";
 import { fetchRemote } from "../lib/materialize";
 import { isRemotePath } from "../lib/remotePath";
+import { finishSwap, runSwap, type SwapJournal } from "../lib/dumpSwap";
+import { consoleSwapDeps } from "../lib/dumpSwapConsole";
 
 export type PipelineStage =
   | "copy"
@@ -22,6 +24,7 @@ export type PipelineStage =
   | "compress"
   | "write"
   | "verify"
+  | "park"
   | "send"
   | "install";
 
@@ -75,6 +78,9 @@ export type Pipeline =
       stageMs: StageMs;
       deleted: boolean;
       titleId: string | null;
+      /** A console dump swapped for this package, awaiting Delete the old dump / Keep it
+       *  parked; null once that is chosen (or when nothing was swapped). */
+      swap?: SwapJournal | null;
     }
   | {
       phase: "failed";
@@ -108,6 +114,8 @@ export interface ConversionState {
   /** A new source: clears a finished result; ignored while running. */
   reset: () => void;
   deletePackage: () => Promise<void>;
+  /** After a swap: delete the parked dump, or keep it parked outside the scan roots. */
+  finishReplace: (choice: "delete" | "keep") => Promise<void>;
 }
 
 /** How often a build job is polled (ms). */
@@ -127,6 +135,7 @@ const STAGE_LABEL: Record<PipelineStage, string> = {
   compress: "Compress",
   write: "Write package",
   verify: "Verify",
+  park: "Set the dump aside",
   send: "Send to PS5",
   install: "Install on PS5",
 };
@@ -244,11 +253,51 @@ async function uploadThenInstall(store: PkgLibraryStore, packagePath: string, ho
   }
 }
 
+/** `ps5://10.0.0.2/data/homebrew/G.exfat` → `/data/homebrew/G.exfat`. */
+export function consoleDumpPath(source: string): string | null {
+  const m = /^ps5:\/\/[^/]+(\/.*)$/.exec(source);
+  return m ? m[1] : null;
+}
+
+/** A dump on the console is swapped for its package, never installed beside it: both share a
+ *  title id, and ShadowMountPlus would register the dump again over the install. */
+async function runReplace(packagePath: string, host: string, dump: string) {
+  const p = running();
+  if (!p) return;
+  if (!p.titleId) {
+    fail("park", "The package has no title id to match the dump with.", packagePath);
+    return;
+  }
+  enterStage("park");
+  const startedMs = Date.now();
+  const r = await runSwap(
+    { titleId: p.titleId, dump, packagePath },
+    consoleSwapDeps(host),
+    (step) => enterStage(step === "install" ? "install" : "park"),
+  );
+  if (!running()) return;
+  if (!r.ok) {
+    fail(running()!.stage, r.message ?? "The swap did not finish.", packagePath);
+    return;
+  }
+  const cur = running()!;
+  installDone(packagePath, startedMs - cur.startedMs, Date.now() - startedMs, r.journal ?? null);
+  pushNotification("success", "Installed on the PS5", {
+    body: "The old dump is set aside; delete it or keep it on the Convert screen.",
+    link: "/convert",
+  });
+}
+
 async function runInstall(packagePath: string, host: string | null, method: InstallMethod) {
   const p = running();
   if (!p) return;
   if (!host) {
     fail("send", "Connect to a PS5 to install.", packagePath);
+    return;
+  }
+  const dump = consoleDumpPath(p.source);
+  if (dump) {
+    await runReplace(packagePath, host, dump);
     return;
   }
   enterStage("send");
@@ -271,7 +320,12 @@ async function runInstall(packagePath: string, host: string | null, method: Inst
   }
 }
 
-function installDone(packagePath: string, convertMs: number, installMs: number) {
+function installDone(
+  packagePath: string,
+  convertMs: number,
+  installMs: number,
+  swap: SwapJournal | null = null,
+) {
   const p = running();
   if (!p) return;
   if (p.taskId) useTaskStore.getState().finishTask(p.taskId, "done");
@@ -290,6 +344,7 @@ function installDone(packagePath: string, convertMs: number, installMs: number) 
       stageMs: { ...p.stageMs, [p.stage]: now - p.stageStartedMs },
       deleted: false,
       titleId: p.titleId,
+      swap,
     },
   });
 }
@@ -581,6 +636,14 @@ export const useFpkgConversion = create<ConversionState>((set, get) => ({
   reset: () => {
     const phase = get().pipeline.phase;
     if (phase === "done" || phase === "failed") set({ pipeline: { phase: "idle" } });
+  },
+
+  finishReplace: async (choice) => {
+    const p = get().pipeline;
+    if (p.phase !== "done" || !p.swap || !p.host) return;
+    await finishSwap(p.swap, choice, consoleSwapDeps(p.host));
+    const now = get().pipeline;
+    if (now.phase === "done") set({ pipeline: { ...now, swap: null } });
   },
 
   deletePackage: async () => {

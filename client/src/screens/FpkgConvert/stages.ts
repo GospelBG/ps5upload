@@ -20,6 +20,8 @@ export interface StageRow {
 
 const BUILD: readonly PipelineStage[] = ["check", "plan", "compress", "write", "verify"];
 const INSTALL: readonly PipelineStage[] = ["send", "install"];
+/** A console dump is set aside, then its package installs (see lib/dumpSwap.ts). */
+const SWAP: readonly PipelineStage[] = ["park", "install"];
 
 /** Share of the whole run each stage stands for (compressing dominates a build). */
 const WEIGHT: Record<PipelineStage, number> = {
@@ -30,6 +32,7 @@ const WEIGHT: Record<PipelineStage, number> = {
   compress: 55,
   write: 20,
   verify: 6,
+  park: 3,
   send: 10,
   install: 5,
 };
@@ -44,9 +47,9 @@ function stagesFor(mode: PipelineMode, source: string): readonly PipelineStage[]
   if (mode !== "install" && isArchiveSource(source)) copy.push("extract");
   switch (mode) {
     case "convert-install":
-      return [...copy, ...BUILD, ...INSTALL];
+      return [...copy, ...BUILD, ...(source.startsWith("ps5://") ? SWAP : INSTALL)];
     case "install":
-      return INSTALL;
+      return source.startsWith("ps5://") ? SWAP : INSTALL;
     default:
       return [...copy, ...BUILD];
   }

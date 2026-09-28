@@ -44,6 +44,7 @@ const LABEL: Record<PipelineStage, [string, string]> = {
   compress: ["fpkg.stage.compress", "Compress"],
   write: ["fpkg.stage.write", "Write package"],
   verify: ["fpkg.stage.verify", "Verify"],
+  park: ["fpkg.stage.park", "Set the dump aside"],
   send: ["fpkg.stage.send", "Send to PS5"],
   install: ["fpkg.stage.install", "Install on PS5"],
 };
@@ -74,6 +75,10 @@ export interface RunCardProps {
   onShowFolder: () => void;
   onDelete: () => void;
   onAnother: () => void;
+  /** The source is a dump on the console: installing swaps it out (Convert & replace). */
+  replaces?: boolean;
+  /** After a swap: delete the set-aside dump, or keep it. */
+  onFinishReplace?: (choice: "delete" | "keep") => void;
 }
 
 function RowIcon({ state }: { state: StageRow["state"] }) {
@@ -143,7 +148,9 @@ export function RunCard(props: RunCardProps) {
               onClick={props.onConvertInstall}
               disabled={!props.canInstall || props.canConvert === false}
             >
-              {tr("fpkg.convertInstall", undefined, "Convert & install")}
+              {props.replaces
+                ? tr("fpkg.convertReplace", undefined, "Convert & replace")
+                : tr("fpkg.convertInstall", undefined, "Convert & install")}
             </Button>
             <Button onClick={props.onConvert} disabled={props.canConvert === false}>
               {tr("fpkg.convertOnly", undefined, "Convert only")}
@@ -154,6 +161,15 @@ export function RunCard(props: RunCardProps) {
               </Button>
             )}
           </div>
+          {props.replaces && props.canInstall && (
+            <div className="text-xs text-[var(--color-muted)]">
+              {tr(
+                "fpkg.replaceHint",
+                undefined,
+                "The dump on the PS5 is set aside while its package installs, and put back if the install fails. Saves are kept.",
+              )}
+            </div>
+          )}
           {!props.canInstall && (
             <div className="text-xs text-[var(--color-muted)]">
               {tr("fpkg.needConsole", undefined, "Connect to a PS5 to install.")}
@@ -323,6 +339,25 @@ export function RunCard(props: RunCardProps) {
         <div className="break-all text-sm text-[var(--color-text)]">
           {p.deleted ? tr("fpkg.deleted", undefined, "Package deleted") : p.packagePath}
         </div>
+        {p.swap && (
+          <div className="flex flex-col gap-2 rounded-md border border-[var(--color-border)] p-3 text-sm">
+            <span>
+              {tr(
+                "fpkg.swapDone",
+                { path: p.swap.parked },
+                "The old dump is set aside at {path}. Launch the game to check it runs, then delete the dump or keep it.",
+              )}
+            </span>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="danger" size="sm" onClick={() => props.onFinishReplace?.("delete")}>
+                {tr("fpkg.deleteDump", undefined, "Delete the old dump")}
+              </Button>
+              <Button size="sm" onClick={() => props.onFinishReplace?.("keep")}>
+                {tr("fpkg.keepDump", undefined, "Keep it parked")}
+              </Button>
+            </div>
+          </div>
+        )}
         {!p.deleted && p.mode !== "ffpfsc" && installChoice(!installed)}
         <div className="flex flex-wrap gap-2">
           {installed && !p.deleted && p.host && (

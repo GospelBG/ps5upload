@@ -5,7 +5,7 @@
 // install. `state/fpkgConversion` drives the run; this screen holds the source, its check and the
 // remembered options, and hands every action the exact package the run names.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { PackagePlus } from "lucide-react";
 
@@ -28,6 +28,8 @@ import { useTaskStore } from "../../state/tasks";
 import { GameCard } from "./GameCard";
 import { OptionsCard } from "./OptionsCard";
 import { RunCard } from "./RunCard";
+import { SwapJournals } from "./SwapJournals";
+import { consoleSwapDeps } from "../../lib/dumpSwapConsole";
 
 /** How long a first press of Delete package stays armed. */
 const DELETE_ARM_MS = 5000;
@@ -55,6 +57,9 @@ export default function FpkgConvertScreen() {
   const cancel = useFpkgConversion((s) => s.cancel);
   const reset = useFpkgConversion((s) => s.reset);
   const deletePackage = useFpkgConversion((s) => s.deletePackage);
+  const finishReplace = useFpkgConversion((s) => s.finishReplace);
+  // The console's swap journals are read through these; one set per console.
+  const swapDeps = useMemo(() => (canInstall ? consoleSwapDeps(host) : null), [canInstall, host]);
   const installTaskId = pipeline.phase === "running" ? pipeline.installTaskId : null;
   const installTask = useTaskStore((s) =>
     installTaskId ? (s.tasks.find((t) => t.id === installTaskId) ?? null) : null,
@@ -292,6 +297,12 @@ export default function FpkgConvertScreen() {
         outputFree={inspection?.output_free}
       />
 
+      <SwapJournals
+        deps={swapDeps}
+        hidden={locked}
+        shownTitle={pipeline.phase === "done" && pipeline.swap ? pipeline.swap.titleId : null}
+      />
+
       {error && (
         <Callout tone="error" title={tr("fpkg.error", undefined, "Conversion error")}>
           {error}
@@ -319,6 +330,10 @@ export default function FpkgConvertScreen() {
         }}
         onDelete={onDelete}
         onAnother={onAnother}
+        replaces={source.trim().startsWith("ps5://")}
+        onFinishReplace={(choice) =>
+          void finishReplace(choice).catch((e) => setError(e instanceof Error ? e.message : String(e)))
+        }
       />
 
       <details className="text-sm">

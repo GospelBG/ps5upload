@@ -56,6 +56,13 @@ vi.mock("./pkgLibrary", () => ({
   }),
 }));
 vi.mock("./notifications", () => ({ pushNotification: vi.fn() }));
+const runSwap = vi.fn();
+const finishSwap = vi.fn(async () => {});
+vi.mock("../lib/dumpSwap", () => ({
+  runSwap: (...a: unknown[]) => runSwap(...a),
+  finishSwap: (...a: unknown[]) => finishSwap(...(a as [])),
+}));
+vi.mock("../lib/dumpSwapConsole", () => ({ consoleSwapDeps: () => ({}) }));
 const remoteFetch = vi.fn();
 const cleanupFetched = vi.fn(async () => {});
 vi.mock("../api/remote", () => ({
@@ -82,6 +89,8 @@ describe("fpkg pipeline", () => {
     useTaskStore.setState({ tasks: [] });
     build.mockReset().mockResolvedValue({ job_id: "j1" });
     extract.mockReset().mockResolvedValue({ job_id: "x1" });
+    runSwap.mockReset();
+    finishSwap.mockClear();
     cleanupExtract.mockClear();
     jobStatus.mockReset();
     installStream.mockReset();
@@ -501,6 +510,56 @@ describe("fpkg pipeline", () => {
     await useFpkgConversion.getState().compress("remote://nas-1/g.exfat", "/out");
     expect(useFpkgConversion.getState().pipeline).toMatchObject({ stage: "copy" });
     expect(remoteFetch).toHaveBeenCalled();
+  });
+
+  it("swaps a console dump for its package instead of installing beside it", async () => {
+    const journal = { v: 1, titleId: "PPSA30528", dump: "/data/homebrew/G.exfat", parked: "/data/ps5upload/parked/G.exfat" };
+    jobStatus.mockResolvedValue({
+      status: "done",
+      dest: "/out/a.pkg",
+      bytes_sent: 1,
+      tx_id_hex: "UP0000-PPSA30528_00-X000000000000000",
+    });
+    runSwap.mockImplementation(async (_i: unknown, _d: unknown, onStep: (s: string) => void) => {
+      onStep("park");
+      onStep("install");
+      return { ok: true, journal };
+    });
+    await useFpkgConversion
+      .getState()
+      .start({ source: "ps5://10.0.0.2/data/homebrew/G.exfat", outputDir: "/out" }, { install: true, host: "10.0.0.2" });
+    await tick();
+    await tick();
+    expect(installStream).not.toHaveBeenCalled();
+    expect(runSwap).toHaveBeenCalledWith(
+      { titleId: "PPSA30528", dump: "/data/homebrew/G.exfat", packagePath: "/out/a.pkg" },
+      expect.anything(),
+      expect.any(Function),
+    );
+    expect(useFpkgConversion.getState().pipeline).toMatchObject({ phase: "done", swap: journal });
+    await useFpkgConversion.getState().finishReplace("delete");
+    expect(finishSwap).toHaveBeenCalledWith(journal, "delete", expect.anything());
+    expect(useFpkgConversion.getState().pipeline).toMatchObject({ phase: "done", swap: null });
+  });
+
+  it("reports a swap that was rolled back as a failed install", async () => {
+    jobStatus.mockResolvedValue({
+      status: "done",
+      dest: "/out/a.pkg",
+      bytes_sent: 1,
+      tx_id_hex: "UP0000-PPSA30528_00-X000000000000000",
+    });
+    runSwap.mockResolvedValue({ ok: false, rolledBack: true, message: "The install did not finish. The dump is back where it was." });
+    await useFpkgConversion
+      .getState()
+      .start({ source: "ps5://10.0.0.2/data/homebrew/G.exfat", outputDir: "/out" }, { install: true, host: "10.0.0.2" });
+    await tick();
+    await tick();
+    expect(useFpkgConversion.getState().pipeline).toMatchObject({
+      phase: "failed",
+      message: "The install did not finish. The dump is back where it was.",
+      packagePath: "/out/a.pkg",
+    });
   });
 });
 
