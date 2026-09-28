@@ -9,6 +9,7 @@ import {
   Play,
   Square,
   Trash2,
+  ScanSearch,
   RotateCcw,
   ListOrdered,
   X,
@@ -17,6 +18,8 @@ import {
 } from "lucide-react";
 
 import { Button, ErrorCard, Spinner, Toggle } from "../../components";
+import { queueItemViewPath } from "../../lib/queueView";
+import { usePackageViewer } from "../../state/packageViewer";
 import { GameIcon } from "../../components/GameIcon";
 import { PlatformBadge } from "../../components/PlatformBadge";
 import { humanizeJobErrorReason } from "../../api/ps5";
@@ -490,6 +493,7 @@ export function QueueRow({
 }) {
   const tr = useTr();
   const isInstall = item.sourceKind === "install";
+  const viewPath = queueItemViewPath(item);
   // Game identity for the row — so you can tell what's what at a glance.
   // pkg: title id parsed out of the ContentID drives the cover (appmeta/CDN)
   // and the PS4/PS5 badge. game-folder: the folder's own sce_sys/icon0.png.
@@ -679,6 +683,17 @@ export function QueueRow({
           >
             <ArrowDown size={14} />
           </button>
+          {viewPath && (
+            <button
+              type="button"
+              onClick={() => usePackageViewer.getState().open(viewPath)}
+              title={tr("viewer_open", undefined, "View details")}
+              aria-label={tr("viewer_open", undefined, "View details")}
+              className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-3)]"
+            >
+              <ScanSearch size={14} />
+            </button>
+          )}
           {isActive && isInstall ? null : isActive ? (
             // An install can't be stopped halfway (Sony's installer owns it
             // once it starts), so a running install row has no Cancel.

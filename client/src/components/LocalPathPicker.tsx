@@ -11,6 +11,7 @@ import {
   RefreshCw,
   Send,
   X,
+  ScanSearch,
 } from "lucide-react";
 
 import { Button } from ".";
@@ -22,6 +23,7 @@ import { hostOf, transferAddr } from "../lib/addr";
 import { fsListDir } from "../api/ps5";
 import { useConnectionsStore } from "../state/connections";
 import { useLocalPickerStore } from "../state/localPicker";
+import { usePackageViewer } from "../state/packageViewer";
 import { useTr } from "../state/lang";
 
 /**
@@ -69,6 +71,8 @@ export interface PickerViewProps {
   onRetry: () => void;
   onEditConnection: () => void;
   onInstall: (path: string) => void;
+  /** Open a file in the package viewer (Connections → Browse). */
+  onView?: (path: string) => void;
   onSend: (path: string) => void;
   onCancel: () => void;
   onRoot: (root: string) => void;
@@ -219,6 +223,12 @@ export function PickerView(p: PickerViewProps) {
                         </button>
                         {p.actions && !e.is_dir && (
                           <span className="flex shrink-0 gap-1 pe-3">
+                            {p.onView && /\.(f?pkg|exfat|ffpkg|ffpfsc)$/i.test(e.name) && (
+                              <Button variant="ghost" size="sm" onClick={() => p.onView!(e.path)}>
+                                <ScanSearch size={14} />
+                                {tr("viewer_related_view", undefined, "View")}
+                              </Button>
+                            )}
                             {isPkg && (
                               <Button variant="ghost" size="sm" onClick={() => p.onInstall(e.path)}>
                                 <PackagePlus size={14} />
@@ -489,6 +499,10 @@ export function LocalPathPicker() {
         const act = pending.actions;
         settle(null);
         if (act && connectionId) act.onInstall(remotePath(connectionId, p));
+      }}
+      onView={(p) => {
+        settle(null);
+        if (connectionId) usePackageViewer.getState().open(remotePath(connectionId, p));
       }}
       onSend={(p) => {
         const act = pending.actions;

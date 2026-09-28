@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
+import { usePackageViewer } from "../../state/packageViewer";
 import { useShallow } from "zustand/react/shallow";
 import {
   FolderTree,
@@ -23,6 +24,7 @@ import {
   Usb,
   PackagePlus,
   Eye,
+  ScanSearch,
   Hash,
   BadgeCheck,
 } from "lucide-react";
@@ -142,6 +144,15 @@ function parent(p: string): string {
   const i = p.lastIndexOf("/");
   if (i <= 0) return "/";
   return p.slice(0, i);
+}
+
+const isViewablePackage = (name: string) => /\.f?pkg$/i.test(name);
+
+/** What the package viewer can show: a package, a game image, or a folder named like a game
+ *  (a title id, as dumps are). */
+export function viewableEntry(name: string, isDir: boolean): boolean {
+  if (isDir) return /^[A-Z]{4}\d{5}/.test(name);
+  return isViewablePackage(name) || /\.(exfat|ffpkg|ffpfsc)$/i.test(name);
 }
 
 function joinPath(dir: string, name: string): string {
@@ -600,6 +611,38 @@ export default function FileSystemScreen() {
     () => (entries ? entries.filter((e) => selected.has(e.name)) : []),
     [entries, selected],
   );
+
+  const navigate = useNavigate();
+  /** Open the package viewer on an entry here, with the actions that fit it. */
+  const viewEntry = (entry: DirEntry) => {
+    const full = joinPath(path, entry.name);
+    const source = `ps5://${host}${full}`;
+    const viewer = usePackageViewer.getState();
+    viewer.open(
+      source,
+      isViewablePackage(entry.name)
+        ? [
+            {
+              label: tr("fs_install_action", undefined, "Install"),
+              primary: true,
+              onClick: () => {
+                viewer.close();
+                void runInstallPkg(entry);
+              },
+            },
+          ]
+        : [
+            {
+              label: tr("drop_convert", undefined, "Convert…"),
+              primary: true,
+              onClick: () => {
+                viewer.close();
+                navigate("/convert", { state: { source } });
+              },
+            },
+          ],
+    );
+  };
 
   const runInstallPkg = async (entry: DirEntry) => {
     const fullPath = joinPath(path, entry.name);
@@ -2415,6 +2458,17 @@ export default function FileSystemScreen() {
                       className="rounded-md border border-[var(--color-border)] p-1 hover:bg-[var(--color-surface-3)] disabled:opacity-40"
                     >
                       <Upload size={12} />
+                    </button>
+                  )}
+                  {viewableEntry(e.name, isDir) && host && (
+                    <button
+                      type="button"
+                      onClick={() => viewEntry(e)}
+                      aria-label={tr("viewer_open", undefined, "View details")}
+                      title={tr("viewer_open", undefined, "View details")}
+                      className="rounded-md border border-[var(--color-border)] p-1 hover:bg-[var(--color-surface-3)]"
+                    >
+                      <ScanSearch size={12} />
                     </button>
                   )}
                   {!isDir && e.size <= 256 * 1024 && (

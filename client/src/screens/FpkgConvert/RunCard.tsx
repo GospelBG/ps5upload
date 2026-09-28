@@ -77,6 +77,8 @@ export interface RunCardProps {
   onAnother: () => void;
   /** The source is a dump on the console: installing swaps it out (Convert & replace). */
   replaces?: boolean;
+  /** Open the built package in the viewer. */
+  onViewPackage?: () => void;
   /** After a swap: delete the set-aside dump, or keep it. */
   onFinishReplace?: (choice: "delete" | "keep") => void;
 }
@@ -367,6 +369,9 @@ export function RunCard(props: RunCardProps) {
           )}
           {!p.deleted && (
             <Button onClick={props.onShowFolder}>{tr("fpkg.showFolder", undefined, "Show in folder")}</Button>
+          )}
+          {!p.deleted && p.mode !== "ffpfsc" && props.onViewPackage && (
+            <Button onClick={props.onViewPackage}>{tr("viewer_open", undefined, "View details")}</Button>
           )}
           {!p.deleted && p.mode !== "ffpfsc" && (
             <Button variant="danger" onClick={props.onDelete}>

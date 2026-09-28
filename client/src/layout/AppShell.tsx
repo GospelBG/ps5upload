@@ -33,7 +33,7 @@ import {
 } from "../state/roster";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { isTauriEnv, safeUnlisten } from "../lib/tauriEnv";
-import { isInstallPackagePath } from "../lib/pkgDropDedupe";
+import { trStatic } from "../lib/trStatic";
 import { useDocumentVisible } from "../lib/visibility";
 import { useScheduleRunner } from "../state/schedules";
 import {
@@ -76,6 +76,8 @@ import { useTr } from "../state/lang";
 import { isAndroid } from "../lib/platform";
 import { localFs } from "../api/localFs";
 import { getAppVersion } from "../lib/appVersion";
+import { GlobalPackageViewer } from "../components/GlobalPackageViewer";
+import { dropTarget, usePackageViewer } from "../state/packageViewer";
 
 /** Background status polling for the engine + payload dots in the
  *  status bar. Runs for the lifetime of the app so the indicators
@@ -897,12 +899,10 @@ function useKeepPs5Awake() {
   }, [active]);
 }
 
-/** App-wide drag-drop listener that auto-routes .pkg files to the
- *  Install Package screen. Other file types fall through to the
- *  per-screen handlers (Upload screen subscribes to the same event
- *  separately). The auto-route only fires when the user is NOT
- *  already on /install-package — avoids stomping on the screen's
- *  own picker. */
+/** App-wide drag-drop listener: a package, game image or folder dropped on a screen without
+ *  its own drop zone opens the package viewer, whose Install… / Convert… takes it to the screen
+ *  that does that. A drop never starts anything by itself. Screens with their own drop zone
+ *  (Install Package, Payloads, Upload, Convert) keep their drops. */
 function usePkgAutoRoute() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -914,24 +914,30 @@ function usePkgAutoRoute() {
     const p = getCurrentWebview().onDragDropEvent((e) => {
       if (cancelled) return;
       if (e.payload.type !== "drop") return;
-      // Find the FIRST .pkg ANYWHERE in the drop, not just paths[0] — a mixed
-      // or reordered drop like [game.elf, patch.pkg] should still route the
-      // pkg to Install Package instead of being missed.
-      const pkg = (e.payload.paths ?? []).find(isInstallPackagePath);
-      if (!pkg) return;
-      // Screens that own their own drag-drop opt out of the app-wide pkg
-      // auto-route, so a drop meant for them doesn't also yank the user to
-      // Install Package: /install-package itself, and /payloads (the playlist
-      // dropzone). Without this a mixed .elf+.pkg drop on Payloads both built
-      // a playlist AND navigated away.
-      if (
-        location.pathname === "/install-package" ||
-        location.pathname === "/payloads"
-      )
-        return;
-      // Pass the picked path via navigation state — InstallPackage
-      // can pick it up and pre-fill its source field.
-      navigate("/install-package", { state: { droppedPath: pkg } });
+      // The first viewable thing ANYWHERE in the drop, not just paths[0]: a mixed drop like
+      // [game.elf, patch.pkg] still finds the package.
+      const target = dropTarget(e.payload.paths ?? [], location.pathname);
+      if (!target) return;
+      const viewer = usePackageViewer.getState();
+      viewer.open(target.path, [
+        target.kind === "package"
+          ? {
+              label: trStatic("drop_install", "Install…"),
+              primary: true,
+              onClick: () => {
+                viewer.close();
+                navigate("/install-package", { state: { droppedPath: target.path } });
+              },
+            }
+          : {
+              label: trStatic("drop_convert", "Convert…"),
+              primary: true,
+              onClick: () => {
+                viewer.close();
+                navigate("/convert", { state: { source: target.path } });
+              },
+            },
+      ]);
     });
     p.then((fn) => {
       // (2.11.0) Use safeUnlisten — was bare try/catch inline. Upload
@@ -1316,6 +1322,7 @@ export default function AppShell() {
       {/* Global in-app file/folder picker (Android real-path browser).
           Mounted once; screens drive it via pickLocalPath(). */}
       <LocalPathPicker />
+      <GlobalPackageViewer />
       {/* v5 mobile top bar — kept slim; primary nav is the bottom
           tab bar. Only renders below md. */}
       <div className="h-top-bar flex items-center gap-2 border-b border-[var(--color-border)] bg-[var(--color-surface-raised)] px-3 pb-2 pt-[calc(env(safe-area-inset-top)_+_0.5rem)] shadow-sm md:hidden">

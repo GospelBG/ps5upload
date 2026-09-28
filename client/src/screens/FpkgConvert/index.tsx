@@ -22,6 +22,7 @@ import { useWebviewDrop } from "../../lib/useWebviewDrop";
 import { useConnectionStore } from "../../state/connection";
 import { useConvertPrefs } from "../../state/convertPrefs";
 import { isArchiveSource, useFpkgConversion } from "../../state/fpkgConversion";
+import { useLocation } from "react-router";
 import { useTr } from "../../state/lang";
 import { pickLocalPath } from "../../state/localPicker";
 import { useTaskStore } from "../../state/tasks";
@@ -29,6 +30,7 @@ import { GameCard } from "./GameCard";
 import { OptionsCard } from "./OptionsCard";
 import { RunCard } from "./RunCard";
 import { SwapJournals } from "./SwapJournals";
+import { usePackageViewer } from "../../state/packageViewer";
 import { consoleSwapDeps } from "../../lib/dumpSwapConsole";
 
 /** How long a first press of Delete package stays armed. */
@@ -133,6 +135,15 @@ export default function FpkgConvertScreen() {
   );
 
   const dropActive = useWebviewDrop(chooseSource, !locked);
+
+  // A game handed over from elsewhere (the viewer's Convert… on a drop).
+  const location = useLocation();
+  const handed = (location.state as { source?: string } | null)?.source;
+  useEffect(() => {
+    if (handed) chooseSource(handed);
+    // Once per hand-over.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handed]);
 
   // The inspection of a restored result's source, so its title id is there for Launch.
   useEffect(() => {
@@ -275,6 +286,11 @@ export default function FpkgConvertScreen() {
         onBrowseImage={() => void browse("file")}
         onRemotePick={chooseSource}
         onBrowseConsole={canInstall ? () => void browseConsole() : undefined}
+        onView={
+          inspection && source.trim() && !isArchiveSource(source.trim())
+            ? () => usePackageViewer.getState().open(source.trim())
+            : undefined
+        }
         canBrowse={canBrowse}
         inspection={inspection}
         checking={checking}
@@ -331,6 +347,9 @@ export default function FpkgConvertScreen() {
         onDelete={onDelete}
         onAnother={onAnother}
         replaces={source.trim().startsWith("ps5://")}
+        onViewPackage={() => {
+          if (pipeline.phase === "done") usePackageViewer.getState().open(pipeline.packagePath);
+        }}
         onFinishReplace={(choice) =>
           void finishReplace(choice).catch((e) => setError(e instanceof Error ? e.message : String(e)))
         }

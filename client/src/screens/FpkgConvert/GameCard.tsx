@@ -47,6 +47,8 @@ export interface GameCardProps {
   onBrowseImage: () => void;
   /** A folder or image picked on a saved server. */
   onRemotePick: (path: string) => void;
+  /** Open the chosen game in the package viewer; absent when there's nothing to show. */
+  onView?: () => void;
   /** Browse the connected console for a game; absent when no console answers. */
   onBrowseConsole?: () => void;
   canBrowse: boolean;
@@ -207,6 +209,15 @@ export function GameCard(props: GameCardProps) {
                 {inspection.title ?? inspection.content_id ?? inspection.source}
               </span>
               {titleIdOf(inspection.content_id) && <span> · {titleIdOf(inspection.content_id)}</span>}
+              {props.onView && (
+                <button
+                  type="button"
+                  onClick={props.onView}
+                  className="ml-2 text-[var(--color-accent)] hover:underline"
+                >
+                  {tr("viewer_open", undefined, "View details")}
+                </button>
+              )}
               <span>
                 {" · "}
                 {prettyBytes(inspection.bytes)} ·{" "}
