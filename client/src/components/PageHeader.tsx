@@ -45,7 +45,8 @@ export function PageHeader({
           <span className="grid h-9 w-9 shrink-0 place-items-center rounded-[0.7rem] bg-[var(--color-accent-soft)] text-[var(--color-accent)]">
             <Icon size={18} />
           </span>
-          <h1 className="truncate text-2xl font-bold tracking-[-0.025em]">
+          {/* A phone has room for a two-line title, not for "Firmware Spoof Detecti…". */}
+          <h1 className="min-w-0 text-2xl leading-tight font-bold tracking-[-0.025em] [overflow-wrap:anywhere] sm:truncate">
             {title}
           </h1>
           {count !== undefined && (
@@ -55,7 +56,11 @@ export function PageHeader({
           )}
           {loading && <Spinner size={14} tone="accent" />}
         </div>
-        {right && <div className="shrink-0 sm:pt-0.5">{right}</div>}
+        {/* On a phone the actions sit under the title: let their row wrap, so a
+            button keeps its label instead of shrinking to "Ref…". */}
+        {right && (
+          <div className="shrink-0 sm:pt-0.5 [&>div]:flex-wrap max-sm:[&>div]:justify-start">{right}</div>
+        )}
       </div>
       {description && (
         <p className="max-w-3xl text-sm leading-relaxed text-[var(--color-muted)] sm:pl-12">

@@ -890,7 +890,7 @@ function Step1Picker({
               "Drop a file or folder here — it's detected automatically",
             )}
       </div>
-      <div className="mt-4 flex items-center justify-center gap-2">
+      <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
         {/* Native OS dialogs can't offer "file or folder" in one prompt, so there are two
             pickers — but drag-drop above needs no choice at all (it stats the path and
             auto-detects). The ▾ on each picks from a saved server instead. */}
