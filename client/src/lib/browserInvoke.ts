@@ -734,6 +734,16 @@ export async function browserInvoke<T>(
     case "fpkg_delete": {
       return postJson<T>("/api/fpkg/delete", { path: args["path"] });
     }
+    case "fpkg_extract": {
+      return postJson<T>("/api/fpkg/extract", {
+        source: args["source"],
+        output_dir: args["outputDir"],
+        password: args["password"],
+      });
+    }
+    case "fpkg_extract_cleanup": {
+      return postJson<T>("/api/fpkg/extract/cleanup", { path: args["path"] });
+    }
     case "ffpfsc_compress": {
       return postJson<T>("/api/ffpfsc/compress", {
         source: args["source"],

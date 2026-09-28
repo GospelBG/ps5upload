@@ -18,6 +18,8 @@ vi.hoisted(() => {
 });
 
 const build = vi.fn();
+const extract = vi.fn();
+const cleanupExtract = vi.fn(async () => ({ ok: true }));
 const deletePackage = vi.fn(async () => ({ ok: true }));
 const jobStatus = vi.fn();
 const installStream = vi.fn();
@@ -31,6 +33,8 @@ const emitRow = (row: { path: string; status: string; bytes?: number; totalBytes
 vi.mock("../api/fpkg", () => ({
   fpkg: {
     build: (...a: unknown[]) => build(...a),
+    extract: (...a: unknown[]) => extract(...a),
+    cleanupExtract: (...a: unknown[]) => cleanupExtract(...(a as [])),
     compress: vi.fn(),
     deletePackage: (...a: unknown[]) => deletePackage(...(a as [])),
   },
@@ -77,6 +81,8 @@ describe("fpkg pipeline", () => {
     useFpkgConversion.setState({ pipeline: { phase: "idle" } });
     useTaskStore.setState({ tasks: [] });
     build.mockReset().mockResolvedValue({ job_id: "j1" });
+    extract.mockReset().mockResolvedValue({ job_id: "x1" });
+    cleanupExtract.mockClear();
     jobStatus.mockReset();
     installStream.mockReset();
     uploadInstall.mockReset();
@@ -439,5 +445,70 @@ describe("fpkg pipeline", () => {
     expect(first.startsWith("/out/.ps5upload-source/")).toBe(true);
     expect(second).not.toBe(first);
   });
-});
 
+  it("unpacks a local archive, builds the game inside, then removes the unpack", async () => {
+    const game = "/out/.ps5upload-extract-x1/My Game";
+    jobStatus
+      .mockResolvedValueOnce({ status: "running", bytes_sent: 5, total_bytes: 10 })
+      .mockResolvedValueOnce({ status: "done", dest: game, bytes_sent: 10 })
+      .mockResolvedValueOnce({ status: "done", dest: "/out/a.pkg", bytes_sent: 1 });
+    await useFpkgConversion
+      .getState()
+      .start({ source: "/dl/game.7z", outputDir: "/out" }, { install: false, host: null });
+    expect(useFpkgConversion.getState().pipeline).toMatchObject({ phase: "running", stage: "extract" });
+    expect(extract).toHaveBeenCalledWith("/dl/game.7z", "/out", undefined);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(useFpkgConversion.getState().pipeline).toMatchObject({
+      stage: "extract",
+      stageDone: 5,
+      stageTotal: 10,
+    });
+    await tick();
+    expect(build).toHaveBeenCalledWith(expect.objectContaining({ source: game, outputDir: "/out" }));
+    await tick();
+    expect(useFpkgConversion.getState().pipeline).toMatchObject({
+      phase: "done",
+      source: "/dl/game.7z",
+      packagePath: "/out/a.pkg",
+    });
+    expect(cleanupExtract).toHaveBeenCalledWith(game);
+  });
+
+  it("copies a server archive, unpacks the copy, and removes both", async () => {
+    const game = "/out/.ps5upload-extract-x1/G";
+    jobStatus
+      .mockResolvedValueOnce({ status: "done", dest: "/out/.ps5upload-source/r/g.zip", bytes_sent: 1 })
+      .mockResolvedValueOnce({ status: "done", dest: game, bytes_sent: 1 })
+      .mockResolvedValueOnce({ status: "failed", error: "disk full" });
+    await useFpkgConversion
+      .getState()
+      .start({ source: "remote://nas-1/dl/g.zip", outputDir: "/out" }, { install: false, host: null });
+    expect(useFpkgConversion.getState().pipeline).toMatchObject({ stage: "copy" });
+    await tick();
+    await tick();
+    expect(extract).toHaveBeenCalledWith("/out/.ps5upload-source/r/g.zip", "/out", undefined);
+    await tick();
+    await tick();
+    expect(build).toHaveBeenCalledWith(expect.objectContaining({ source: game }));
+    expect(useFpkgConversion.getState().pipeline).toMatchObject({ phase: "failed", message: "disk full" });
+    expect(cleanupFetched).toHaveBeenCalledWith("/out/.ps5upload-source/r/g.zip");
+    expect(cleanupExtract).toHaveBeenCalledWith(game);
+  });
+
+  it("passes a RAR password, and says plainly when one is needed", async () => {
+    jobStatus.mockResolvedValueOnce({ status: "failed", error: "rar_password_required" });
+    await useFpkgConversion
+      .getState()
+      .start(
+        { source: "/dl/g.part1.rar", outputDir: "/out" },
+        { install: false, host: null, password: "pw" },
+      );
+    expect(extract).toHaveBeenCalledWith("/dl/g.part1.rar", "/out", "pw");
+    await tick();
+    const p = useFpkgConversion.getState().pipeline;
+    expect(p).toMatchObject({ phase: "failed", stage: "extract" });
+    expect(p.phase === "failed" && p.message).toMatch(/password/i);
+    expect(p.phase === "failed" && p.message).not.toMatch(/rar_password/);
+    expect(build).not.toHaveBeenCalled();
+  });
+});

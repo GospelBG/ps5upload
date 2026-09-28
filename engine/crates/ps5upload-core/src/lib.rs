@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod app_lifecycle;
+pub mod archive_extract;
 pub mod backport_pack;
 pub mod backup;
 pub mod bps;

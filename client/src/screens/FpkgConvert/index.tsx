@@ -22,7 +22,7 @@ import { isTauriEnv } from "../../lib/tauriEnv";
 import { useWebviewDrop } from "../../lib/useWebviewDrop";
 import { useConnectionStore } from "../../state/connection";
 import { useConvertPrefs } from "../../state/convertPrefs";
-import { useFpkgConversion } from "../../state/fpkgConversion";
+import { isArchiveSource, useFpkgConversion } from "../../state/fpkgConversion";
 import { useTr } from "../../state/lang";
 import { pickLocalPath } from "../../state/localPicker";
 import { useTaskStore } from "../../state/tasks";
@@ -70,6 +70,8 @@ export default function FpkgConvertScreen() {
   // overwrite the one chosen after it.
   const latest = useRef(createLatest());
   const [checking, setChecking] = useState(false);
+  // A .rar's password: held for this source only, never stored.
+  const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [deleteArmed, setDeleteArmed] = useState(false);
   const disarm = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -78,9 +80,9 @@ export default function FpkgConvertScreen() {
   const check = useCallback(
     async (path: string) => {
       if (!path.trim()) return;
-      // A game on a saved server is read when the run copies it here; looking inside it now
-      // would mean copying it all twice.
-      if (isRemotePath(path.trim())) {
+      // A game on a saved server is read when the run copies it here, and an archive when the
+      // run unpacks it; looking inside either now would mean doing that twice.
+      if (isRemotePath(path.trim()) || isArchiveSource(path.trim())) {
         latest.current.begin();
         setInspection(null);
         setEstimates(null);
@@ -120,6 +122,7 @@ export default function FpkgConvertScreen() {
       reset();
       setDeleteArmed(false);
       setSource(path);
+      setPassword("");
       void check(path);
     },
     [check, reset],
@@ -144,14 +147,14 @@ export default function FpkgConvertScreen() {
         const title =
           mode === "folder"
             ? tr("fpkg.pickFolder", undefined, "Choose the game folder")
-            : tr("fpkg.pickImage", undefined, "Choose an .exfat or .ffpkg image");
+            : tr("fpkg.pickImage", undefined, "Choose a game image or archive");
         const picked = !isTauriEnv()
           ? await pickLocalPath({ mode, title })
           : await pickPath({
               mode,
               title,
               filters:
-                mode === "file" ? [{ name: "Game image", extensions: ["exfat", "ffpkg"] }] : undefined,
+                mode === "file" ? [{ name: "Game image or archive", extensions: ["exfat", "ffpkg", "ffpfsc", "zip", "7z", "rar"] }] : undefined,
             });
         if (picked) chooseSource(picked);
       } catch {
@@ -183,7 +186,7 @@ export default function FpkgConvertScreen() {
     setError(null);
     void start(
       { source: source.trim(), outputDir: outputDir.trim() || undefined, compression },
-      { install, host: install ? host : null },
+      { install, host: install ? host : null, password: password || undefined },
     );
   };
 
@@ -248,6 +251,7 @@ export default function FpkgConvertScreen() {
           setEstimates(null);
           setChecking(false);
           setSource(v);
+          setPassword("");
         }}
         onCheck={() => void check(source)}
         onBrowseFolder={() => void browse("folder")}
@@ -258,6 +262,8 @@ export default function FpkgConvertScreen() {
         checking={checking}
         locked={locked}
         dropActive={dropActive}
+        password={password}
+        onPassword={setPassword}
       />
 
       <OptionsCard
@@ -313,6 +319,13 @@ export default function FpkgConvertScreen() {
                   "fpkg.about",
                   undefined,
                   "Point it at a game folder, or at an .exfat or .ffpkg mount image. The converter reads the tree, checks that everything a launchable package needs is present, and writes a debug-format .pkg into the output folder.",
+                )}
+              </p>
+              <p>
+                {tr(
+                  "fpkg.aboutArchives",
+                  undefined,
+                  "Also accepted: a .ffpfsc image, read through the image inside it, and a .zip, .7z or .rar archive, unpacked into the output folder first. Only .rar archives can have a password.",
                 )}
               </p>
               <p>

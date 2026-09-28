@@ -4,6 +4,7 @@
 import type { Pipeline, PipelineMode, PipelineStage } from "../../state/fpkgConversion";
 import type { Task } from "../../state/tasks";
 import { isRemotePath } from "../../lib/remotePath";
+import { isArchiveSource } from "../../state/fpkgConversion";
 
 export type RowState = "pending" | "active" | "done" | "failed";
 
@@ -23,6 +24,7 @@ const INSTALL: readonly PipelineStage[] = ["send", "install"];
 /** Share of the whole run each stage stands for (compressing dominates a build). */
 const WEIGHT: Record<PipelineStage, number> = {
   copy: 25,
+  extract: 20,
   check: 2,
   plan: 2,
   compress: 55,
@@ -33,7 +35,9 @@ const WEIGHT: Record<PipelineStage, number> = {
 };
 
 function stagesFor(mode: PipelineMode, source: string): readonly PipelineStage[] {
-  const copy: PipelineStage[] = mode !== "install" && isRemotePath(source) ? ["copy"] : [];
+  const copy: PipelineStage[] = [];
+  if (mode !== "install" && isRemotePath(source)) copy.push("copy");
+  if (mode !== "install" && isArchiveSource(source)) copy.push("extract");
   switch (mode) {
     case "convert-install":
       return [...copy, ...BUILD, ...INSTALL];

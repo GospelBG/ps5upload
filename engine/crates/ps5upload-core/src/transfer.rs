@@ -2800,7 +2800,7 @@ static ZIP_MATERIALISER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// and absolute/empty paths — the same zip-slip defense as the client's
 /// `save_archive::sanitize_entry`, returning a string instead of a host
 /// `PathBuf`. Returns `None` for directory-only or unsafe names.
-fn sanitize_zip_entry(name: &str) -> Option<String> {
+pub(crate) fn sanitize_zip_entry(name: &str) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     for seg in name.split('/') {
         if seg.is_empty() || seg == "." {
@@ -3823,7 +3823,7 @@ pub fn transfer_zip_resumable(
 /// `sanitize_zip_entry`, except 7z archives created on Windows legitimately use
 /// '\\' as the path separator (zip always uses '/'), so backslashes are
 /// translated to forward slashes rather than rejected.
-fn sanitize_7z_entry(name: &str) -> Option<String> {
+pub(crate) fn sanitize_7z_entry(name: &str) -> Option<String> {
     sanitize_zip_entry(&name.replace('\\', "/"))
 }
 
@@ -3869,7 +3869,7 @@ fn select_sevenz_decode_threads(configured: Option<&str>) -> u32 {
         .unwrap_or(1) as u32
 }
 
-fn sevenz_decode_threads() -> u32 {
+pub(crate) fn sevenz_decode_threads() -> u32 {
     select_sevenz_decode_threads(std::env::var("PS5UPLOAD_7Z_THREADS").ok().as_deref())
 }
 
@@ -4265,6 +4265,8 @@ pub use rar_support::{
     inspect_rar, rar_plan_entries_for_test, rar_plan_preview, spawn_rar_worker_for_test,
     transfer_rar_resumable, transfer_rar_streaming,
 };
+#[cfg(not(target_os = "android"))]
+pub(crate) use rar_support::{rar_dirs, rar_plan_entries, spawn_rar_worker};
 
 #[cfg(not(target_os = "android"))]
 mod rar_support {
@@ -4557,6 +4559,24 @@ mod rar_support {
     /// sorted names transposed two adjacent pairs in a real 181-file archive
     /// — `precisionarrow` vs `precision_precisionplus`, where `_` sorts
     /// before a letter — and the lock-step check caught it.
+    /// The archive's directory entries, sanitised: an empty one (a game may
+    /// look for it) has no file to create it.
+    pub(crate) fn rar_dirs(archive_path: &Path, password: Option<&str>) -> Result<Vec<String>> {
+        let path_str = archive_path.to_string_lossy().into_owned();
+        let mut out = Vec::new();
+        for entry in list_headers(&path_str, password)
+            .map_err(|e| map_rar_open_err(&path_str, "open rar", e))?
+        {
+            let entry = entry.map_err(|e| map_rar_err("read rar header", e))?;
+            if entry.is_directory() {
+                if let Some(rel) = sanitize_rar_entry(&entry.filename) {
+                    out.push(rel);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn rar_plan_entries(
         archive_path: &Path,
         password: Option<&str>,
@@ -4607,7 +4627,7 @@ mod rar_support {
     /// Runs on its own thread because UnRAR pushes bytes at us while the shard
     /// sender pulls; the bounded channel between them is the backpressure, so
     /// peak memory is a few chunks rather than a whole entry.
-    fn spawn_rar_worker(
+    pub(crate) fn spawn_rar_worker(
         archive_path: &Path,
         password: Option<&str>,
         excludes: Vec<String>,
@@ -4702,6 +4722,9 @@ mod rar_support {
                     true
                 });
 
+                // UnRAR reports a wrong password on a content-encrypted entry
+                // as a CRC error; with a password given, that is what it means.
+                let encrypted = header.entry().is_encrypted();
                 let sink = StreamSink::new(chunk_tx);
                 let result = header.read_to_sink(sink);
 
@@ -4726,7 +4749,11 @@ mod rar_support {
                         // The sink was consumed (and its sender dropped)
                         // inside the failed call, so the forwarder can finish.
                         let _ = fwd.join();
-                        fail(&tx, format!("{:#}", map_rar_err("extract rar entry", e)));
+                        if encrypted && password.is_some() && e.code == RarCode::BadData {
+                            fail(&tx, "rar_password_wrong".to_string());
+                        } else {
+                            fail(&tx, format!("{:#}", map_rar_err("extract rar entry", e)));
+                        }
                         return;
                     }
                 }

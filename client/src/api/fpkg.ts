@@ -45,7 +45,7 @@ export interface FpkgInspection {
 }
 
 export interface FpkgBuildRequest {
-  /** A game folder, or an .exfat / .ffpkg mount image. */
+  /** A game folder, an .exfat / .ffpkg / .ffpfsc image, or a .zip / .7z / .rar holding one. */
   source: string;
   /** Defaults to ~/Downloads/fpkgs in the engine. */
   outputDir?: string;
@@ -73,6 +73,12 @@ export const fpkg = {
       compression: req.compression,
       firmware: req.firmware,
     }),
+  /** Unpack a .zip / .7z / .rar into an unpack folder in `outputDir`, as a job; the job's
+   *  `dest` is the game found inside. A RAR's password goes with it, never stored. */
+  extract: (source: string, outputDir?: string, password?: string) =>
+    invoke<{ job_id: string }>("fpkg_extract", { source, outputDir, password }),
+  /** Remove the unpack folder a game path from `extract` lies in. */
+  cleanupExtract: (path: string) => invoke<{ ok: boolean }>("fpkg_extract_cleanup", { path }),
   /** Size and time at each compression level for a game: a separate request from the check,
    *  since sampling a large game on a slow drive takes a while. */
   estimate: (source: string) => invoke<FpkgEstimates>("fpkg_estimate", { source }),

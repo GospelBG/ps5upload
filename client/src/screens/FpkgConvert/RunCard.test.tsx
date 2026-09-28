@@ -101,6 +101,7 @@ describe("RunCard", () => {
       installTaskId: null,
       taskId: null,
       copiedSource: null,
+      extractedSource: null,
       packagePath: null,
       titleId: null,
     });
@@ -196,6 +197,7 @@ describe("RunCard", () => {
       installTaskId: null,
       taskId: null,
       copiedSource: null,
+      extractedSource: null,
       packagePath: null,
       titleId: null,
     });

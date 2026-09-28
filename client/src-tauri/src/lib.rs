@@ -293,6 +293,8 @@ pub fn run() {
             commands::fpkg_delete,
             commands::fpkg_estimate,
             commands::ffpfsc_compress,
+            commands::fpkg_extract,
+            commands::fpkg_extract_cleanup,
             commands::job_status,
             commands::job_cancel,
             commands::engine_logs_tail,

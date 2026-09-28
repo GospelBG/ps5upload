@@ -13,6 +13,7 @@ const base = {
   installTaskId: null,
   taskId: null,
   copiedSource: null,
+  extractedSource: null,
   packagePath: null,
   titleId: null,
 };

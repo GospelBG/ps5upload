@@ -16,6 +16,7 @@ import { isRemotePath } from "../lib/remotePath";
 
 export type PipelineStage =
   | "copy"
+  | "extract"
   | "check"
   | "plan"
   | "compress"
@@ -58,6 +59,9 @@ export type Pipeline =
       titleId: string | null;
       /** A server source copied to this computer for the build; removed once it succeeds. */
       copiedSource: string | null;
+      /** The game unpacked from an archive (inside an engine unpack folder); removed with it
+       *  once the run is over. */
+      extractedSource: string | null;
     }
   | {
       phase: "done";
@@ -88,7 +92,13 @@ export interface ConversionState {
   pipeline: Pipeline;
   start: (
     req: FpkgBuildRequest,
-    opts: { install: boolean; host: string | null; method?: InstallMethod },
+    opts: {
+      install: boolean;
+      host: string | null;
+      method?: InstallMethod;
+      /** An archive's password (RAR); never stored. */
+      password?: string;
+    },
   ) => Promise<void>;
   /** Compress an .exfat / .ffpkg image into a .ffpfsc. */
   compress: (source: string, outputDir?: string) => Promise<void>;
@@ -111,6 +121,7 @@ type Running = Extract<Pipeline, { phase: "running" }>;
 /** The stage names Convert's progress card shows. */
 const STAGE_LABEL: Record<PipelineStage, string> = {
   copy: "Copy from server",
+  extract: "Unpack archive",
   check: "Check source",
   plan: "Plan package",
   compress: "Compress",
@@ -375,18 +386,82 @@ function beginRun(mode: PipelineMode, source: string, host: string | null, stage
       packagePath: null,
       titleId: null,
       copiedSource: null,
+      extractedSource: null,
     },
   });
 }
 
-/** Build from a local copy of a source on a saved server: copy it (a stage of this run, with
- *  progress and Cancel) into the output folder, then start the job `startJob` makes. */
-async function copyThenStart(
+/** `.zip`, `.7z` or `.rar` (a multi-part set starts at its first `.partN.rar`). */
+export function isArchiveSource(path: string): boolean {
+  return /\.(zip|7z|rar)$/i.test(path.trim());
+}
+
+/** The engine's archive errors, said for a person. */
+export function archiveErrorText(message: string): string {
+  if (/rar_password_required/.test(message))
+    return "This archive is password-protected. Enter its password and start again.";
+  if (/rar_password_wrong/.test(message))
+    return "The archive's password is wrong. Check it and start again.";
+  const missing = /rar_missing_volume:\s*(.+)/.exec(message);
+  if (missing)
+    return `A part of this archive is missing: ${missing[1].trim()}. Keep every part in the same folder.`;
+  return message;
+}
+
+/** Unpack an archive with the engine, following its job; the game path found inside. */
+async function extractArchive(archive: string, outputDir: string | undefined, password?: string) {
+  const { job_id } = await fpkg.extract(archive, outputDir, password);
+  update({ jobId: job_id });
+  for (;;) {
+    const s = await jobStatus(job_id);
+    if (s.status === "done") return s.dest ?? "";
+    if (s.status === "failed") throw new Error(s.error ?? "The archive did not unpack.");
+    if (running()?.jobId === job_id) enterStage("extract", s.bytes_sent ?? 0, s.total_bytes ?? 0);
+    await new Promise((r) => setTimeout(r, POLL_MS));
+  }
+}
+
+/** Get a source ready for the build, as stages of this run (each with progress and Cancel):
+ *  a server source is copied into the output folder, an archive is unpacked there. Then start
+ *  the job `startJob` makes on what that left. */
+async function prepareThenStart(
   source: string,
   outputDir: string | undefined,
   startJob: (local: string) => Promise<{ job_id: string }>,
   install: InstallMethod | null,
+  password?: string,
 ) {
+  let local = source;
+  if (isRemotePath(source)) {
+    if (!(await copyFromServer(source, outputDir))) return;
+    local = running()?.copiedSource ?? "";
+  }
+  if (isArchiveSource(local)) {
+    enterStage("extract");
+    try {
+      local = await extractArchive(local, outputDir, password);
+    } catch (error) {
+      fail("extract", archiveErrorText(error instanceof Error ? error.message : String(error)), null);
+      return;
+    }
+    if (!running()) {
+      void fpkg.cleanupExtract(local).catch(() => {});
+      return;
+    }
+    update({ extractedSource: local, jobId: null });
+  }
+  enterStage("check");
+  try {
+    const { job_id } = await startJob(local);
+    update({ jobId: job_id });
+    poll(job_id, install);
+  } catch (error) {
+    fail("check", error instanceof Error ? error.message : String(error), null);
+  }
+}
+
+/** Copy a server source into the output folder; false (the run already failed) if it didn't. */
+async function copyFromServer(source: string, outputDir: string | undefined): Promise<boolean> {
   let local: string;
   try {
     local = await fetchRemote(source, {
@@ -400,28 +475,22 @@ async function copyThenStart(
     });
   } catch (error) {
     fail("copy", error instanceof Error ? error.message : String(error), null);
-    return;
+    return false;
   }
-  if (!running()) return;
+  if (!running()) return false;
   update({ copiedSource: local, jobId: null });
-  enterStage("check");
-  try {
-    const { job_id } = await startJob(local);
-    update({ jobId: job_id });
-    poll(job_id, install);
-  } catch (error) {
-    fail("check", error instanceof Error ? error.message : String(error), null);
-  }
+  return true;
 }
 
 function runFolder(): string {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 }
 
-/** The copy of a server source is only scaffolding: drop it once the build is over, whether it
- *  finished or not (the next run copies again into a folder of its own). */
+/** The copy of a server source and an archive's unpack are only scaffolding: drop them once
+ *  the build is over, whether it finished or not (the next run makes its own). */
 function dropCopy(p: Running) {
   if (p.copiedSource) void remoteApi.cleanupFetched(p.copiedSource).catch(() => {});
+  if (p.extractedSource) void fpkg.cleanupExtract(p.extractedSource).catch(() => {});
 }
 
 /** "UP4433-PPSA17221_00-MINECRAFTPS50000" → "PPSA17221". */
@@ -438,12 +507,23 @@ function currentHost(): string | null {
 export const useFpkgConversion = create<ConversionState>((set, get) => ({
   pipeline: { phase: "idle" },
 
-  start: async (req, { install, host, method = "stream" }) => {
+  start: async (req, { install, host, method = "stream", password }) => {
     const then = install ? method : null;
     if (get().pipeline.phase === "running") return;
-    if (isRemotePath(req.source)) {
-      beginRun(install ? "convert-install" : "convert", req.source, host, "copy");
-      void copyThenStart(req.source, req.outputDir, (local) => fpkg.build({ ...req, source: local }), then);
+    if (isRemotePath(req.source) || isArchiveSource(req.source)) {
+      beginRun(
+        install ? "convert-install" : "convert",
+        req.source,
+        host,
+        isRemotePath(req.source) ? "copy" : "extract",
+      );
+      void prepareThenStart(
+        req.source,
+        req.outputDir,
+        (local) => fpkg.build({ ...req, source: local }),
+        then,
+        password,
+      );
       return;
     }
     beginRun(install ? "convert-install" : "convert", req.source, host, "check");
@@ -460,7 +540,7 @@ export const useFpkgConversion = create<ConversionState>((set, get) => ({
     if (get().pipeline.phase === "running") return;
     if (isRemotePath(source)) {
       beginRun("ffpfsc", source, null, "copy");
-      void copyThenStart(source, outputDir, (local) => fpkg.compress(local, outputDir), null);
+      void prepareThenStart(source, outputDir, (local) => fpkg.compress(local, outputDir), null);
       return;
     }
     beginRun("ffpfsc", source, null, "compress");

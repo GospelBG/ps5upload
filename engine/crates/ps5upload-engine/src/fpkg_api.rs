@@ -612,6 +612,318 @@ pub(crate) async fn ffpfsc_compress_handler(
         .into_response()
 }
 
+/// Prefix of the folders archives are unpacked into, inside the output folder.
+const EXTRACT_PREFIX: &str = ".ps5upload-extract-";
+
+/// Unpack folders this engine is still using (a build reads from one until it is cleaned).
+fn active_extracts() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+/// Unpacking needs room for the files and, after them, for a package about as large on the
+/// same drive; the 1% is the margin the build's own check keeps.
+fn extract_shortfall(free: u64, unpacked: u64) -> Option<String> {
+    let needed = unpacked.saturating_mul(2).saturating_add(unpacked / 100);
+    (free < needed).then(|| {
+        format!(
+            "only {:.1} GiB free in the output folder; unpacking this archive and building its package needs about {:.1} GiB",
+            free as f64 / (1u64 << 30) as f64,
+            needed as f64 / (1u64 << 30) as f64,
+        )
+    })
+}
+
+/// The unpack folder `path` is in (it or an ancestor named `.ps5upload-extract-*`), or None:
+/// cleanup never deletes anything else.
+fn extract_root_of(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|a| {
+            a.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(EXTRACT_PREFIX) && n.len() > EXTRACT_PREFIX.len())
+        })
+        .map(Path::to_path_buf)
+}
+
+/// Unpack folders left in `out` by an earlier run (a crash, a closed app), not in use now.
+fn remove_stale_extracts(out: &Path) {
+    let Ok(entries) = std::fs::read_dir(out) else {
+        return;
+    };
+    let active = active_extracts().lock().unwrap_or_else(|e| e.into_inner());
+    for e in entries.flatten() {
+        let p = e.path();
+        let stale = e
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(EXTRACT_PREFIX))
+            && e.file_type().is_ok_and(|t| t.is_dir())
+            && !active.contains(&p);
+        if stale {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ExtractReq {
+    /// A `.zip`, `.7z` or `.rar` (the first volume of a multi-part set).
+    source: String,
+    #[serde(default)]
+    output_dir: Option<String>,
+    /// RAR only; never logged.
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// POST /api/fpkg/extract — unpack a game archive into the output folder, as a job. Done's
+/// `dest` is the game found inside (a folder or an image), which the build then reads; the
+/// unpack folder is removed by `/api/fpkg/extract/cleanup`, on failure, or by a later run.
+pub(crate) async fn fpkg_extract_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ExtractReq>,
+) -> impl IntoResponse {
+    use ps5upload_core::archive_extract;
+    let source = resolve_engine_path(&req.source);
+    if archive_extract::archive_kind(&source).is_none() || !source.is_file() {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            format!("{} is not a .zip, .7z or .rar file", source.display()),
+        )
+        .into_response();
+    }
+    let out = output_dir(req.output_dir.as_deref());
+    if let Err(e) = std::fs::create_dir_all(&out) {
+        return json_err(StatusCode::BAD_REQUEST, format!("{}: {e}", out.display()))
+            .into_response();
+    }
+    let password = req.password.filter(|p| !p.is_empty());
+    let size = {
+        let (source, password, out) = (source.clone(), password.clone(), out.clone());
+        tokio::task::spawn_blocking(move || {
+            remove_stale_extracts(&out);
+            archive_extract::unpacked_size(&source, password.as_deref())
+        })
+        .await
+    };
+    let total = match size {
+        Ok(Ok(total)) => total,
+        Ok(Err(e)) => return json_err(StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+        Err(join) => {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("the archive listing failed: {join}"),
+            )
+            .into_response()
+        }
+    };
+    if let Some(message) = build::free_bytes(&out).and_then(|free| extract_shortfall(free, total)) {
+        return json_err(StatusCode::BAD_REQUEST, message).into_response();
+    }
+
+    let job_id = Uuid::new_v4();
+    let dest = out.join(format!("{EXTRACT_PREFIX}{job_id}"));
+    active_extracts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dest.clone());
+    let cancel = register_transfer_cancel(job_id);
+    let bytes = Arc::new(AtomicU64::new(0));
+    let started_at_ms = now_ms();
+    set_job(
+        &state.jobs,
+        &state.events_tx,
+        job_id,
+        JobState::Running {
+            stage: None,
+            started_at_ms,
+            bytes_sent: 0,
+            total_bytes: total,
+            files: Vec::new(),
+            skipped_files: 0,
+            skipped_bytes: 0,
+            files_processing: 0,
+            files_finalized: 0,
+            files_finalizing_total: 0,
+            bytes_finalized: 0,
+        },
+    );
+    let jobs = state.jobs.clone();
+    let events_tx = state.events_tx.clone();
+    let tick_bytes = bytes.clone();
+    let ticker = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut g = jobs.lock().unwrap_or_else(|e| e.into_inner());
+            match g.get_mut(&job_id) {
+                Some(JobState::Running { bytes_sent, .. }) => {
+                    *bytes_sent = tick_bytes.load(Ordering::Relaxed);
+                    let state = g.get(&job_id).cloned();
+                    drop(g);
+                    if let Some(state) = state {
+                        let msg = serde_json::json!({ "job_id": job_id.to_string(), "job": state });
+                        let _ = events_tx.send(msg.to_string());
+                    }
+                }
+                _ => break,
+            }
+        }
+    });
+
+    let state_for_job = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut progress = |done: u64, _total: u64| bytes.store(done, Ordering::Relaxed);
+        let outcome =
+            archive_extract::extract(&source, &dest, password.as_deref(), &mut progress, &cancel)
+                .and_then(|()| archive_extract::find_game(&dest));
+        let completed_at_ms = now_ms();
+        ticker.abort();
+        match outcome {
+            Ok(game) => {
+                crate::engine_log::record(
+                    "info",
+                    format!(
+                        "fpkg: unpacked {} ({} bytes); the game is {}",
+                        source.display(),
+                        total,
+                        game.display()
+                    ),
+                );
+                set_job(
+                    &state_for_job.jobs,
+                    &state_for_job.events_tx,
+                    job_id,
+                    JobState::Done {
+                        started_at_ms,
+                        completed_at_ms,
+                        elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
+                        tx_id_hex: String::new(),
+                        shards_sent: 0,
+                        bytes_sent: total,
+                        dest: game.display().to_string(),
+                        files_sent: 0,
+                        skipped_files: 0,
+                        skipped_bytes: 0,
+                        commit_ack: None,
+                    },
+                );
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&dest);
+                active_extracts()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&dest);
+                crate::engine_log::record("warn", format!("fpkg: unpack failed: {error:#}"));
+                set_job(
+                    &state_for_job.jobs,
+                    &state_for_job.events_tx,
+                    job_id,
+                    JobState::Failed {
+                        started_at_ms,
+                        completed_at_ms,
+                        elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
+                        error: format!("{error:#}"),
+                        error_reason: None,
+                        error_detail: None,
+                    },
+                );
+            }
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(JobCreated {
+            job_id: job_id.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ExtractCleanupReq {
+    /// The game path an unpack reported, or its unpack folder.
+    path: String,
+}
+
+/// POST /api/fpkg/extract/cleanup — remove an unpack folder once its build is over.
+pub(crate) async fn fpkg_extract_cleanup_handler(
+    Json(req): Json<ExtractCleanupReq>,
+) -> impl IntoResponse {
+    let path = resolve_engine_path(&req.path);
+    let Some(root) = extract_root_of(&path) else {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            format!("{} is not an unpack folder", path.display()),
+        )
+        .into_response();
+    };
+    let removed = tokio::task::spawn_blocking(move || {
+        active_extracts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&root);
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("{}: {e}", root.display())),
+        }
+    })
+    .await;
+    match removed {
+        Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(join) => json_err(StatusCode::INTERNAL_SERVER_ERROR, join.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod extract_tests {
+    use super::*;
+
+    #[test]
+    fn space_for_the_files_and_then_the_package() {
+        let gib = 1u64 << 30;
+        assert!(extract_shortfall(21 * gib, 10 * gib).is_none());
+        let m = extract_shortfall(15 * gib, 10 * gib).unwrap();
+        assert!(m.contains("15.0 GiB") && m.contains("20.1 GiB"), "{m}");
+    }
+
+    #[test]
+    fn cleanup_only_reaches_an_unpack_folder() {
+        let root = Path::new("/out/.ps5upload-extract-abc");
+        assert_eq!(
+            extract_root_of(&root.join("My Game/eboot.bin")).as_deref(),
+            Some(root)
+        );
+        assert_eq!(extract_root_of(root).as_deref(), Some(root));
+        assert!(extract_root_of(Path::new("/out/games/x")).is_none());
+        assert!(extract_root_of(Path::new("/out/.ps5upload-extract-")).is_none());
+    }
+
+    #[test]
+    fn stale_unpacks_go_but_active_ones_stay() {
+        let out = std::env::temp_dir().join(format!("ps5upload-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let (old, live, keep) = (
+            out.join(".ps5upload-extract-old"),
+            out.join(".ps5upload-extract-live"),
+            out.join("game.pkg"),
+        );
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(&keep, b"x").unwrap();
+        active_extracts().lock().unwrap().insert(live.clone());
+        remove_stale_extracts(&out);
+        assert!(!old.exists());
+        assert!(live.exists() && keep.exists());
+        active_extracts().lock().unwrap().remove(&live);
+    }
+}
+
 #[cfg(test)]
 mod delete_tests {
     use super::*;

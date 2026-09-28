@@ -2415,6 +2415,35 @@ pub async fn fpkg_delete(path: String) -> Result<JsonValue, String> {
     post_json(&url, &serde_json::json!({ "path": path })).await
 }
 
+/// Unpack a game archive into the output folder; runs as an engine job whose `dest` is the
+/// game found inside. POST /api/fpkg/extract.
+#[tauri::command]
+pub async fn fpkg_extract(
+    source: String,
+    output_dir: Option<String>,
+    password: Option<String>,
+) -> Result<JsonValue, String> {
+    let base = engine::url();
+    let url = format!("{base}/api/fpkg/extract");
+    post_json(
+        &url,
+        &serde_json::json!({
+            "source": source,
+            "output_dir": output_dir,
+            "password": password,
+        }),
+    )
+    .await
+}
+
+/// Remove an archive's unpack folder. POST /api/fpkg/extract/cleanup.
+#[tauri::command]
+pub async fn fpkg_extract_cleanup(path: String) -> Result<JsonValue, String> {
+    let base = engine::url();
+    let url = format!("{base}/api/fpkg/extract/cleanup");
+    post_json(&url, &serde_json::json!({ "path": path })).await
+}
+
 /// Compress a game image into a `.ffpfsc` for ShadowMountPlus; runs as an engine job.
 #[tauri::command]
 pub async fn ffpfsc_compress(

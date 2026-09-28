@@ -6,6 +6,7 @@ import type { FpkgInspection } from "../../api/fpkg";
 import { Card, Input } from "../../components";
 import { BrowseButton, PathLabel } from "../../components/BrowseButton";
 import { isRemotePath } from "../../lib/remotePath";
+import { isArchiveSource } from "../../state/fpkgConversion";
 import { useTr } from "../../state/lang";
 import { prettyBytes } from "./RunCard";
 
@@ -52,6 +53,9 @@ export interface GameCardProps {
   /** A run is going: nothing here may change. */
   locked: boolean;
   dropActive: boolean;
+  /** A .rar's password, when the source is one; never stored. */
+  password: string;
+  onPassword: (value: string) => void;
 }
 
 export function GameCard(props: GameCardProps) {
@@ -73,7 +77,7 @@ export function GameCard(props: GameCardProps) {
         >
           <FolderInput size={20} aria-hidden className="text-[var(--color-muted)]" />
           <div>
-            {tr("fpkg.dropHere", undefined, "Drop a game folder, .exfat or .ffpkg here")}
+            {tr("fpkg.dropHere", undefined, "Drop a game folder, image or archive here")}
           </div>
           {props.canBrowse && (
             <div className="flex flex-wrap justify-center gap-2">
@@ -89,9 +93,9 @@ export function GameCard(props: GameCardProps) {
               <BrowseButton
                 mode="file"
                 remote
-                label={tr("fpkg.browseImage", undefined, "Image…")}
-                title={tr("fpkg.pickImage", undefined, "Choose an .exfat or .ffpkg image")}
-                filters={[{ name: "Game image", extensions: ["exfat", "ffpkg"] }]}
+                label={tr("fpkg.browseImage", undefined, "Image or archive…")}
+                title={tr("fpkg.pickImage", undefined, "Choose a game image or archive")}
+                filters={[{ name: "Game image or archive", extensions: ["exfat", "ffpkg", "ffpfsc", "zip", "7z", "rar"] }]}
                 disabled={props.locked || props.checking}
                 onMainClick={props.onBrowseImage}
                 onPick={props.onRemotePick}
@@ -107,7 +111,7 @@ export function GameCard(props: GameCardProps) {
               placeholder={tr(
                 "fpkg.sourcePlaceholder",
                 undefined,
-                "/games/PPSA09519.exfat, /games/my-game, /games/game.ffpkg",
+                "/games/PPSA09519.exfat, /games/my-game, /downloads/game.7z",
               )}
               value={props.source}
               disabled={props.locked}
@@ -128,6 +132,31 @@ export function GameCard(props: GameCardProps) {
               )}
             </span>
           </div>
+        )}
+        {isArchiveSource(props.source) && !isRemotePath(props.source) && !props.locked && (
+          <div className="flex items-center gap-1 text-sm text-[var(--color-muted)]">
+            <PathLabel path={props.source} />
+            <span>
+              {"— "}
+              {tr(
+                "fpkg.archiveSource",
+                undefined,
+                "an archive. It is unpacked into the output folder when you start, and removed when the run ends.",
+              )}
+            </span>
+          </div>
+        )}
+        {/\.rar$/i.test(props.source.trim()) && (
+          <Input
+            id="fpkg-archive-password"
+            type="password"
+            autoComplete="off"
+            label={tr("fpkg.archivePassword", undefined, "Archive password")}
+            hint={tr("fpkg.archivePasswordHint", undefined, "Only for a password-protected .rar. It is not saved.")}
+            value={props.password}
+            disabled={props.locked}
+            onChange={(e) => props.onPassword(e.target.value)}
+          />
         )}
         {props.checking && (
           <div className="text-sm text-[var(--color-muted)]">

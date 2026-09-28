@@ -13,7 +13,8 @@ vi.mock("../../lib/tauriEnv", () => ({ isTauriEnv: () => false }));
 
 import type { FpkgInspection } from "../../api/fpkg";
 import { CompressionTiles } from "./CompressionTiles";
-import { firmwareLine } from "./GameCard";
+import { firmwareLine, GameCard, type GameCardProps } from "./GameCard";
+import { MemoryRouter } from "react-router";
 import { OptionsCard } from "./OptionsCard";
 
 const estimates = {
@@ -94,5 +95,46 @@ describe("GameCard firmware line", () => {
       "Runs on FW 5.10 and later",
     );
     expect(firmwareLine(base, tr)).toBeNull();
+  });
+});
+
+describe("GameCard archive source", () => {
+  const props = (source: string): GameCardProps => ({
+    source,
+    onSourceTyped: () => {},
+    onCheck: () => {},
+    onBrowseFolder: () => {},
+    onBrowseImage: () => {},
+    onRemotePick: () => {},
+    canBrowse: true,
+    inspection: null,
+    checking: false,
+    locked: false,
+    dropActive: false,
+    password: "",
+    onPassword: () => {},
+  });
+
+  it("says an archive is unpacked when the run starts, and asks a .rar for its password", () => {
+    const rar = renderToStaticMarkup(
+      <MemoryRouter>
+        <GameCard {...props("/dl/game.part1.rar")} />
+      </MemoryRouter>,
+    );
+    expect(rar).toContain("unpacked into the output folder");
+    expect(rar).toContain('type="password"');
+    const zip = renderToStaticMarkup(
+      <MemoryRouter>
+        <GameCard {...props("/dl/game.zip")} />
+      </MemoryRouter>,
+    );
+    expect(zip).toContain("unpacked into the output folder");
+    expect(zip).not.toContain('type="password"');
+    const folder = renderToStaticMarkup(
+      <MemoryRouter>
+        <GameCard {...props("/games/g")} />
+      </MemoryRouter>,
+    );
+    expect(folder).not.toContain("unpacked");
   });
 });

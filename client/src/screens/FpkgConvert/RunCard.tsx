@@ -38,6 +38,7 @@ export function deleteLabel(armed: boolean): string {
 
 const LABEL: Record<PipelineStage, [string, string]> = {
   copy: ["fpkg.stage.copy", "Copy from server"],
+  extract: ["fpkg.stage.extract", "Unpack archive"],
   check: ["fpkg.stage.check", "Check source"],
   plan: ["fpkg.stage.plan", "Plan package"],
   compress: ["fpkg.stage.compress", "Compress"],
