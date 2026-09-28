@@ -59,7 +59,9 @@ export function Button({
   // long, that's a layout decision for the call site (truncate / give room),
   // never a reason to stack letters.
   const base =
-    "inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-[var(--radius-control)] font-semibold " +
+    // `shrink-0`: a button keeps its label; a tight row wraps (or the call site
+    // gives room) rather than ellipsizing "Refresh" to "Ref…".
+    "inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-[var(--radius-control)] font-semibold " +
     "transition-[background-color,border-color,color,transform,box-shadow] active:translate-y-px " +
     "disabled:cursor-not-allowed disabled:opacity-50";
 

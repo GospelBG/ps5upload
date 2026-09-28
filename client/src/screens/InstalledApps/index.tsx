@@ -602,7 +602,7 @@ function Section({
         </div>
         {controls}
       </div>
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(8rem,1fr))] gap-3">
         {children}
       </div>
     </section>
@@ -1280,7 +1280,7 @@ export default function InstalledAppsScreen({
             aria-hidden
             // Must match the real Section grid breakpoints exactly (line ~308)
             // or the cards visibly reflow the moment data arrives.
-            className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6"
+            className="grid grid-cols-[repeat(auto-fill,minmax(8rem,1fr))] gap-3"
           >
             {Array.from({ length: 10 }, (_, i) => (
               <Skeleton key={i} className="aspect-square" />
