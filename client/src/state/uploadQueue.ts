@@ -59,6 +59,7 @@ import { releaseCopy } from "../lib/materialize";
 import {
   getInstallExecutor,
   registerInstallEnqueuer,
+  registerPkgQueueApi,
   type EnqueueInstallInput,
   type EnqueuedInstall,
   type InstallRequest,
@@ -1728,6 +1729,34 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
 
 // pkgLibrary queues installs through the bridge (it can't import this module).
 registerInstallEnqueuer((input) => useUploadQueueStore.getState().enqueueInstall(input));
+registerPkgQueueApi({
+  add(item) {
+    const q = useUploadQueueStore.getState();
+    q.add(item);
+    const items = useUploadQueueStore.getState().items;
+    const id = items[items.length - 1].id;
+    void useUploadQueueStore.getState().startHost(hostOf(item.addr));
+    return id;
+  },
+  watch(id, cb) {
+    const view = (items: QueueItem[]) => {
+      const it = items.find((x) => x.id === id);
+      return it
+        ? {
+            status: it.status,
+            bytesSent: it.bytesSent,
+            totalBytes: it.totalBytes,
+            bytesPerSec: it.bytesPerSec,
+            error: it.error,
+          }
+        : null;
+    };
+    cb(view(useUploadQueueStore.getState().items));
+    return useUploadQueueStore.subscribe((s, prev) => {
+      if (s.items !== prev.items) cb(view(s.items));
+    });
+  },
+});
 
 /** Post-install settle. A main-payload install briefly destabilises SceShellUI
  *  (the screen-black blip) and the connection recovers a beat later; starting

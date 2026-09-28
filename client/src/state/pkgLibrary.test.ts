@@ -45,6 +45,20 @@ vi.mock("../api/ps5", () => ({
     detail?: string;
   },
   jobCancel: vi.fn(async () => {}),
+  // The queue uploads through these; route them to the same raw commands the
+  // tests below script with `invoke`.
+  startTransferFile: vi.fn(async (src: string, dest: string, addr: string) => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const r = (await invoke("transfer_file", { req: { src, dest, addr, tx_id: null } })) as {
+      job_id?: string;
+    };
+    if (!r?.job_id) throw new Error("upload did not start");
+    return r.job_id;
+  }),
+  jobStatus: vi.fn(async (jobId: string) => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke("job_status", { jobId });
+  }),
 }));
 vi.mock("../lib/ensurePayloadCurrent", () => ({ ensurePayloadCurrent: vi.fn(async () => {}) }));
 // No active transfer in tests → installs proceed immediately.
@@ -52,12 +66,21 @@ vi.mock("../lib/ps5Transfers", () => ({ transferScreenBusy: () => false }));
 
 import { invoke } from "@tauri-apps/api/core";
 import { useUploadQueueStore } from "./uploadQueue";
+import { useUploadSettingsStore } from "./uploadSettings";
 import { getInstallExecutor, registerInstallExecutor } from "./consoleQueueBridge";
 
 // Installs run through the console queue: start every test with an empty,
 // idle queue so one test's items never hold up the next.
 const pristineQueue = useUploadQueueStore.getState();
 beforeEach(() => {
+  // A failed upload would otherwise retry with backoff (the queue's recovery).
+  useUploadSettingsStore.setState({ autoResume: false });
+  // Blocks below mockReset() these; start every test from a working install.
+  vi.mocked(pkgInstall).mockResolvedValue({ ok: true, job: "job1" });
+  vi.mocked(pkgInstallStatus).mockResolvedValue({
+    phase: "done",
+    verdict: "installed",
+  } as never);
   useUploadQueueStore.getState().stop();
   useUploadQueueStore.setState({
     ...pristineQueue,
@@ -2089,4 +2112,57 @@ describe("installs go through the console queue", () => {
     expect(order.map((o) => o.match(/([BUD])\.pkg/)?.[1])).toEqual(["B", "U", "D"]);
     // Three installs with the queue's 1.5 s settle between them.
   }, 15_000);
+});
+
+describe("Install Package uploads use the console queue", () => {
+  const host = "192.168.55.9";
+  const cid = "UP0000-CUSA33334_00-TEST000000000000";
+  const script = (head: unknown) =>
+    vi.mocked(invoke).mockImplementation(async (command: unknown) => {
+      if (command === "pkg_metadata_split") return head;
+      if (command === "transfer_file") return { job_id: "t1" };
+      if (command === "job_status") return { status: "done", bytes_sent: 8192, total_bytes: 8192 };
+      return {};
+    });
+  beforeEach(() => {
+    evictPkgLibraryStore(host);
+    vi.mocked(pkgInstall).mockReset().mockResolvedValue({ ok: true, job: "job1" });
+    vi.mocked(pkgInstallStatus)
+      .mockReset()
+      .mockResolvedValue(installStatus({ phase: "done", verdict: "installed" }));
+    useInstallSettingsStore.setState({ autoInstallAfterUpload: true });
+  });
+  afterEach(() => {
+    vi.mocked(invoke).mockReset();
+    evictPkgLibraryStore(host);
+  });
+
+  it("uploads through one queue item, then queues the install", async () => {
+    script({ parts: ["/g/a.pkg"], total_size: 8192, head: { content_id: cid, title: "T", category: "gd" } });
+    await pkgLibraryStore(host).getState().addAndUpload("/g/a.pkg", host);
+    const items = useUploadQueueStore.getState().items;
+    expect(items.map((i) => i.sourceKind)).toEqual(["pkg", "install"]);
+    expect(items[0]).toMatchObject({ sourcePath: "/g/a.pkg", installAfterUpload: false, status: "done" });
+    expect(items[1].install).toMatchObject({ via: "library" });
+    expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === "transfer_file")).toHaveLength(1);
+  }, 15_000);
+
+  it("a split .pkg set is rejected before anything is queued", async () => {
+    script({ parts: [{}, {}], total_size: 200, head: {} });
+    await pkgLibraryStore(host).getState().addAndUpload("/g/split_0.pkg", host);
+    expect(useUploadQueueStore.getState().items).toHaveLength(0);
+    expect(pkgLibraryStore(host).getState().error).toMatch(/Split \.pkg/);
+  });
+
+  it("a failed upload drops the row and says why, and queues no install", async () => {
+    vi.mocked(invoke).mockImplementation(async (command: unknown) => {
+      if (command === "pkg_metadata_split")
+        return { parts: ["/g/a.pkg"], total_size: 8192, head: { content_id: cid, category: "gd" } };
+      if (command === "transfer_file") throw new Error("connection refused");
+      return {};
+    });
+    await pkgLibraryStore(host).getState().addAndUpload("/g/a.pkg", host);
+    expect(pkgLibraryStore(host).getState().error).toMatch(/connection refused/);
+    expect(useUploadQueueStore.getState().items.some((i) => i.sourceKind === "install")).toBe(false);
+  });
 });

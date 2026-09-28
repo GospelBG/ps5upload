@@ -4,6 +4,7 @@
 // this module imports no store.
 import type { ExternalPkg } from "../api/ps5";
 import type { LinkInstallMode } from "./linkInstallPrefs";
+import type { AddQueueItem } from "./uploadQueue";
 
 /** What to install and where it comes from. */
 export type InstallRequest =
@@ -72,4 +73,33 @@ export function registerInstallEnqueuer(
 export function enqueueInstall(input: EnqueueInstallInput): EnqueuedInstall {
   if (!enqueuer) throw new Error("The install queue is not ready yet.");
   return enqueuer(input);
+}
+
+/** A queue item's progress, as the library row mirrors it. */
+export interface QueueItemProgress {
+  status: "pending" | "running" | "done" | "failed";
+  bytesSent: number;
+  totalBytes: number;
+  bytesPerSec: number;
+  error: string | null;
+}
+
+/** Package uploads through the console queue (Install Package's uploader). */
+export interface PkgQueueApi {
+  /** Add a `pkg` item, start its console, and return the item's id. */
+  add: (item: AddQueueItem) => string;
+  /** Call `cb` now and on every change of item `id`; null once it is gone.
+   *  Returns an unsubscribe. */
+  watch: (id: string, cb: (p: QueueItemProgress | null) => void) => () => void;
+}
+
+let pkgQueueApi: PkgQueueApi | null = null;
+
+export function registerPkgQueueApi(api: PkgQueueApi): void {
+  pkgQueueApi = api;
+}
+
+export function pkgQueue(): PkgQueueApi {
+  if (!pkgQueueApi) throw new Error("The install queue is not ready yet.");
+  return pkgQueueApi;
 }

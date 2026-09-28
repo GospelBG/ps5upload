@@ -46,11 +46,9 @@ import {
   fingerprintFromStagingSubdir,
   isAddonCategory,
 } from "../lib/pkgStagingPath";
-import { ensurePayloadCurrent } from "../lib/ensurePayloadCurrent";
 import {
   INTERNAL_PKG_DIR,
   libraryDirs,
-  pkgMkdirChain,
   resolvePkgStorage,
   usePkgStorageStore,
 } from "../lib/pkgStorage";
@@ -69,6 +67,7 @@ import { useToastStore } from "./toasts";
 import { parsePS5Firmware } from "../lib/ps5Firmware";
 import {
   enqueueInstall,
+  pkgQueue,
   registerInstallExecutor,
   type InstallHooks,
   type InstallRequest,
@@ -2373,7 +2372,9 @@ const makePkgLibraryStore = () =>
         // for a real ContentID being added twice mid-upload.)
         if (
           get().entries.some(
-            (e) => e.path === destPath && e.status === "uploading",
+            (e) =>
+              e.path === destPath &&
+              (e.status === "uploading" || e.status === "queued"),
           )
         ) {
           // Native drag events can be observed once by AppShell during navigation
@@ -2397,18 +2398,7 @@ const makePkgLibraryStore = () =>
           return;
         }
 
-        // The transfer port (:9113) is single-client: another upload (from the
-        // Upload screen or another .pkg here) must finish before this one starts,
-        // or they collide on the port. `othersBusy` is true while any such
-        // transfer holds it.
-        const othersBusy = () =>
-          transferScreenBusy(host) ||
-          get().entries.some(
-            (e) => e.path !== destPath && e.status === "uploading",
-          );
-
-        // 3. Optimistic row — "queued" if it has to wait for the port, else
-        //    straight to "uploading".
+        // 3. Optimistic row — "queued" until the console queue uploads it.
         const optimistic: PkgEntry = {
           name: basename,
           path: destPath,
@@ -2423,7 +2413,7 @@ const makePkgLibraryStore = () =>
           category,
           platform,
           authenticity,
-          status: othersBusy() ? "queued" : "uploading",
+          status: "queued",
           bytes: 0,
           totalBytes,
         };
@@ -2441,104 +2431,57 @@ const makePkgLibraryStore = () =>
             ),
           });
 
-        // 4. Upload over the bulk-transfer port, polling job_status for progress.
+        // 4. Upload as a console-queue item. The queue owns the transfer port,
+        //    the folder chain on the drive, the payload check and recovery, and
+        //    runs it after whatever is already queued for this console. It only
+        //    uploads: the install below keeps the same-version variant rules.
         try {
-          // Wait our turn on the single-client port instead of colliding. Bail if
-          // the user removed this queued row in the meantime.
-          while (othersBusy()) {
-            if (!get().entries.some((e) => e.path === destPath)) return;
-            await sleep(400);
-          }
-          patch({ status: "uploading" });
-          // Make sure the console is on the matching (hardened) payload before we
-          // stream — same guard the upload queue uses.
-          await ensurePayloadCurrent(hostOf(host));
-          // Updates/DLC stage into a sub-dir; create it first (mkdir -p,
-          // EEXIST-tolerant) so the single-file transfer's open() doesn't fail
-          // with ENOENT on a parent that doesn't exist yet.
-          // mkdir is one level at a time: create every folder from the
-          // drive's ps5upload/ folder down to this package's folder (the
-          // category and fingerprint sub-dirs for an update or DLC).
-          const packageDir = destPath.replace(/\/[^/]*$/, "");
-          if (storage.volume || stagingDir) {
-            try {
-              for (const dir of pkgMkdirChain(packageDir)) {
-                await fsMkdir(transferAddr(host), dir);
-              }
-            } catch (e) {
-              patch({
-                status: "idle",
-                bytes: undefined,
-                lastResult: {
-                  ok: false,
-                  message: `Couldn't create the package folder on the PS5: ${pkgError(e)}`,
-                },
+          const id = pkgQueue().add({
+            sourceKind: "pkg",
+            sourcePath: localPath,
+            displayName: title || originalName,
+            resolvedDest: destPath,
+            addr: transferAddr(host),
+            strategy: "overwrite",
+            reconcileMode: "fast",
+            excludes: [],
+            mountAfterUpload: false,
+            mountReadOnly: true,
+            registerAfterUpload: false,
+            contentId,
+            category: category ?? null,
+            installAfterUpload: false,
+            deletePkgAfterInstall: false,
+          });
+          const uploaded = await new Promise<{ ok: boolean; message?: string }>(
+            (resolve) => {
+              let finished = false;
+              let unsub: (() => void) | null = null;
+              const finish = (r: { ok: boolean; message?: string }) => {
+                if (finished) return;
+                finished = true;
+                unsub?.();
+                resolve(r);
+              };
+              // Mirror the queue item onto this row while it waits and uploads.
+              unsub = pkgQueue().watch(id, (q) => {
+                if (!q) return finish({ ok: false, message: "Removed from the queue." });
+                if (q.status === "pending") patch({ status: "queued" });
+                else if (q.status === "running")
+                  patch({
+                    status: "uploading",
+                    bytes: q.bytesSent,
+                    totalBytes: q.totalBytes || totalBytes,
+                    bytesPerSec: q.bytesPerSec,
+                  });
+                else if (q.status === "done") finish({ ok: true });
+                else finish({ ok: false, message: q.error ?? "upload failed" });
               });
-              return;
-            }
-          }
-          const tx = (await invoke("transfer_file", {
-            req: {
-              src: localPath,
-              dest: destPath,
-              addr: transferAddr(host),
-              tx_id: null,
+              // watch() reports at once, so the item may already be finished.
+              if (finished) unsub();
             },
-          })) as { job_id?: string };
-          const jobId = tx.job_id;
-          if (!jobId) throw new Error("upload did not start");
-          let polls = 0;
-          // No-progress watchdog: bail if bytes don't advance for a while.
-          // We key on progress rather than a fixed total cap so an honest
-          // multi-GB upload isn't killed, while a job wedged in a non-terminal
-          // state (or a silently dead transfer) can't spin forever — which
-          // would leave the row "uploading" and block every future install.
-          const STALL_LIMIT = 240; // × 500ms = 120s with zero progress
-          let lastBytes = -1;
-          let stalled = 0;
-          // Same 2 s trailing window as the Upload queue (500 ms polls × 4).
-          // An instantaneous "bytes since last poll" rate swings between
-          // hundreds of MiB/s and zero because the payload commits in shard
-          // bursts; the window bridges the empty ticks.
-          const rateSamples: RateSample[] = [];
-          patch({ bytesPerSec: 0 });
-          for (;;) {
-            await sleep(500);
-            let js: {
-              status?: string;
-              bytes_sent?: number;
-              total_bytes?: number;
-              error?: string | null;
-            };
-            try {
-              js = (await invoke("job_status", { jobId })) as typeof js;
-            } catch (e) {
-              if (++polls >= 5) throw e;
-              continue;
-            }
-            polls = 0;
-            if (typeof js.bytes_sent === "number") {
-              const now = Date.now();
-              pushRateSample(rateSamples, now, js.bytes_sent);
-              patch({
-                bytes: js.bytes_sent,
-                totalBytes: js.total_bytes ?? totalBytes,
-                bytesPerSec: computeRate(rateSamples, now),
-              });
-              if (js.bytes_sent > lastBytes) {
-                lastBytes = js.bytes_sent;
-                stalled = 0;
-              } else if (++stalled >= STALL_LIMIT) {
-                throw new Error("upload stalled — no progress for 2 minutes");
-              }
-            } else if (++stalled >= STALL_LIMIT) {
-              throw new Error("upload stalled — no status from the PS5");
-            }
-            if (js.status === "done") break;
-            if (js.status === "failed") {
-              throw new Error(js.error || "upload failed");
-            }
-          }
+          );
+          if (!uploaded.ok) throw new Error(uploaded.message);
           // Settle to idle and record the completion time before refreshing, so
           // the authoritative row immediately shows where/when it came from.
           const uploadedAt = Date.now();
@@ -2609,9 +2552,6 @@ const makePkgLibraryStore = () =>
     },
 
     async uploadInstall(localPath, host, opts) {
-      if (get().installing) {
-        return { ok: false, message: "Another install is running." };
-      }
       let dest: string | null = null;
       set({ error: null });
       await get().addAndUpload(localPath, host, {
@@ -2633,9 +2573,6 @@ const makePkgLibraryStore = () =>
       if (staged.status !== "idle") return failed("The upload did not finish.");
       if (staged.lastResult && !staged.lastResult.ok) {
         return { ok: false, message: staged.lastResult.message };
-      }
-      if (get().installing) {
-        return { ok: false, message: "Another install is running." };
       }
       // A successful install with auto-remove on drops the row, so catch the
       // result as it is written rather than reading the row afterwards.
