@@ -976,67 +976,214 @@ fn apply_param_json(
     }
 }
 
-fn parse_sfo_into(buf: &[u8], meta: &mut PkgMetadata) -> Result<(), &'static str> {
+/// A PARAM.SFO value: text (fmt 0x0204 / 0x0004) or a 32-bit integer (fmt 0x0404).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "lowercase")]
+pub enum SfoValue {
+    Text(String),
+    Int(u32),
+}
+
+/// Every PARAM.SFO key in file order, integers decoded as integers.
+pub fn sfo_params(buf: &[u8]) -> Result<Vec<(String, SfoValue)>, &'static str> {
     if buf.len() < 0x14 {
         return Err("SFO too small");
     }
-    let magic = &buf[..4];
-    if magic != b"\0PSF" {
+    if &buf[..4] != b"\0PSF" {
         return Err("SFO magic mismatch");
     }
     let keys_off = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
     let data_off = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as usize;
-    let n_entries = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]) as usize;
-    if keys_off > buf.len() || data_off > buf.len() || n_entries > 256 {
+    let n = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]) as usize;
+    if keys_off > buf.len() || data_off > buf.len() || n > 256 {
         return Err("SFO offsets / count out of range");
     }
-    let entries_start = 0x14;
-    if entries_start + n_entries * 0x10 > buf.len() {
+    if 0x14 + n * 0x10 > buf.len() {
         return Err("SFO entry table truncated");
     }
-    for i in 0..n_entries {
-        let e = &buf[entries_start + i * 0x10..entries_start + (i + 1) * 0x10];
-        let key_off = u16::from_le_bytes([e[0], e[1]]) as usize;
-        let data_len = u32::from_le_bytes([e[4], e[5], e[6], e[7]]) as usize;
-        let d_off = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as usize;
-
-        // Offsets are u16/u32 widened with `as usize`; on a 32-bit
-        // build these sums can wrap. Checked arithmetic keeps a
-        // wrapped value from slipping under the `buf.len()` guard.
-        let key_abs = match keys_off.checked_add(key_off) {
-            Some(v) => v,
-            None => continue,
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let e = &buf[0x14 + i * 0x10..0x14 + (i + 1) * 0x10];
+        let fmt = u16::from_le_bytes([e[2], e[3]]);
+        let len = u32::from_le_bytes([e[4], e[5], e[6], e[7]]) as usize;
+        // Offsets are widened with `as usize`; checked sums keep a wrapped
+        // value from slipping under the `buf.len()` guards on 32-bit builds.
+        let Some(key_abs) = keys_off.checked_add(u16::from_le_bytes([e[0], e[1]]) as usize) else {
+            continue;
         };
-        if key_abs >= buf.len() {
+        let Some(d_abs) =
+            data_off.checked_add(u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as usize)
+        else {
+            continue;
+        };
+        let Some(d_end) = d_abs.checked_add(len) else {
+            continue;
+        };
+        if key_abs >= buf.len() || d_end > buf.len() {
             continue;
         }
         let key_end = buf[key_abs..]
             .iter()
             .position(|&b| b == 0)
-            .map(|p| key_abs + p)
-            .unwrap_or(buf.len());
-        let key = std::str::from_utf8(&buf[key_abs..key_end]).unwrap_or("");
-
-        let data_abs = match data_off.checked_add(d_off) {
-            Some(v) => v,
-            None => continue,
+            .map_or(buf.len(), |p| key_abs + p);
+        let key = String::from_utf8_lossy(&buf[key_abs..key_end]).to_string();
+        let data = &buf[d_abs..d_end];
+        let value = if fmt == 0x0404 && len >= 4 {
+            SfoValue::Int(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
+        } else {
+            let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+            SfoValue::Text(String::from_utf8_lossy(&data[..end]).to_string())
         };
-        let data_end = match data_abs.checked_add(data_len) {
-            Some(v) => v,
-            None => continue,
-        };
-        if data_end > buf.len() {
-            continue;
-        }
-        // Most string entries are NUL-terminated within `data_len`.
-        let trimmed = &buf[data_abs..data_end];
-        let trimmed_end = trimmed
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(trimmed.len());
-        let val = String::from_utf8_lossy(&trimmed[..trimmed_end]).to_string();
+        out.push((key, value));
+    }
+    Ok(out)
+}
 
-        match key {
+/// One entry of a package's entry table.
+#[derive(Debug, Clone, Serialize)]
+pub struct PkgEntryInfo {
+    pub id: u32,
+    /// From the package's name table, or the well-known name for the id.
+    pub name: Option<String>,
+    /// Absolute offset in the package file.
+    pub offset: u64,
+    pub size: u32,
+    /// Encrypted with keys we never have: its bytes are not readable.
+    pub encrypted: bool,
+}
+
+/// Name table entry id, and the entry flag that marks encrypted data.
+const ENTRY_NAMES: u32 = 0x0200;
+const ENTRY_FLAG_ENCRYPTED: u32 = 0x8000_0000;
+
+/// Well-known entry ids (psdevwiki), for packages without a readable name table.
+fn known_entry_name(id: u32) -> Option<&'static str> {
+    Some(match id {
+        0x0400 => "license.dat",
+        0x0401 => "license.info",
+        0x0402 => "nptitle.dat",
+        0x0403 => "npbind.dat",
+        0x0409 => "psreserved.dat",
+        0x1000 => "param.sfo",
+        0x1001 => "playgo-chunk.dat",
+        0x1003 => "playgo-manifest.xml",
+        0x1006 => "pic1.png",
+        0x1007 => "pubtoolinfo.dat",
+        0x1200 => "icon0.png",
+        0x1220 => "pic0.png",
+        0x1240 => "snd0.at9",
+        0x1260 => "changeinfo/changeinfo.xml",
+        0x1280 => "icon0.dds",
+        0x12A0 => "pic0.dds",
+        0x12C0 => "pic1.dds",
+        0x2000 => "param.json",
+        _ => return None,
+    })
+}
+
+/// The metadata container of a package: its base offset in the file and its
+/// 0xA0-byte header. A PS5 `\x7FFIH` image points at an embedded `\x7FCNT`.
+fn container_of(f: &mut File, size: u64) -> Result<(u64, [u8; 0xA0]), PkgError> {
+    if size < 0xA0 {
+        return Err(PkgError::Truncated(size));
+    }
+    let mut head = [0u8; 0xA0];
+    f.seek(SeekFrom::Start(0))?;
+    f.read_exact(&mut head)?;
+    let magic = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+    if magic == PKG_MAGIC {
+        return Ok((0, head));
+    }
+    if magic != PKG_MAGIC_FIH {
+        return Err(PkgError::Header("not a PS4/PS5 package"));
+    }
+    let base = u64::from_le_bytes([
+        head[0x58], head[0x59], head[0x5A], head[0x5B], head[0x5C], head[0x5D], head[0x5E],
+        head[0x5F],
+    ]);
+    if base == 0 || base.checked_add(0xA0).is_none_or(|end| end > size) {
+        return Err(PkgError::Header("PS5 FIH embedded CNT offset out of range"));
+    }
+    let mut cnt = [0u8; 0xA0];
+    f.seek(SeekFrom::Start(base))?;
+    f.read_exact(&mut cnt)?;
+    if u32::from_be_bytes([cnt[0], cnt[1], cnt[2], cnt[3]]) != PKG_MAGIC {
+        return Err(PkgError::Header("PS5 FIH embedded CNT magic mismatch"));
+    }
+    Ok((base, cnt))
+}
+
+/// Every entry of a package's entry table, with names and encryption.
+pub fn pkg_entries(path: &Path) -> Result<Vec<PkgEntryInfo>, PkgError> {
+    let mut f = File::open(path)?;
+    let size = f.metadata()?.len();
+    let (base, head) = container_of(&mut f, size)?;
+    let count = u32::from_be_bytes([head[0x10], head[0x11], head[0x12], head[0x13]]);
+    let table = u32::from_be_bytes([head[0x18], head[0x19], head[0x1A], head[0x1B]]);
+    if count == 0 || count > 1024 {
+        return Err(PkgError::Header("entry count out of range"));
+    }
+    let mut buf = vec![0u8; count as usize * 0x20];
+    f.seek(SeekFrom::Start(base + table as u64))?;
+    f.read_exact(&mut buf)?;
+    let mut entries: Vec<(PkgEntryInfo, u32)> = buf
+        .chunks_exact(0x20)
+        .map(|e| {
+            let be = |i: usize| u32::from_be_bytes([e[i], e[i + 1], e[i + 2], e[i + 3]]);
+            (
+                PkgEntryInfo {
+                    id: be(0),
+                    name: None,
+                    offset: base + be(0x10) as u64,
+                    size: be(0x14),
+                    encrypted: be(8) & ENTRY_FLAG_ENCRYPTED != 0,
+                },
+                be(4),
+            )
+        })
+        .collect();
+    // The name table, when present and readable, names every entry.
+    let names = entries
+        .iter()
+        .find(|(e, _)| e.id == ENTRY_NAMES && !e.encrypted && e.size <= 1 << 20)
+        .and_then(|(e, _)| read_pkg_entry(path, e, 1 << 20).ok());
+    for (e, name_off) in entries.iter_mut() {
+        let from_table = names.as_ref().and_then(|t| {
+            let at = *name_off as usize;
+            if *name_off == 0 || at >= t.len() {
+                return None;
+            }
+            let end = t[at..]
+                .iter()
+                .position(|&b| b == 0)
+                .map_or(t.len(), |p| at + p);
+            let n = String::from_utf8_lossy(&t[at..end]).to_string();
+            (!n.is_empty()).then_some(n)
+        });
+        e.name = from_table.or_else(|| known_entry_name(e.id).map(str::to_string));
+    }
+    Ok(entries.into_iter().map(|(e, _)| e).collect())
+}
+
+/// The bytes of one entry, when it is not encrypted and not larger than `max`.
+pub fn read_pkg_entry(path: &Path, entry: &PkgEntryInfo, max: u32) -> Result<Vec<u8>, PkgError> {
+    if entry.encrypted {
+        return Err(PkgError::Header("entry is encrypted"));
+    }
+    if entry.size > max {
+        return Err(PkgError::Header("entry too large"));
+    }
+    let mut f = File::open(path)?;
+    let mut buf = vec![0u8; entry.size as usize];
+    f.seek(SeekFrom::Start(entry.offset))?;
+    f.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn parse_sfo_into(buf: &[u8], meta: &mut PkgMetadata) -> Result<(), &'static str> {
+    for (key, value) in sfo_params(buf)? {
+        let SfoValue::Text(val) = value else { continue };
+        match key.as_str() {
             "TITLE" => meta.title = val,
             "TITLE_ID" => meta.title_id = val,
             "CATEGORY" => meta.category = val,
@@ -1885,6 +2032,93 @@ mod tests {
             checked += 1;
         }
         eprintln!("checked {checked} real sample(s)");
+    }
+
+    fn build_sfo_typed(text: &[(&str, &str)], ints: &[(&str, u32)]) -> Vec<u8> {
+        // header 0x14 + 0x10 per entry, then the key table, then the data table.
+        let n = text.len() + ints.len();
+        let mut keys = Vec::new();
+        let mut data = Vec::new();
+        let mut index = Vec::new();
+        for (k, v) in text {
+            let val = format!("{v}\0");
+            index.extend_from_slice(&(keys.len() as u16).to_le_bytes());
+            index.extend_from_slice(&0x0204u16.to_le_bytes());
+            index.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            index.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            index.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            keys.extend_from_slice(k.as_bytes());
+            keys.push(0);
+            data.extend_from_slice(val.as_bytes());
+        }
+        for (k, v) in ints {
+            index.extend_from_slice(&(keys.len() as u16).to_le_bytes());
+            index.extend_from_slice(&0x0404u16.to_le_bytes());
+            index.extend_from_slice(&4u32.to_le_bytes());
+            index.extend_from_slice(&4u32.to_le_bytes());
+            index.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            keys.extend_from_slice(k.as_bytes());
+            keys.push(0);
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let key_off = 0x14 + n * 0x10;
+        let data_off = key_off + keys.len();
+        let mut sfo = Vec::new();
+        sfo.extend_from_slice(b"\x00PSF");
+        sfo.extend_from_slice(&[1, 1, 0, 0]);
+        sfo.extend_from_slice(&(key_off as u32).to_le_bytes());
+        sfo.extend_from_slice(&(data_off as u32).to_le_bytes());
+        sfo.extend_from_slice(&(n as u32).to_le_bytes());
+        sfo.extend_from_slice(&index);
+        sfo.extend_from_slice(&keys);
+        sfo.extend_from_slice(&data);
+        sfo
+    }
+
+    #[test]
+    fn sfo_params_decodes_text_and_integers() {
+        let sfo = build_sfo_typed(
+            &[("TITLE", "Jak X"), ("CATEGORY", "gd")],
+            &[("SYSTEM_VER", 0x0505_0000), ("PARENTAL_LEVEL", 5)],
+        );
+        let p = sfo_params(&sfo).unwrap();
+        assert!(p.contains(&("TITLE".into(), SfoValue::Text("Jak X".into()))));
+        assert!(p.contains(&("SYSTEM_VER".into(), SfoValue::Int(0x0505_0000))));
+        assert!(p.contains(&("PARENTAL_LEVEL".into(), SfoValue::Int(5))));
+    }
+
+    #[test]
+    fn pkg_entries_lists_ids_names_and_encryption() {
+        let sfo = build_sfo_typed(&[("CATEGORY", "gd")], &[]);
+        let table_offset = 0x40u32;
+        let count = 2u32;
+        let data_off = table_offset + count * 0x20;
+        let mut pkg = vec![0u8; data_off as usize];
+        pkg[0..4].copy_from_slice(&PKG_MAGIC.to_be_bytes());
+        pkg[0x10..0x14].copy_from_slice(&count.to_be_bytes());
+        pkg[0x18..0x1C].copy_from_slice(&table_offset.to_be_bytes());
+        let e0 = table_offset as usize;
+        pkg[e0..e0 + 4].copy_from_slice(&ENTRY_PARAM_SFO.to_be_bytes());
+        pkg[e0 + 0x10..e0 + 0x14].copy_from_slice(&data_off.to_be_bytes());
+        pkg[e0 + 0x14..e0 + 0x18].copy_from_slice(&(sfo.len() as u32).to_be_bytes());
+        let e1 = e0 + 0x20;
+        pkg[e1..e1 + 4].copy_from_slice(&0x0400u32.to_be_bytes()); // license.dat
+        pkg[e1 + 8..e1 + 12].copy_from_slice(&0x8000_0000u32.to_be_bytes()); // encrypted
+        pkg[e1 + 0x10..e1 + 0x14].copy_from_slice(&(data_off + sfo.len() as u32).to_be_bytes());
+        pkg[e1 + 0x14..e1 + 0x18].copy_from_slice(&16u32.to_be_bytes());
+        pkg.extend_from_slice(&sfo);
+        pkg.extend_from_slice(&[0u8; 16]);
+        let path = tempdir().join("entries-test.pkg");
+        std::fs::write(&path, &pkg).unwrap();
+
+        let entries = pkg_entries(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name.as_deref(), Some("param.sfo"));
+        assert!(!entries[0].encrypted);
+        assert_eq!(entries[1].name.as_deref(), Some("license.dat"));
+        assert!(entries[1].encrypted);
+        assert_eq!(read_pkg_entry(&path, &entries[0], 1 << 20).unwrap(), sfo);
+        assert!(read_pkg_entry(&path, &entries[1], 1 << 20).is_err());
     }
 
     fn tempdir() -> std::path::PathBuf {
