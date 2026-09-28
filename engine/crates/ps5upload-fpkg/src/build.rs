@@ -914,6 +914,27 @@ pub fn package_digest(path: &Path) -> Result<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A real Battlefield 6 build (Windows, Balanced): 234 GiB read and compressed in 50 min 47 s
+    /// while the source drive gave ~82 MB/s, then 113 GiB written in 12 min and verified in 8½.
+    /// The old estimate said 17 min: compression alone, from memory, on every thread at once.
+    #[test]
+    fn a_build_takes_its_slowest_input_and_every_stage() {
+        let gib = |g: f64| (g * 1024.0 * 1024.0 * 1024.0) as u64;
+        let secs = build_seconds(gib(234.0), gib(113.33), 234e6, 82e6, 166e6);
+        let minutes = secs as f64 / 60.0;
+        // Reading bounds compression (51 min), then the write and a read-back of the package.
+        assert!((68.0..=80.0).contains(&minutes), "{minutes} min");
+        // A fast source leaves the CPU as the limit.
+        let cpu_bound = build_seconds(gib(10.0), gib(5.0), 100e6, 1e9, 1e9);
+        assert_eq!(
+            cpu_bound,
+            (gib(10.0) as f64 / 100e6 + 2.0 * gib(5.0) as f64 / 1e9).ceil() as u64
+        );
+        // Nothing to do still takes a moment.
+        assert_eq!(build_seconds(0, 0, 1.0, 1.0, 1.0), 1);
+    }
+
     #[test]
     fn fakelib_files_are_never_repaired() {
         assert!(super::is_fakelib("fakelib/libSceAmpr.sprx"));
@@ -1052,14 +1073,78 @@ pub struct Estimates {
     pub smallest: Estimate,
 }
 
-/// Blocks sampled for an estimate.
+/// Blocks sampled for an estimate (at least; more on a machine with many threads).
 const ESTIMATE_BLOCKS: usize = 60;
+/// How much of the source is read in one run to time the drive (or the network) it is on.
+const READ_PROBE: u64 = 128 * 1024 * 1024;
+/// How much is written to the output folder to time its drive.
+const WRITE_PROBE: usize = 64 * 1024 * 1024;
 
-/// Estimated package size and build time at each level: a sample of the game's blocks, spread
-/// evenly through its files, compressed at every level, scaled to the whole game and to every
-/// core of this machine. Sizes are kept in level order (a slower level never shows larger) and
-/// times are whole seconds, at least one.
-pub fn estimate(source_path: &Path) -> Result<Estimates> {
+/// Whole seconds for a build of `total` source bytes into a `package` of that size: compression
+/// runs as fast as the slower of the encoder and the source's reads allow, then the package is
+/// written and read back to verify (the read-back is timed at the write speed too: the same
+/// drive, and it errs long rather than short). Rates are bytes per second.
+fn build_seconds(
+    total: u64,
+    package: u64,
+    compress_rate: f64,
+    read_rate: f64,
+    write_rate: f64,
+) -> u64 {
+    let compress = total as f64 / compress_rate.min(read_rate).max(1.0);
+    let write_and_verify = 2.0 * package as f64 / write_rate.max(1.0);
+    ((compress + write_and_verify).ceil() as u64).max(1)
+}
+
+/// The source's sequential read speed: one run of up to [`READ_PROBE`] from the middle of its
+/// largest file (the middle, so the headers the check just read aren't what gets timed). None
+/// when there is too little to time; the encoder is then the only limit that counts.
+fn probe_read_rate(tree: &mut dyn source::SourceTree, files: &[SourceFile]) -> Result<Option<f64>> {
+    let Some(big) = files.iter().max_by_key(|f| f.size) else {
+        return Ok(None);
+    };
+    let len = big.size.min(READ_PROBE);
+    if len < 8 * 1024 * 1024 {
+        return Ok(None);
+    }
+    let started = std::time::Instant::now();
+    let mut at = (big.size - len) / 2;
+    let end = at + len;
+    while at < end {
+        let n = (end - at).min(4 * 1024 * 1024) as usize;
+        tree.read_range(&big.path, at, n)?;
+        at += n as u64;
+    }
+    Ok(Some(len as f64 / started.elapsed().as_secs_f64().max(1e-6)))
+}
+
+/// The output drive's write speed: [`WRITE_PROBE`] bytes written and flushed to disk in a
+/// scratch file there, then removed. None when the folder can't take it.
+fn probe_write_rate(dir: &Path, fill: &[u8]) -> Option<f64> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir).ok()?;
+    let path = dir.join(format!(".ps5upload-speed-{}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<f64> {
+        let mut f = std::fs::File::create(&path)?;
+        let chunk: Vec<u8> = fill.iter().copied().cycle().take(1024 * 1024).collect();
+        let started = std::time::Instant::now();
+        for _ in 0..WRITE_PROBE / chunk.len() {
+            f.write_all(&chunk)?;
+        }
+        f.sync_all()?;
+        Ok(WRITE_PROBE as f64 / started.elapsed().as_secs_f64().max(1e-6))
+    })();
+    let _ = std::fs::remove_file(&path);
+    result.ok()
+}
+
+/// Estimated package size and whole build time at each level. The size comes from a sample of
+/// the game's blocks, spread evenly through its files, compressed at every level. The time adds
+/// every stage: compression, bounded by the slower of the encoder (timed on all threads at
+/// once, so shared cores count as what they give) and the source's measured read speed, then
+/// the package's write and read-back at the output drive's measured speed (see
+/// [`build_seconds`]). Sizes are kept in level order (a slower level never shows larger).
+pub fn estimate(source_path: &Path, output_dir: Option<&Path>) -> Result<Estimates> {
     use crate::kraken::{encode_block_at, Level, BLOCK};
     let mut tree = source::open(source_path)?;
     let files: Vec<SourceFile> = tree
@@ -1072,11 +1157,13 @@ pub fn estimate(source_path: &Path) -> Result<Estimates> {
     if total == 0 {
         return format_err("the source has no data to estimate");
     }
-    let step = (total / ESTIMATE_BLOCKS as u64).max(1);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let wanted = ESTIMATE_BLOCKS.max(threads * 4);
+    let step = (total / wanted as u64).max(1);
     let mut blocks = Vec::new();
     let (mut at, mut base) = (0u64, 0u64);
     for f in &files {
-        while at < base + f.size && blocks.len() < ESTIMATE_BLOCKS {
+        while at < base + f.size && blocks.len() < wanted {
             let offset = at - base;
             let len = (f.size - offset).min(BLOCK as u64) as usize;
             blocks.push(tree.read_range(&f.path, offset, len)?);
@@ -1084,23 +1171,46 @@ pub fn estimate(source_path: &Path) -> Result<Estimates> {
         }
         base += f.size;
     }
+    let read_rate = probe_read_rate(tree.as_mut(), &files)?.unwrap_or(f64::INFINITY);
     let raw: usize = blocks.iter().map(Vec::len).sum();
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()) as f64;
-    let measure = |level: Level| {
+    // Every thread at once, timed by the wall clock: what the build's pool actually gets.
+    let encode_all = |level: Level| -> (usize, f64) {
+        let per = blocks.len().div_ceil(threads).max(1);
         let started = std::time::Instant::now();
-        let stored: usize = blocks
-            .iter()
-            .map(|b| {
-                encode_block_at(b, level)
-                    .iter()
-                    .map(|h| h.bytes().len())
-                    .sum::<usize>()
-            })
-            .sum();
-        let rate = raw as f64 / started.elapsed().as_secs_f64().max(1e-6) * threads;
+        let stored: usize = std::thread::scope(|scope| {
+            let workers: Vec<_> = blocks
+                .chunks(per)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|b| {
+                                encode_block_at(b, level)
+                                    .iter()
+                                    .map(|h| h.bytes().len())
+                                    .sum::<usize>()
+                            })
+                            .sum::<usize>()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap_or(0)).sum()
+        });
+        (
+            stored,
+            raw as f64 / started.elapsed().as_secs_f64().max(1e-6),
+        )
+    };
+    let fill = blocks.first().map(Vec::as_slice).unwrap_or(&[0u8]);
+    let write_rate = output_dir
+        .and_then(|d| probe_write_rate(d, fill))
+        .unwrap_or(read_rate);
+    let measure = |level: Level| {
+        let (stored, rate) = encode_all(level);
+        let bytes = (total as f64 * stored as f64 / raw.max(1) as f64) as u64;
         Estimate {
-            bytes: (total as f64 * stored as f64 / raw.max(1) as f64) as u64,
-            seconds: ((total as f64 / rate).ceil() as u64).max(1),
+            bytes,
+            seconds: build_seconds(total, bytes, rate, read_rate, write_rate),
         }
     };
     let fast = measure(Level::Fast);

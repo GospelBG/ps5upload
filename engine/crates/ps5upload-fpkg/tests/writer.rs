@@ -461,7 +461,7 @@ fn inspecting_toward_a_missing_output_folder_still_answers() {
 fn estimates_rank_the_levels_and_cover_the_game() {
     let dir = TempDir::new("estimate-src");
     write_tree(dir.path());
-    let e = build::estimate(dir.path()).unwrap();
+    let e = build::estimate(dir.path(), Some(dir.path())).unwrap();
     assert!(e.smallest.bytes <= e.balanced.bytes && e.balanced.bytes <= e.fast.bytes);
     // The tree is mostly a 600 KiB run of one byte: well under its size once compressed.
     assert!(e.balanced.bytes < 600 * 1024);

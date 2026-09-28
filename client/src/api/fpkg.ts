@@ -84,7 +84,8 @@ export const fpkg = {
   cleanupExtract: (path: string) => invoke<{ ok: boolean }>("fpkg_extract_cleanup", { path }),
   /** Size and time at each compression level for a game: a separate request from the check,
    *  since sampling a large game on a slow drive takes a while. */
-  estimate: (source: string) => invoke<FpkgEstimates>("fpkg_estimate", { source }),
+  estimate: (source: string, outputDir?: string) =>
+    invoke<FpkgEstimates>("fpkg_estimate", { source, outputDir }),
   /** Delete a package this engine built (the Convert screen's Delete package); the engine
    *  refuses any other file. */
   deletePackage: (path: string) => invoke<{ ok: boolean }>("fpkg_delete", { path }),

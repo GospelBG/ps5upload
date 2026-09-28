@@ -734,7 +734,10 @@ export async function browserInvoke<T>(
       });
     }
     case "fpkg_estimate": {
-      return postJson<T>("/api/fpkg/estimate", { source: args["source"] });
+      return postJson<T>("/api/fpkg/estimate", {
+        source: args["source"],
+        output_dir: args["outputDir"],
+      });
     }
     case "fpkg_delete": {
       return postJson<T>("/api/fpkg/delete", { path: args["path"] });

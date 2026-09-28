@@ -129,7 +129,7 @@ export default function FpkgConvertScreen() {
         // The estimate is a separate, slower sample: it never holds up the check.
         setEstimates("pending");
         fpkg
-          .estimate(path.trim())
+          .estimate(path.trim(), outputDir.trim() || undefined)
           .then((e) => latest.current.isCurrent(token) && setEstimates(e))
           .catch(() => latest.current.isCurrent(token) && setEstimates(null));
       } catch (e) {

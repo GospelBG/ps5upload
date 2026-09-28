@@ -196,6 +196,13 @@ describe("engine-backed commands the web UI depends on (#300)", () => {
     expect(calls[0].url).toBe(`${B}/api/ps5/cheats/list`);
   });
 
+  it("tells the estimate where the package would go", async () => {
+    const calls = captureFetch({});
+    await browserInvoke("fpkg_estimate", { source: "/g", outputDir: "/out" });
+    expect(calls[0].url).toBe(`${B}/api/fpkg/estimate`);
+    expect(JSON.parse(String(calls[0].init.body))).toEqual({ source: "/g", output_dir: "/out" });
+  });
+
   it("sends a Convert build's language to the engine", async () => {
     const calls = captureFetch({ job_id: "j" });
     await browserInvoke("fpkg_build", { source: "/g", language: "de-DE" });

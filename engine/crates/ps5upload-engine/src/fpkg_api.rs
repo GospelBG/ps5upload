@@ -197,6 +197,9 @@ pub(crate) async fn fpkg_delete_handler(
 #[derive(Deserialize)]
 pub(crate) struct EstimateReq {
     source: String,
+    /// Where the package would go: its drive's write speed is part of the time.
+    #[serde(default)]
+    output_dir: Option<String>,
 }
 
 /// POST /api/fpkg/estimate — package size and time at each compression level, from a sample of
@@ -207,7 +210,8 @@ pub(crate) async fn fpkg_estimate_handler(
     Json(req): Json<EstimateReq>,
 ) -> impl IntoResponse {
     let source = resolve_engine_path(&req.source);
-    match tokio::task::spawn_blocking(move || build::estimate(&source)).await {
+    let out = output_dir(req.output_dir.as_deref());
+    match tokio::task::spawn_blocking(move || build::estimate(&source, Some(&out))).await {
         Ok(Ok(estimates)) => (StatusCode::OK, Json(estimates)).into_response(),
         Ok(Err(error)) => json_err(StatusCode::BAD_REQUEST, error.to_string()).into_response(),
         Err(join) => json_err(
