@@ -26,7 +26,13 @@ const MAX_FILES: usize = 200_000;
 const HEADROOM: u64 = 1024 * 1024 * 1024;
 
 /// The server, every file to copy (relative path, entry), and whether the pick was a folder.
-type Listed = (Arc<dyn RemoteFs>, Vec<(String, Entry)>, bool);
+/// The copy's files, whether it is a folder, and a RAR set's other volumes (server path, entry).
+type Listed = (
+    Arc<dyn RemoteFs>,
+    Vec<(String, Entry)>,
+    bool,
+    Vec<(String, Entry)>,
+);
 
 pub type Jobs = Arc<Mutex<HashMap<Uuid, JobState>>>;
 
@@ -45,11 +51,55 @@ pub struct FetchBody {
     pub dest_dir: Option<String>,
 }
 
-/// Copies this engine made, and what to delete to remove each: the copy itself, or the temp
-/// folder the engine created for it. Only these can be removed through `cleanup`.
-fn fetched() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
-    static F: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+/// Copies this engine made, and what to delete to remove each: the copy itself (plus the
+/// other volumes of a RAR set copied beside it), or the temp folder the engine created for it.
+/// Only these can be removed through `cleanup`.
+fn fetched() -> &'static Mutex<HashMap<PathBuf, Vec<PathBuf>>> {
+    static F: OnceLock<Mutex<HashMap<PathBuf, Vec<PathBuf>>>> = OnceLock::new();
     F.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The other volumes of the RAR set `name` starts, among `names` (the same folder), sorted:
+/// `game.part1.rar` → `game.part2.rar`, …; `game.rar` → `game.r00`, `game.r01`, …. Empty when
+/// `name` is not a set's first volume. UnRAR finds the rest of a set beside the first volume,
+/// so a copy of the first alone cannot be extracted.
+pub(crate) fn rar_set_siblings(name: &str, names: &[String]) -> Vec<String> {
+    let lower = name.to_ascii_lowercase();
+    let Some(base) = lower.strip_suffix(".rar") else {
+        return Vec::new();
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut out: Vec<String> = if let Some(at) = base.rfind(".part") {
+        let num = &base[at + 5..];
+        if !digits(num) || num.parse::<u32>().ok() != Some(1) {
+            return Vec::new();
+        }
+        let prefix = format!("{}.part", &base[..at]);
+        names
+            .iter()
+            .filter(|n| {
+                let l = n.to_ascii_lowercase();
+                l != lower
+                    && l.strip_prefix(&prefix)
+                        .and_then(|r| r.strip_suffix(".rar"))
+                        .is_some_and(digits)
+            })
+            .cloned()
+            .collect()
+    } else {
+        let prefix = format!("{base}.r");
+        names
+            .iter()
+            .filter(|n| {
+                let l = n.to_ascii_lowercase();
+                l.strip_prefix(&prefix)
+                    .is_some_and(|r| r.len() == 2 && digits(r))
+            })
+            .cloned()
+            .collect()
+    };
+    out.sort();
+    out
 }
 
 fn err(code: StatusCode, msg: impl Into<String>) -> Response {
@@ -90,16 +140,45 @@ pub(crate) async fn start_fetch(r: Arc<Remote>, deps: FetchDeps, body: FetchBody
                     let top = fs.stat(&path).await?;
                     if top.is_dir {
                         let files = fs.walk(&path, MAX_FILES).await?;
-                        Ok((fs, files, true))
+                        Ok((fs, files, true, Vec::new()))
                     } else {
-                        Ok((fs, vec![(String::new(), top)], false))
+                        // A RAR set's first volume brings the rest of the set with it.
+                        let name = path.rsplit('/').next().unwrap_or("").to_string();
+                        let mut siblings = Vec::new();
+                        if name.to_ascii_lowercase().ends_with(".rar") {
+                            let dir = match path.rfind('/') {
+                                Some(0) | None => "/".to_string(),
+                                Some(i) => path[..i].to_string(),
+                            };
+                            let mut entries = Vec::new();
+                            let mut cursor = None;
+                            loop {
+                                let page = fs.list(&dir, cursor).await?;
+                                entries.extend(page.entries);
+                                match page.next_cursor {
+                                    Some(c) => cursor = Some(c),
+                                    None => break,
+                                }
+                            }
+                            let names: Vec<String> = entries
+                                .iter()
+                                .filter(|e| !e.is_dir)
+                                .map(|e| e.name.clone())
+                                .collect();
+                            for sib in rar_set_siblings(&name, &names) {
+                                if let Some(e) = entries.iter().find(|e| e.name == sib) {
+                                    siblings.push((super::path::join(&dir, &sib)?, e.clone()));
+                                }
+                            }
+                        }
+                        Ok((fs, vec![(String::new(), top)], false, siblings))
                     }
                 }
             })
             .await
     }
     .await;
-    let (fs, files, is_dir) = match listed {
+    let (fs, files, is_dir, siblings) = match listed {
         Ok(v) => v,
         Err(e) => return super::api::remote_err(&e),
     };
@@ -109,7 +188,8 @@ pub(crate) async fn start_fetch(r: Arc<Remote>, deps: FetchDeps, body: FetchBody
             format!("That folder has more than {MAX_FILES} files."),
         );
     }
-    let total: u64 = files.iter().map(|(_, e)| e.size).sum();
+    let total: u64 = files.iter().map(|(_, e)| e.size).sum::<u64>()
+        + siblings.iter().map(|(_, e)| e.size).sum::<u64>();
 
     let (dest_dir, made_dir) = match body.dest_dir.as_deref().filter(|d| !d.trim().is_empty()) {
         Some(d) => (crate::fpkg_api::resolve_engine_path(d), false),
@@ -165,10 +245,20 @@ pub(crate) async fn start_fetch(r: Arc<Remote>, deps: FetchDeps, body: FetchBody
         running(started_at_ms, 0, total),
     );
 
-    let remove_root = if made_dir {
-        dest_dir.clone()
+    // A RAR set's other volumes land beside the first.
+    let sibling_copies: Vec<(String, Entry, PathBuf)> = siblings
+        .into_iter()
+        .map(|(remote, e)| {
+            let local = dest_dir.join(&e.name);
+            (remote, e, local)
+        })
+        .collect();
+    let remove_roots: Vec<PathBuf> = if made_dir {
+        vec![dest_dir.clone()]
     } else {
-        dest.clone()
+        std::iter::once(dest.clone())
+            .chain(sibling_copies.iter().map(|(_, _, l)| l.clone()))
+            .collect()
     };
     let pool = Arc::clone(&r.pool);
     let store = Arc::clone(&r.store);
@@ -183,6 +273,7 @@ pub(crate) async fn start_fetch(r: Arc<Remote>, deps: FetchDeps, body: FetchBody
             base,
             is_dir,
             files,
+            siblings: sibling_copies,
             dest: dest.clone(),
             cancel,
             backoff: deps.backoff,
@@ -202,7 +293,7 @@ pub(crate) async fn start_fetch(r: Arc<Remote>, deps: FetchDeps, body: FetchBody
                 fetched()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(dest.clone(), remove_root);
+                    .insert(dest.clone(), remove_roots);
                 crate::set_job(
                     &deps.jobs,
                     &deps.events_tx,
@@ -224,12 +315,14 @@ pub(crate) async fn start_fetch(r: Arc<Remote>, deps: FetchDeps, body: FetchBody
             }
             Err(e) => {
                 // A single file dies as `<name>.partial`; a folder takes its partials with it.
-                let _ = std::fs::remove_file(format!("{}.partial", dest.display()));
-                let _ = if remove_root.is_dir() {
-                    std::fs::remove_dir_all(&remove_root)
-                } else {
-                    std::fs::remove_file(&remove_root)
-                };
+                for root in &remove_roots {
+                    let _ = std::fs::remove_file(format!("{}.partial", root.display()));
+                    let _ = if root.is_dir() {
+                        std::fs::remove_dir_all(root)
+                    } else {
+                        std::fs::remove_file(root)
+                    };
+                }
                 crate::set_job(
                     &deps.jobs,
                     &deps.events_tx,
@@ -261,6 +354,8 @@ struct CopyJob<'a> {
     base: String,
     is_dir: bool,
     files: Vec<(String, Entry)>,
+    /// Extra single files copied after `files`: (server path, entry, local path).
+    siblings: Vec<(String, Entry, PathBuf)>,
     dest: PathBuf,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     backoff: super::pool::Backoff,
@@ -290,6 +385,7 @@ fn safe_join(dest: &Path, rel: &str) -> Result<PathBuf, String> {
 async fn copy_all(job: CopyJob<'_>) -> Result<u64, String> {
     use std::io::Write;
     let mut done = 0u64;
+    let mut work: Vec<(String, PathBuf, &Entry)> = Vec::new();
     for (rel, entry) in &job.files {
         let (remote, local) = if job.is_dir {
             (
@@ -299,6 +395,12 @@ async fn copy_all(job: CopyJob<'_>) -> Result<u64, String> {
         } else {
             (job.base.clone(), job.dest.clone())
         };
+        work.push((remote, local, entry));
+    }
+    for (remote, entry, local) in &job.siblings {
+        work.push((remote.clone(), local.clone(), entry));
+    }
+    for (remote, local, entry) in work {
         if let Some(parent) = local.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
@@ -344,7 +446,7 @@ async fn copy_all(job: CopyJob<'_>) -> Result<u64, String> {
         drop(out);
         std::fs::rename(&partial, &local).map_err(|e| format!("{}: {e}", local.display()))?;
     }
-    Ok(job.files.len() as u64)
+    Ok((job.files.len() + job.siblings.len()) as u64)
 }
 
 /// `POST /api/remote/fetch/cleanup` — remove a copy this engine made. Nothing else.
@@ -354,20 +456,24 @@ pub(crate) async fn cleanup(dest: &str) -> Response {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&key);
-    let Some(root) = root else {
+    let Some(roots) = root else {
         return err(StatusCode::BAD_REQUEST, "That is not a copy this app made.");
     };
-    let r = if root.is_dir() {
-        std::fs::remove_dir_all(&root)
-    } else {
-        std::fs::remove_file(&root)
-    };
+    let mut r = Ok(());
+    for root in &roots {
+        let one = if root.is_dir() {
+            std::fs::remove_dir_all(root)
+        } else {
+            std::fs::remove_file(root)
+        };
+        match one {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => r = Err((root.clone(), e)),
+            _ => {}
+        }
+    }
     match r {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Json(json!({ "ok": true })).into_response()
-        }
-        Err(e) => err(
+        Err((root, e)) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("{}: {e}", root.display()),
         ),
@@ -645,5 +751,80 @@ mod tests {
             !dest_dir.parent().unwrap().join("escape").exists(),
             "wrote outside the destination"
         );
+    }
+
+    #[test]
+    fn a_first_rar_volume_names_its_set() {
+        let names: Vec<String> = [
+            "g.part1.rar",
+            "g.part2.rar",
+            "g.part10.rar",
+            "g.part2.rar.txt",
+            "h.part2.rar",
+            "old.rar",
+            "old.r00",
+            "old.r01",
+            "old.r0x",
+            "x.zip",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            rar_set_siblings("g.part1.rar", &names),
+            ["g.part10.rar", "g.part2.rar"]
+        );
+        assert_eq!(
+            rar_set_siblings("G.PART01.RAR", &["G.PART02.RAR".into()]),
+            ["G.PART02.RAR"]
+        );
+        assert_eq!(rar_set_siblings("old.rar", &names), ["old.r00", "old.r01"]);
+        // Not a first volume, or not a set: nothing extra.
+        assert!(rar_set_siblings("g.part2.rar", &names).is_empty());
+        assert!(rar_set_siblings("x.zip", &names).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_multi_part_rar_arrives_with_every_volume_and_leaves_with_them() {
+        let (r, id) = setup(&[
+            ("/dl/g.part1.rar", b"one"),
+            ("/dl/g.part2.rar", b"two"),
+            ("/dl/g.part3.rar", b"three"),
+            ("/dl/other.rar", b"x"),
+        ]);
+        let (d, jobs) = deps(plenty);
+        let dest_dir = crate::remote::store::test_dir();
+        let (code, out) = json_of(
+            start_fetch(
+                Arc::clone(&r),
+                d,
+                FetchBody {
+                    path: format!("remote://{id}/dl/g.part1.rar"),
+                    dest_dir: Some(dest_dir.display().to_string()),
+                },
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{out}");
+        let job: Uuid = out["job_id"].as_str().unwrap().parse().unwrap();
+        let JobState::Done {
+            dest, bytes_sent, ..
+        } = wait(&jobs, job).await
+        else {
+            panic!("fetch failed")
+        };
+        assert_eq!(PathBuf::from(&dest), dest_dir.join("g.part1.rar"));
+        assert_eq!(bytes_sent, 11);
+        assert_eq!(
+            std::fs::read(dest_dir.join("g.part3.rar")).unwrap(),
+            b"three"
+        );
+        assert!(!dest_dir.join("other.rar").exists());
+        let (code, _) = json_of(cleanup(&dest).await).await;
+        assert_eq!(code, StatusCode::OK);
+        for v in ["g.part1.rar", "g.part2.rar", "g.part3.rar"] {
+            assert!(!dest_dir.join(v).exists(), "{v}");
+        }
     }
 }
