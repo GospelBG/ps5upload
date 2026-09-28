@@ -423,6 +423,10 @@ mod tests {
             while !stop2.load(Ordering::Relaxed) {
                 match l.accept() {
                     Ok((mut s, _)) => {
+                        // BSD/macOS: the accepted socket inherits the listener's
+                        // O_NONBLOCK, so a read before the client writes returned
+                        // WouldBlock and the request went unrecorded (a flake).
+                        s.set_nonblocking(false).ok();
                         s.set_read_timeout(Some(Duration::from_millis(200))).ok();
                         let mut buf = [0u8; 512];
                         let n = s.read(&mut buf).unwrap_or(0);
