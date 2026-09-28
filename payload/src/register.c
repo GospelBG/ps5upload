@@ -1415,6 +1415,28 @@ int register_title_from_path(const char *src_path,
  * under the default debugger authid would be rejected on FW 9.60+ exactly
  * like InstallByPackage is. Swap for the call window, then restore. */
 
+/* Remove the flat /user/appmeta/<title_id> folder register_title_from_path
+ * filled (copy_sce_sys_to_appmeta copies files only): unlink its regular
+ * files, then the folder. Never recurses -- anything unexpected in there is
+ * left, and so is the folder. */
+static void remove_our_appmeta(const char *title_id) {
+    char dir[REG_MAX_PATH];
+    snprintf(dir, sizeof(dir), "%s/%s", REG_APPMETA_BASE, title_id);
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        char f[REG_MAX_PATH];
+        int n = snprintf(f, sizeof(f), "%s/%s", dir, e->d_name);
+        if (n <= 0 || (size_t)n >= sizeof(f)) continue;
+        struct stat st;
+        if (lstat(f, &st) == 0 && S_ISREG(st.st_mode)) (void)unlink(f);
+    }
+    closedir(d);
+    (void)rmdir(dir);
+}
+
 int unregister_title(const char *title_id, const char **err_reason_out,
                      unsigned *sony_rc_out) {
     register_module_init();
@@ -1468,6 +1490,7 @@ int unregister_title(const char *title_id, const char **err_reason_out,
      * Same serialization + grace period as install. Sony's uninstall
      * stub shares implementation internals with install (they touch
      * the same app.db row), so the same kernel-lock concerns apply. */
+    int uninstall_rc = -1;
     if (g_reg.app_uninstall) {
         /* Signature is (title_id, p1, p2). The trailing out-params
          * accept NULL — the call only needs the title_id and
@@ -1494,6 +1517,7 @@ int unregister_title(const char *title_id, const char **err_reason_out,
             (void)kernel_set_ucred_authid(mypid, PS5_SHELLCORE_AUTHID);
         }
         int unrc = g_reg.app_uninstall(title_id, NULL, NULL);
+        uninstall_rc = unrc;
         /* Restore the prior authid with retry-and-verify (3 attempts),
          * matching authid.h's ps5_authid_release(). A single unverified
          * set could silently fail and leave this pid holding the ShellCore
@@ -1523,6 +1547,11 @@ int unregister_title(const char *title_id, const char **err_reason_out,
                     title_id, (unsigned)unrc);
         }
     }
+    /* Our registration copied sce_sys into /user/appmeta/<id>; Sony's
+     * uninstall does not know about that copy, and the app lists every
+     * appmeta folder as installed -- so an uninstalled folder game kept
+     * showing up. Once Sony has confirmed the uninstall, remove it. */
+    if (ours && uninstall_rc == 0) remove_our_appmeta(title_id);
     return 0;
 }
 
