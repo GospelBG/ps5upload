@@ -298,6 +298,9 @@ interface QueueState {
    *  when the item finishes or is removed; a duplicate resolves at once with
    *  ok:false. */
   enqueueInstall: (input: EnqueueInstallInput) => EnqueuedInstall;
+  /** Re-run one failed install item; returns a fresh waiter, or null when the
+   *  row is missing, not an install, or not failed. */
+  retryInstall: (id: string) => EnqueuedInstall | null;
   remove: (id: string) => void;
   /** Cancel a single item and drop it from the queue. If it's the one
    *  actively uploading, its in-flight engine job is aborted (at the next
@@ -469,9 +472,15 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       const { items, continueOnFailure } = get();
       // Redact RAR passwords before persisting — they stay in the live
       // in-memory items (so the current run can extract) but never touch disk.
-      const persistItems = items.map((it) =>
-        it.rarPassword ? { ...it, rarPassword: null } : it,
-      );
+      const persistItems = items.map((it) => {
+        let out = it.rarPassword ? { ...it, rarPassword: null } : it;
+        // A link can carry a signed token: never persist it. The item is
+        // dropped on the next hydrate.
+        if (out.install?.via === "link") {
+          out = { ...out, install: undefined, sourcePath: "url:" };
+        }
+        return out;
+      });
       const doc: QueueDocument = { items: persistItems, continueOnFailure };
       void uploadQueueSave(doc)
         .then(() => set({ persistenceError: null }))
@@ -1288,6 +1297,16 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         //   feature) but they won't crash.
         const items = (doc.items ?? []).map((it) => {
           const next = { ...it };
+          // An install that was running is never re-run by itself: Sony may
+          // already have accepted it, and repeating a patch install can wipe
+          // the base game.
+          if (next.sourceKind === "install" && next.status === "running") {
+            next.status = "failed";
+            next.installPhase = "error";
+            next.error =
+              "Interrupted when the app closed. Check the game on the PS5, then retry if it isn't installed.";
+            next.completedAt = Date.now();
+          }
           if (next.status === "running") next.status = "pending";
           if (!next.txIdHex) next.txIdHex = generateTxIdHex();
           // Back-fill the bytes/sec field added in 2.2.22 — older
@@ -1319,8 +1338,18 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             next.filesFinalizingTotal = 0;
           return next;
         });
+        // A link item comes back without its request (never saved): drop it.
+        const kept = items.filter(
+          (it) => it.sourceKind !== "install" || it.install != null,
+        );
+        const dropped = items.length - kept.length;
+        if (dropped > 0) {
+          pushNotification("info", "Queued links were cleared", {
+            body: `${dropped} install link${dropped === 1 ? " was" : "s were"} not kept after restart — links are never saved to disk. Add them again from Install Package.`,
+          });
+        }
         set({
-          items,
+          items: kept,
           continueOnFailure: doc.continueOnFailure ?? false,
           loaded: true,
           persistenceError: null,
@@ -1376,6 +1405,26 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       return { id: added.id, done };
     },
 
+    retryInstall(id) {
+      const it = get().items.find((x) => x.id === id);
+      if (!it || it.sourceKind !== "install" || it.status !== "failed") return null;
+      set((s) => ({
+        items: patchItem(s.items, id, {
+          status: "pending",
+          error: null,
+          errorReason: null,
+          errorDetail: null,
+          installPhase: null,
+          installPct: null,
+          completedAt: null,
+        }),
+      }));
+      scheduleSave();
+      const done = new Promise<InstallResult>((resolve) => waiters.set(id, resolve));
+      void get().startHost(hostOf(it.addr));
+      return { id, done };
+    },
+
     add(input) {
       const item: QueueItem = {
         id: newId(),
@@ -1407,6 +1456,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     },
 
     remove(id) {
+      settle(id, { ok: false, message: "Removed from the queue." });
       set((s) => ({ items: removeItem(s.items, id) }));
       scheduleSave();
     },
@@ -1414,6 +1464,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     cancelItem(id) {
       const item = get().items.find((it) => it.id === id);
       if (!item) return;
+      settle(id, { ok: false, message: "Removed from the queue." });
       const h = hostOf(item.addr);
       // A pending / done / failed item isn't touching the wire — just drop it.
       // (Pending removal also keeps the drain loop from ever claiming it.)
@@ -1462,6 +1513,9 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       // user clicks Clear, the UI empties, and a subsequent upload
       // mysteriously stalls behind the orphaned transfer. Mirrors the
       // documented reset() caveat in transfer.ts.
+      for (const it of get().items) {
+        settle(it.id, { ok: false, message: "Removed from the queue." });
+      }
       const inFlight = get().items.find((it) => it.status === "running");
       if (inFlight) {
         pushNotification(

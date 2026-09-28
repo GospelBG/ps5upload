@@ -54,6 +54,7 @@ import {
   powerStandby,
   fsDelete,
   uploadQueueSave,
+  uploadQueueLoad,
 } from "../api/ps5";
 import { useRestAfterUploadStore } from "./restAfterUpload";
 import { ensurePayloadCurrent } from "../lib/ensurePayloadCurrent";
@@ -1261,5 +1262,124 @@ describe("install items", () => {
     } as unknown as QueueItem;
     expect(sameInstall(item, { host: "10.0.0.2", request: { via: "stream", source: "/x.pkg" }, displayName: "other" })).toBe(true);
     expect(sameInstall(item, { host: "10.0.0.3", request: { via: "stream", source: "/x.pkg" }, displayName: "X" })).toBe(false);
+  });
+});
+
+describe("install item lifecycle", () => {
+  const host = "10.0.0.2";
+  beforeEach(() => {
+    vi.useRealTimers();
+    useUploadQueueStore.getState().stop();
+    mockedEnsurePayload.mockReset().mockResolvedValue(undefined as never);
+    useUploadQueueStore.setState({
+      ...pristineQueue,
+      items: [],
+      runningHosts: {},
+      running: false,
+      continueOnFailure: true,
+      loaded: true,
+    });
+  });
+  afterEach(() => {
+    useUploadQueueStore.getState().stop();
+  });
+
+  it("[RF 1] removing a queued install resolves its waiter", async () => {
+    registerInstallExecutor(() => new Promise(() => {})); // never finishes
+    const s = useUploadQueueStore.getState();
+    s.enqueueInstall({ host, request: { via: "stream", source: "/a.pkg" }, displayName: "A" });
+    const b = s.enqueueInstall({ host, request: { via: "stream", source: "/b.pkg" }, displayName: "B" });
+    useUploadQueueStore.getState().remove(b.id);
+    await expect(b.done).resolves.toMatchObject({
+      ok: false,
+      message: expect.stringMatching(/removed from the queue/i),
+    });
+  });
+
+  it("[RF 1] a queue stopped by a failure leaves later waiters pending", async () => {
+    useUploadQueueStore.setState({ continueOnFailure: false });
+    registerInstallExecutor(async (req) =>
+      req.via === "stream" && req.source === "/a.pkg" ? { ok: false, message: "no" } : { ok: true },
+    );
+    const s = useUploadQueueStore.getState();
+    const a = s.enqueueInstall({ host, request: { via: "stream", source: "/a.pkg" }, displayName: "A" });
+    const b = s.enqueueInstall({ host, request: { via: "stream", source: "/b.pkg" }, displayName: "B" });
+    await expect(a.done).resolves.toMatchObject({ ok: false });
+    let settled = false;
+    void b.done.then(() => (settled = true));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(settled).toBe(false);
+    expect(useUploadQueueStore.getState().items.find((i) => i.id === b.id)?.status).toBe("pending");
+  });
+
+  it("[RF 4] retryInstall re-runs one failed item with a fresh waiter", async () => {
+    let n = 0;
+    registerInstallExecutor(async () => (++n === 1 ? { ok: false, message: "first" } : { ok: true }));
+    const first = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "library", path: "/p.pkg" }, displayName: "P",
+    });
+    await expect(first.done).resolves.toMatchObject({ ok: false });
+    for (let i = 0; i < 200 && useUploadQueueStore.getState().runningHosts[host]; i++)
+      await new Promise((r) => setTimeout(r, 5));
+    const again = useUploadQueueStore.getState().retryInstall(first.id);
+    expect(again).not.toBeNull();
+    await expect(again!.done).resolves.toEqual({ ok: true });
+  });
+
+  it("never writes a link to disk", async () => {
+    registerInstallExecutor(() => new Promise(() => {}));
+    useUploadQueueStore.getState().enqueueInstall({
+      host,
+      request: { via: "link", url: "https://cdn.example/x.pkg?token=SECRET", mode: "stream", insecureTls: false },
+      displayName: "X",
+    });
+    await new Promise((r) => setTimeout(r, 450)); // past the 300 ms save debounce
+    const calls = mockedQueueSave.mock.calls;
+    const saved = JSON.stringify(calls[calls.length - 1]?.[0]);
+    expect(saved).not.toContain("SECRET");
+    expect(saved).not.toContain("cdn.example");
+  });
+
+  it("hydrate: an interrupted install is failed (not re-run) and a link item is dropped", async () => {
+    const base = {
+      addr: "10.0.0.2:9113", strategy: "overwrite", reconcileMode: "fast", excludes: [],
+      mountAfterUpload: false, mountReadOnly: true, registerAfterUpload: false,
+      txIdHex: "00", bytesSent: 0, totalBytes: 0, bytesPerSec: 0, filesFinalized: 0,
+      filesFinalizingTotal: 0, mountedAt: null, registeredAs: null, mountWarnings: [],
+      error: null, errorReason: null, errorDetail: null, addedAt: 1, startedAt: 1, completedAt: null,
+      resolvedDest: "",
+    };
+    vi.mocked(uploadQueueLoad).mockResolvedValueOnce({
+      continueOnFailure: false,
+      items: [
+        { ...base, id: "i1", sourceKind: "install", sourcePath: "ps5:/p.pkg", displayName: "P",
+          install: { via: "library", path: "/p.pkg" }, status: "running" },
+        { ...base, id: "i2", sourceKind: "install", sourcePath: "url:", displayName: "L", status: "pending" },
+      ],
+    } as never);
+    vi.stubGlobal("window", { isTauri: true });
+    try {
+      await useUploadQueueStore.getState().hydrate();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    const items = useUploadQueueStore.getState().items;
+    expect(items.map((i) => i.id)).toEqual(["i1"]);
+    expect(items[0].status).toBe("failed");
+    expect(items[0].error).toMatch(/interrupted/i);
+  });
+
+  it("[RF 5] works without Tauri persistence (browser build)", async () => {
+    registerInstallExecutor(async () => ({ ok: true }));
+    vi.stubGlobal("window", {}); // a browser: no Tauri → in-memory only
+    try {
+      await useUploadQueueStore.getState().hydrate();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "stream", source: "/w.pkg" }, displayName: "W",
+    });
+    await expect(q.done).resolves.toEqual({ ok: true });
   });
 });
