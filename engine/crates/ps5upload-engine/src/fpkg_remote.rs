@@ -299,4 +299,67 @@ mod tests {
             std::path::PathBuf::from("remote://abc/games/x")
         );
     }
+
+    /// Throughput of the console reader Convert uses (ftpsrv + read-ahead), on a real file.
+    /// Run by hand: PS5UPLOAD_SPEED_HOST=192.168.86.99 PS5UPLOAD_SPEED_FILE=/user/app/X/app.pkg
+    /// cargo test -p ps5upload-engine --release --lib console_read_speed -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn console_read_speed() {
+        use std::io::Read;
+        let host = std::env::var("PS5UPLOAD_SPEED_HOST").expect("PS5UPLOAD_SPEED_HOST");
+        let path = std::env::var("PS5UPLOAD_SPEED_FILE").expect("PS5UPLOAD_SPEED_FILE");
+        let limit: u64 = std::env::var("PS5UPLOAD_SPEED_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2 << 30);
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            use crate::remote::store::{Connection, Protocol, Secret};
+            let conn = Connection {
+                id: String::new(),
+                name: "PS5".into(),
+                protocol: Protocol::Ftp,
+                host,
+                port: CONSOLE_FTP_PORT,
+                share: String::new(),
+                user: String::new(),
+                start_path: String::new(),
+                host_key: None,
+            };
+            let fs = handle
+                .block_on(crate::remote::ftp_fs::FtpFs::connect(
+                    &conn,
+                    &Secret::None,
+                    false,
+                ))
+                .unwrap();
+            let files = ConsoleFiles {
+                fs: Arc::new(fs),
+                handle: handle.clone(),
+                label: "speed".into(),
+            };
+            let mut r = files.open(&path).unwrap();
+            // The builder asks for block-sized ranges, front to back.
+            let mut buf = vec![0u8; 2 << 20];
+            let started = std::time::Instant::now();
+            let mut done = 0u64;
+            while done < limit {
+                let n = r.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                done += n as u64;
+            }
+            let secs = started.elapsed().as_secs_f64();
+            println!(
+                "console read: {:.2} GiB in {:.1} s = {:.1} MB/s",
+                done as f64 / (1u64 << 30) as f64,
+                secs,
+                done as f64 / 1e6 / secs
+            );
+        })
+        .await
+        .unwrap();
+    }
 }
