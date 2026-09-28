@@ -324,10 +324,16 @@ impl Ufs2Image<File> {
     /// Open a `.ffpkg` (or any UFS2 image) by path. Cheap — only
     /// reads the superblock.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Ufs2Error> {
-        let mut f = File::open(path)?;
-        let sb = Superblock::read(&mut f)?;
+        Self::from_reader(File::open(path)?)
+    }
+}
+
+impl<R: Read + Seek> Ufs2Image<R> {
+    /// An image in any seekable bytes (a `.ffpfsc`'s inner image, say).
+    pub fn from_reader(mut reader: R) -> Result<Self, Ufs2Error> {
+        let sb = Superblock::read(&mut reader)?;
         Ok(Self {
-            reader: f,
+            reader,
             superblock: sb,
         })
     }

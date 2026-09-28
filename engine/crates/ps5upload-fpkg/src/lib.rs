@@ -25,6 +25,7 @@ pub mod naps;
 pub mod outer;
 pub mod outer_write;
 pub mod pfsc;
+pub mod pfsc_reader;
 pub mod pfsimage;
 pub mod plan;
 pub mod playgo;
@@ -105,9 +106,13 @@ pub(crate) fn format_err<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error::Format(msg.into()))
 }
 
-/// A package on disk, read by offset.
+/// Bytes that can be read at any offset: a file, or a view into one (a `.ffpfsc`'s image).
+pub trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
+
+/// A package or image, read by offset.
 pub struct PkgFile {
-    file: std::fs::File,
+    file: Box<dyn ReadSeek>,
     len: u64,
 }
 
@@ -115,7 +120,12 @@ impl PkgFile {
     pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
-        Ok(Self { file, len })
+        Ok(Self::from_reader(Box::new(file), len))
+    }
+
+    /// Any seekable bytes of known length.
+    pub fn from_reader(file: Box<dyn ReadSeek>, len: u64) -> Self {
+        Self { file, len }
     }
 
     pub fn len(&self) -> u64 {

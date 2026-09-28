@@ -1,11 +1,11 @@
 //! A `.ffpkg` game image as a source tree: the UFS2 reader, wrapped for the converter.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ps5upload_pkg::ufs2::{Inode, Ufs2Error, Ufs2Image, ROOT_INODE};
 
 use crate::source::{is_junk, SourceFile, SourceTree};
-use crate::{format_err, Result};
+use crate::{format_err, ReadSeek, Result};
 
 /// A directory tree deeper than this is refused, as the reader's own walker does.
 const MAX_DEPTH: u32 = 32;
@@ -18,22 +18,28 @@ impl From<Ufs2Error> for crate::Error {
 
 /// A game image's files and the inodes they came from, in the same order.
 pub struct Ufs2Source {
-    path: PathBuf,
-    image: Ufs2Image<std::fs::File>,
+    label: String,
+    image: Ufs2Image<Box<dyn ReadSeek>>,
     files: Vec<SourceFile>,
     inodes: Vec<Inode>,
 }
 
 impl Ufs2Source {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut image = Ufs2Image::open(path)
-            .map_err(|e| crate::Error::Format(format!("{}: {e}", path.display())))?;
+        let file = std::fs::File::open(path)?;
+        Self::from_reader(Box::new(file), format!("ffpkg {}", path.display()))
+    }
+
+    /// A UFS2 image in any seekable bytes; `label` names it in errors and logs.
+    pub fn from_reader(reader: Box<dyn ReadSeek>, label: String) -> Result<Self> {
+        let mut image = Ufs2Image::from_reader(reader)
+            .map_err(|e| crate::Error::Format(format!("{label}: {e}")))?;
         let mut files = Vec::new();
         let mut inodes = Vec::new();
         let root = image.read_inode(ROOT_INODE)?;
         walk(&mut image, &root, "", 0, &mut files, &mut inodes)?;
         if files.is_empty() {
-            return format_err(format!("{} holds no files", path.display()));
+            return format_err(format!("{label} holds no files"));
         }
         let order: Vec<usize> = {
             let mut idx: Vec<usize> = (0..files.len()).collect();
@@ -43,7 +49,7 @@ impl Ufs2Source {
         let files = order.iter().map(|&i| files[i].clone()).collect();
         let inodes = order.iter().map(|&i| inodes[i].clone()).collect();
         Ok(Self {
-            path: path.to_path_buf(),
+            label,
             image,
             files,
             inodes,
@@ -79,8 +85,8 @@ impl SourceTree for Ufs2Source {
 
     fn describe(&self) -> String {
         format!(
-            "ffpkg {} (UFS2, {} KiB blocks, {} files)",
-            self.path.display(),
+            "{} (UFS2, {} KiB blocks, {} files)",
+            self.label,
             self.image.superblock.block_size / 1024,
             self.files.len()
         )
@@ -88,7 +94,7 @@ impl SourceTree for Ufs2Source {
 }
 
 fn walk(
-    image: &mut Ufs2Image<std::fs::File>,
+    image: &mut Ufs2Image<Box<dyn ReadSeek>>,
     dir: &Inode,
     prefix: &str,
     depth: u32,
@@ -145,7 +151,7 @@ fn walk(
 /// Reads one run of entries' inodes — a contiguous, same-cylinder-group stretch — in a
 /// single call, ignoring entries whose inode the image cannot produce.
 fn read_run(
-    image: &mut Ufs2Image<std::fs::File>,
+    image: &mut Ufs2Image<Box<dyn ReadSeek>>,
     entries: &[ps5upload_pkg::ufs2::DirEntry],
     run: &[usize],
     out: &mut [Option<Inode>],

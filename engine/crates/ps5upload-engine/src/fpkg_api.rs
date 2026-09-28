@@ -33,7 +33,7 @@ const STAGES: [build::Stage; 5] = [
 
 #[derive(Deserialize)]
 pub(crate) struct InspectReq {
-    /// A game folder, or a `.exfat` / `.ffpkg` mount image.
+    /// A game folder, or a `.exfat` / `.ffpkg` / `.ffpfsc` mount image.
     source: String,
     /// Where the package would go; defaults to `~/Downloads/fpkgs`. Used only to report
     /// the room left.

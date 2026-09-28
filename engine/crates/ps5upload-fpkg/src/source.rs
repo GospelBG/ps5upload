@@ -100,10 +100,51 @@ pub fn open(path: &Path) -> Result<Box<dyn SourceTree>> {
     match ext.as_str() {
         "exfat" => Ok(Box::new(crate::exfat::ExFatSource::open(path)?)),
         "ffpkg" | "ufs2" => Ok(Box::new(crate::ufs2_source::Ufs2Source::open(path)?)),
+        "ffpfsc" => open_ffpfsc(path),
         _ => format_err(format!(
-            "{} is neither a folder nor a supported image (.exfat, .ffpkg)",
+            "{} is neither a folder nor a supported image (.exfat, .ffpkg, .ffpfsc)",
             path.display()
         )),
+    }
+}
+
+/// The image inside a `.ffpfsc`, read through its container. The inner file's name says
+/// which filesystem it holds; an unnamed one is tried as exFAT, then UFS2.
+fn open_ffpfsc(path: &Path) -> Result<Box<dyn SourceTree>> {
+    use crate::pfsc_reader::PfscReader;
+    let reader = PfscReader::open(path)
+        .map_err(|e| crate::Error::Format(format!("{}: {e}", path.display())))?;
+    let inner = reader.inner_name().to_ascii_lowercase();
+    let label = format!("ffpfsc {} ({})", path.display(), reader.inner_name());
+    let exfat = |r: PfscReader| -> Result<Box<dyn SourceTree>> {
+        let len = r.len();
+        let volume =
+            crate::exfat::ExFat::from_file(crate::PkgFile::from_reader(Box::new(r), len), &label)?;
+        Ok(Box::new(crate::exfat::ExFatSource::from_volume(
+            volume,
+            label.clone(),
+        )?))
+    };
+    let ufs2 = |r: PfscReader| -> Result<Box<dyn SourceTree>> {
+        Ok(Box::new(crate::ufs2_source::Ufs2Source::from_reader(
+            Box::new(r),
+            label.clone(),
+        )?))
+    };
+    if inner.ends_with(".exfat") {
+        return exfat(reader);
+    }
+    if inner.ends_with(".ffpkg") || inner.ends_with(".ufs2") {
+        return ufs2(reader);
+    }
+    match exfat(reader) {
+        Ok(tree) => Ok(tree),
+        Err(first) => ufs2(PfscReader::open(path)?).map_err(|_| {
+            crate::Error::Format(format!(
+                "{}: the image inside is neither exFAT nor UFS2 ({first})",
+                path.display()
+            ))
+        }),
     }
 }
 

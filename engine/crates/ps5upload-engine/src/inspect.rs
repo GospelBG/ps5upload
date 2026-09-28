@@ -31,7 +31,7 @@ pub struct GameInspection {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SourceInfo {
-    /// `pkg`, `split-pkg`, `exfat`, `ffpkg` or `folder`.
+    /// `pkg`, `split-pkg`, `exfat`, `ffpkg`, `ffpfsc` or `folder`.
     pub format: String,
     /// `local` in this step.
     pub location: String,
@@ -319,6 +319,7 @@ fn format_of(path: &Path) -> Result<&'static str> {
         "pkg" => "pkg",
         "exfat" => "exfat",
         "ffpkg" | "ufs2" => "ffpkg",
+        "ffpfsc" => "ffpfsc",
         _ => bail!("not a package, image or game folder: {}", path.display()),
     })
 }
@@ -1013,5 +1014,30 @@ mod tests {
         assert_eq!(v("PARENTAL_LEVEL"), "5");
         assert_eq!(v("ATTRIBUTE"), "0x00000010");
         assert_eq!(v("SYSTEM_VER"), "0x05050000");
+    }
+
+    #[test]
+    fn an_ffpfsc_is_inspected_through_its_image() {
+        use ps5upload_fpkg::ffpfsc::{wrap, Control, WrapOptions};
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ps5upload-fpkg/tests/fixtures/mini.exfat");
+        let dir = test_fixtures::scratch();
+        let packed = dir.join("mini.ffpfsc");
+        wrap(
+            &fixture,
+            &packed,
+            &WrapOptions::default(),
+            &mut Control::default(),
+        )
+        .unwrap();
+        let plain = inspect_local(&fixture).unwrap();
+        let g = inspect_local(&packed).unwrap();
+        assert_eq!(g.source.format, "ffpfsc");
+        assert!(!g.identity.title_id.is_empty());
+        assert_eq!(g.identity.title_id, plain.identity.title_id);
+        assert_eq!(
+            read_image(&packed, "ffpfsc", "icon0.png").unwrap(),
+            read_image(&fixture, "exfat", "icon0.png").unwrap()
+        );
     }
 }

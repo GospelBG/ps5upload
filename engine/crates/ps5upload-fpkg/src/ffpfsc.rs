@@ -43,9 +43,9 @@ const PFS_VERSION: u64 = 2;
 const PFS_MAGIC: u64 = 20_130_315;
 const MODE_CASE_INSENSITIVE: u16 = 0x8;
 
-const PFSC_MAGIC: u32 = 0x4353_4650;
+pub(crate) const PFSC_MAGIC: u32 = 0x4353_4650;
 const PFSC_VERSION_WORD: u32 = 6;
-const PFSC_HEADER_LEN: usize = 0x30;
+pub(crate) const PFSC_HEADER_LEN: usize = 0x30;
 const PFSC_TABLE_AT: u64 = 0x400;
 const PFSC_DATA_AT: u64 = 0x10000;
 
@@ -650,20 +650,47 @@ pub fn verify(image: &Path, source: Option<&Path>) -> Result<Inspection> {
     check(image, expect)
 }
 
-fn check(image: &Path, mut expect: Expect) -> Result<Inspection> {
-    let mut f = File::open(image)?;
+/// Where a single-file image keeps its file, read off the header, inode and uroot.
+#[derive(Debug, Clone)]
+pub(crate) struct Layout {
+    pub name: String,
+    /// The file's own size.
+    pub raw_size: u64,
+    /// What it takes in the image: the PFSC container's size when compressed.
+    pub stored: u64,
+    pub compressed: bool,
+    /// Byte offset of the file (or its container) in the image.
+    pub base: u64,
+}
+
+/// Parse the fixed single-file layout. Every length comes from the file, so every read is
+/// bounds-checked: a damaged or hostile image is an error, never a panic.
+pub(crate) fn layout<R: Read + Seek>(f: &mut R) -> Result<Layout> {
     let mut head = vec![0u8; (FILE_BLOCK * BLOCK) as usize];
-    f.read_exact(&mut head)?;
-    let le64 = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
-    let le32 = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
-    if le64(&head, 0) != PFS_VERSION || le64(&head, 8) != PFS_MAGIC {
+    f.seek(SeekFrom::Start(0))?;
+    if f.read_exact(&mut head).is_err() {
+        return format_err("not a PFS image (too short)");
+    }
+    let le64 = |b: &[u8], at: usize| -> Result<u64> {
+        match b.get(at..at + 8) {
+            Some(s) => Ok(u64::from_le_bytes(s.try_into().unwrap())),
+            None => format_err("the PFS header runs past its block"),
+        }
+    };
+    let le32 = |b: &[u8], at: usize| -> Result<u32> {
+        match b.get(at..at + 4) {
+            Some(s) => Ok(u32::from_le_bytes(s.try_into().unwrap())),
+            None => format_err("the PFS header runs past its block"),
+        }
+    };
+    if le64(&head, 0)? != PFS_VERSION || le64(&head, 8)? != PFS_MAGIC {
         return format_err("not a PFS image (version/magic)");
     }
     let node = BLOCK as usize + 3 * INODE_LEN;
-    let flags = le32(&head, node + 4);
-    let stored = le64(&head, node + 8);
-    let second = le64(&head, node + 16);
-    let first_block = le32(&head, node + 0x64) as u64;
+    let flags = le32(&head, node + 4)?;
+    let stored = le64(&head, node + 8)?;
+    let second = le64(&head, node + 16)?;
+    let first_block = u64::from(le32(&head, node + 0x64)?);
     let compressed = flags & FLAG_COMPRESSED != 0;
     let raw_size = if compressed { second } else { stored };
     // The file named in uroot: the third entry.
@@ -671,12 +698,40 @@ fn check(image: &Path, mut expect: Expect) -> Result<Inspection> {
     let mut at = 0usize;
     let mut name = String::new();
     for _ in 0..3 {
-        let len = le32(uroot, at + 8) as usize;
-        let step = le32(uroot, at + 12) as usize;
-        name = String::from_utf8_lossy(&uroot[at + 16..at + 16 + len]).into_owned();
+        let len = le32(uroot, at + 8)? as usize;
+        let step = le32(uroot, at + 12)? as usize;
+        let Some(bytes) = uroot.get(at + 16..at + 16 + len) else {
+            return format_err("a PFS directory entry runs past its block");
+        };
+        name = String::from_utf8_lossy(bytes).into_owned();
+        if step == 0 {
+            return format_err("a PFS directory entry has no length");
+        }
         at += step;
     }
-    let base = first_block * BLOCK;
+    let Some(base) = first_block.checked_mul(BLOCK) else {
+        return format_err("the file's first block is out of range");
+    };
+    Ok(Layout {
+        name,
+        raw_size,
+        stored,
+        compressed,
+        base,
+    })
+}
+
+fn check(image: &Path, mut expect: Expect) -> Result<Inspection> {
+    let mut f = File::open(image)?;
+    let Layout {
+        name,
+        raw_size,
+        stored,
+        compressed,
+        base,
+    } = layout(&mut f)?;
+    let le64 = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    let le32 = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
     if let Expect::Crcs(c) = &expect {
         if c.len() as u64 != raw_size.div_ceil(BLOCK) {
             return format_err("the checksum list does not cover the file");

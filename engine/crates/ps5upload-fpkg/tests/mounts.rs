@@ -359,3 +359,135 @@ fn a_build_from_an_exfat_mount_verifies_and_round_trips() {
     assert_eq!(&rebuilt[meta_at..], &mount_image[meta_at..]);
     std::fs::remove_dir_all(&out).ok();
 }
+
+/// A `.ffpfsc` of an image.
+fn wrapped(image: &Path, name: &str) -> PathBuf {
+    use ps5upload_fpkg::ffpfsc::{wrap, Control, WrapOptions};
+    let dir = std::env::temp_dir().join(format!("fpkg-ffpfsc-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join(format!("{name}.ffpfsc"));
+    wrap(
+        image,
+        &out,
+        &WrapOptions::default(),
+        &mut Control::default(),
+    )
+    .unwrap();
+    out
+}
+
+/// Part 1 of the Convert-inputs spec: a `.ffpfsc` reads back as the image inside it —
+/// every read, at any offset, across block boundaries and at the end.
+#[test]
+fn the_pfsc_reader_reads_the_inner_image_at_any_offset() {
+    use std::io::{Read, Seek, SeekFrom};
+    // The fixture compresses; noise is stored as it is (no block shrinks enough).
+    let noise = std::env::temp_dir().join(format!("fpkg-noise-{}.bin", std::process::id()));
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let bytes: Vec<u8> = (0..0x10000 * 3 + 777)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    std::fs::write(&noise, &bytes).unwrap();
+    for (source, compress) in [(fixture(), true), (noise.clone(), false)] {
+        let raw = std::fs::read(&source).unwrap();
+        let img = wrapped(&source, &format!("reader-{compress}"));
+        let r0 = ps5upload_fpkg::ffpfsc::verify(&img, None).unwrap();
+        assert_eq!(r0.compressed, compress);
+        let mut r = ps5upload_fpkg::pfsc_reader::PfscReader::open(&img).unwrap();
+        assert_eq!(r.len(), raw.len() as u64);
+        let block = 0x10000u64;
+        let len = raw.len() as u64;
+        for (at, n) in [
+            (0, 16),
+            (block - 3, 7),
+            (block * 3 + 100, (block * 2) as usize),
+            (len - 10, 10),
+            (len - 5, 100), // short read at the end
+            (12_345, 1),
+        ] {
+            r.seek(SeekFrom::Start(at)).unwrap();
+            let mut got = vec![0u8; n];
+            let mut filled = 0;
+            loop {
+                let k = r.read(&mut got[filled..]).unwrap();
+                if k == 0 {
+                    break;
+                }
+                filled += k;
+            }
+            let want = &raw[at as usize..(at as usize + n).min(raw.len())];
+            assert_eq!(
+                &got[..filled],
+                want,
+                "at {at:#x} len {n} compress {compress}"
+            );
+        }
+        r.seek(SeekFrom::Start(len + 5)).unwrap();
+        let mut b = [0u8; 4];
+        assert_eq!(r.read(&mut b).unwrap(), 0);
+    }
+}
+
+/// A `.ffpfsc` source is the tree of the image it holds.
+#[test]
+fn an_ffpfsc_opens_as_the_tree_of_its_image() {
+    let img = wrapped(&fixture(), "tree");
+    let mut plain = source::open(&fixture()).unwrap();
+    let mut packed = source::open(&img).unwrap();
+    assert_eq!(plain.files(), packed.files());
+    for f in plain.files().to_vec() {
+        assert_eq!(
+            plain.read(&f.path).unwrap(),
+            packed.read(&f.path).unwrap(),
+            "{}",
+            f.path
+        );
+    }
+    assert!(packed.describe().contains("ffpfsc"));
+}
+
+/// A file that only claims to be `.ffpfsc` is refused with a reason.
+#[test]
+fn a_bogus_ffpfsc_is_refused() {
+    let dir = std::env::temp_dir().join(format!("fpkg-ffpfsc-bogus-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("x.ffpfsc");
+    std::fs::write(&p, vec![0u8; 8 * 0x10000]).unwrap();
+    let err = source::open(&p).err().expect("refused").to_string();
+    assert!(err.contains("PFS"), "{err}");
+}
+
+/// A package built from a `.ffpfsc` is byte for byte the package built from its image.
+#[test]
+fn a_build_from_an_ffpfsc_equals_the_build_from_its_image() {
+    let packed = wrapped(&fixture(), "build");
+    let build_of = |src: &Path, tag: &str| {
+        let out =
+            std::env::temp_dir().join(format!("fpkg-ffpfsc-build-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        let request = BuildRequest {
+            time: Some((1_700_000_000, 0)),
+            seed: Some([0x5A; 16]),
+            kraken: false,
+            ..BuildRequest::new(src, &out)
+        };
+        let report = build::build(&request, &mut |_| {}).unwrap();
+        assert!(report.verify.ok(), "{}", report.verify);
+        std::fs::read(&report.path).unwrap()
+    };
+    let a = build_of(&fixture(), "exfat");
+    let b = build_of(&packed, "ffpfsc");
+    assert!(
+        a == b,
+        "the packages differ ({} vs {} bytes)",
+        a.len(),
+        b.len()
+    );
+}

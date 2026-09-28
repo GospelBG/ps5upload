@@ -56,13 +56,16 @@ pub struct ExFat {
 
 impl ExFat {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = PkgFile::open(path)?;
+        Self::from_file(PkgFile::open(path)?, &path.display().to_string())
+    }
+
+    /// The volume in `file`; `label` names it in errors.
+    pub fn from_file(mut file: PkgFile, label: &str) -> Result<Self> {
         let volume_offset = find_volume(&mut file)?;
         let boot = file.read_at(volume_offset, 512)?;
         if &boot[3..11] != OEM {
             return format_err(format!(
-                "{} +{volume_offset:#x} is not an exFAT volume",
-                path.display()
+                "{label} +{volume_offset:#x} is not an exFAT volume"
             ));
         }
         let sector_shift = boot[108];
@@ -319,7 +322,7 @@ fn early_end(path: &str) -> crate::Error {
 
 /// An exFAT mount image as a source tree.
 pub struct ExFatSource {
-    path: std::path::PathBuf,
+    label: String,
     volume: ExFat,
     files: Vec<SourceFile>,
     inner: Vec<ExFatFile>,
@@ -327,8 +330,13 @@ pub struct ExFatSource {
 
 impl ExFatSource {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut volume = ExFat::open(path)
+        let volume = ExFat::open(path)
             .map_err(|e| crate::Error::Format(format!("{}: {e}", path.display())))?;
+        Self::from_volume(volume, format!("exfat {}", path.display()))
+    }
+
+    /// A volume already opened; `label` is what [`SourceTree::describe`] leads with.
+    pub fn from_volume(mut volume: ExFat, label: String) -> Result<Self> {
         let inner = volume.walk()?;
         let files = inner
             .iter()
@@ -338,7 +346,7 @@ impl ExFatSource {
             })
             .collect();
         Ok(Self {
-            path: path.to_path_buf(),
+            label,
             volume,
             files,
             inner,
@@ -372,8 +380,8 @@ impl SourceTree for ExFatSource {
     fn describe(&self) -> String {
         let g = self.volume.geometry();
         format!(
-            "exfat {} ({} KiB clusters, {} clusters)",
-            self.path.display(),
+            "{} ({} KiB clusters, {} clusters)",
+            self.label,
             g.cluster_size / 1024,
             g.cluster_count
         )
