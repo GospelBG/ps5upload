@@ -202,7 +202,7 @@ export function RunCard(props: RunCardProps) {
           onClick={() => props.onInstall("stream")}
           disabled={!props.canInstall}
         >
-          {tr("fpkg.streamInstall", undefined, "Stream install")}
+          {tr("pkglib.streamInstall", undefined, "Stream & install")}
         </Button>
         <Button onClick={() => props.onInstall("upload")} disabled={!props.canInstall}>
           {tr("fpkg.uploadInstall", undefined, "Upload & install")}

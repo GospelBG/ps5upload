@@ -6,6 +6,15 @@ What's new in ps5upload, written for humans.
 
 ## Unreleased
 
+**Stream & install first.**
+
+- **Stream & install** (renamed from Stream install) is now the main way to
+  install: it's the first, highlighted button on Install Package, dropping a
+  package onto the screen streams it, and a .pkg picked on Upload offers it
+  as the recommended route. Nothing is copied to the PS5 first.
+- **Upload & install** (renamed from Add package) copies the package to the
+  PS5 first, for when the console can't reach this computer.
+
 **See what a package is before you install it.**
 
 - **Package viewer.** Click **View details** on a package in Install Package,

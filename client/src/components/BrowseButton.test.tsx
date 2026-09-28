@@ -35,6 +35,13 @@ describe("BrowseButton", () => {
     expect(out).not.toContain("aria-haspopup");
   });
 
+  it("can be the screen's primary action", () => {
+    const out = renderToStaticMarkup(<BrowseButton mode="file" remote primary onPick={noop} />);
+    expect(out).toContain("bg-[var(--color-accent)]");
+    const plain = renderToStaticMarkup(<BrowseButton mode="file" onPick={noop} />);
+    expect(plain).not.toContain("bg-[var(--color-accent)]");
+  });
+
   it("has a server menu where remote picks are accepted", () => {
     const out = renderToStaticMarkup(<BrowseButton mode="file" remote onPick={noop} />);
     expect(out).toContain('aria-haspopup="menu"');

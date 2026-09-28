@@ -8,7 +8,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   PackageOpen,
-  Plus,
+  Upload,
   Trash2,
   Download,
   RotateCcw,
@@ -586,6 +586,7 @@ export default function InstallPackageScreen() {
   // calls the latest uploader without re-subscribing each render. Updated
   // in an effect (not during render) per the rules-of-hooks ref rule.
   const uploadRef = useRef<(p: string) => void>(() => {});
+  const dropRef = useRef<(p: string) => void>(() => {});
   const recentPkgDrops = useRef(new Map<string, number>());
   useEffect(() => {
     // The window-level drop listener is registered outside JSX, so the
@@ -598,6 +599,17 @@ export default function InstallPackageScreen() {
         acceptPkgDrop(recentPkgDrops.current, p)
       ) {
         void addAndUpload(p, host);
+      }
+    };
+    // A dropped package streams & installs — the preferred path: nothing is
+    // copied to the PS5 first. Upload & install stays on its own button.
+    dropRef.current = (p: string) => {
+      if (
+        hostReady &&
+        payloadStatus === "up" &&
+        acceptPkgDrop(recentPkgDrops.current, p)
+      ) {
+        void runStreamInstall(p, p.split(/[\\/]/).pop() ?? p);
       }
     };
   });
@@ -679,7 +691,7 @@ export default function InstallPackageScreen() {
     const dropped = (location.state as { droppedPath?: string } | null)
       ?.droppedPath;
     if (dropped) {
-      uploadRef.current(dropped);
+      dropRef.current(dropped);
       window.history.replaceState({}, "");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -712,7 +724,7 @@ export default function InstallPackageScreen() {
           return;
         }
         setPickError(null);
-        for (const x of pkgPaths) uploadRef.current(x);
+        for (const x of pkgPaths) dropRef.current(x);
       }
     });
     p.then((fn) => {
@@ -1260,8 +1272,8 @@ export default function InstallPackageScreen() {
         count={entries.length || undefined}
         loading={loading}
         description={tr(
-          "install.description",
-          "Upload .pkg or .fpkg install packages to your PS5, then install them with one tap. Packages stay on the PS5 until you delete them, so you can reinstall any time.",
+          "install.description.stream",
+          "Stream & install sends a .pkg or .fpkg straight from this computer to your PS5 — nothing is copied first, and it's the most reliable way to install. Upload & install copies it to the PS5 first, for when the console can't reach this computer; those copies stay listed here so you can reinstall any time.",
         )}
         right={
           <div className="flex items-center gap-2">
@@ -1304,26 +1316,7 @@ export default function InstallPackageScreen() {
                 {installableCount})
               </Button>
             )}
-            {isTauriEnv() && (
-              <Button
-                variant="primary"
-                size="sm"
-                leftIcon={<Plus size={14} />}
-                onClick={handlePick}
-                loading={picking}
-                disabled={!hostReady}
-                title={
-                  !hostReady
-                    ? tr(
-                        "install.add.disabledHint",
-                        "Set a PS5 host on the Connection tab first",
-                      )
-                    : undefined
-                }
-              >
-                {tr("install.add", "Add package")}
-              </Button>
-            )}
+
             {!isTauriEnv() && (
               <input
                 ref={browserPkgInputRef}
@@ -1356,9 +1349,10 @@ export default function InstallPackageScreen() {
             <BrowseButton
               mode="file"
               remote
+              primary
               icon={<Download size={14} />}
               filters={[{ name: "PlayStation Package", extensions: ["pkg", "fpkg"] }]}
-              label={tr("pkglib.stream", undefined, "Stream install")}
+              label={tr("pkglib.streamInstall", undefined, "Stream & install")}
               // Installs queue per console, so a running install never
               // blocks picking the next one.
               disabled={!hostReady}
@@ -1376,6 +1370,29 @@ export default function InstallPackageScreen() {
               onMainClick={() => void handleStreamPick()}
               onPick={(p) => void streamFromServer(p)}
             />
+            {isTauriEnv() && (
+              <Button
+                variant="secondary"
+                size="sm"
+                leftIcon={<Upload size={14} />}
+                onClick={handlePick}
+                loading={picking}
+                disabled={!hostReady}
+                title={
+                  !hostReady
+                    ? tr(
+                        "install.add.disabledHint",
+                        "Set a PS5 host on the Connection tab first",
+                      )
+                    : tr(
+                        "install.uploadInstall.hint",
+                        "Copy the package to the PS5 first, then install it — for when the console can't reach this computer.",
+                      )
+                }
+              >
+                {tr("install.uploadInstall", "Upload & install")}
+              </Button>
+            )}
           </div>
         }
       />
@@ -1633,12 +1650,12 @@ export default function InstallPackageScreen() {
             size="hero"
             title={
               dropActive
-                ? tr("pkglib.empty.drop", "Drop to upload")
-                : tr("pkglib.empty.title", "No packages uploaded yet")
+                ? tr("pkglib.empty.drop.stream", "Drop to stream & install")
+                : tr("pkglib.empty.title.stream", "Install a package")
             }
             message={tr(
-              "pkglib.empty.body",
-              "Add a .pkg or .fpkg install package to upload it to your PS5, then install it from here. You can also drag either format onto the window.",
+              "pkglib.empty.body.stream",
+              "Use Stream & install to install a .pkg or .fpkg straight from this computer, or drop one onto the window. Packages you copy over with Upload & install are listed here so you can reinstall them.",
             )}
           />
         ) : (

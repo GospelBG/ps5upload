@@ -27,6 +27,8 @@ export interface BrowseButtonProps {
   remote?: boolean;
   label?: string;
   disabled?: boolean;
+  /** The screen's main action: filled in the accent color, like a primary Button. */
+  primary?: boolean;
   /** Spinner on the main button while its work runs. */
   busy?: boolean;
   /** Hover text on the main button. */
@@ -129,8 +131,10 @@ export function BrowseButton(props: BrowseButtonProps) {
     if (path) props.onPick(path);
   };
 
-  const base =
-    "inline-flex min-h-8 items-center gap-1.5 border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 text-sm hover:bg-[var(--color-surface-3)] disabled:opacity-50";
+  const tone = props.primary
+    ? "border-transparent bg-[var(--color-accent)] text-[var(--color-accent-contrast)] shadow-sm hover:brightness-110"
+    : "border-[var(--color-border)] bg-[var(--color-surface-2)] hover:bg-[var(--color-surface-3)]";
+  const base = `inline-flex min-h-8 items-center gap-1.5 border ${tone} px-3 text-sm disabled:opacity-50`;
   const label = props.label ?? tr("browse", undefined, "Browse…");
   return (
     <div ref={wrap} className={`relative inline-flex ${props.className ?? ""}`}>
@@ -151,7 +155,9 @@ export function BrowseButton(props: BrowseButtonProps) {
           aria-haspopup="menu"
           aria-expanded={open}
           aria-label={tr("browse_servers", undefined, "Browse a server")}
-          className={`${base} rounded-e-md border-s-0 px-2`}
+          className={`${base} rounded-e-md px-2 ${
+            props.primary ? "border-s-[var(--color-accent-contrast)]/30" : "border-s-0"
+          }`}
           onClick={() => setOpen((v) => !v)}
           onKeyDown={(e) => e.key === "ArrowDown" && setOpen(true)}
         >

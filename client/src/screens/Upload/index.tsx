@@ -81,7 +81,7 @@ import { BrowseButton } from "../../components/BrowseButton";
 import { isRemotePath } from "../../lib/remotePath";
 import { useUploadSettingsStore } from "../../state/uploadSettings";
 import { useUploadQueueStore } from "../../state/uploadQueue";
-import { usePkgLibrary } from "../../state/pkgLibrary";
+import { pkgLibraryStore, usePkgLibrary } from "../../state/pkgLibrary";
 import { pkgStorageFor } from "../../lib/pkgStorage";
 import {
   stagingBasename,
@@ -1317,6 +1317,16 @@ function Step2Options(props: {
           <PkgFinisherCard
             pkgInfo={source.pkgInfo ?? null}
             onView={isRemotePath(source.path) ? undefined : () => setViewingPkg(true)}
+            onStream={
+              consoleHost
+                ? () => {
+                    // Queued on the console's queue (shown at the top of this
+                    // screen and on Install Package); the pick is done.
+                    void pkgLibraryStore(consoleHost).getState().installStream(source.path, consoleHost);
+                    onClear();
+                  }
+                : undefined
+            }
           />
           <PackagePanel
             path={viewingPkg ? source.path : null}
@@ -2656,10 +2666,13 @@ function RarSourceCard() {
 function PkgFinisherCard({
   pkgInfo,
   onView,
+  onStream,
 }: {
   pkgInfo: PkgSourceInfo | null;
   /** Open the package viewer on this package (a file on this computer). */
   onView?: () => void;
+  /** Stream & install it instead of uploading (the recommended path). */
+  onStream?: () => void;
 }) {
   const tr = useTr();
   const autoInstall = useInstallSettingsStore((s) => s.autoInstallAfterUpload);
@@ -2690,10 +2703,25 @@ function PkgFinisherCard({
           ) : null}
         </div>
       )}
+      {onStream && (
+        <div className="mb-3 flex flex-wrap items-center gap-3 rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-accent)]/10 p-3">
+          <p className="min-w-0 flex-1 text-xs">
+            {tr(
+              "upload_pkg_stream_recommended",
+              undefined,
+              "Recommended: Stream & install sends it straight from this computer — nothing is copied to the PS5 first.",
+            )}
+          </p>
+          <Button variant="primary" size="sm" onClick={onStream}>
+            {tr("pkglib.streamInstall", undefined, "Stream & install")}
+          </Button>
+        </div>
+      )}
       <p className="mb-3 text-xs text-[var(--color-muted)]">
         {tr(
-          "upload_pkg_card_desc",
-          "Uploads into the PS5 package library, then installs — one queued step. The staged copy lives in the library until removed.",
+          "upload_pkg_card_desc_upload",
+          undefined,
+          "Or Upload & install: Upload copies it into the PS5 package library first, then installs — for when the console can't reach this computer. The copy stays in the library until removed.",
         )}
       </p>
       <Toggle
