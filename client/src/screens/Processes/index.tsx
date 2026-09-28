@@ -1,11 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  Cpu,
-  RefreshCw,
-  RotateCw,
-  Skull,
-  TriangleAlert,
-} from "lucide-react";
+import { Cpu, RefreshCw, RotateCw, Skull, TriangleAlert, Layers } from "lucide-react";
 
 import { useConnectionStore } from "../../state/connection";
 import { mgmtAddr, transferAddr } from "../../lib/addr";
@@ -240,7 +234,7 @@ export default function ProcessesScreen() {
   return (
     <div className="app-page">
       <PageHeader
-        icon={Cpu}
+        icon={Layers}
         title={tr("processes_title", undefined, "Processes")}
         count={procs.length || undefined}
         description={tr(

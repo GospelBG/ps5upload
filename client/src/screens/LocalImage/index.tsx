@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { HardDrive, FolderOpen, Eject, Info } from "lucide-react";
+import { HardDrive, FolderOpen, Eject, Info, FilePen } from "lucide-react";
 import {
   PageHeader,
   Button,
@@ -103,7 +103,7 @@ export default function LocalImageScreen() {
   return (
     <div className="app-page">
       <PageHeader
-        icon={HardDrive}
+        icon={FilePen}
         title={tr("localimage_title", undefined, "Edit Game Image")}
         description={tr(
           "localimage_subtitle",

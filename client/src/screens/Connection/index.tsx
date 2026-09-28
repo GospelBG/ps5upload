@@ -22,17 +22,7 @@ import { pollUntilReady, type PollHandle } from "../../lib/pollUntilReady";
 import { parsePS5Firmware } from "../../lib/ps5Firmware";
 import { compareVersions } from "../../lib/semver";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
-import {
-  AlertTriangle,
-  CheckCircle2,
-  CircleDashed,
-  XCircle,
-  Send,
-  ArrowRight,
-  Plug,
-  Radar,
-  Sparkles,
-} from "lucide-react";
+import { AlertTriangle, CheckCircle2, CircleDashed, XCircle, Send, ArrowRight, Radar, Sparkles, Cable } from "lucide-react";
 import { PageHeader, Button, Spinner, ErrorCard } from "../../components";
 import { useRosterStore } from "../../state/roster";
 import { hostOf } from "../../lib/addr";
@@ -594,7 +584,7 @@ export default function ConnectionScreen() {
   return (
     <div className="app-page">
       <PageHeader
-        icon={Plug}
+        icon={Cable}
         title={tr("connection_title", undefined, "Connect to your PS5")}
         description={tr(
           "connection_description",

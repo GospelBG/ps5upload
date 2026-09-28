@@ -18,12 +18,10 @@ import {
   Upload,
   PackageOpen,
   Gamepad2,
-  LibraryBig,
   Search,
   FolderTree,
   Cpu,
   CircleUserRound,
-  Gauge,
   Boxes,
   Save,
   Image as ImageIcon,
@@ -50,6 +48,9 @@ import {
   Stethoscope,
   HardDrive,
   PackagePlus,
+  Layers,
+  WandSparkles,
+  FilePen,
 } from "lucide-react";
 
 export interface NavItem {
@@ -130,7 +131,7 @@ export const NAV_ITEMS: NavItem[] = [
     to: "/games",
     key: "v5_tab_games",
     fallback: "Games",
-    icon: LibraryBig,
+    icon: Gamepad2,
     section: { key: "nav_section_games_mods", fallback: "Games & content" },
   },
   {
@@ -157,7 +158,7 @@ export const NAV_ITEMS: NavItem[] = [
     to: "/local-image",
     key: "local_image",
     fallback: "Edit Game Image",
-    icon: HardDrive,
+    icon: FilePen,
   },
   {
     to: "/game-activity",
@@ -169,7 +170,7 @@ export const NAV_ITEMS: NavItem[] = [
     to: "/cheats",
     key: "cheats_title",
     fallback: "Cheats",
-    icon: Gamepad2,
+    icon: WandSparkles,
   },
   // Observe and manage the selected console.
   {
@@ -183,7 +184,7 @@ export const NAV_ITEMS: NavItem[] = [
     to: "/processes",
     key: "processes",
     fallback: "Processes",
-    icon: Gauge,
+    icon: Layers,
   },
   {
     to: "/profile",

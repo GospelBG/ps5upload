@@ -1,15 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  Gamepad2,
-  RefreshCw,
-  Power,
-  Trash2,
-  ToggleLeft,
-  ToggleRight,
-  ChevronRight,
-  Zap,
-  Download,
-} from "lucide-react";
+import { Gamepad2, RefreshCw, Power, Trash2, ToggleLeft, ToggleRight, ChevronRight, Zap, Download, WandSparkles } from "lucide-react";
 import {
   PageHeader,
   Button,
@@ -234,7 +224,7 @@ export default function CheatsScreen() {
   return (
     <div className="app-page space-y-4">
       <PageHeader
-        icon={Gamepad2}
+        icon={WandSparkles}
         title={tr("cheats_title", undefined, "Cheats")}
         description={tr(
           "cheats_description",

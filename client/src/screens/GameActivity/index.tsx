@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Activity, RefreshCw, Database, Clock, TrendingUp, Trash2 } from "lucide-react";
+import { RefreshCw, Database, Clock, TrendingUp, Trash2 } from "lucide-react";
 import { PageHeader, Button, ErrorCard, ConnectionGate, EmptyState, Card, Spinner, Modal } from "../../components";
 import { useTr } from "../../state/lang";
 import { useConnectionStore } from "../../state/connection";
@@ -118,7 +118,7 @@ export default function GameActivityScreen() {
     <div className="app-page">
       <ConnectionGate>
         <PageHeader
-          icon={Activity}
+          icon={Clock}
           title={tr("game_activity_title", undefined, "Game Activity Tracker")}
           description={tr(
             "game_activity_subtitle",

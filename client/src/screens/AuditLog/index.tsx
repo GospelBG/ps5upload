@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { ScrollText } from "lucide-react";
+import { ShieldCheck } from "lucide-react";
 
 import { PageHeader } from "../../components";
 import { useTr } from "../../state/lang";
@@ -37,7 +37,7 @@ export default function AuditLogScreen() {
   return (
     <div className="app-page">
       <PageHeader
-        icon={ScrollText}
+        icon={ShieldCheck}
         title={tr("audit_log_title", undefined, "Audit log")}
         description={tr(
           "audit_log_description",
