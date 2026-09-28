@@ -265,6 +265,24 @@ fn apply_param_json(g: &mut GameInspection, v: &serde_json::Value) {
             }
         }
     }
+    // A PS5 application declares `applicationCategoryType` 0 instead of a
+    // category (a package's own header says game or patch, and wins).
+    if g.identity.category.is_empty()
+        && obj.get("applicationCategoryType").and_then(|c| c.as_u64()) == Some(0)
+    {
+        g.identity.category = "gd".to_string();
+    }
+    // PS5 keeps the build date in pubtools; the epoch means "not set".
+    if let Some(date) = obj
+        .get("pubtools")
+        .and_then(|p| p.get("creationDate"))
+        .and_then(|d| d.as_str())
+        .and_then(|d| d.get(..10))
+    {
+        if date != "1970-01-01" {
+            g.specs.build_date = Some(date.to_string());
+        }
+    }
     g.identity.platform = "ps5".to_string();
 }
 
@@ -811,6 +829,32 @@ mod tests {
             .iter()
             .any(|p| p.key == "conceptId" && p.value == "10001234"));
         assert!(!g.partial);
+    }
+
+    #[test]
+    fn a_ps5_dump_is_a_game_with_its_build_date() {
+        let dir = test_fixtures::scratch();
+        let sys = dir.join("sce_sys");
+        std::fs::create_dir_all(&sys).unwrap();
+        std::fs::write(
+            sys.join("param.json"),
+            br#"{"titleId":"PPSA30528","contentId":"UP1004-PPSA30528_00-REDEMPTION000001",
+              "applicationCategoryType":0,
+              "pubtools":{"creationDate":"2026-01-28 10:47:23","toolVersion":"3.13"}}"#,
+        )
+        .unwrap();
+        let g = inspect_local(&dir).unwrap();
+        assert_eq!(g.identity.content_type, "game");
+        assert_eq!(g.specs.build_date.as_deref(), Some("2026-01-28"));
+
+        // An unset creation date (the epoch) is not a build date.
+        std::fs::write(
+            sys.join("param.json"),
+            br#"{"titleId":"PPSA03016","applicationCategoryType":0,
+              "pubtools":{"creationDate":"1970-01-01 00:00:00"}}"#,
+        )
+        .unwrap();
+        assert_eq!(inspect_local(&dir).unwrap().specs.build_date, None);
     }
 
     #[test]
