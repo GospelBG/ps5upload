@@ -287,6 +287,8 @@ pub fn run() {
             commands::ps5_app_register,
             commands::ps5_app_unregister,
             commands::fpkg_inspect,
+            commands::game_inspect,
+            commands::game_inspect_image,
             commands::fpkg_build,
             commands::fpkg_delete,
             commands::fpkg_estimate,

@@ -6,7 +6,7 @@
 //! guessing).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 use ps5upload_pkg::{pkg_entries, read_pkg_entry, sfo_params, PkgAuthenticity, SfoValue};
@@ -478,6 +478,143 @@ pub fn read_image(path: &Path, format: &str, name: &str) -> Result<Vec<u8>> {
     Ok(tree.read(&format!("sce_sys/{name}"))?)
 }
 
+/// Inspections by token, so the image requests that follow reuse one parse.
+/// Keyed by path + size + mtime: a changed file is parsed again.
+pub struct InspectCache {
+    cap: usize,
+    inner: std::sync::Mutex<Vec<CacheEntry>>,
+}
+
+struct CacheEntry {
+    key: (PathBuf, u64, std::time::SystemTime),
+    token: String,
+    at: std::time::Instant,
+    inspection: GameInspection,
+}
+
+/// How long a token stays valid.
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+impl InspectCache {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            inner: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The cached token and inspection for this exact file, or a fresh one.
+    pub fn inspect(&self, path: &Path) -> Result<(String, GameInspection)> {
+        let meta = std::fs::metadata(path)?;
+        let key = (
+            path.to_path_buf(),
+            meta.len(),
+            meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+        );
+        {
+            let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            entries.retain(|e| e.at.elapsed() < CACHE_TTL);
+            if let Some(e) = entries.iter().find(|e| e.key == key) {
+                return Ok((e.token.clone(), e.inspection.clone()));
+            }
+        }
+        let inspection = inspect_local(path)?;
+        let token = new_token();
+        let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        entries.push(CacheEntry {
+            key,
+            token: token.clone(),
+            at: std::time::Instant::now(),
+            inspection: inspection.clone(),
+        });
+        let excess = entries.len().saturating_sub(self.cap);
+        entries.drain(..excess);
+        Ok((token, inspection))
+    }
+
+    /// The path and format an image request's token points at.
+    pub fn source_of(&self, token: &str) -> Option<(PathBuf, String)> {
+        let entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .iter()
+            .find(|e| e.token == token && e.at.elapsed() < CACHE_TTL)
+            .map(|e| (e.key.0.clone(), e.inspection.source.format.clone()))
+    }
+}
+
+fn new_token() -> String {
+    let mut b = [0u8; 16];
+    // The OS generator; never a Unix-only path (the engine also runs on Windows).
+    let _ = getrandom::fill(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+static CACHE: std::sync::LazyLock<InspectCache> =
+    std::sync::LazyLock::new(|| InspectCache::new(32));
+
+#[derive(serde::Deserialize)]
+pub(crate) struct InspectReq {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct InspectResp {
+    token: String,
+    inspection: GameInspection,
+}
+
+/// POST /api/game/inspect — what a package, image or game folder is.
+pub(crate) async fn inspect_handler(
+    axum::Json(req): axum::Json<InspectReq>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = crate::fpkg_api::resolve_engine_path(&req.path);
+    match tokio::task::spawn_blocking(move || CACHE.inspect(&path)).await {
+        Ok(Ok((token, inspection))) => {
+            axum::Json(InspectResp { token, inspection }).into_response()
+        }
+        Ok(Err(e)) => {
+            crate::json_err(axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
+        Err(join) => crate::json_err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the inspection task failed: {join}"),
+        )
+        .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ImageQuery {
+    token: String,
+    name: String,
+}
+
+/// GET /api/game/inspect/image — one image of an inspected source.
+pub(crate) async fn inspect_image_handler(
+    axum::extract::Query(q): axum::extract::Query<ImageQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some((path, format)) = CACHE.source_of(&q.token) else {
+        return crate::json_err(
+            axum::http::StatusCode::NOT_FOUND,
+            "unknown or expired token",
+        )
+        .into_response();
+    };
+    match tokio::task::spawn_blocking(move || read_image(&path, &format, &q.name)).await {
+        Ok(Ok(bytes)) => ([(axum::http::header::CONTENT_TYPE, "image/png")], bytes).into_response(),
+        Ok(Err(e)) => {
+            crate::json_err(axum::http::StatusCode::NOT_FOUND, e.to_string()).into_response()
+        }
+        Err(join) => crate::json_err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the image task failed: {join}"),
+        )
+        .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod test_fixtures {
     use std::path::{Path, PathBuf};
@@ -577,6 +714,23 @@ mod test_fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cache_reuses_a_token_until_the_file_changes() {
+        // [RF 5]
+        let dir = test_fixtures::scratch();
+        let p = test_fixtures::write_cnt_pkg(dir.join("a.pkg"), "gd");
+        let cache = InspectCache::new(32);
+        let (t1, _) = cache.inspect(&p).unwrap();
+        let (t2, _) = cache.inspect(&p).unwrap();
+        assert_eq!(t1, t2);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&p, std::fs::read(&p).unwrap()).unwrap(); // new mtime
+        let (t3, _) = cache.inspect(&p).unwrap();
+        assert_ne!(t1, t3);
+        assert!(cache.source_of(&t3).is_some());
+        assert!(cache.source_of("nope").is_none());
+    }
 
     #[test]
     fn firmware_formats() {

@@ -2328,6 +2328,35 @@ pub async fn transfer_dir_reconcile(req: TransferDirReconcileReq) -> Result<Json
     post_json(&url, &body).await
 }
 
+/// What a package, image or game folder is: identity, specs, PARAM, images.
+/// POST /api/game/inspect.
+#[tauri::command]
+pub async fn game_inspect(path: String) -> Result<JsonValue, String> {
+    let base = engine::url();
+    let url = format!("{base}/api/game/inspect");
+    post_json(&url, &serde_json::json!({ "path": path })).await
+}
+
+/// One image of an inspected source, as base64. GET /api/game/inspect/image.
+#[tauri::command]
+pub async fn game_inspect_image(token: String, name: String) -> Result<JsonValue, String> {
+    use base64::Engine as _;
+    let base = engine::url();
+    let resp = http_client()
+        .get(format!("{base}/api/game/inspect/image"))
+        .query(&[("token", token.as_str()), ("name", name.as_str())])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("image request failed: {}", resp.status()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "base64": base64::engine::general_purpose::STANDARD.encode(&bytes)
+    }))
+}
+
 /// What a game source is, before converting it: readiness, size and cost.
 /// POST /api/fpkg/inspect.
 #[tauri::command]

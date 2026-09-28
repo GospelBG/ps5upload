@@ -692,6 +692,25 @@ export async function browserInvoke<T>(
 
     // ── Jobs ────────────────────────────────────────────────────────────────
 
+    case "game_inspect": {
+      return postJson<T>("/api/game/inspect", { path: args["path"] });
+    }
+    case "game_inspect_image": {
+      const q = new URLSearchParams({
+        token: String(args["token"]),
+        name: String(args["name"]),
+      });
+      const r = await fetch(`${getEngineUrl()}/api/game/inspect/image?${q}`, {
+        signal: AbortSignal.timeout(TIMEOUT_STANDARD),
+      });
+      if (!r.ok) throw new Error(await extractEngineError(r));
+      const bytes = new Uint8Array(await r.arrayBuffer());
+      let bin = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      }
+      return { base64: btoa(bin) } as T;
+    }
     case "fpkg_inspect": {
       // TS caller: { source, outputDir }
       return postJson<T>("/api/fpkg/inspect", {

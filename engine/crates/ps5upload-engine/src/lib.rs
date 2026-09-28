@@ -8853,6 +8853,11 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         .route("/api/ps5/pkg/scan-external", get(ps5_pkg_scan_external))
         .route("/api/ps5/pkg/metadata", get(ps5_pkg_metadata))
         .route("/api/ps5/list-dir", get(ps5_list_dir))
+        .route("/api/game/inspect", post(inspect::inspect_handler))
+        .route(
+            "/api/game/inspect/image",
+            get(inspect::inspect_image_handler),
+        )
         .route("/api/fpkg/inspect", post(fpkg_api::fpkg_inspect_handler))
         .route("/api/fpkg/build", post(fpkg_api::fpkg_build_handler))
         .route("/api/fpkg/delete", post(fpkg_api::fpkg_delete_handler))
