@@ -547,7 +547,6 @@ export default function InstallPackageScreen() {
     name: string;
   } | null>(null);
   const [picking, setPicking] = useState(false);
-  const [streaming, setStreaming] = useState(false);
   const [remoteUrl, setRemoteUrl] = useState("");
   const [dropActive, setDropActive] = useState(false);
   const browserPkgInputRef = useRef<HTMLInputElement>(null);
@@ -787,7 +786,6 @@ export default function InstallPackageScreen() {
 
   async function handleBrowserStreamFile(file: File) {
     setPickError(null);
-    setStreaming(true);
     let uploadId: string | null = null;
     try {
       const staged = await stageBrowserPkg(file);
@@ -800,7 +798,6 @@ export default function InstallPackageScreen() {
         // Best effort: a stale-upload sweep also catches browser crashes.
         await deleteBrowserPkgUpload(uploadId).catch(() => {});
       }
-      setStreaming(false);
     }
   }
 
@@ -815,13 +812,10 @@ export default function InstallPackageScreen() {
       setPickError(tr("pkglib.stream.notPkg", undefined, "Pick a .pkg or .fpkg file."));
       return;
     }
-    setStreaming(true);
     try {
       await runStreamInstall(path, path.split("/").pop() ?? path);
     } catch (e) {
       setPickError(`${e}`);
-    } finally {
-      setStreaming(false);
     }
   }
 
@@ -857,14 +851,11 @@ export default function InstallPackageScreen() {
         );
         return;
       }
-      setStreaming(true);
       try {
         const name = picked.split(/[\\/]/).pop() ?? picked;
         await runStreamInstall(picked, name);
       } catch (e) {
         setPickError(`${e}`);
-      } finally {
-        setStreaming(false);
       }
       return;
     }
@@ -880,7 +871,6 @@ export default function InstallPackageScreen() {
     // reliable on all firmwares" — which pointed them at the destructive
     // route. Keeping a `destructive: true` confirm on the safe path while
     // the unsafe one was one click away was the wrong way round.
-    setStreaming(true);
     try {
       const sel = isAndroid()
         ? await pickPath({
@@ -898,8 +888,6 @@ export default function InstallPackageScreen() {
       await runStreamInstall(sourcePath, streamName);
     } catch (e) {
       setPickError(`${e}`);
-    } finally {
-      setStreaming(false);
     }
   }
 
@@ -913,7 +901,6 @@ export default function InstallPackageScreen() {
       cancelLabel: tr("pkglib.stream.fallback.cancel", "Not now"),
     });
     if (!approved) return;
-    setStreaming(true);
     try {
       const result = await installUrl(remoteUrl.trim(), host, {
         mode: linkMode,
@@ -930,8 +917,8 @@ export default function InstallPackageScreen() {
         message,
       });
       if (!result.ok) setPickError(message);
-    } finally {
-      setStreaming(false);
+    } catch (e) {
+      setPickError(`${e}`);
     }
   }
 
@@ -1259,22 +1246,17 @@ export default function InstallPackageScreen() {
                   )
                 }
                 loading={installingAll}
-                disabled={!hostReady || installing || installingAll}
+                disabled={!hostReady || installingAll}
                 title={
                   !hostReady
                     ? tr(
                         "install.add.disabledHint",
                         "Set a PS5 host on the Connection tab first",
                       )
-                    : installing
-                      ? tr(
-                          "pkglib.add.installingHint",
-                          "Wait for the current install to finish",
-                        )
-                      : tr(
-                          "pkglib.installAll.hint",
-                          "Install every staged package, base games before updates and DLC",
-                        )
+                    : tr(
+                        "pkglib.installAll.hint",
+                        "Install every staged package, base games before updates and DLC",
+                      )
                 }
               >
                 {tr("pkglib.installAll", undefined, "Install all")} (
@@ -1288,19 +1270,14 @@ export default function InstallPackageScreen() {
                 leftIcon={<Plus size={14} />}
                 onClick={handlePick}
                 loading={picking}
-                disabled={!hostReady || installing || installingAll}
+                disabled={!hostReady}
                 title={
                   !hostReady
                     ? tr(
                         "install.add.disabledHint",
                         "Set a PS5 host on the Connection tab first",
                       )
-                    : installing
-                      ? tr(
-                          "pkglib.add.installingHint",
-                          "Wait for the current install to finish",
-                        )
-                      : undefined
+                    : undefined
                 }
               >
                 {tr("install.add", "Add package")}
@@ -1325,7 +1302,7 @@ export default function InstallPackageScreen() {
                 variant="ghost"
                 size="sm"
                 onClick={() => browserPkgInputRef.current?.click()}
-                disabled={!hostReady || installing || installingAll || streaming}
+                disabled={!hostReady}
                 title={tr(
                   "pkglib.stream.fromDevice.hint",
                   undefined,
@@ -1339,10 +1316,11 @@ export default function InstallPackageScreen() {
               mode="file"
               remote
               icon={<Download size={14} />}
-              busy={streaming}
               filters={[{ name: "PlayStation Package", extensions: ["pkg", "fpkg"] }]}
               label={tr("pkglib.stream", undefined, "Stream install")}
-              disabled={!hostReady || installing || installingAll}
+              // Installs queue per console, so a running install never
+              // blocks picking the next one.
+              disabled={!hostReady}
               tooltip={
                 !hostReady
                   ? tr(
@@ -1425,8 +1403,7 @@ export default function InstallPackageScreen() {
               className="min-w-52 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-surface-1)] px-2 py-1.5 text-sm text-[var(--color-text)]"
             />
             <Button variant="secondary" size="sm" onClick={handleUrlInstall}
-              disabled={!hostReady || !remoteUrl.trim() || installing || installingAll || streaming}
-              loading={streaming}>
+              disabled={!hostReady || !remoteUrl.trim()}>
               {tr("pkglib.url.install", "Install link")}
             </Button>
           </div>
@@ -2078,7 +2055,8 @@ function ExternalPackages({ host }: { host: string }) {
                       <Download size={13} />
                     )
                   }
-                  disabled={installing}
+                  // Each click queues; only this package's own install locks it.
+                  disabled={installingPath === p.path}
                   onClick={() => void onInstall(p)}
                 >
                   {installingPath === p.path
