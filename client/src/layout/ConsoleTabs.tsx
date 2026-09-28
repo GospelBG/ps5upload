@@ -45,6 +45,17 @@ function useConsoleBusy(host: string): boolean {
   return uploading || installing;
 }
 
+/** How many items wait in this console's queue (a number, so the tab only
+ *  re-renders when the count changes, not on every progress tick). */
+function useQueuedCount(host: string): number {
+  const key = hostOf(host);
+  return useUploadQueueStore(
+    (s) =>
+      s.items.filter((i) => i.status === "pending" && hostOf(i.addr) === key)
+        .length,
+  );
+}
+
 function ConsoleTab({
   id,
   name,
@@ -62,6 +73,8 @@ function ConsoleTab({
   onClick: () => void;
 }) {
   const busy = useConsoleBusy(host);
+  const queued = useQueuedCount(host);
+  const tr = useTr();
   return (
     <button
       type="button"
@@ -95,6 +108,14 @@ function ConsoleTab({
           style={{ background: accent ?? "var(--color-accent)" }}
           aria-hidden
         />
+      )}
+      {queued > 0 && (
+        <span
+          className="shrink-0 rounded-full bg-[var(--color-surface-3)] px-1.5 text-xs tabular-nums text-[var(--color-muted)]"
+          title={tr("console_tab_queue_count", { n: queued }, `${queued} in queue`)}
+        >
+          {queued}
+        </span>
       )}
     </button>
   );

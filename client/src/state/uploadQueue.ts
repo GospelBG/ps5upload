@@ -66,6 +66,7 @@ import {
   type InstallResult,
 } from "./consoleQueueBridge";
 import { PS5_PAYLOAD_PORT } from "./connection";
+import { trStatic } from "../lib/trStatic";
 import { ensurePayloadCurrent } from "../lib/ensurePayloadCurrent";
 import { effectiveUploadStreams } from "../lib/uploadStreams";
 import {
@@ -1317,8 +1318,10 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           if (next.sourceKind === "install" && next.status === "running") {
             next.status = "failed";
             next.installPhase = "error";
-            next.error =
-              "Interrupted when the app closed. Check the game on the PS5, then retry if it isn't installed.";
+            next.error = trStatic(
+              "queue_install_interrupted",
+              "Interrupted when the app closed. Check the game on the PS5, then retry if it isn't installed.",
+            );
             next.completedAt = Date.now();
           }
           if (next.status === "running") next.status = "pending";
@@ -1358,9 +1361,16 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         );
         const dropped = items.length - kept.length;
         if (dropped > 0) {
-          pushNotification("info", "Queued links were cleared", {
-            body: `${dropped} install link${dropped === 1 ? " was" : "s were"} not kept after restart — links are never saved to disk. Add them again from Install Package.`,
-          });
+          pushNotification(
+            "info",
+            trStatic("queue_links_cleared_title", "Queued links were cleared"),
+            {
+              body: trStatic(
+                "queue_links_cleared_body",
+                "{n} install link(s) weren't kept after restart — links are never saved to disk. Add them again from Install Package.",
+              ).replace("{n}", String(dropped)),
+            },
+          );
         }
         set({
           items: kept,

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { QueuePanel } from "../Upload/QueuePanel";
 import { volumeOfPkgPath } from "../../lib/pkgStorage";
 import { useLocation, useNavigate } from "react-router";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -1601,6 +1602,9 @@ export default function InstallPackageScreen() {
             </div>
           </div>
         )}
+
+        {/* This console's queue: installs and uploads waiting or running. */}
+        {hostReady && <QueuePanel host={host} />}
 
         {hostReady && <ExternalPackages host={host} />}
 

@@ -13,6 +13,7 @@ import {
   ListOrdered,
   X,
   Ban,
+  UploadCloud,
 } from "lucide-react";
 
 import { Button, ErrorCard, Spinner, Toggle } from "../../components";
@@ -30,10 +31,12 @@ import { MAX_AUTO_RECOVER_ATTEMPTS } from "../../lib/uploadRecovery";
 import { useTr } from "../../state/lang";
 import { useConsoleLabel } from "../../state/roster";
 import {
+  installOrderPriority,
   useUploadQueueStore,
   type QueueItem,
   type QueueItemStatus,
 } from "../../state/uploadQueue";
+import { isRemotePath } from "../../lib/remotePath";
 import { useTransferStore } from "../../state/transfer";
 
 /** One console's slice of the queue, in first-seen order. */
@@ -71,9 +74,36 @@ function groupByConsole(items: QueueItem[]): ConsoleGroup[] {
  *  console at once. This is what lets a queue holding games for 3
  *  different consoles actually upload to all 3 — and reorder one
  *  console's list while another console is mid-upload. */
-export function QueuePanel() {
+/** The queue items to show: every console's, or just `host`'s. */
+export function queueItemsForHost(
+  items: QueueItem[],
+  host: string | undefined,
+): QueueItem[] {
+  if (!host) return items;
+  const h = hostOf(host);
+  return items.filter((i) => hostOf(i.addr) === h);
+}
+
+/** Each pending item's 1-based place in its console's run order: the order the
+ *  queue actually runs them in (base → update → DLC, then add order). */
+export function pendingPositions(items: QueueItem[]): Map<string, number> {
+  const pending = items
+    .map((it, index) => ({ it, index }))
+    .filter(({ it }) => it.status === "pending")
+    .sort(
+      (a, b) =>
+        installOrderPriority(a.it) - installOrderPriority(b.it) ||
+        a.index - b.index,
+    );
+  return new Map(pending.map(({ it }, i) => [it.id, i + 1]));
+}
+
+/** The console queue. On Upload it shows every console; Install Package
+ *  passes `host` to show just the console being installed to. */
+export function QueuePanel({ host }: { host?: string } = {}) {
   const tr = useTr();
-  const items = useUploadQueueStore((s) => s.items);
+  const allItems = useUploadQueueStore((s) => s.items);
+  const items = useMemo(() => queueItemsForHost(allItems, host), [allItems, host]);
   const continueOnFailure = useUploadQueueStore((s) => s.continueOnFailure);
   const running = useUploadQueueStore((s) => s.running);
   const runningHosts = useUploadQueueStore((s) => s.runningHosts);
@@ -87,6 +117,10 @@ export function QueuePanel() {
   const clear = useUploadQueueStore((s) => s.clear);
   const remove = useUploadQueueStore((s) => s.remove);
   const cancelItem = useUploadQueueStore((s) => s.cancelItem);
+  const retryInstall = useUploadQueueStore((s) => s.retryInstall);
+  const retryInstallViaUpload = useUploadQueueStore(
+    (s) => s.retryInstallViaUpload,
+  );
   const moveUp = useUploadQueueStore((s) => s.moveUp);
   const moveDown = useUploadQueueStore((s) => s.moveDown);
   const retryFailed = useUploadQueueStore((s) => s.retryFailed);
@@ -146,7 +180,7 @@ export function QueuePanel() {
       <header className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2 text-sm font-semibold">
           <ListOrdered size={14} />
-          <span>{tr("queue_title", undefined, "Upload queue")}</span>
+          <span>{tr("queue_title", undefined, "Queue")}</span>
           {multiConsole && (
             <span className="rounded bg-[var(--color-surface-3)] px-1.5 py-0.5 text-xs font-medium text-[var(--color-muted)]">
               {tr(
@@ -254,6 +288,8 @@ export function QueuePanel() {
             onMoveDown={moveDown}
             onRemove={remove}
             onCancel={cancelItem}
+            onRetry={(id) => void retryInstall(id)}
+            onRetryViaUpload={(id) => void retryInstallViaUpload(id)}
           />
         ))}
       </div>
@@ -275,6 +311,8 @@ function ConsoleGroup({
   onMoveDown,
   onRemove,
   onCancel,
+  onRetry,
+  onRetryViaUpload,
 }: {
   host: string;
   items: QueueItem[];
@@ -286,6 +324,8 @@ function ConsoleGroup({
   onMoveDown: (id: string) => void;
   onRemove: (id: string) => void;
   onCancel: (id: string) => void;
+  onRetry: (id: string) => void;
+  onRetryViaUpload: (id: string) => void;
 }) {
   const tr = useTr();
   const label = useConsoleLabel(host);
@@ -316,16 +356,20 @@ function ConsoleGroup({
     return { runningN, pending, done, failed };
   }, [items]);
 
+  const positions = useMemo(() => pendingPositions(items), [items]);
   const rows = (
     <ul className="grid gap-2">
       {items.map((item) => (
         <QueueRow
           key={item.id}
           item={item}
+          position={positions.get(item.id)}
           onMoveUp={() => onMoveUp(item.id)}
           onMoveDown={() => onMoveDown(item.id)}
           onRemove={() => onRemove(item.id)}
           onCancel={() => onCancel(item.id)}
+          onRetry={() => onRetry(item.id)}
+          onRetryViaUpload={() => onRetryViaUpload(item.id)}
         />
       ))}
     </ul>
@@ -424,32 +468,42 @@ function ConsoleGroup({
   );
 }
 
-function QueueRow({
+export function QueueRow({
   item,
+  position,
   onMoveUp,
   onMoveDown,
   onRemove,
   onCancel,
+  onRetry,
+  onRetryViaUpload,
 }: {
   item: QueueItem;
+  /** 1-based place in this console's run order, for a waiting item. */
+  position?: number;
   onMoveUp: () => void;
   onMoveDown: () => void;
   onRemove: () => void;
   onCancel: () => void;
+  onRetry: () => void;
+  onRetryViaUpload: () => void;
 }) {
   const tr = useTr();
+  const isInstall = item.sourceKind === "install";
   // Game identity for the row — so you can tell what's what at a glance.
   // pkg: title id parsed out of the ContentID drives the cover (appmeta/CDN)
   // and the PS4/PS5 badge. game-folder: the folder's own sce_sys/icon0.png.
   // Other kinds (plain file, archive, image) have no game art, so no thumb.
   const titleId =
-    item.sourceKind === "pkg"
+    item.sourceKind === "pkg" || isInstall
       ? titleIdFromContentId(item.contentId)
       : null;
   const titleInfo = useTitleInfo(titleId);
   const platform = platformForTitleId(titleId);
   const hasGameArt =
-    item.sourceKind === "pkg" || item.sourceKind === "game-folder";
+    item.sourceKind === "pkg" ||
+    item.sourceKind === "game-folder" ||
+    isInstall;
   const rowName = queueRowName(item, titleInfo?.title);
   const pct =
     item.totalBytes > 0
@@ -484,6 +538,8 @@ function QueueRow({
   // a whole-queue lock: you can freely reorder a console's PENDING jobs
   // while another job (even on the same console) is uploading.
   const lockRow = isActive;
+  const installPct =
+    typeof item.installPct === "number" ? Math.max(0, Math.min(99, item.installPct)) : 0;
 
   return (
     <li
@@ -515,17 +571,34 @@ function QueueRow({
             <span className="truncate font-medium">{rowName}</span>
             {platform && <PlatformBadge platform={platform} />}
           </div>
-          <div className="mt-0.5 truncate font-mono text-xs text-[var(--color-muted)]">
-            → {item.resolvedDest}
-          </div>
+          {isInstall ? (
+            <div className="mt-0.5 truncate text-xs text-[var(--color-muted)]">
+              {installSourceLabel(item, tr)}
+            </div>
+          ) : (
+            <div className="mt-0.5 truncate font-mono text-xs text-[var(--color-muted)]">
+              → {item.resolvedDest}
+            </div>
+          )}
           <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-[var(--color-muted)]">
-            <span>
-              {tr(
-                `queue_strategy_${item.strategy}`,
-                undefined,
-                item.strategy === "resume" ? "Resume" : "Overwrite",
-              )}
-            </span>
+            {!isInstall && (
+              <span>
+                {tr(
+                  `queue_strategy_${item.strategy}`,
+                  undefined,
+                  item.strategy === "resume" ? "Resume" : "Overwrite",
+                )}
+              </span>
+            )}
+            {item.status === "pending" && position != null && (
+              <span>
+                {tr(
+                  "queue_install_waiting",
+                  { n: position },
+                  `Queued (#${position})`,
+                )}
+              </span>
+            )}
             {item.excludes.length > 0 && (
               <span>
                 {tr(
@@ -606,7 +679,9 @@ function QueueRow({
           >
             <ArrowDown size={14} />
           </button>
-          {isActive ? (
+          {isActive && isInstall ? null : isActive ? (
+            // An install can't be stopped halfway (Sony's installer owns it
+            // once it starts), so a running install row has no Cancel.
             // The actively-uploading row: move/remove are locked (mutating the
             // array under the runner is unsafe), so Cancel is the only per-item
             // control here. It aborts THIS upload (partial transfer stays
@@ -655,7 +730,27 @@ function QueueRow({
         </div>
       )}
 
-      {isActive && !isRecovering && (
+      {isActive && isInstall && (
+        <div className="mt-2">
+          <div className="mb-1 flex items-baseline justify-between text-xs text-[var(--color-muted)]">
+            <span>
+              {tr(
+                "queue_install_running",
+                { pct: installPct },
+                `Installing… ${installPct}%`,
+              )}
+            </span>
+          </div>
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-surface-3)]">
+            <div
+              className="h-full bg-[var(--color-accent)] transition-[width] duration-300"
+              style={{ width: `${installPct}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {isActive && !isInstall && !isRecovering && (
         <div className="mt-2">
           <div className="mb-1 flex flex-wrap items-baseline justify-between gap-x-3 text-xs text-[var(--color-muted)]">
             <span>
@@ -754,7 +849,7 @@ function QueueRow({
         </div>
       )}
 
-      {item.status === "done" && (
+      {item.status === "done" && !isInstall && (
         <DoneStats bytesSent={item.bytesSent} bytesPerSec={item.bytesPerSec} />
       )}
 
@@ -764,6 +859,29 @@ function QueueRow({
           reason={item.errorReason}
           detail={item.errorDetail}
         />
+      )}
+
+      {item.status === "failed" && isInstall && (
+        <div className="mt-2 flex flex-wrap gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            leftIcon={<RotateCcw size={12} />}
+            onClick={onRetry}
+          >
+            {tr("task_retry", undefined, "Retry")}
+          </Button>
+          {item.fallbackToUpload && (
+            <Button
+              variant="primary"
+              size="sm"
+              leftIcon={<UploadCloud size={12} />}
+              onClick={onRetryViaUpload}
+            >
+              {tr("queue_retry_via_upload", undefined, "Retry via upload")}
+            </Button>
+          )}
+        </div>
       )}
     </li>
   );
@@ -907,4 +1025,22 @@ function StatusIcon({ status }: { status: QueueItemStatus }) {
         />
       );
   }
+}
+
+/** Where an install item's package comes from, in words. */
+function installSourceLabel(
+  item: QueueItem,
+  tr: ReturnType<typeof useTr>,
+): string {
+  const req = item.install;
+  if (req?.via === "stream" && isRemotePath(req.source)) {
+    return tr("queue_install_from_server", undefined, "Stream install from a saved server");
+  }
+  if (req?.via === "stream") {
+    return tr("queue_install_from_pc", undefined, "Stream install from this computer");
+  }
+  if (req?.via === "link" || item.sourcePath.startsWith("url:")) {
+    return tr("queue_install_from_link", undefined, "Install from a link");
+  }
+  return tr("queue_install_on_ps5", undefined, "Install from the PS5");
 }
