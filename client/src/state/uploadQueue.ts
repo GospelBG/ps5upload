@@ -481,9 +481,14 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
    *  legitimately fire a half-dozen patches per second (bytes_sent
    *  updates), and we don't want to round-trip Tauri/disk on each. */
   const scheduleSave = () => {
+    // Never save before the saved queue has loaded: it would overwrite it
+    // with only what was added since the app started. hydrate() saves the
+    // merged list once it has loaded.
+    if (!get().loaded) return;
     if (saveTimer !== null) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       saveTimer = null;
+      if (!get().loaded) return;
       const { items, continueOnFailure } = get();
       // Redact RAR passwords before persisting — they stay in the live
       // in-memory items (so the current run can extract) but never touch disk.
@@ -512,6 +517,11 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
   /** Callers awaiting an install item's outcome. In memory only: after a
    *  restart nobody is waiting, and the row itself shows the result. */
   const waiters = new Map<string, (r: InstallResult) => void>();
+  /** Per console: the install that is running right now. Sony's install
+   *  can't be stopped halfway, so Stop and Clear leave it running; a new
+   *  drain loop waits for it before starting anything else on that console
+   *  (the PS5 installs one package at a time). */
+  const installInFlight = new Map<string, Promise<unknown>>();
   const settle = (id: string, r: InstallResult) => {
     const w = waiters.get(id);
     if (w) {
@@ -522,7 +532,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
 
   /** Run an install item through the executor pkgLibrary registered. Throws
    *  InstallItemError when the install finished but didn't install. */
-  const runInstallItem = async (item: QueueItem, isLive: () => boolean) => {
+  const runInstallItem = async (item: QueueItem) => {
     const exec = getInstallExecutor();
     if (!exec || !item.install) {
       throw new Error("This install can't run: its details were not kept.");
@@ -530,14 +540,21 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     set((s) => ({
       items: patchItem(s.items, item.id, { installPhase: "installing", installPct: 0 }),
     }));
-    const r = await exec(item.install, hostOf(item.addr), {
-      onProgress: (pct) => {
-        if (isLive()) {
-          set((s) => ({ items: patchItem(s.items, item.id, { installPct: pct }) }));
-        }
-      },
+    const h = hostOf(item.addr);
+    const running = exec(item.install, h, {
+      // Progress keeps flowing even after Stop: the install is still going.
+      onProgress: (pct) =>
+        set((s) => ({ items: patchItem(s.items, item.id, { installPct: pct }) })),
       onStatus: () => {},
     });
+    const tracked = running.catch(() => {});
+    installInFlight.set(h, tracked);
+    let r: InstallResult;
+    try {
+      r = await running;
+    } finally {
+      if (installInFlight.get(h) === tracked) installInFlight.delete(h);
+    }
     if (!r.ok) throw new InstallItemError(r);
     settle(item.id, r);
     return {
@@ -570,7 +587,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     installPhase: QueueItem["installPhase"];
     installedTitle: string | null;
   }> => {
-    if (item.sourceKind === "install") return runInstallItem(item, isLive);
+    if (item.sourceKind === "install") return runInstallItem(item);
     const isFolder =
       item.sourceKind === "folder" || item.sourceKind === "game-folder";
     const isArchive = item.sourceKind === "archive";
@@ -1078,6 +1095,22 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     drain: while (isLive()) {
       const next = pickNext();
       if (!next) break;
+      // An install from a stopped loop may still be running on this console.
+      const nh = hostOf(next.addr);
+      const inflight = installInFlight.get(nh);
+      if (
+        inflight &&
+        get().items.some(
+          (it) =>
+            it.sourceKind === "install" &&
+            it.status === "running" &&
+            hostOf(it.addr) === nh,
+        )
+      ) {
+        await inflight;
+        if (!isLive()) return;
+        continue;
+      }
 
       // Let the payload settle between jobs (see INTER_JOB_SETTLE_MS).
       // Per-loop counter ⇒ the settle is per-console, not global.
@@ -1161,7 +1194,8 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           if (!isLive()) return;
           break; // success → next item
         } catch (e) {
-          if (!isLive()) return;
+          // An install's outcome is recorded even after Stop: it really ran.
+          if (!isLive() && next.sourceKind !== "install") return;
           const message = e instanceof Error ? e.message : String(e);
           // Lift the structured payload error fields onto the item
           // if waitForJob's thrown error carries them. UI uses these
@@ -1212,7 +1246,10 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
                 e instanceof InstallItemError ? e.result : { ok: false, message },
               );
             }
-            if (!shouldContinueAfterFailure(get().continueOnFailure)) {
+            if (!isLive()) return;
+            // One failed install never holds up the installs queued after it
+            // (Install all used to carry on past a failure too).
+            if (!isInstall && !shouldContinueAfterFailure(get().continueOnFailure)) {
               break drain; // hard stop: tear down this console's loop
             }
             break; // continueOnFailure → move to the next item
@@ -1379,12 +1416,16 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             },
           );
         }
+        // Keep anything queued before the load finished (an install started
+        // from another screen), after the saved items.
+        const live = get().items.filter((it) => !kept.some((k) => k.id === it.id));
         set({
-          items: kept,
+          items: [...kept, ...live],
           continueOnFailure: doc.continueOnFailure ?? false,
           loaded: true,
           persistenceError: null,
         });
+        if (live.length > 0) scheduleSave();
       } catch (e) {
         // load_json_or_default returns {} on missing file, so this
         // catch only fires on real corruption (bad JSON, IO error,
@@ -1447,6 +1488,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           errorDetail: null,
           installPhase: null,
           installPct: null,
+          fallbackToUpload: false,
           completedAt: null,
         }),
       }));
@@ -1471,12 +1513,35 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       }
       const source = it.install.source;
       const host = hostOf(it.addr);
-      set((s) => ({ items: removeItem(s.items, id) }));
-      scheduleSave();
-      // Install Package's upload: its own checks, then an upload item and an
-      // install item in this queue.
-      void pkgLibraryStore(host).getState().addAndUpload(source, host);
-      return { ok: true };
+      // Install Package's upload, with the options the old "Retry from PS5
+      // staging?" dialog used: install once uploaded, and this file wins over
+      // a same-version variant already staged. The failed row goes only once
+      // the upload is accepted (onDest), so a refusal leaves it to retry.
+      const lib = pkgLibraryStore(host);
+      return new Promise((resolve) => {
+        let accepted = false;
+        void lib
+          .getState()
+          .addAndUpload(source, host, {
+            installAfterUpload: true,
+            selectVariant: true,
+            onDest: () => {
+              if (accepted) return;
+              accepted = true;
+              set((s) => ({ items: removeItem(s.items, id) }));
+              scheduleSave();
+              resolve({ ok: true });
+            },
+          })
+          .then(() => {
+            if (!accepted) {
+              resolve({
+                ok: false,
+                message: lib.getState().error ?? "The package couldn't be added.",
+              });
+            }
+          });
+      });
     },
 
     add(input) {
@@ -1518,6 +1583,8 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     cancelItem(id) {
       const item = get().items.find((it) => it.id === id);
       if (!item) return;
+      // Sony's install can't be stopped halfway; the row finishes on its own.
+      if (item.sourceKind === "install" && item.status === "running") return;
       settle(id, { ok: false, message: "Removed from the queue." });
       const h = hostOf(item.addr);
       // A pending / done / failed item isn't touching the wire — just drop it.
@@ -1567,8 +1634,13 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       // user clicks Clear, the UI empties, and a subsequent upload
       // mysteriously stalls behind the orphaned transfer. Mirrors the
       // documented reset() caveat in transfer.ts.
+      // An install that is running stays (it can't be stopped); everything
+      // else goes.
+      const keep = get().items.filter(
+        (it) => it.sourceKind === "install" && it.status === "running",
+      );
       for (const it of get().items) {
-        settle(it.id, { ok: false, message: "Removed from the queue." });
+        if (!keep.includes(it)) settle(it.id, { ok: false, message: "Removed from the queue." });
       }
       const inFlight = get().items.find((it) => it.status === "running");
       if (inFlight) {
@@ -1594,12 +1666,18 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           void jobCancel(jid).catch(() => {});
         }
       }
-      set({ items: [], runningHosts: {}, running: false });
+      set({ items: keep, runningHosts: {}, running: false });
       scheduleSave();
     },
 
     retryFailed() {
-      set((s) => ({ items: resetFailedToPending(s.items) }));
+      set((s) => ({
+        items: resetFailedToPending(s.items).map((it) =>
+          it.sourceKind === "install" && it.status === "pending" && it.installPhase
+            ? { ...it, installPhase: null, installPct: null, fallbackToUpload: false }
+            : it,
+        ),
+      }));
       scheduleSave();
     },
 
@@ -1631,6 +1709,9 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         (it) =>
           hostOf(it.addr) === h &&
           it.status === "failed" &&
+          // Never re-run an install by itself (a repeated patch install can
+          // wipe the base game): only uploads resume on reconnect.
+          it.sourceKind !== "install" &&
           isAutoRecoverable(it.errorReason, it.error),
       );
       let resumed = 0;
@@ -1682,8 +1763,16 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           // Fire-and-forget + guarded: a standby rejection (unsupported FW)
           // must never surface as an unhandledrejection from the drain loop.
           if (restAfterUploadEnabled() && !nextPendingForHost(get().items, h)) {
+            // Only real upload sessions count. An install finishes on the
+            // console after our call returns, and an Install Package upload
+            // has its install queued right after it: sleeping then would cut
+            // either one off.
             const didWork = get().items.some(
-              (it) => hostOf(it.addr) === h && it.status === "done",
+              (it) =>
+                hostOf(it.addr) === h &&
+                it.status === "done" &&
+                isUploadItem(it) &&
+                !(it.sourceKind === "pkg" && it.installAfterUpload === false),
             );
             if (didWork) {
               void powerStandby(mgmtAddr(h))
@@ -1741,7 +1830,12 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         return {
           runningHosts: rh,
           running: anyRunning(rh),
-          items: resetRunningToPending(s.items, (it) => hostOf(it.addr) === h),
+          // A running install stays running: Sony's install can't be
+          // stopped, and re-queueing it would install it twice.
+          items: resetRunningToPending(
+            s.items,
+            (it) => hostOf(it.addr) === h && it.sourceKind !== "install",
+          ),
         };
       });
       scheduleSave();

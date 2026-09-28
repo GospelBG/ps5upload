@@ -173,6 +173,14 @@ function useStatusPolling() {
   // uploads on its down→up edge. Same cooldown discipline as the auto-loader
   // — a flapping helper must not loop-restart the queue.
   const uploadResumeFiredAtRef = useRef<Record<string, number>>({});
+  // Load the saved queue at startup, not when a Queue panel first mounts:
+  // installs from any screen go into it, and must never race the load.
+  useEffect(() => {
+    if (!useUploadQueueStore.getState().loaded) {
+      void useUploadQueueStore.getState().hydrate();
+    }
+  }, []);
+
   useEffect(() => {
     void getAppVersion()
       .then((v) => {

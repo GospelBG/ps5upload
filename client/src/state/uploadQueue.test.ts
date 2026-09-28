@@ -1407,7 +1407,10 @@ describe("Retry via upload", () => {
       message: "unreachable",
       stagedFallbackRecommended: true,
     }));
-    const addAndUpload = vi.fn(async () => {});
+    // Accepts the file (onDest), as addAndUpload does once its checks pass.
+    const addAndUpload = vi.fn(
+      async (_p: string, _h: string, o?: { onDest?: (d: string) => void }) => o?.onDest?.("/dest"),
+    );
     pkgLibraryStore(host).setState({ addAndUpload } as never);
     const q = useUploadQueueStore.getState().enqueueInstall({
       host, request: { via: "stream", source: "/games/a.pkg" }, displayName: "A",
@@ -1418,7 +1421,7 @@ describe("Retry via upload", () => {
     const r = await useUploadQueueStore.getState().retryInstallViaUpload(q.id);
     expect(r.ok).toBe(true);
     expect(useUploadQueueStore.getState().items.find((i) => i.id === q.id)).toBeUndefined();
-    expect(addAndUpload).toHaveBeenCalledWith("/games/a.pkg", host);
+    expect(addAndUpload).toHaveBeenCalledWith("/games/a.pkg", host, expect.anything());
   });
 
   it("is refused for a link", async () => {
@@ -1451,5 +1454,164 @@ describe("isUploadItem", () => {
     expect(isUploadItem({ sourceKind: "install" } as QueueItem)).toBe(false);
     expect(isUploadItem({ sourceKind: "pkg" } as QueueItem)).toBe(true);
     expect(isUploadItem({ sourceKind: "folder" } as QueueItem)).toBe(true);
+  });
+});
+
+describe("review fixes", () => {
+  const host = "10.0.0.2";
+  beforeEach(() => {
+    vi.useRealTimers();
+    useUploadQueueStore.getState().stop();
+    mockedEnsurePayload.mockReset().mockResolvedValue(undefined as never);
+    mockedQueueSave.mockClear();
+    useUploadQueueStore.setState({
+      ...pristineQueue,
+      items: [],
+      runningHosts: {},
+      running: false,
+      continueOnFailure: false,
+      loaded: true,
+    });
+  });
+  afterEach(() => useUploadQueueStore.getState().stop());
+  const until = async (cond: () => boolean) => {
+    for (let i = 0; i < 600 && !cond(); i++) await new Promise((r) => setTimeout(r, 5));
+    expect(cond()).toBe(true);
+  };
+  const row = (id: string) => useUploadQueueStore.getState().items.find((i) => i.id === id);
+
+  it("Stop during a running install leaves it running (never re-queued), and it runs once", async () => {
+    let calls = 0;
+    let finish!: (r: InstallResult) => void;
+    registerInstallExecutor(() => {
+      calls++;
+      return new Promise((r) => (finish = r));
+    });
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "stream", source: "/a.pkg" }, displayName: "A",
+    });
+    await until(() => calls === 1);
+    useUploadQueueStore.getState().stopHost(host);
+    expect(row(q.id)?.status).toBe("running");
+    void useUploadQueueStore.getState().startHost(host);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(calls).toBe(1);
+    finish({ ok: true });
+    await expect(q.done).resolves.toEqual({ ok: true });
+    await until(() => row(q.id)?.status === "done");
+  });
+
+  it("a stopped install that then fails is marked failed and its waiter settles", async () => {
+    let finish!: (r: InstallResult) => void;
+    registerInstallExecutor(() => new Promise((r) => (finish = r)));
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "stream", source: "/b.pkg" }, displayName: "B",
+    });
+    await until(() => row(q.id)?.status === "running");
+    useUploadQueueStore.getState().stopHost(host);
+    finish({ ok: false, message: "nope" });
+    await expect(q.done).resolves.toMatchObject({ ok: false, message: "nope" });
+    await until(() => row(q.id)?.status === "failed");
+  });
+
+  it("Clear keeps an install that is still running", async () => {
+    registerInstallExecutor(() => new Promise(() => {}));
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "stream", source: "/c.pkg" }, displayName: "C",
+    });
+    await until(() => row(q.id)?.status === "running");
+    useUploadQueueStore.getState().clear();
+    expect(row(q.id)?.status).toBe("running");
+  });
+
+  it("a queue item added before the saved queue loads is kept, and nothing is saved before the load", async () => {
+    useUploadQueueStore.setState({ loaded: false });
+    registerInstallExecutor(() => new Promise(() => {}));
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "stream", source: "/d.pkg" }, displayName: "D",
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(mockedQueueSave).not.toHaveBeenCalled();
+    vi.mocked(uploadQueueLoad).mockResolvedValueOnce({
+      continueOnFailure: false,
+      items: [{ ...(row(q.id) as QueueItem), id: "old", sourceKind: "file", sourcePath: "/old", status: "pending" }],
+    } as never);
+    vi.stubGlobal("window", { isTauri: true });
+    try {
+      await useUploadQueueStore.getState().hydrate();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    const ids = useUploadQueueStore.getState().items.map((i) => i.id);
+    expect(ids).toContain("old");
+    expect(ids).toContain(q.id);
+    expect(row(q.id)?.status).toBe("running");
+  });
+
+  it("reconnecting never re-runs a failed install", async () => {
+    useUploadSettingsStore.setState({ autoResume: true });
+    registerInstallExecutor(async () => ({ ok: false, message: "connection refused" }));
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "library", path: "/e.pkg" }, displayName: "E",
+    });
+    await q.done;
+    await until(() => !useUploadQueueStore.getState().runningHosts[host]);
+    const n = await useUploadQueueStore.getState().resumeFailedRecoverable(host);
+    expect(n).toBe(0);
+    expect(row(q.id)?.status).toBe("failed");
+  });
+
+  it("one failed install does not stop the installs after it", async () => {
+    registerInstallExecutor(async (req) =>
+      req.via === "library" && req.path === "/f1.pkg" ? { ok: false, message: "x" } : { ok: true },
+    );
+    const s = useUploadQueueStore.getState();
+    const a = s.enqueueInstall({ host, request: { via: "library", path: "/f1.pkg" }, displayName: "F1" });
+    const b = s.enqueueInstall({ host, request: { via: "library", path: "/f2.pkg" }, displayName: "F2" });
+    await a.done;
+    await expect(b.done).resolves.toEqual({ ok: true });
+  }, 10_000);
+
+  it("Retry via upload keeps the old dialog's options and removes the row only once accepted", async () => {
+    registerInstallExecutor(async () => ({ ok: false, stagedFallbackRecommended: true }));
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "stream", source: "/g.pkg" }, displayName: "G",
+    });
+    await q.done;
+    await until(() => !useUploadQueueStore.getState().runningHosts[host]);
+    // Refused: the row stays.
+    pkgLibraryStore(host).setState({
+      error: "Couldn't read .pkg header",
+      addAndUpload: vi.fn(async () => {}),
+    } as never);
+    const refused = await useUploadQueueStore.getState().retryInstallViaUpload(q.id);
+    expect(refused.ok).toBe(false);
+    expect(row(q.id)).toBeDefined();
+    // Accepted: options passed, row removed.
+    const addAndUpload = vi.fn(
+      async (_p: string, _h: string, o?: { onDest?: (d: string) => void }) => o?.onDest?.("/dest"),
+    );
+    pkgLibraryStore(host).setState({ error: null, addAndUpload } as never);
+    const ok = await useUploadQueueStore.getState().retryInstallViaUpload(q.id);
+    expect(ok.ok).toBe(true);
+    expect(addAndUpload).toHaveBeenCalledWith(
+      "/g.pkg",
+      host,
+      expect.objectContaining({ installAfterUpload: true, selectVariant: true }),
+    );
+    expect(row(q.id)).toBeUndefined();
+  });
+
+  it("rest mode is not triggered by installs or by an upload waiting for its install", async () => {
+    useRestAfterUploadStore.setState({ enabled: true });
+    mockedStandby.mockClear();
+    registerInstallExecutor(async () => ({ ok: true }));
+    const q = useUploadQueueStore.getState().enqueueInstall({
+      host, request: { via: "library", path: "/h.pkg" }, displayName: "H",
+    });
+    await q.done;
+    await until(() => !useUploadQueueStore.getState().runningHosts[host]);
+    expect(mockedStandby).not.toHaveBeenCalled();
+    useRestAfterUploadStore.setState({ enabled: false });
   });
 });
