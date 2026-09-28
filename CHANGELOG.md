@@ -4,7 +4,32 @@ What's new in ps5upload, written for humans.
 
 ---
 
-## Unreleased
+## 5.37.0
+
+**Add several games at once.** (#335)
+
+- **Upload several sources together.** Pick several files or folders, drop
+  several at once, or use **Add games from a folder…**: they appear in a
+  review list that checks each one, shows where it will land and flags
+  problems, then queues them all with one button.
+- **Tick several in the in-app browser.** In the browser build, on Android and
+  when browsing a saved server, the file browser now has checkboxes that stay
+  ticked while you move between folders, and an **Add N** button.
+
+**Convert, more ways.**
+
+- **A convert queue.** Queue several games; they're converted one after
+  another, and each finished package can go straight to the console's install
+  queue.
+- **More sources.** Convert from a `.zip`, `.7z` or `.rar` (including a
+  password-protected or multi-part `.rar`), from a `.ffpfsc` image, or straight
+  from a game on a saved server or on the PS5, without copying it first.
+- **Convert & replace.** Swaps a game dump on the console for its package: the
+  dump is set aside, the package installs, and the dump comes back if anything
+  fails.
+- **Game language.** For a game that stays in English on a console set to
+  another language, Convert can declare one language in the package. Most
+  games follow the console's language and aren't affected.
 
 **Stream & install first.**
 
@@ -39,6 +64,28 @@ What's new in ps5upload, written for humans.
   install, its queue row offers to upload the package and install it instead.
 - An install that was running when the app closed is never re-run by itself —
   check the game, then retry if needed. Queued links aren't saved to disk.
+
+**Package viewer, everywhere.**
+
+- The viewer now has **Files**, **Images** and **Related** tabs, and opens
+  packages and games on a saved server or on the PS5 as well as on this
+  computer — from Install Package, Upload, Convert, the queue, File System,
+  the server browser, or by dropping a file on the app.
+
+**Fixes.**
+
+- Retrying an interrupted single-file upload could write past the end of the
+  file; it now resumes exactly where the PS5 left off.
+- Uninstalling a game folder the app registered no longer leaves it listed
+  in Games.
+- Force-quitting or crashing the desktop app no longer leaves its engine
+  running and holding its port.
+- A save backup folder (such as `PPSA17221.bak`) shows its game's icon and
+  name.
+- Every screen uses the same layout, buttons never squeeze their labels, and
+  phones wrap long titles and button rows.
+- In the browser build, the FAQ and changelog load, and options a web page
+  can't provide are hidden.
 
 ---
 
