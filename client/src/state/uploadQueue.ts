@@ -398,6 +398,23 @@ export function installOrderPriority(it: QueueItem): number {
   return 0;
 }
 
+/** A console's library installs that are waiting or running, by staged path:
+ *  Install Package shows these on the library rows (and blocks Delete). */
+export function libraryInstallStates(
+  items: QueueItem[],
+  host: string,
+): Map<string, "queued" | "installing"> {
+  const h = hostOf(host);
+  const out = new Map<string, "queued" | "installing">();
+  for (const it of items) {
+    if (it.sourceKind !== "install" || it.install?.via !== "library") continue;
+    if (hostOf(it.addr) !== h) continue;
+    if (it.status === "pending") out.set(it.install.path, "queued");
+    else if (it.status === "running") out.set(it.install.path, "installing");
+  }
+  return out;
+}
+
 /** Whether a queue item is an upload the activity bar and task list should
  *  show as one. An install item's executor registers its own task, so
  *  mirroring it too would show every install twice, once as an "Upload". */
@@ -516,17 +533,24 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
 
   /** Callers awaiting an install item's outcome. In memory only: after a
    *  restart nobody is waiting, and the row itself shows the result. */
-  const waiters = new Map<string, (r: InstallResult) => void>();
+  const waiters = new Map<string, ((r: InstallResult) => void)[]>();
+  /** A promise for item `id`'s outcome; any number of callers can wait. */
+  const wait = (id: string) =>
+    new Promise<InstallResult>((resolve) => {
+      const list = waiters.get(id) ?? [];
+      list.push(resolve);
+      waiters.set(id, list);
+    });
   /** Per console: the install that is running right now. Sony's install
    *  can't be stopped halfway, so Stop and Clear leave it running; a new
    *  drain loop waits for it before starting anything else on that console
    *  (the PS5 installs one package at a time). */
   const installInFlight = new Map<string, Promise<unknown>>();
   const settle = (id: string, r: InstallResult) => {
-    const w = waiters.get(id);
-    if (w) {
+    const list = waiters.get(id);
+    if (list) {
       waiters.delete(id);
-      w(r);
+      for (const w of list) w(r);
     }
   };
 
@@ -1444,15 +1468,10 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
 
     enqueueInstall(input) {
       const existing = get().items.find((it) => sameInstall(it, input));
-      if (existing) {
-        return {
-          id: existing.id,
-          done: Promise.resolve({
-            ok: false,
-            message: `${input.displayName} is already in the queue.`,
-          }),
-        };
-      }
+      // The same install again (a second click, or the same package from
+      // another screen) joins the one already queued: one run, one result
+      // for every caller.
+      if (existing) return { id: existing.id, done: wait(existing.id) };
       const bare = hostOf(input.host);
       get().add({
         sourceKind: "install",
@@ -1472,7 +1491,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       });
       const items = get().items;
       const added = items[items.length - 1];
-      const done = new Promise<InstallResult>((resolve) => waiters.set(added.id, resolve));
+      const done = wait(added.id);
       void get().startHost(bare);
       return { id: added.id, done };
     },
@@ -1493,7 +1512,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         }),
       }));
       scheduleSave();
-      const done = new Promise<InstallResult>((resolve) => waiters.set(id, resolve));
+      const done = wait(id);
       void get().startHost(hostOf(it.addr));
       return { id, done };
     },

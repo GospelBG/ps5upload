@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { libraryInstallStates, useUploadQueueStore } from "../../state/uploadQueue";
 import { isRemotePath } from "../../lib/remotePath";
 import { PackagePanel } from "../../components/PackagePanel";
 import { QueuePanel } from "../Upload/QueuePanel";
@@ -547,6 +548,19 @@ export default function InstallPackageScreen() {
     Map<string, InstalledPkgArtifact[]>
   >(() => new Map());
   const [pickError, setPickError] = useState<string | null>(null);
+  // Library rows' queue state, as a string key so this screen re-renders only
+  // when a row's state changes, not on every progress tick.
+  const libStateKey = useUploadQueueStore((s) =>
+    [...libraryInstallStates(s.items, host)].map(([p, v]) => `${p}\u0000${v}`).join("\n"),
+  );
+  const libStates = useMemo(() => {
+    const m = new Map<string, "queued" | "installing">();
+    for (const line of libStateKey ? libStateKey.split("\n") : []) {
+      const [p, v] = line.split("\u0000");
+      m.set(p, v as "queued" | "installing");
+    }
+    return m;
+  }, [libStateKey]);
   // The row whose original file is open in the package viewer.
   const [viewEntry, setViewEntry] = useState<PkgEntry | null>(null);
   /** Terminal outcome of the last stream install, shown IN THIS VIEW.
@@ -1210,6 +1224,10 @@ export default function InstallPackageScreen() {
   const installBlocked = false;
 
   const renderPkgRow = (entry: PkgEntry) => {
+    // A row whose install is waiting or running in the console queue shows it
+    // (and can't be deleted from under the queued install).
+    const queued = libStates.get(entry.path);
+    if (queued && entry.status === "idle") entry = { ...entry, status: queued };
     const installed = pkgRowInstalled(
       entry,
       installedIds,
@@ -1223,7 +1241,7 @@ export default function InstallPackageScreen() {
         host={host}
         installed={installed}
         installDisabled={installBlocked}
-        deleteDisabled={installing}
+        deleteDisabled={installing || !!queued}
         alternativeKey={alternativeKey}
         selectedForInstallAll={
           !!alternativeKey &&

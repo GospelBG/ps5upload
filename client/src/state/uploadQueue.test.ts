@@ -69,7 +69,7 @@ import {
 import { useUploadSettingsStore } from "./uploadSettings";
 import { runPkgInstall, pkgLibraryStore } from "./pkgLibrary";
 import { registerInstallExecutor, type InstallResult } from "./consoleQueueBridge";
-import { isUploadItem, sameInstall } from "./uploadQueue";
+import { isUploadItem, libraryInstallStates, sameInstall } from "./uploadQueue";
 
 // The store before any test stubs its actions (some blocks replace startHost).
 const pristineQueue = useUploadQueueStore.getState();
@@ -1233,14 +1233,16 @@ describe("install items", () => {
     expect(calls).toEqual(["/hold.pkg", "/base.pkg", "/upd.pkg", "/dlc.pkg"]);
   });
 
-  it("refuses the same install queued twice on one console", () => {
+  it("a second identical install joins the first instead of failing", async () => {
     const s = useUploadQueueStore.getState();
-    s.enqueueInstall({ host, request: { via: "stream", source: "/x.pkg" }, displayName: "X" });
-    const again = s.enqueueInstall({ host, request: { via: "stream", source: "/x.pkg" }, displayName: "X" });
-    return expect(again.done).resolves.toMatchObject({
-      ok: false,
-      message: expect.stringMatching(/already in the queue/),
-    });
+    const a = s.enqueueInstall({ host, request: { via: "stream", source: "/x.pkg" }, displayName: "X" });
+    const b = s.enqueueInstall({ host, request: { via: "stream", source: "/x.pkg" }, displayName: "X" });
+    expect(b.id).toBe(a.id);
+    await waitFor(() => calls.length === 1);
+    gate.get("/x.pkg")!({ ok: true });
+    await expect(a.done).resolves.toEqual({ ok: true });
+    await expect(b.done).resolves.toEqual({ ok: true });
+    expect(calls).toEqual(["/x.pkg"]);
   });
 
   it("never auto-recovers an install item", async () => {
@@ -1613,5 +1615,25 @@ describe("review fixes", () => {
     await until(() => !useUploadQueueStore.getState().runningHosts[host]);
     expect(mockedStandby).not.toHaveBeenCalled();
     useRestAfterUploadStore.setState({ enabled: false });
+  });
+});
+
+describe("libraryInstallStates", () => {
+  it("maps a console's queued and running library installs by path", () => {
+    const it = (id: string, addr: string, path: string, status: string) =>
+      ({ id, addr, sourceKind: "install", install: { via: "library", path }, status }) as unknown as QueueItem;
+    const m = libraryInstallStates(
+      [
+        it("a", "10.0.0.2:9113", "/lib/a.pkg", "pending"),
+        it("b", "10.0.0.2:9113", "/lib/b.pkg", "running"),
+        it("c", "10.0.0.2:9113", "/lib/c.pkg", "done"),
+        it("d", "10.0.0.3:9113", "/lib/d.pkg", "pending"),
+      ],
+      "10.0.0.2",
+    );
+    expect(m.get("/lib/a.pkg")).toBe("queued");
+    expect(m.get("/lib/b.pkg")).toBe("installing");
+    expect(m.has("/lib/c.pkg")).toBe(false);
+    expect(m.has("/lib/d.pkg")).toBe(false);
   });
 });
