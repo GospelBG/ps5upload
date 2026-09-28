@@ -8,15 +8,12 @@ test("guides a disconnected user through primary navigation and recovery", async
   // serves any same-origin /api probe as inert app HTML in this test setup.
   await page.goto("/home", { waitUntil: "domcontentloaded" });
 
-  // The sidebar pins Home and nothing else until the user stars screens in
-  // More, so a fresh profile sees exactly one favourite plus the More
-  // escape hatch. (The nav landmark keeps its "Primary" name deliberately —
-  // "Favorites" is the visible heading, not the landmark's accessible name.)
+  // A fresh profile's sidebar lists every screen: nothing is hidden behind More
+  // until the user hides it.
   const primary = page.getByRole("navigation", { name: "Primary" });
   await expect(primary.getByRole("link", { name: "Home" })).toBeVisible();
-  await expect(primary.getByText("Star screens in More")).toBeVisible();
-  for (const notPinned of ["Games", "Files", "Console", "Tasks"]) {
-    await expect(primary.getByRole("link", { name: notPinned })).toHaveCount(0);
+  for (const shown of ["Games", "Files", "Console", "Tasks", "Convert to FPKG"]) {
+    await expect(primary.getByRole("link", { name: shown, exact: true })).toBeVisible();
   }
 
   await expect(
@@ -33,9 +30,11 @@ test("guides a disconnected user through primary navigation and recovery", async
     page.locator('[aria-disabled="true"]').filter({ hasText: /^Upload/ }),
   ).toBeVisible();
 
-  // Everything unpinned stays one click away through More.
+  // More lists every screen too (and is where hidden ones come back). Scoped to the
+  // page body: the sidebar carries the same links.
+  const body = page.getByRole("main");
   await page.getByRole("link", { name: "More" }).click();
-  await page.getByRole("link", { name: "Tasks" }).click();
+  await body.getByRole("link", { name: "Tasks", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Tasks" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Tasks", pressed: true })).toBeVisible();
   await expect(page.getByRole("button", { name: /history/i })).toBeVisible();
@@ -43,8 +42,8 @@ test("guides a disconnected user through primary navigation and recovery", async
 
   await page.getByRole("link", { name: "More" }).click();
   await expect(page.getByRole("heading", { name: "More" })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Install Package" })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Settings" })).toBeVisible();
+  await expect(body.getByRole("link", { name: "Install Package" })).toBeVisible();
+  await expect(body.getByRole("link", { name: "Settings" })).toBeVisible();
 
   // Regression: this screen used to draw its entire staging UI with no console
   // connected — a small "No PS5 host set" warning, and then the full body
