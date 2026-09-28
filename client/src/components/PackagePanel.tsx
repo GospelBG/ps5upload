@@ -26,6 +26,7 @@ import {
 } from "../lib/packageChecks";
 import { useConnectionStore } from "../state/connection";
 import { useTr } from "../state/lang";
+import { writeClipboard } from "../lib/clipboard";
 
 export interface PanelAction {
   label: string;
@@ -183,10 +184,22 @@ export function PackagePanelView({
     [tr("viewer_field_sdk", undefined, "SDK"), g.specs.sdk_ver],
     [tr("viewer_field_built", undefined, "Built"), g.specs.build_date],
     [tr("viewer_field_drm", undefined, "DRM"), g.specs.drm],
-    [tr("viewer_field_age", undefined, "Age rating"), g.specs.age_rating],
+    // PS4's PARENTAL_LEVEL is a 1–11 level, not an age.
+    [
+      g.identity.platform === "ps4"
+        ? tr("viewer_field_parental", undefined, "Parental level")
+        : tr("viewer_field_age", undefined, "Age rating"),
+      g.specs.age_rating,
+    ],
     [tr("viewer_field_languages", undefined, "Languages"), g.specs.languages.length ? g.specs.languages.join(", ") : null],
     [tr("viewer_field_size", undefined, "Size"), formatBytes(g.source.size)],
-    [tr("viewer_field_files", undefined, "Files"), g.specs.file_count != null ? String(g.specs.file_count) : null],
+    [
+      // A package counts its entry table, not files.
+      g.source.format === "pkg" || g.source.format === "split-pkg"
+        ? tr("viewer_field_entries", undefined, "Entries")
+        : tr("viewer_field_files", undefined, "Files"),
+      g.specs.file_count != null ? String(g.specs.file_count) : null,
+    ],
   ];
 
   const params = showAll ? g.params : g.params.filter((p) => CURATED_KEYS.has(p.key));
@@ -317,7 +330,7 @@ export function PackagePanelView({
               size="sm"
               variant="ghost"
               leftIcon={<Copy size={12} />}
-              onClick={() => void navigator.clipboard?.writeText(copyText).catch(() => {})}
+              onClick={() => void writeClipboard(copyText)}
             >
               {tr("viewer_copy", undefined, "Copy details")}
             </Button>
@@ -356,13 +369,15 @@ export function PackagePanel({
   const [tab, setTab] = useState<Tab>("overview");
   const [installed, setInstalled] = useState<PanelChecks["installed"]>(null);
   const [free, setFree] = useState<number | null>(null);
-  const latest = useRef<string | null>(null);
+  // Bumped per load: a reply for an earlier path or console is ignored.
+  const request = useRef(0);
   const kernel = useConnectionStore((s) =>
     host ? (s.runtimeByHost[hostOf(host)]?.ps5Kernel ?? null) : null,
   );
 
   useEffect(() => {
-    latest.current = path;
+    const req = ++request.current;
+    const current = () => request.current === req;
     setData(null);
     setError(null);
     setCover(null);
@@ -373,18 +388,18 @@ export function PackagePanel({
     if (!path) return;
     void gameInspect(path)
       .then(async (r) => {
-        if (latest.current !== path) return;
+        if (!current()) return;
         setData(r);
         const names = new Set(r.inspection.images.map((i) => i.name));
         if (names.has("icon0.png")) {
           void gameInspectImageUrl(r.token, "icon0.png")
-            .then((u) => latest.current === path && setCover(u))
+            .then((u) => current() && setCover(u))
             .catch(() => {});
         }
         const bg = names.has("pic0.png") ? "pic0.png" : names.has("pic1.png") ? "pic1.png" : null;
         if (bg) {
           void gameInspectImageUrl(r.token, bg)
-            .then((u) => latest.current === path && setBackdrop(u))
+            .then((u) => current() && setBackdrop(u))
             .catch(() => {});
         }
         if (host) {
@@ -394,18 +409,18 @@ export function PackagePanel({
               packageType: pkgTypeForCategory(g.identity.category, g.identity.platform),
             })
               .then((pre) => {
-                if (latest.current !== path) return;
+                if (!current()) return;
                 setInstalled(installedFromPreflight(g.specs.app_ver, pre));
               })
               .catch(() => {});
           }
           void listVolumes(transferAddr(host))
-            .then((vols) => latest.current === path && setFree(largestFreeBytes(vols)))
+            .then((vols) => current() && setFree(largestFreeBytes(vols)))
             .catch(() => {});
         }
       })
       .catch((e) => {
-        if (latest.current === path) setError(e instanceof Error ? e.message : String(e));
+        if (current()) setError(e instanceof Error ? e.message : String(e));
       });
   }, [path, host]);
 

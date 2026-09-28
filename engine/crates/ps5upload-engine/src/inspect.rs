@@ -180,7 +180,11 @@ fn apply_sfo(g: &mut GameInspection, params: &[(String, SfoValue)]) {
     for (key, value) in params {
         let shown = match value {
             SfoValue::Text(t) => t.clone(),
-            SfoValue::Int(i) => format!("0x{i:08X}"),
+            // Flags and BCD versions read best in hex; counts and levels don't.
+            SfoValue::Int(i) if key.starts_with("ATTRIBUTE") || key.ends_with("_VER") => {
+                format!("0x{i:08X}")
+            }
+            SfoValue::Int(i) => i.to_string(),
         };
         g.params.push(ParamField {
             key: key.clone(),
@@ -287,8 +291,11 @@ fn apply_param_json(g: &mut GameInspection, v: &serde_json::Value) {
 }
 
 fn finish(g: &mut GameInspection) {
-    if g.identity.title_id.is_empty() && g.identity.content_id.len() >= 16 {
-        g.identity.title_id = g.identity.content_id[7..16].to_string();
+    if g.identity.title_id.is_empty() {
+        // `get`, not slicing: a malformed id may split a multi-byte character.
+        if let Some(t) = g.identity.content_id.get(7..16) {
+            g.identity.title_id = t.to_string();
+        }
     }
     if g.identity.platform.is_empty() {
         if let Some(p) = platform_from_title_id(&g.identity.title_id) {
@@ -422,6 +429,17 @@ fn inspect_tree(path: &Path, format: &str) -> Result<GameInspection> {
     let mut tree = ps5upload_fpkg::source::open(path)?;
     let files = tree.files().to_vec();
     let has = |p: &str| files.iter().any(|f| f.path == p);
+    let mut too_large = Vec::new();
+    // A text file this viewer reads whole, or None when it is absent, too
+    // large (a damaged image can claim any size) or unreadable.
+    let mut read_text = |tree: &mut Box<dyn ps5upload_fpkg::source::SourceTree>, p: &str| {
+        let f = files.iter().find(|f| f.path == p)?;
+        if f.size > u64::from(MAX_TEXT_BYTES) {
+            too_large.push(p.to_string());
+            return None;
+        }
+        tree.read(p).ok()
+    };
     let mut g = GameInspection {
         authenticity: "none".to_string(),
         ..Default::default()
@@ -439,7 +457,7 @@ fn inspect_tree(path: &Path, format: &str) -> Result<GameInspection> {
     };
     let mut have_param = false;
     if has("sce_sys/param.json") {
-        if let Ok(bytes) = tree.read("sce_sys/param.json") {
+        if let Some(bytes) = read_text(&mut tree, "sce_sys/param.json") {
             let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes[..end]) {
                 apply_param_json(&mut g, &v);
@@ -448,7 +466,7 @@ fn inspect_tree(path: &Path, format: &str) -> Result<GameInspection> {
         }
     }
     if !have_param && has("sce_sys/param.sfo") {
-        if let Ok(bytes) = tree.read("sce_sys/param.sfo") {
+        if let Some(bytes) = read_text(&mut tree, "sce_sys/param.sfo") {
             if let Ok(params) = sfo_params(&bytes) {
                 apply_sfo(&mut g, &params);
                 have_param = true;
@@ -470,10 +488,11 @@ fn inspect_tree(path: &Path, format: &str) -> Result<GameInspection> {
         }
     }
     let change = format!("sce_sys/{CHANGEINFO}");
-    if has(&change) {
-        if let Ok(bytes) = tree.read(&change) {
-            g.change_notes = Some(String::from_utf8_lossy(&bytes).to_string());
-        }
+    if let Some(bytes) = read_text(&mut tree, &change) {
+        g.change_notes = Some(String::from_utf8_lossy(&bytes).to_string());
+    }
+    for p in too_large {
+        g.warnings.push(format!("{p} is too large to show"));
     }
     g.specs.file_count = Some(files.len() as u64);
     finish(&mut g);
@@ -493,18 +512,24 @@ pub fn read_image(path: &Path, format: &str, name: &str) -> Result<Vec<u8>> {
         return Ok(read_pkg_entry(path, e, MAX_IMAGE_BYTES)?);
     }
     let mut tree = ps5upload_fpkg::source::open(path)?;
-    Ok(tree.read(&format!("sce_sys/{name}"))?)
+    let p = format!("sce_sys/{name}");
+    match tree.files().iter().find(|f| f.path == p) {
+        None => bail!("no {name} in this game"),
+        Some(f) if f.size > u64::from(MAX_IMAGE_BYTES) => bail!("{name} is too large to show"),
+        Some(_) => Ok(tree.read(&p)?),
+    }
 }
 
 /// Inspections by token, so the image requests that follow reuse one parse.
-/// Keyed by path + size + mtime: a changed file is parsed again.
+/// Keyed by path plus the size and mtime of every file the inspection depends
+/// on: a changed file, split part or folder PARAM is parsed again.
 pub struct InspectCache {
     cap: usize,
     inner: std::sync::Mutex<Vec<CacheEntry>>,
 }
 
 struct CacheEntry {
-    key: (PathBuf, u64, std::time::SystemTime),
+    key: (PathBuf, Vec<(u64, std::time::SystemTime)>),
     token: String,
     at: std::time::Instant,
     inspection: GameInspection,
@@ -523,21 +548,18 @@ impl InspectCache {
 
     /// The cached token and inspection for this exact file, or a fresh one.
     pub fn inspect(&self, path: &Path) -> Result<(String, GameInspection)> {
-        let meta = std::fs::metadata(path)?;
-        let key = (
-            path.to_path_buf(),
-            meta.len(),
-            meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-        );
+        let key = (path.to_path_buf(), fingerprint(path)?);
         {
             let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             entries.retain(|e| e.at.elapsed() < CACHE_TTL);
-            if let Some(e) = entries.iter().find(|e| e.key == key) {
+            if let Some(e) = entries.iter_mut().find(|e| e.key == key) {
+                // In use: keep its token alive for the image requests to come.
+                e.at = std::time::Instant::now();
                 return Ok((e.token.clone(), e.inspection.clone()));
             }
         }
         let inspection = inspect_local(path)?;
-        let token = new_token();
+        let token = new_token()?;
         let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         entries.push(CacheEntry {
             key,
@@ -560,11 +582,43 @@ impl InspectCache {
     }
 }
 
-fn new_token() -> String {
+/// Size and mtime of `path` and what else its inspection reads: a folder's
+/// PARAM files (editing them leaves the folder's own mtime alone) and a
+/// package's split parts.
+fn fingerprint(path: &Path) -> Result<Vec<(u64, std::time::SystemTime)>> {
+    let stamp = |p: &Path| {
+        std::fs::metadata(p)
+            .ok()
+            .map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)))
+    };
+    let Some(own) = stamp(path) else {
+        bail!("cannot read {}", path.display());
+    };
+    let mut out = vec![own];
+    if path.is_dir() {
+        for f in ["sce_sys/param.json", "sce_sys/param.sfo"] {
+            out.extend(stamp(&path.join(f)));
+        }
+    } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let dir = path.parent().unwrap_or(Path::new("."));
+        // Same walk as the split-set parser: <name>.0, <name>.1, ...
+        for i in 0..=1024u32 {
+            match stamp(&dir.join(format!("{name}.{i}"))) {
+                Some(s) => out.push(s),
+                None => break,
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn new_token() -> Result<String> {
     let mut b = [0u8; 16];
     // The OS generator; never a Unix-only path (the engine also runs on Windows).
-    let _ = getrandom::fill(&mut b);
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    // A token is what lets a request read files, so never fall back to a
+    // guessable one.
+    getrandom::fill(&mut b).map_err(|e| anyhow::anyhow!("no secure random source: {e}"))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
 static CACHE: std::sync::LazyLock<InspectCache> =
@@ -893,5 +947,71 @@ mod tests {
         );
         assert_eq!(g.identity.title, "Fixture");
         assert_eq!(g.identity.content_type, "game");
+    }
+
+    #[test]
+    fn the_cache_sees_a_folder_param_edit_and_a_split_part_change() {
+        let dir = test_fixtures::scratch();
+        let sys = dir.join("g/sce_sys");
+        std::fs::create_dir_all(&sys).unwrap();
+        std::fs::write(sys.join("param.json"), br#"{"titleId":"PPSA00001"}"#).unwrap();
+        let cache = InspectCache::new(32);
+        let (t1, g1) = cache.inspect(&dir.join("g")).unwrap();
+        assert_eq!(g1.identity.title_id, "PPSA00001");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Editing a file inside sce_sys leaves the folder's own mtime alone.
+        std::fs::write(sys.join("param.json"), br#"{"titleId":"PPSA00002"}"#).unwrap();
+        let (t2, g2) = cache.inspect(&dir.join("g")).unwrap();
+        assert_ne!(t1, t2);
+        assert_eq!(g2.identity.title_id, "PPSA00002");
+
+        let lead = test_fixtures::write_cnt_pkg(dir.join("s.pkg"), "gd");
+        std::fs::write(dir.join("s.pkg.0"), vec![0u8; 10]).unwrap();
+        let (t3, g3) = cache.inspect(&lead).unwrap();
+        std::fs::write(dir.join("s.pkg.0"), vec![0u8; 20]).unwrap();
+        let (t4, g4) = cache.inspect(&lead).unwrap();
+        assert_ne!(t3, t4);
+        assert_eq!(g4.source.size, g3.source.size + 10);
+    }
+
+    #[test]
+    fn a_non_ascii_content_id_does_not_panic() {
+        let mut g = GameInspection::default();
+        g.identity.content_id = "EP9000-PPSA0123é_00-X".to_string();
+        finish(&mut g);
+        assert!(g.identity.title_id.is_empty() || g.identity.title_id.is_char_boundary(0));
+    }
+
+    #[test]
+    fn oversized_text_in_a_folder_is_not_read_whole() {
+        let dir = test_fixtures::scratch();
+        let sys = dir.join("sce_sys");
+        std::fs::create_dir_all(sys.join("changeinfo")).unwrap();
+        std::fs::write(sys.join("param.json"), br#"{"titleId":"PPSA00001"}"#).unwrap();
+        std::fs::write(
+            sys.join("changeinfo/changeinfo.xml"),
+            vec![b'a'; MAX_TEXT_BYTES as usize + 1],
+        )
+        .unwrap();
+        let g = inspect_local(&dir).unwrap();
+        assert!(g.change_notes.is_none());
+        assert!(g.warnings.iter().any(|w| w.contains("changeinfo")));
+    }
+
+    #[test]
+    fn sfo_numbers_read_as_numbers_and_flags_as_hex() {
+        let mut g = GameInspection::default();
+        apply_sfo(
+            &mut g,
+            &[
+                ("PARENTAL_LEVEL".to_string(), SfoValue::Int(5)),
+                ("ATTRIBUTE".to_string(), SfoValue::Int(0x10)),
+                ("SYSTEM_VER".to_string(), SfoValue::Int(0x0505_0000)),
+            ],
+        );
+        let v = |k: &str| g.params.iter().find(|p| p.key == k).unwrap().value.clone();
+        assert_eq!(v("PARENTAL_LEVEL"), "5");
+        assert_eq!(v("ATTRIBUTE"), "0x00000010");
+        assert_eq!(v("SYSTEM_VER"), "0x05050000");
     }
 }

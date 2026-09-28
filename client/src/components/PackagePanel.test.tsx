@@ -99,6 +99,22 @@ describe("PackagePanelView", () => {
     expect(html).toContain("encrypted or missing");
   });
 
+  it("names a package's entries and a PS4 parental level for what they are", () => {
+    const html = view();
+    expect(html).toContain("Entries");
+    expect(html).toContain("Parental level");
+    const folder = view({
+      inspection: {
+        ...g,
+        source: { ...g.source, format: "folder", parts: [] },
+        identity: { ...g.identity, platform: "ps5" },
+      },
+    });
+    expect(folder).toContain("Files");
+    expect(folder).toContain("Age rating");
+    expect(folder).not.toContain("Parental level");
+  });
+
   it("details lists PARAM keys behind Show all", () => {
     const html = view({ tab: "details" });
     expect(html).toContain("TITLE");
