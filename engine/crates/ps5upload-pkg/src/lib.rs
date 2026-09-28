@@ -1069,6 +1069,17 @@ const ENTRY_FLAG_ENCRYPTED: u32 = 0x8000_0000;
 /// Well-known entry ids (psdevwiki), for packages without a readable name table.
 fn known_entry_name(id: u32) -> Option<&'static str> {
     Some(match id {
+        // The container's own entries (names as the PS4 package tools use them).
+        0x0001 => "digests",
+        0x0010 => "entry_keys",
+        0x0020 => "image_key",
+        0x0080 => "general_digests",
+        0x0100 => "metas",
+        0x0200 => "entry_names",
+        0x0404 => "selfinfo.dat",
+        0x0406 => "imageinfo.dat",
+        0x0407 => "target-deltainfo.dat",
+        0x0408 => "origin-deltainfo.dat",
         0x0400 => "license.dat",
         0x0401 => "license.info",
         0x0402 => "nptitle.dat",
@@ -2178,5 +2189,21 @@ mod tests {
             read_pkg_entry(&path, e, 1 << 20).unwrap(),
             read_pkg_entry_from(&mut cur, e, 1 << 20).unwrap()
         );
+    }
+
+    #[test]
+    fn container_system_entries_have_names() {
+        for (id, name) in [
+            (0x0001, "digests"),
+            (0x0010, "entry_keys"),
+            (0x0020, "image_key"),
+            (0x0080, "general_digests"),
+            (0x0100, "metas"),
+            (0x0200, "entry_names"),
+            (0x0404, "selfinfo.dat"),
+        ] {
+            assert_eq!(known_entry_name(id), Some(name), "{id:#06x}");
+        }
+        assert_eq!(known_entry_name(0x040A), None);
     }
 }
