@@ -5,7 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // deterministically without a PS5 or engine.
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const releaseCopy = vi.fn(async () => {});
-vi.mock("../lib/materialize", () => ({ releaseCopy: (...a: unknown[]) => releaseCopy(...(a as [])) }));
+const materializeRemote = vi.fn(async (p: string) => p);
+vi.mock("../lib/materialize", () => ({
+  releaseCopy: (...a: unknown[]) => releaseCopy(...(a as [])),
+  materializeRemote: (p: string) => materializeRemote(p),
+}));
 vi.mock("../lib/ensurePayloadCurrent", () => ({
   ensurePayloadCurrent: vi.fn(async () => {}),
 }));
@@ -1651,3 +1655,44 @@ describe("failedStreamInstallIds", () => {
     expect(failedStreamInstallIds(items, "/staged/x.pkg")).toEqual(["a"]);
   });
 });
+
+describe("an archive on a saved server", () => {
+  beforeEach(() => {
+    installLocalStorageStub();
+    vi.useFakeTimers();
+    mockedJobStatus.mockReset().mockResolvedValue({ status: "done", bytes_sent: 1 } as Awaited<ReturnType<typeof jobStatus>>);
+    materializeRemote.mockReset().mockResolvedValue("/tmp/copies/g.zip");
+    releaseCopy.mockClear();
+    useUploadQueueStore.setState({ items: [], running: false, runningHosts: {}, continueOnFailure: false, loaded: true });
+  });
+  afterEach(() => {
+    useUploadQueueStore.getState().stop();
+    vi.useRealTimers();
+  });
+
+  it("is copied here when its turn comes, uploaded from the copy, and the copy removed", async () => {
+    useUploadQueueStore.getState().add({
+      sourceKind: "archive",
+      sourcePath: "remote://nas-1/dl/g.zip",
+      displayName: "g.zip",
+      resolvedDest: "/data/homebrew/g",
+      addr: "192.168.1.10:9113",
+      strategy: "overwrite",
+      reconcileMode: "fast",
+      excludes: [],
+      mountAfterUpload: false,
+      mountReadOnly: true,
+      registerAfterUpload: false,
+    });
+    expect(materializeRemote).not.toHaveBeenCalled();
+    const p = useUploadQueueStore.getState().start();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await p;
+    expect(materializeRemote).toHaveBeenCalledWith("remote://nas-1/dl/g.zip");
+    const { startTransferZip } = await import("../api/ps5");
+    const calls = vi.mocked(startTransferZip).mock.calls;
+    expect(calls[calls.length - 1]?.[0]).toBe("/tmp/copies/g.zip");
+    expect(releaseCopy).toHaveBeenCalledWith("/tmp/copies/g.zip");
+  });
+});
+

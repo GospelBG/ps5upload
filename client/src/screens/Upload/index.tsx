@@ -83,10 +83,6 @@ import { useUploadSettingsStore } from "../../state/uploadSettings";
 import { useUploadQueueStore } from "../../state/uploadQueue";
 import { pkgLibraryStore, usePkgLibrary } from "../../state/pkgLibrary";
 import { pkgStorageFor } from "../../lib/pkgStorage";
-import {
-  stagingBasename,
-  stagingSubdirForCategory,
-} from "../../lib/pkgStagingPath";
 import { useInstallSettingsStore } from "../../state/installSettings";
 import { useRecentHostMetricsStore } from "../../state/recentHostMetrics";
 import {
@@ -94,6 +90,7 @@ import {
   formatEtaSeconds,
   pickBannerMode,
 } from "../../lib/uploadEta";
+import { buildUploadQueueItem, type UploadItemOptions } from "../../lib/uploadQueueItem";
 import { resolveUploadDest } from "../../lib/uploadDest";
 import { QueuePanel } from "./QueuePanel";
 import { humanizePs5Error } from "../../lib/humanizeError";
@@ -340,96 +337,53 @@ export default function UploadScreen() {
   /** Snapshot the current source + destination + options into a queue
    *  item. Captured at click time, so subsequent edits to the form
    *  don't bleed into the queued item. */
-  const handleAddToQueue = (strategy: "overwrite" | "resume") => {
-    if (!source || !host?.trim()) return;
-    const addr0 = `${host}:${PS5_PAYLOAD_PORT}`;
-    // A .pkg is a package: it stages into the package library and the queue's
-    // pkg finisher installs it (and optionally deletes the staged copy). The
-    // destination is the library staging path (not the user's volume/subpath),
-    // and the install/delete defaults come from the Install Package settings.
-    if (source.kind === "pkg") {
-      const pkgInfo = source.pkgInfo ?? null;
-      const cid = pkgInfo?.contentId ?? "";
-      const basename = stagingBasename(
-        cid,
-        Math.random().toString(36).slice(2),
-        Date.now(),
+  /** The shared options every queued upload from this screen takes. Also tells the user when
+   *  a package falls back to internal storage. */
+  const uploadItemOptions = (strategy: "overwrite" | "resume", hasPackage: boolean): UploadItemOptions => {
+    // The console's default package drive (Volumes screen), or internal storage when that
+    // drive is not connected.
+    const storage = pkgStorageFor(host ?? "", availableVolumes.length > 0 ? availableVolumes : null);
+    if (hasPackage && storage.fellBack) {
+      pushNotification(
+        "info",
+        tr("pkg_storage_fallback_title", undefined, "Using internal storage"),
+        {
+          body: tr(
+            "pkg_storage_fallback_body",
+            { drive: storage.chosen ?? "" },
+            "The default package drive ({drive}) isn't available, so this package goes to internal storage.",
+          ),
+        },
       );
-      const subdir = stagingSubdirForCategory(pkgInfo?.category ?? null);
-      // The console's default package drive (Volumes screen), or internal
-      // storage when that drive is not connected.
-      const storage = pkgStorageFor(
-        host,
-        availableVolumes.length > 0 ? availableVolumes : null,
-      );
-      if (storage.fellBack) {
-        pushNotification(
-          "info",
-          tr("pkg_storage_fallback_title", undefined, "Using internal storage"),
-          {
-            body: tr(
-              "pkg_storage_fallback_body",
-              { drive: storage.chosen ?? "" },
-              "The default package drive ({drive}) isn't available, so this package goes to internal storage.",
-            ),
-          },
-        );
-      }
-      const dest = subdir
-        ? `${storage.dir}/${subdir}/${basename}`
-        : `${storage.dir}/${basename}`;
-      const settings = useInstallSettingsStore.getState();
-      const displayName =
-        pkgInfo?.title?.trim() ||
-        (source.path.split(/[\\/]/).pop() ?? source.path);
-      queueAdd({
-        sourceKind: "pkg",
-        sourcePath: source.path,
-        displayName,
-        resolvedDest: dest,
-        addr: addr0,
-        strategy: "overwrite",
-        reconcileMode,
-        excludes: [],
-        contentId: cid,
-        category: pkgInfo?.category ?? null,
-        installAfterUpload: settings.autoInstallAfterUpload,
-        deletePkgAfterInstall: settings.autoRemoveAfterInstall,
-        mountAfterUpload: false,
-        mountReadOnly,
-        registerAfterUpload: false,
-      });
-      return;
     }
-    const { dest } = resolveUploadDest(
+    const settings = useInstallSettingsStore.getState();
+    return {
+      addr: `${host}:${PS5_PAYLOAD_PORT}`,
       destinationVolume,
       destinationSubpath,
-      source.path,
-      source.kind === "archive",
       archiveIntoSubfolder,
-    );
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
-    const displayName =
-      source.path
-        .replace(/[\\/]+$/, "")
-        .split(/[\\/]/)
-        .pop() ?? source.path;
-    queueAdd({
-      sourceKind: source.kind,
-      sourcePath: source.path,
-      displayName,
-      resolvedDest: dest,
-      addr,
-      strategy,
       reconcileMode,
+      strategy,
       excludes: activeExcludes,
-      // Capture the .rar password (if any) into the queued item; the direct
-      // startTransfer paths read it from the store instead.
-      rarPassword: source.kind === "archive" ? rarPassword : null,
-      mountAfterUpload: source.kind === "image" && mountAfterUpload,
+      mountAfterUpload,
       mountReadOnly,
-      registerAfterUpload: source.kind === "game-folder" && registerAfterUpload,
-    });
+      registerAfterUpload,
+      installAfterUpload: settings.autoInstallAfterUpload,
+      deletePkgAfterInstall: settings.autoRemoveAfterInstall,
+      pkgDir: storage.dir,
+      nonce: Math.random().toString(36).slice(2),
+      now: Date.now(),
+    };
+  };
+
+  /** Snapshot the current source + destination + options into a queue
+   *  item. Captured at click time, so subsequent edits to the form
+   *  don't bleed into the queued item. */
+  const handleAddToQueue = (strategy: "overwrite" | "resume") => {
+    if (!source || !host?.trim()) return;
+    queueAdd(
+      buildUploadQueueItem(source, rarPassword, uploadItemOptions(strategy, source.kind === "pkg")),
+    );
   };
 
   /** Queue every part of a multi-part archive set in one click.

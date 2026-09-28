@@ -55,7 +55,28 @@ import { withConsolePrefix } from "./roster";
 import { hostOf, mgmtAddr } from "../lib/addr";
 import { log } from "./logs";
 import { isRemotePath } from "../lib/remotePath";
-import { releaseCopy } from "../lib/materialize";
+import { materializeRemote, releaseCopy } from "../lib/materialize";
+
+/** Local copies of server archives, by queue item: made when the item's turn comes (not at
+ *  pick time — ten archives would otherwise be ten downloads before any upload), reused when
+ *  the item retries, released when it finishes or is removed. */
+const archiveCopies = new Map<string, string>();
+
+async function archiveSourceFor(item: { id: string; sourcePath: string }): Promise<string> {
+  if (!isRemotePath(item.sourcePath)) return item.sourcePath;
+  const have = archiveCopies.get(item.id);
+  if (have) return have;
+  const local = await materializeRemote(item.sourcePath);
+  archiveCopies.set(item.id, local);
+  return local;
+}
+
+function releaseArchiveCopy(id: string) {
+  const local = archiveCopies.get(id);
+  if (!local) return;
+  archiveCopies.delete(id);
+  void releaseCopy(local);
+}
 import {
   getInstallExecutor,
   registerInstallEnqueuer,
@@ -655,11 +676,12 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       // re-sends only un-acked shards.
       const bandwidthCap = useUploadSettingsStore.getState().bandwidthCapMbps;
       const fmt = archiveFormat(item.sourcePath);
+      const archivePath = await archiveSourceFor(item);
       if (fmt === "rar") {
         // .rar → host UnRAR extract; carry the (optional) password captured
         // at add time. Resume re-extracts and re-sends only un-acked shards.
         jobId = await startTransferRar(
-          item.sourcePath,
+          archivePath,
           item.resolvedDest,
           item.addr,
           item.rarPassword ?? null,
@@ -670,7 +692,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       } else {
         const start = fmt === "7z" ? startTransfer7z : startTransferZip;
         jobId = await start(
-          item.sourcePath,
+          archivePath,
           item.resolvedDest,
           item.addr,
           item.txIdHex,
@@ -1229,6 +1251,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           // An archive picked on a saved server was copied here to upload; the copy is done
           // with now. (Local paths are not copies and are left alone.)
           void releaseCopy(next.sourcePath);
+          releaseArchiveCopy(next.id);
           if (!isLive()) return;
           break; // success → next item
         } catch (e) {
@@ -1609,6 +1632,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
 
     remove(id) {
       settle(id, { ok: false, message: "Removed from the queue." });
+      releaseArchiveCopy(id);
       set((s) => ({ items: removeItem(s.items, id) }));
       scheduleSave();
     },
