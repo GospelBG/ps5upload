@@ -6,6 +6,16 @@ What's new in ps5upload, written for humans.
 
 ## Unreleased
 
+**See what a package is before you install it.**
+
+- **Package viewer.** Click **View details** on a package in Install Package,
+  or on Upload's package card, to see its cover, version, region, minimum
+  firmware, SDK and build date, the update's "What's new" notes, and every
+  field in its PARAM. It also says plainly whether this PS5 can run it,
+  whether it's already installed (and if this one is newer or older), and
+  whether it fits. Works for .pkg files (including split sets), .exfat and
+  .ffpkg images, and game folders.
+
 **One queue for each console.**
 
 - **Queue stream installs.** Stream installs, links, library installs and

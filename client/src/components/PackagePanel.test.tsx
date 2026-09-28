@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
-import { PackagePanelView, type PanelChecks } from "./PackagePanel";
+import { changeNotesText, PackagePanelView, type PanelChecks } from "./PackagePanel";
 import type { GameInspection } from "../api/gameInspect";
 
 const g: GameInspection = {
@@ -103,5 +103,17 @@ describe("PackagePanelView", () => {
     const html = view({ tab: "details" });
     expect(html).toContain("TITLE");
     expect(html).toContain("Show all");
+  });
+});
+
+describe("changeNotesText", () => {
+  it("keeps the text inside CDATA sections", () => {
+    const xml =
+      '<?xml version="1.0"?><changeinfo><changes app_ver="01.02"><![CDATA[Fixed a crash in the hangar.\nBetter frame pacing.]]></changes></changeinfo>';
+    expect(changeNotesText(xml)).toBe("Fixed a crash in the hangar.\nBetter frame pacing.");
+  });
+  it("hides an empty What's new", () => {
+    const html = view({ inspection: { ...g, change_notes: "<changeinfo></changeinfo>" } });
+    expect(html).not.toContain("What&#x27;s new");
   });
 });

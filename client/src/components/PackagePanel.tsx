@@ -60,6 +60,9 @@ const CURATED_KEYS = new Set([
 /** `changeinfo.xml` as readable text: tags out, entities decoded. */
 export function changeNotesText(xml: string): string {
   return xml
+    // Notes are usually wrapped in CDATA: keep the text, drop the wrapper.
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_m, text: string) => `\n${text}\n`)
+    .replace(/<\?[^>]*\?>/g, "\n")
     .replace(/<[^>]*>/g, "\n")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
@@ -178,10 +181,11 @@ export function PackagePanelView({
   ];
 
   const params = showAll ? g.params : g.params.filter((p) => CURATED_KEYS.has(p.key));
+  const notes = g.change_notes ? changeNotesText(g.change_notes) : "";
   const copyText = g.params.map((p) => `${p.key}: ${p.value}`).join("\n");
 
   return (
-    <div className="grid gap-4">
+    <div className="grid gap-4 p-4">
       <header className="relative overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] p-4">
         {backdropUrl && (
           <img
@@ -284,11 +288,11 @@ export function PackagePanelView({
               </ul>
             </div>
           )}
-          {g.change_notes && (
+          {notes && (
             <div className="text-sm">
               <div className="mb-1 text-[var(--color-muted)]">{tr("viewer_whats_new", undefined, "What's new")}</div>
               <p className="whitespace-pre-wrap rounded-md bg-[var(--color-surface-2)] p-3 text-xs">
-                {changeNotesText(g.change_notes)}
+                {notes}
               </p>
             </div>
           )}

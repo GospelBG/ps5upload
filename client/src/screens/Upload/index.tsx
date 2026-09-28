@@ -2675,25 +2675,19 @@ function PkgFinisherCard({
     <section className="mb-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] p-5">
       <div className="mb-2 flex items-center gap-2 text-sm font-medium">
         <Package size={16} className="text-[var(--color-muted)]" />
-        {tr("upload_pkg_card_title", "Package install")}
+        <span className="flex-1">{tr("upload_pkg_card_title", "Package install")}</span>
+        {onView && (
+          <Button variant="secondary" size="sm" onClick={onView}>
+            {tr("viewer_open", undefined, "View details")}
+          </Button>
+        )}
       </div>
       {label && (
-        <div className="mb-2 flex min-w-0 items-center gap-2 text-xs text-[var(--color-muted)]">
-          <span className="truncate">
-            {label}
-            {pkgInfo && pkgInfo.totalBytes > 0 ? (
-              <> · {formatBytes(pkgInfo.totalBytes)}</>
-            ) : null}
-          </span>
-          {onView && (
-            <button
-              type="button"
-              onClick={onView}
-              className="shrink-0 rounded px-1 text-[var(--color-accent)] hover:underline"
-            >
-              {tr("viewer_open", undefined, "View details")}
-            </button>
-          )}
+        <div className="mb-2 truncate text-xs text-[var(--color-muted)]">
+          {label}
+          {pkgInfo && pkgInfo.totalBytes > 0 ? (
+            <> · {formatBytes(pkgInfo.totalBytes)}</>
+          ) : null}
         </div>
       )}
       <p className="mb-3 text-xs text-[var(--color-muted)]">
