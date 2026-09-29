@@ -4,6 +4,40 @@ What's new in ps5upload, written for humans.
 
 ---
 
+## 5.39.0
+
+**Cheats, redesigned around your games.**
+
+- **Start from your game, not a file name.** The Cheats screen now lists the
+  games on your PS5 with their covers, grouped by what you can do next:
+  **Playing now**, **Cheats ready**, **Cheats to download**, and (folded away)
+  games nobody has published cheats for. Each game shows how many cheats
+  exist for it, and whether any are made for the version you have.
+- **Game details.** Pick a game to see its cover, version, size, install date,
+  when it was last opened, and its content ID.
+- **Downloading is obvious.** Every cheat file has its own **Download**
+  button, with the one made for your installed version first and marked
+  **Your version**. If nothing matches your version, the screen says so and
+  warns that cheats for other versions usually do nothing or crash the game.
+- **Switch cheats on in the same place.** Once downloaded, the game's cheats
+  appear as switches right above. The screen now says up front that the game
+  has to be running for them to work, instead of failing when you try, and
+  warns when your cheats were made for a different version.
+- **The cheat engine explains itself.** The bar at the top says whether it
+  is on, what is running, and that it turns on by itself when you switch a
+  cheat on.
+- **Browse all cheats** (for games that aren't on this PS5) is now a
+  labelled button instead of a small icon, and shows covers too.
+- A three-step guide shows until your first download.
+
+**On-screen messages can be marked read.**
+
+- Every message on the PS5 on-screen messages screen used to show as unread,
+  with no way to change it. Each one now has **Mark read** / **Mark unread**,
+  and there is **Mark all as read**. The choice is remembered per console.
+
+---
+
 ## 5.38.0
 
 **Install queue: everything about an install, in its own row.**

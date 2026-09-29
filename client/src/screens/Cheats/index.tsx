@@ -1,225 +1,185 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Gamepad2, RefreshCw, Power, Trash2, ToggleLeft, ToggleRight, ChevronRight, Zap, Download, WandSparkles } from "lucide-react";
+import { Gamepad2, Globe, Power, RefreshCw, WandSparkles, Zap } from "lucide-react";
 import {
   PageHeader,
   Button,
   ErrorCard,
   ConnectionGate,
   EmptyState,
-  Card,
+  GameIcon,
   Spinner,
 } from "../../components";
 import { useTr } from "../../state/lang";
 import { useConnectionStore } from "../../state/connection";
-import { transferAddr } from "../../lib/addr";
+import { hostOf, transferAddr } from "../../lib/addr";
 import { humanizePs5Error } from "../../lib/humanizeError";
 import {
-  cheatsList,
-  cheatsGet,
-  cheatsToggle,
-  cheatsDelete,
-  cheatsReload,
-  cheatsStatus,
-  cheatsEngineSet,
+  appInfoDetails,
   appsInstalled,
-  type InstalledTitle,
-  type CheatTitle,
-  type CheatMod,
-  type CheatsStatusResponse,
+  cheatsEngineSet,
+  cheatsList,
+  cheatsReload,
   cheatsReposSearch,
+  cheatsStatus,
+  type AppInfoDetails,
+  type CheatRepoEntry,
+  type CheatTitle,
+  type CheatsStatusResponse,
+  type InstalledTitle,
 } from "../../api/ps5";
 import { RepoBrowser } from "./RepoBrowser";
-import {
-  isUsableGameTitle,
-  namesFromRepoEntries,
-  resolveCheatName,
-} from "../../lib/cheatBrowse";
+import { CheatGameList } from "./CheatGameList";
+import { CheatGameDetail } from "./CheatGameDetail";
+import { namesFromRepoEntries } from "../../lib/cheatBrowse";
+import { buildCheatGames, cheatSections, filterCheatGames } from "../../lib/cheatGames";
 
-/** Repo names live for the session, not the component.
+/** The cheat collection's index, for the session.
  *
- *  The index is a few hundred KB across three repos and changes about as often
- *  as somebody publishes a cheat, so re-fetching it every time the user opens
- *  the Cheats screen is pure latency. */
-let repoNameCache = new Map<string, string>();
+ *  ~11k lines across the repos, served from the engine's cache in well under
+ *  a second — and it changes about as often as somebody publishes a cheat,
+ *  so fetching it once is enough. Having all of it up front is what lets the
+ *  list say which games have cheats before anyone searches. */
+let indexCache: CheatRepoEntry[] | null = null;
+/** Game details by host + title id, for the session: a version doesn't
+ *  change while you browse, and each is a round trip to the console. */
+const detailsCache = new Map<string, AppInfoDetails | null>();
 
 export default function CheatsScreen() {
   const tr = useTr();
   const host = useConnectionStore((s) => s.host);
   const payloadStatus = useConnectionStore((s) => s.payloadStatus);
   const addr = host ? transferAddr(host) : "";
+  const up = !!addr && payloadStatus === "up";
 
-  /* Names for the games on this console.
-   *
-   * A cheat file only carries a game name in the .json format; .shn and
-   * .mc4 carry none, so those rows showed a bare title id twice over.
-   * The console knows what the game is called, so ask it. */
   const [installed, setInstalled] = useState<InstalledTitle[]>([]);
-  useEffect(() => {
-    void (async () => {
-      if (!addr || payloadStatus !== "up") return;
-      try {
-        const r = await appsInstalled(addr);
-        setInstalled(r.titles);
-      } catch {
-        // Non-fatal: rows fall back to the title id, as before.
-        setInstalled([]);
-      }
-    })();
-  }, [addr, payloadStatus]);
-
-
-  const namesByTitleId = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const g of installed) {
-      if (g.titleId && g.titleName) m.set(g.titleId.toUpperCase(), g.titleName);
-    }
-    return m;
-  }, [installed]);
-
-  const [titles, setTitles] = useState<CheatTitle[]>([]);
+  const [downloaded, setDownloaded] = useState<CheatTitle[]>([]);
   const [status, setStatus] = useState<CheatsStatusResponse | null>(null);
+  const [index, setIndex] = useState<CheatRepoEntry[]>(indexCache ?? []);
+  const [indexError, setIndexError] = useState(false);
   const [loading, setLoading] = useState(false);
-  /* Names from the cheat repos, for games that are NOT installed here.
-   *
-   * The installed list above only covers games on this console, so a cheat
-   * downloaded for anything else showed a bare title id — the complaint in
-   * issue #315. The repo index already maps every published cheat's title id
-   * to its game name, so ask it once and keep the answer for the session;
-   * it is one fetch of data the browser downloads anyway. */
-  const [repoNames, setRepoNames] = useState<Map<string, string>>(repoNameCache);
-  useEffect(() => {
-    // Only worth a network round trip when something is ACTUALLY unnamed.
-    // Most users have the game installed, in which case the console already
-    // told us its name and fetching three repo indexes would be a stall that
-    // bought nothing. Cached for the session so revisiting the screen is free.
-    const unresolved = titles.some(
-      (t) =>
-        !isUsableGameTitle(t.name) &&
-        !isUsableGameTitle(namesByTitleId.get(t.title_id.toUpperCase())) &&
-        !repoNameCache.has(t.title_id.toUpperCase()),
-    );
-    if (!unresolved || repoNameCache.size > 0) return;
-    void (async () => {
-      try {
-        const r = await cheatsReposSearch("");
-        repoNameCache = namesFromRepoEntries(r.entries ?? []);
-        setRepoNames(repoNameCache);
-      } catch {
-        // Offline or a repo is down. Names simply fall back as before —
-        // never a reason to show an error on a screen about cheats.
-      }
-    })();
-  }, [titles, namesByTitleId]);
-
   const [error, setError] = useState<string | null>(null);
-  const [selectedTitle, setSelectedTitle] = useState<string | null>(null);
-  const [mods, setMods] = useState<CheatMod[]>([]);
-  const [modsLoading, setModsLoading] = useState(false);
-  const [modsError, setModsError] = useState<string | null>(null);
-  const [toggling, setToggling] = useState<number | null>(null);
-  const [showRepoBrowser, setShowRepoBrowser] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [showBrowser, setShowBrowser] = useState(false);
+  const [details, setDetails] = useState<Map<string, AppInfoDetails | null>>(new Map());
 
   const refresh = useCallback(async () => {
-    if (!addr || payloadStatus !== "up") return;
+    if (!up) return;
     setLoading(true);
     setError(null);
     try {
-      const [list, st] = await Promise.all([
+      const [list, st, apps] = await Promise.all([
         cheatsList(addr),
         cheatsStatus(addr).catch(() => null),
+        appsInstalled(addr).catch(() => null),
       ]);
-      setTitles(list.titles ?? []);
+      setDownloaded(list.titles ?? []);
       setStatus(st);
+      if (apps) setInstalled(apps.titles);
     } catch (e) {
       setError(humanizePs5Error(String(e)));
     } finally {
       setLoading(false);
     }
-  }, [addr, payloadStatus]);
+  }, [addr, up]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
-  const loadMods = useCallback(
-    async (titleId: string) => {
-      if (!addr) return;
-      setSelectedTitle(titleId);
-      setMods([]);
-      setModsError(null);
-      setModsLoading(true);
+  useEffect(() => {
+    if (indexCache) return;
+    void (async () => {
       try {
-        const resp = await cheatsGet(titleId, addr);
-        setMods(resp.mods ?? []);
-        if (resp.error) setModsError(resp.error);
-      } catch (e) {
-        setModsError(humanizePs5Error(String(e)));
-      } finally {
-        setModsLoading(false);
+        const r = await cheatsReposSearch("");
+        indexCache = r.entries ?? [];
+        setIndex(indexCache);
+      } catch {
+        // Offline or a repo is down: the list still shows your games and
+        // the cheats already on the console, just not what else exists.
+        setIndexError(true);
       }
-    },
-    [addr],
+    })();
+  }, []);
+
+  const repoNames = useMemo(() => namesFromRepoEntries(index), [index]);
+  const games = useMemo(
+    () =>
+      buildCheatGames({
+        installed,
+        downloaded,
+        index,
+        runningTitleId: status?.game_running ? status.game_title_id : null,
+        repoNames,
+      }),
+    [installed, downloaded, index, status, repoNames],
   );
+  const sections = useMemo(() => cheatSections(filterCheatGames(games, query)), [games, query]);
+  const selected = games.find((g) => g.titleId === selectedId) ?? null;
 
-  const handleToggle = async (index: number, currentOn: boolean) => {
-    if (!addr || !selectedTitle) return;
-    setToggling(index);
-    try {
-      const resp = await cheatsToggle(selectedTitle, index, !currentOn, addr);
-      if (!resp.ok) {
-        setModsError(resp.err || "Toggle failed");
-      } else {
-        setMods((prev) =>
-          prev.map((m) =>
-            m.index === index ? { ...m, on: !currentOn } : m,
-          ),
-        );
-        setModsError(null);
+  // Versions for the games that have cheats, fetched one at a time in the
+  // background: the list can then say "for your version", which is the
+  // difference between a cheat that works and one that does nothing.
+  useEffect(() => {
+    if (!up) return;
+    const h = hostOf(host);
+    const wanted = games.filter(
+      (g) => g.installed && (g.available.length > 0 || g.downloaded || g.titleId === selectedId),
+    );
+    let cancelled = false;
+    void (async () => {
+      // The selected game first: its detail pane is waiting on it.
+      const ordered = [...wanted].sort(
+        (a, b) => Number(b.titleId === selectedId) - Number(a.titleId === selectedId),
+      );
+      for (const g of ordered) {
+        if (cancelled) return;
+        const key = `${h}/${g.titleId}`;
+        if (!detailsCache.has(key)) {
+          detailsCache.set(key, await appInfoDetails(addr, g.titleId));
+        }
+        if (cancelled) return;
+        setDetails((prev) => {
+          if (prev.get(g.titleId) === detailsCache.get(key)) return prev;
+          const next = new Map(prev);
+          next.set(g.titleId, detailsCache.get(key) ?? null);
+          return next;
+        });
       }
-    } catch (e) {
-      setModsError(humanizePs5Error(String(e)));
-    } finally {
-      setToggling(null);
-    }
-  };
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [games, up, addr, host, selectedId]);
 
-  const handleDelete = async () => {
-    if (!addr || !selectedTitle) return;
-    if (!confirm(`Delete all cheat files for ${selectedTitle}?`)) return;
+  // Open the game being played, or failing that the first game with cheats
+  // ready — on a wide screen an empty right-hand pane is wasted.
+  useEffect(() => {
+    if (selectedId || typeof window === "undefined") return;
+    if (!window.matchMedia?.("(min-width: 768px)").matches) return;
+    const first = sections.find((s) => s.key !== "none")?.games[0];
+    if (first) setSelectedId(first.titleId);
+  }, [sections, selectedId]);
+
+  async function setEngine(enabled: boolean) {
     try {
-      await cheatsDelete(selectedTitle, addr);
-      setSelectedTitle(null);
-      setMods([]);
-      void refresh();
+      const r = await cheatsEngineSet(enabled, addr);
+      if (r.ok) setStatus((prev) => (prev ? { ...prev, enabled: r.enabled } : prev));
     } catch (e) {
-      setModsError(humanizePs5Error(String(e)));
+      setError(humanizePs5Error(String(e)));
     }
-  };
+  }
 
-  const handleReload = async () => {
-    if (!addr) return;
+  async function reload() {
     try {
       await cheatsReload(addr);
-      void refresh();
-      if (selectedTitle) void loadMods(selectedTitle);
     } catch (e) {
       setError(humanizePs5Error(String(e)));
     }
-  };
+    await refresh();
+  }
 
-  const handleEngineToggle = async () => {
-    if (!addr || !status) return;
-    try {
-      const resp = await cheatsEngineSet(!status.enabled, addr);
-      if (resp.ok) {
-        setStatus((prev) =>
-          prev ? { ...prev, enabled: resp.enabled } : prev,
-        );
-      }
-    } catch (e) {
-      setError(humanizePs5Error(String(e)));
-    }
-  };
+  const nothingDownloaded = downloaded.length === 0;
 
   return (
     <div className="app-page space-y-4">
@@ -227,32 +187,35 @@ export default function CheatsScreen() {
         icon={WandSparkles}
         title={tr("cheats_title", undefined, "Cheats")}
         description={tr(
-          "cheats_description",
+          "cheats_description_v2",
           undefined,
-          "Apply memory patches to running games. Supports JSON, SHN, and patch files.",
+          "Pick a game, download cheats made for its version, then switch them on while you play.",
         )}
         right={
           <div className="flex items-center gap-2">
             <Button
-              variant="ghost"
+              variant="secondary"
               size="sm"
-              onClick={() => setShowRepoBrowser(true)}
-              disabled={payloadStatus !== "up" || !addr}
-              title={tr("cheats_download_title", undefined, "Download Community Cheats")}
+              leftIcon={<Globe size={14} />}
+              onClick={() => setShowBrowser(true)}
+              disabled={!up}
+              title={tr(
+                "cheats_browse_all_hint",
+                undefined,
+                "Search the whole collection, including games that aren't on this PS5",
+              )}
             >
-              <Download size={14} />
+              {tr("cheats_browse_all", undefined, "Browse all cheats")}
             </Button>
             <Button
               variant="ghost"
               size="sm"
-              onClick={handleReload}
-              disabled={loading || payloadStatus !== "up" || !addr}
+              onClick={() => void reload()}
+              disabled={loading || !up}
+              aria-label={tr("cheats_refresh", undefined, "Refresh")}
+              title={tr("cheats_refresh", undefined, "Refresh")}
             >
-              {loading ? (
-                <Spinner size={14} tone="inherit" />
-              ) : (
-                <RefreshCw size={14} />
-              )}
+              {loading ? <Spinner size={14} tone="inherit" /> : <RefreshCw size={14} />}
             </Button>
           </div>
         }
@@ -262,235 +225,178 @@ export default function CheatsScreen() {
         {error && <ErrorCard title={error} />}
 
         {status && (
-          <Card>
-            <div className="flex flex-wrap items-center justify-between gap-3 p-4">
-              <div className="flex items-center gap-3">
-                <Power
-                  size={18}
-                  className={
-                    status.enabled
-                      ? "text-[var(--color-good)]"
-                      : "text-[var(--color-muted)]"
-                  }
-                />
-                <div>
-                  <div className="text-sm font-medium">
-                    {tr(
-                      "cheats_engine",
-                      undefined,
-                      "Cheat Engine",
-                    )}
-                  </div>
-                  <div className="text-xs text-[var(--color-muted)]">
-                    {status.enabled
-                      ? tr("cheats_status_enabled", "Enabled")
-                      : tr("cheats_status_disabled", "Disabled")}
-                    {status.game_running && (
-                      <span className="ml-2 text-[var(--color-accent)]">
-                        {tr("cheats_game_label", "Game:")}{" "}
-                        {status.game_title_id ||
-                          tr("cheats_unknown", "unknown")}{" "}
-                        {tr("cheats_pid_label", "(PID:")} {status.game_pid})
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </div>
-              <div className="flex items-center gap-3">
-                {status.patches_total > 0 && (
-                  <span className="flex items-center gap-1 text-xs text-[var(--color-muted)]">
-                    <Zap size={12} />
-                    {status.patches_total}{" "}
-                    {tr("cheats_patches_applied", "patches applied")}
-                  </span>
-                )}
-                <Button
-                  variant={status.enabled ? "primary" : "ghost"}
-                  size="sm"
-                  onClick={handleEngineToggle}
-                >
-                  {status.enabled ? tr("cheats_disable", "Disable") : tr("cheats_enable", "Enable")}
-                </Button>
-              </div>
-            </div>
-          </Card>
+          <EngineBar
+            host={host}
+            status={status}
+            runningName={games.find((g) => g.running)?.name ?? null}
+            onToggle={() => void setEngine(!status.enabled)}
+            onOpenRunning={() => status.game_title_id && setSelectedId(status.game_title_id.toUpperCase())}
+          />
         )}
 
-        <div className="grid gap-4 md:grid-cols-[280px_1fr]">
-          {/* Title list */}
-          <div className="space-y-2">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
-              {tr("cheats_titles", undefined, "Titles")}
-            </h3>
-            {titles.length === 0 && !loading ? (
-              <EmptyState
-                icon={Gamepad2}
-                title={tr(
-                  "cheats_no_titles",
-                  undefined,
-                  "No cheat files",
-                )}
-                message={tr(
-                  "cheats_no_titles_hint",
-                  undefined,
-                  "Upload cheat files to /data/ps5upload/cheats/ on the PS5",
-                )}
-              />
-            ) : (
-              <div className="space-y-1">
-                {titles.map((t) => (
-                  <button
-                    key={t.title_id}
-                    onClick={() => void loadMods(t.title_id)}
-                    className={`flex w-full items-center justify-between rounded-md border px-3 py-2 text-left text-sm transition-colors ${
-                      selectedTitle === t.title_id
-                        ? "border-[var(--color-accent)] bg-[var(--color-accent-soft)]"
-                        : "border-[var(--color-border)] bg-[var(--color-surface-2)] hover:border-[var(--color-accent)]/40"
-                    }`}
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate font-medium">
-                        {resolveCheatName(t.title_id, {
-                          fromCheatFile: t.name,
-                          installed: namesByTitleId,
-                          fromRepoIndex: repoNames,
-                        })}
-                      </div>
-                      <div className="font-mono text-xs text-[var(--color-muted)]">
-                        {t.title_id}
-                        {t.version && (
-                          <span className="ml-1.5 opacity-80">
-                            {tr("cheats_version_label", undefined, "v")}
-                            {t.version}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {t.running && (
-                        <span className="flex items-center gap-1 text-xs text-[var(--color-good)]">
-                          <span className="inline-block h-2 w-2 rounded-full bg-[var(--color-good)]" />
-                        </span>
-                      )}
-                      <ChevronRight size={14} className="text-[var(--color-muted)]" />
-                    </div>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
+        {nothingDownloaded && (
+          <ol className="grid gap-2 text-xs sm:grid-cols-3">
+            {[
+              tr("cheats_step1", undefined, "Pick one of your games below."),
+              tr("cheats_step2", undefined, "Download a cheat made for your game's version."),
+              tr("cheats_step3_v2", undefined, "Start the game on the PS5, then switch cheats on here."),
+            ].map((text, i) => (
+              <li
+                key={i}
+                className="flex items-start gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 py-2"
+              >
+                <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[var(--color-accent)] text-[11px] font-semibold text-[var(--color-accent-contrast)]">
+                  {i + 1}
+                </span>
+                <span className="text-[var(--color-muted)]">{text}</span>
+              </li>
+            ))}
+          </ol>
+        )}
 
-          {/* Mod list */}
-          <div className="space-y-2">
-            {!selectedTitle ? (
-              <EmptyState
-                icon={ToggleLeft}
-                title={tr(
-                  "cheats_select_title",
-                  undefined,
-                  "Select a title",
-                )}
-                message={tr(
-                  "cheats_select_title_hint",
-                  undefined,
-                  "Choose a game from the list to view available cheats",
-                )}
-              />
-            ) : (
-              <>
-                <div className="flex items-center justify-between">
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--color-muted)]">
-                    {tr("cheats_mods", undefined, "Mods")} — {selectedTitle}
-                  </h3>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={handleDelete}
-                  >
-                    <Trash2 size={14} />
-                  </Button>
-                </div>
-                {modsError && <ErrorCard title={modsError} />}
-                {modsLoading ? (
-                  <div className="flex items-center justify-center py-8">
-                    <Spinner size={20} />
-                  </div>
-                ) : mods.length === 0 ? (
-                  <EmptyState
-                    icon={ToggleLeft}
-                    title={tr(
-                      "cheats_no_mods",
-                      undefined,
-                      "No mods found",
-                    )}
-                    message={tr(
-                      "cheats_no_mods_hint",
-                      undefined,
-                      "This title has no cheat file or it is empty",
-                    )}
-                  />
-                ) : (
-                  <div className="space-y-2">
-                    {mods.map((m) => (
-                      <div
-                        key={m.index}
-                        className={`rounded-md border px-3 py-2.5 ${
-                          m.on
-                            ? "border-[var(--color-good)]/40 bg-[var(--color-good-soft)]"
-                            : "border-[var(--color-border)] bg-[var(--color-surface-2)]"
-                        }`}
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="min-w-0 flex-1">
-                            <div className="text-sm font-medium">
-                              {m.name || `Mod #${m.index}`}
-                            </div>
-                            {m.desc && (
-                              <div className="mt-0.5 text-xs text-[var(--color-muted)]">
-                                {m.desc}
-                              </div>
-                            )}
-                            <div className="mt-1 flex items-center gap-2 text-xs text-[var(--color-muted)]">
-                              <span className="font-mono">{m.type}</span>
-                            </div>
-                          </div>
-                          <button
-                            onClick={() => void handleToggle(m.index, m.on)}
-                            disabled={toggling === m.index}
-                            className="flex-shrink-0"
-                          >
-                            {toggling === m.index ? (
-                              <Spinner size={20} tone="inherit" />
-                            ) : m.on ? (
-                              <ToggleRight
-                                size={24}
-                                className="text-[var(--color-good)]"
-                              />
-                            ) : (
-                              <ToggleLeft
-                                size={24}
-                                className="text-[var(--color-muted)]"
-                              />
-                            )}
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </>
+        {indexError && (
+          <p className="text-xs text-[var(--color-warn)]">
+            {tr(
+              "cheats_index_offline",
+              undefined,
+              "Couldn't reach the cheat collection, so only cheats already on the PS5 are shown.",
             )}
+          </p>
+        )}
+
+        {games.length === 0 && !loading ? (
+          <EmptyState
+            icon={Gamepad2}
+            title={tr("cheats_no_games", undefined, "No games found on this PS5.")}
+            message={tr(
+              "cheats_no_games_hint",
+              undefined,
+              "Install a game first, or use Browse all cheats to get cheats for any game.",
+            )}
+          />
+        ) : (
+          <div className="grid gap-5 md:grid-cols-[minmax(260px,340px)_1fr]">
+            <div className={selected ? "max-md:hidden" : ""}>
+              <CheatGameList
+                host={host}
+                sections={sections}
+                query={query}
+                onQuery={setQuery}
+                selectedId={selectedId}
+                onSelect={setSelectedId}
+                details={details}
+              />
+            </div>
+            <div className={selected ? "" : "max-md:hidden"}>
+              {selected ? (
+                <CheatGameDetail
+                  key={selected.titleId}
+                  host={host}
+                  addr={addr}
+                  game={selected}
+                  details={details.get(selected.titleId)}
+                  onChanged={refresh}
+                  onBack={() => setSelectedId(null)}
+                />
+              ) : (
+                <EmptyState
+                  icon={Gamepad2}
+                  title={tr("cheats_select_title", undefined, "Select a title")}
+                  message={tr(
+                    "cheats_select_title_hint",
+                    undefined,
+                    "Choose a game from the list to view available cheats",
+                  )}
+                />
+              )}
+            </div>
           </div>
-        </div>
+        )}
       </ConnectionGate>
 
-      {showRepoBrowser && addr && (
+      {showBrowser && addr && (
         <RepoBrowser
           addr={addr}
           onDownloaded={() => void refresh()}
-          onClose={() => setShowRepoBrowser(false)}
+          onClose={() => setShowBrowser(false)}
         />
       )}
+    </div>
+  );
+}
+
+/** The engine switch and what it is doing right now, in one line. */
+function EngineBar({
+  host,
+  status,
+  runningName,
+  onToggle,
+  onOpenRunning,
+}: {
+  host: string;
+  status: CheatsStatusResponse;
+  runningName: string | null;
+  onToggle: () => void;
+  onOpenRunning: () => void;
+}) {
+  const tr = useTr();
+  return (
+    <div
+      className={`flex flex-wrap items-center gap-3 rounded-lg border px-4 py-3 ${
+        status.enabled
+          ? "border-[var(--color-good)]/40 bg-[var(--color-good)]/5"
+          : "border-[var(--color-border)] bg-[var(--color-surface-2)]"
+      }`}
+    >
+      <Power
+        size={18}
+        className={status.enabled ? "text-[var(--color-good)]" : "text-[var(--color-muted)]"}
+      />
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">
+          {status.enabled
+            ? tr("cheats_engine_on", undefined, "Cheat engine is on")
+            : tr("cheats_engine_off", undefined, "Cheat engine is off")}
+        </div>
+        <div className="text-xs text-[var(--color-muted)]">
+          {status.enabled
+            ? tr("cheats_engine_on_hint", undefined, "Cheats you switch on apply to the running game.")
+            : tr("cheats_engine_off_hint_v2", undefined, "It turns on by itself when you switch a cheat on.")}
+        </div>
+      </div>
+      {status.game_running && (
+        <button
+          type="button"
+          onClick={onOpenRunning}
+          className="flex min-w-0 items-center gap-2 rounded-md px-2 py-1 text-left hover:bg-[var(--color-surface-3)]"
+        >
+          <GameIcon host={hostOf(host)} titleId={status.game_title_id} size={32} />
+          <span className="min-w-0">
+            <span className="block text-[11px] text-[var(--color-muted)]">
+              {tr("cheats_now_playing", undefined, "Now playing")}
+            </span>
+            <span className="block max-w-[14rem] truncate text-sm font-medium">
+              {runningName || status.game_title_id}
+            </span>
+          </span>
+        </button>
+      )}
+      {status.enabled && status.patches_total > 0 && (
+        <span className="flex items-center gap-1 text-xs text-[var(--color-muted)]">
+          <Zap size={12} />
+          {tr("cheats_patches_count", { n: status.patches_total }, `${status.patches_total} patches applied`)}
+        </span>
+      )}
+      <Button
+        variant={status.enabled ? "secondary" : "primary"}
+        size="sm"
+        leftIcon={<Power size={13} />}
+        onClick={onToggle}
+      >
+        {status.enabled
+          ? tr("cheats_engine_turn_off", undefined, "Turn off")
+          : tr("cheats_engine_turn_on", undefined, "Turn on")}
+      </Button>
     </div>
   );
 }

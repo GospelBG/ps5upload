@@ -587,7 +587,9 @@ export async function browserInvoke<T>(
       const sep = base.includes("?") ? "&" : "?";
       const keys = String(args["keys"] ?? "");
       const q =
-        `title_id=${encodeURIComponent(String(args["title_id"] ?? ""))}` +
+        // Tauri callers pass `titleId` (its camelCase convention); accept
+        // the snake_case spelling too.
+        `title_id=${encodeURIComponent(String(args["titleId"] ?? args["title_id"] ?? ""))}` +
         (keys ? `&keys=${encodeURIComponent(keys)}` : "");
       return getJson<T>(`${base}${sep}${q}`);
     }

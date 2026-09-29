@@ -14,7 +14,8 @@ import {
   ExternalLink,
   Package,
 } from "lucide-react";
-import { Button, ErrorCard, Card, Spinner, Toggle } from "../../components";
+import { Button, ErrorCard, Card, GameIcon, Spinner, Toggle } from "../../components";
+import { hostOf } from "../../lib/addr";
 import { useTr } from "../../state/lang";
 import {
   cheatsReposList,
@@ -267,6 +268,7 @@ export function RepoBrowser({ addr, onDownloaded, onClose }: RepoBrowserProps) {
                     onClick={() => void searchFor(g.titleId)}
                     className="flex w-full items-center justify-between gap-3 border-b border-[var(--color-border)] px-3 py-2 text-left last:border-b-0 hover:bg-[var(--color-surface-2)]"
                   >
+                    <GameIcon host={hostOf(addr)} titleId={g.titleId} size={28} />
                     <span className="min-w-0 flex-1 truncate text-sm">
                       {g.titleName || g.titleId}
                     </span>
@@ -372,6 +374,7 @@ export function RepoBrowser({ addr, onDownloaded, onClose }: RepoBrowserProps) {
               {visible.map((e) => (
                 <Card key={e.filename}>
                   <div className="flex items-center justify-between gap-3 p-3">
+                    <GameIcon host={hostOf(addr)} titleId={titleIdOf(e.filename)} size={40} />
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-sm font-medium">
                         {displayTitle(e, namesByTitleId)}
@@ -394,7 +397,7 @@ export function RepoBrowser({ addr, onDownloaded, onClose }: RepoBrowserProps) {
                     ) : downloaded.has(e.filename) ? (
                       <span className="flex flex-shrink-0 items-center gap-1.5 text-sm font-medium text-[var(--color-good)]">
                         <CheckCircle2 size={16} />
-                        {tr("cheats_installed", undefined, "Installed")}
+                        {tr("cheats_downloaded", undefined, "Downloaded")}
                       </span>
                     ) : (
                       <Button
@@ -412,8 +415,8 @@ export function RepoBrowser({ addr, onDownloaded, onClose }: RepoBrowserProps) {
                         }
                       >
                         {downloading === e.filename
-                          ? tr("cheats_installing", undefined, "Installing\u2026")
-                          : tr("cheats_install", undefined, "Install")}
+                          ? tr("cheats_downloading", undefined, "Downloading\u2026")
+                          : tr("cheats_download", undefined, "Download")}
                       </Button>
                     )}
                   </div>

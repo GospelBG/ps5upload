@@ -22,6 +22,8 @@ import { useStaleHostGuard } from "../../lib/staleHostGuard";
 import { transferAddr } from "../../lib/addr";
 import { notifList, notifClear, type Notification } from "../../api/ps5";
 import { humanizePs5Error } from "../../lib/humanizeError";
+import { hostOf } from "../../lib/addr";
+import { isNotifRead, usePs5NotifRead } from "../../state/ps5NotifRead";
 
 function formatTs(ts: number): string {
   if (!ts) return "—";
@@ -107,7 +109,13 @@ export default function NotificationsScreen() {
     return () => window.clearInterval(id);
   }, [refresh, visible]);
 
-  const unreadCount = items.filter((n) => !n.read).length;
+  // The payload has no read state, so it is kept here, per console.
+  const readState = usePs5NotifRead((s) => (host ? s.byHost[hostOf(host)] : undefined));
+  const markAll = usePs5NotifRead((s) => s.markAll);
+  const setRead = usePs5NotifRead((s) => s.setRead);
+  const isRead = (n: Notification) => isNotifRead(readState, n.seq);
+  const unreadCount = items.filter((n) => !isRead(n)).length;
+  const maxSeq = items.reduce((m, n) => Math.max(m, n.seq), 0);
 
   return (
     <div className="app-page space-y-4">
@@ -158,8 +166,8 @@ export default function NotificationsScreen() {
         {error && <ErrorCard title={error} />}
 
         {unreadCount > 0 && (
-          <div className="rounded-lg border border-[var(--color-warn)] bg-[var(--color-warn-soft)] px-4 py-2 text-sm text-[var(--color-warn)]">
-            <span className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-4 py-2 text-sm">
+            <span className="flex items-center gap-2 text-[var(--color-accent)]">
               <Mail size={14} />
               {tr(
                 "notifications_unread",
@@ -167,6 +175,14 @@ export default function NotificationsScreen() {
                 `${unreadCount} unread`,
               )}
             </span>
+            <Button
+              variant="secondary"
+              size="sm"
+              leftIcon={<CheckCheck size={14} />}
+              onClick={() => host && markAll(host, maxSeq)}
+            >
+              {tr("notifications_mark_all_read", undefined, "Mark all as read")}
+            </Button>
           </div>
         )}
 
@@ -186,36 +202,56 @@ export default function NotificationsScreen() {
           />
         ) : (
           <div className="space-y-2">
-            {items.map((n) => (
-              <div
-                key={n.seq}
-                className={`rounded-md border px-3 py-2.5 ${
-                  n.read
-                    ? "border-[var(--color-border)] bg-[var(--color-surface-2)]"
-                    : "border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)]"
-                }`}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 text-xs text-[var(--color-muted)]">
-                      <span className="font-mono tabular-nums">#{n.seq}</span>
-                      <span>{formatTs(n.ts)}</span>
-                      <span className={`font-medium ${levelColor(n.level)}`}>
-                        {n.level}
-                      </span>
-                      {n.read ? (
-                        <CheckCheck size={12} className="opacity-50" />
-                      ) : (
-                        <MailOpen size={12} />
-                      )}
+            {items.map((n) => {
+              const read = isRead(n);
+              return (
+                <div
+                  key={n.seq}
+                  className={`rounded-md border px-3 py-2.5 transition-colors ${
+                    read
+                      ? "border-[var(--color-border)] bg-[var(--color-surface-2)]"
+                      : "border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)]"
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <span
+                      aria-hidden
+                      className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${
+                        read ? "bg-transparent" : "bg-[var(--color-accent)]"
+                      }`}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div
+                        className={`text-sm ${
+                          read
+                            ? "text-[var(--color-muted)]"
+                            : "font-medium text-[var(--color-text)]"
+                        }`}
+                      >
+                        {n.msg}
+                      </div>
+                      <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-[var(--color-muted)]">
+                        <span className={`font-medium ${levelColor(n.level)}`}>
+                          {n.level}
+                        </span>
+                        <span>{formatTs(n.ts)}</span>
+                        <span className="font-mono tabular-nums opacity-70">#{n.seq}</span>
+                      </div>
                     </div>
-                    <div className="mt-1 text-sm text-[var(--color-text)]">
-                      {n.msg}
-                    </div>
+                    <button
+                      type="button"
+                      onClick={() => host && setRead(host, n.seq, !read)}
+                      className="flex shrink-0 items-center gap-1 rounded px-2 py-1 text-xs text-[var(--color-muted)] hover:bg-[var(--color-surface-3)] hover:text-[var(--color-text)]"
+                    >
+                      {read ? <Mail size={12} /> : <MailOpen size={12} />}
+                      {read
+                        ? tr("notifications_mark_unread", undefined, "Mark unread")
+                        : tr("notifications_mark_read", undefined, "Mark read")}
+                    </button>
                   </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </ConnectionGate>

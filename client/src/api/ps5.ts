@@ -4921,6 +4921,50 @@ export async function cheatsEngineSet(
   return invoke("cheats_engine_set", { req: { addr: addr ?? null, enabled } });
 }
 
+/** A few fields of one title's appinfo.db row: its version, size, content
+ *  id and install / last-opened times. Keys are appinfo.db column names;
+ *  absent ones are simply missing from the result. */
+export interface AppInfoDetails {
+  /** CONTENT_VERSION (PS5, `01.000.016`) or APP_VER (PS4, `01.05`) — the
+   *  same form the cheat files name their target version in. */
+  version: string | null;
+  sizeBytes: number | null;
+  contentId: string | null;
+  installedAt: string | null;
+  lastOpenedAt: string | null;
+}
+
+export async function appInfoDetails(
+  transferAddr: string,
+  titleId: string,
+): Promise<AppInfoDetails | null> {
+  try {
+    const res = await invoke<{
+      ok?: boolean;
+      rows?: Array<{ key?: string; val?: string }>;
+    }>("ps5_appinfo_query", {
+      addr: toMgmtAddr(transferAddr),
+      // Tauri maps camelCase to the command's snake_case `title_id`.
+      titleId,
+      keys: "CONTENT_VERSION,APP_VER,#_size,#_install_time,#_last_access_time,CONTENT_ID",
+    });
+    if (!res?.ok) return null;
+    const v = new Map((res.rows ?? []).map((r) => [r.key ?? "", (r.val ?? "").trim()]));
+    const get = (k: string) => v.get(k) || null;
+    const size = Number(get("#_size"));
+    return {
+      version: get("CONTENT_VERSION") ?? get("APP_VER"),
+      sizeBytes: Number.isFinite(size) && size > 0 ? size : null,
+      contentId: get("CONTENT_ID"),
+      installedAt: get("#_install_time"),
+      lastOpenedAt: get("#_last_access_time"),
+    };
+  } catch {
+    // Details are a nicety: a console that can't answer just shows fewer.
+    return null;
+  }
+}
+
 // ── Community cheat repos ───────────────────────────────────────────
 export interface CheatRepo {
   id: string;
