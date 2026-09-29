@@ -679,7 +679,8 @@ export async function browserInvoke<T>(
       const { addr, slot, id } = args["req"] as {
         addr?: string | null;
         slot: number;
-        id?: number | null;
+        // "0x…" or decimal: a 64-bit id does not fit a JS number.
+        id?: string | null;
       };
       return postJson<T>("/api/profile/activate", { addr, slot, id });
     }

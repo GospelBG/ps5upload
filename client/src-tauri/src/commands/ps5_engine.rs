@@ -605,8 +605,13 @@ pub struct ProfileActivateReq {
     #[serde(default)]
     pub addr: Option<String>,
     pub slot: i32,
+    /// Passed through to the engine untouched. The client sends a STRING
+    /// ("0x…" or decimal) because a 64-bit account id can't survive as a
+    /// JavaScript number; a `u64` here rejected every real request with
+    /// "invalid type: string, expected u64". The engine parses and
+    /// validates both forms (`AccountIdInput`).
     #[serde(default)]
-    pub id: Option<u64>,
+    pub id: Option<JsonValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2757,4 +2762,30 @@ pub(crate) fn urlencoding(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod profile_activate_req_tests {
+    use super::ProfileActivateReq;
+
+    /// The client sends the account id as a string: a 64-bit id does not fit
+    /// a JavaScript number. A `u64` field rejected every such request.
+    #[test]
+    fn accepts_a_hex_string_id_and_passes_it_through() {
+        let req: ProfileActivateReq = serde_json::from_value(serde_json::json!({
+            "addr": null, "slot": 1, "id": "0x7a356e99a9e2205c"
+        }))
+        .expect("string id must deserialize");
+        assert_eq!(req.id, Some(serde_json::json!("0x7a356e99a9e2205c")));
+    }
+
+    #[test]
+    fn accepts_a_number_or_no_id() {
+        let n: ProfileActivateReq =
+            serde_json::from_value(serde_json::json!({ "slot": 0, "id": 42 })).unwrap();
+        assert_eq!(n.id, Some(serde_json::json!(42)));
+        let none: ProfileActivateReq =
+            serde_json::from_value(serde_json::json!({ "slot": 0, "id": null })).unwrap();
+        assert_eq!(none.id, None);
+    }
 }
