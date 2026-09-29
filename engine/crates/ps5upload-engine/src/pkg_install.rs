@@ -2874,6 +2874,9 @@ fn streamed_metadata(
 }
 
 /// Metadata for a package read through ranges rather than from a local file.
+// Both callers are desktop-only, so on Android this was dead code (and a
+// warning in every `make android-deploy`).
+#[cfg(not(target_os = "android"))]
 fn stream_metadata(
     head: ps5upload_pkg::ReaderMetadata,
     fingerprint: String,

@@ -91,7 +91,12 @@ ANDROID_ICON_SRC   := src-tauri/icons/sources/macos_squircle_1024.png
 # picks Homebrew's cargo and fails with "can't find crate for `core`/`std`").
 RUSTUP_CARGO_BIN := $(shell dirname "$$(rustup which cargo 2>/dev/null)" 2>/dev/null)
 # Env preamble shared by the android recipes.
-ANDROID_ENV = JAVA_HOME="$(ANDROID_JAVA_HOME)" ANDROID_HOME="$(ANDROID_HOME)" NDK_HOME="$(ANDROID_NDK_HOME)" $(if $(RUSTUP_CARGO_BIN),PATH="$(RUSTUP_CARGO_BIN):$$PATH")
+# Debug APKs keep line tables only. With full debug info the app library was
+# 558 MB, stored uncompressed, so the APK passed 1.1 GB and `adb install`
+# failed on an emulator with INSTALL_FAILED_INSUFFICIENT_STORAGE. Line tables
+# keep function names and file:line in backtraces. Set here, not in
+# Cargo.toml, so the desktop `tauri dev` build keeps its full debug info.
+ANDROID_ENV = JAVA_HOME="$(ANDROID_JAVA_HOME)" ANDROID_HOME="$(ANDROID_HOME)" NDK_HOME="$(ANDROID_NDK_HOME)" CARGO_PROFILE_DEV_DEBUG=line-tables-only $(if $(RUSTUP_CARGO_BIN),PATH="$(RUSTUP_CARGO_BIN):$$PATH")
 # adb from the SDK (falls back to PATH if a device-only adb is installed).
 ADB ?= $(ANDROID_HOME)/platform-tools/adb
 
@@ -346,6 +351,7 @@ _android-install-if-device:
 		echo "⚠ No Android device connected — APK is at $$apk."; \
 		echo "  Plug in a device (USB debugging on), then: $$adb install -r \"$$apk\""; \
 	else \
+		failed=0; \
 		for d in $$devs; do \
 			echo "Updating the app on device $$d (adb install -r)..."; \
 			out=$$("$$adb" -s "$$d" install -r "$$apk" 2>&1); \
@@ -358,18 +364,36 @@ _android-install-if-device:
 					echo "✓ App reinstalled on $$d"; \
 				else \
 					echo "⚠ Could not install on $$d — APK is at $$apk (install manually: $$adb -s $$d install -r \"$$apk\")."; \
+					failed=1; \
+				fi; \
+			elif printf '%s' "$$out" | grep -qi 'INSUFFICIENT_STORAGE' && case "$$d" in emulator-*) true;; *) false;; esac; then \
+				echo "⚠ $$d is out of space — removing the old install (an emulator's app data is disposable) and retrying..."; \
+				"$$adb" -s "$$d" uninstall "$(ANDROID_APP_ID)" >/dev/null 2>&1 || true; \
+				if out=$$("$$adb" -s "$$d" install "$$apk" 2>&1) && ! printf '%s' "$$out" | grep -qi 'Failure'; then \
+					echo "✓ App reinstalled on $$d"; \
+				else \
+					echo "⚠ Still could not install on $$d — free space on it (or wipe it: emulator -avd <name> -wipe-data):"; \
+					printf '%s\n' "$$out" | sed 's/^/    /'; \
+					failed=1; \
 				fi; \
 			else \
 				echo "⚠ adb install failed on $$d (build is fine — APK is at $$apk):"; \
 				printf '%s\n' "$$out" | sed 's/^/    /'; \
+				if printf '%s' "$$out" | grep -qi 'INSUFFICIENT_STORAGE'; then \
+					echo "  The device is out of space. Free some, then: $$adb -s $$d install -r \"$$apk\""; \
+				fi; \
+				failed=1; \
 			fi; \
 		done; \
+		if [ $$failed -eq 0 ]; then echo "✓ Android build deployed to connected device(s)."; \
+		else echo "⚠ Android build NOT deployed to every device — see above."; fi; \
 	fi
 
 # Build the Android APK and install/update it on the connected device(s) in
 # one step — the simplest "push my latest changes to the phone".
+# The install step reports its own outcome: it used to be followed by an
+# unconditional "✓ deployed", even straight after a failed install.
 android-deploy: android-build _android-install-if-device
-	@echo "✓ Android build deployed to connected device(s)."
 
 # Rebuild the payload only when the PS5 SDK is configured; otherwise skip so a
 # frontend-only `make run-client` keeps working without the SDK. The shell
