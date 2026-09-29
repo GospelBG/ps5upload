@@ -4939,8 +4939,9 @@ export async function appInfoDetails(
   titleId: string,
 ): Promise<AppInfoDetails | null> {
   try {
-    const res = await invoke<{
+    const resp = await invoke<{
       ok?: boolean;
+      error?: string | null;
       rows?: Array<{ key?: string; val?: string }>;
     }>("ps5_appinfo_query", {
       addr: toMgmtAddr(transferAddr),
@@ -4948,7 +4949,8 @@ export async function appInfoDetails(
       titleId,
       keys: "CONTENT_VERSION,APP_VER,#_size,#_install_time,#_last_access_time,CONTENT_ID",
     });
-    if (!res?.ok) return null;
+    // A refusal throws here and lands in the catch below: no details.
+    const res = assertOk(resp, "Read game details");
     const v = new Map((res.rows ?? []).map((r) => [r.key ?? "", (r.val ?? "").trim()]));
     const get = (k: string) => v.get(k) || null;
     const size = Number(get("#_size"));
