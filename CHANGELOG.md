@@ -4,6 +4,35 @@ What's new in ps5upload, written for humans.
 
 ---
 
+## 5.38.0
+
+**Install queue: everything about an install, in its own row.**
+
+- **The running install shows its own progress.** Phase (copying,
+  sending to the PS5, installing on the PS5), a progress bar, bytes done
+  of total, speed and time left now sit inside the item being installed,
+  instead of in a separate line further down the page. A link install
+  shows both speeds: downloading from the link and sending to the PS5.
+- **What it's waiting on is said in the row.** "Waiting for the PS5 to be
+  ready", "Verifying the installed package" and similar notes appear
+  under the bar, and before the first numbers arrive the row says it is
+  getting ready instead of showing a stuck 0%.
+- **Grouped the way you read it.** The queue is split into **Now**, **Up
+  next** (numbered in the order they will run: base game → update → DLC)
+  and **Finished** (failures first). The header shows only the counts that
+  matter, e.g. "1 in progress · 1 waiting".
+- **Tidier rows.** Waiting rows are compact, with move up/down only where
+  a move is possible. Updates and DLC are labelled, and a finished install
+  says how big it was plus any closing message from the installer.
+- **Less repetition on the Install page.** A stream or link install's
+  result is shown only on its queue row, not in extra cards as well. The
+  page now reads top to bottom: queue, link install, USB drives, options,
+  then notes. The fake-package (FPKG) checklist folds away until you open it.
+- Works on phone-width screens too: titles wrap instead of being cut to
+  one letter, and the percentage moves next to the phase label.
+
+---
+
 ## 5.37.2
 
 - **No crash screen after an update.** A web UI tab left open while the app
@@ -14,6 +43,8 @@ What's new in ps5upload, written for humans.
 - Building from source (`make run-client`, `make run-android`, …) no longer
   reinstalls the client's packages every time, which broke a dev app already
   running.
+
+---
 
 ## 5.37.1
 

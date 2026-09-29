@@ -948,6 +948,10 @@ interface PkgLibraryState {
    *  upload is QUEUED behind an active transfer (the PS5 can only do one at a
    *  time). Null when nothing is waiting. */
   busyNotice: string | null;
+  /** The "download the link to this computer first" step, which runs before
+   *  its install joins the queue — so it has no queue row to show it and
+   *  needs its own line on the Install screen. Null when no download runs. */
+  downloadNotice: string | null;
 
   /** True while `installAll` is driving a sequential batch. Cosmetic — it
    *  disables the Install-all button and shows batch progress; it does NOT
@@ -1425,6 +1429,40 @@ export function describeInstallSample(
   return { detail, current, pct };
 }
 
+
+/** Feed an install's samples to the queue row as structured progress: the
+ *  phase, the bytes, and a smoothed rate the row turns into speed and time
+ *  left. A sample that carries a note (the numbers stopped moving, and why)
+ *  goes to `onStatus` instead, as does the wait before the PS5 starts. */
+export function installSampleFeed(
+  hooks: InstallHooks | undefined,
+): (sample: InstallSample) => void {
+  const samples: RateSample[] = [{ ts: Date.now(), bytes: 0 }];
+  return (s) => {
+    if (!hooks) return;
+    const now = Date.now();
+    const current = Math.max(s.transferBytes, s.installedBytes);
+    pushRateSample(samples, now, current);
+    if (s.note) {
+      hooks.onStatus(s.note);
+      return;
+    }
+    if (s.phase === "queued" && current === 0) {
+      hooks.onStatus("Waiting for the PS5 to start…");
+      return;
+    }
+    if (!(s.total > 0)) return;
+    hooks.onProgress(Math.min(99, Math.floor((100 * current) / s.total)), {
+      phase: s.phase === "download" ? "transfer" : "install",
+      current,
+      total: s.total,
+      bytesPerSec: computeRate(samples, now),
+      ...(s.originRateBps && s.originRateBps > 0
+        ? { originBytesPerSec: s.originRateBps }
+        : {}),
+    });
+  };
+}
 
 /** Confirm a DPI fallback by comparing the installed app.pkg/patch.pkg/DLC
  * artifact to the exact source identity. This closes the old gap where DPI
@@ -2158,6 +2196,7 @@ const makePkgLibraryStore = () =>
     error: null,
     installing: false,
     busyNotice: null,
+    downloadNotice: null,
     installingAll: false,
 
     async refresh(host) {
@@ -2614,10 +2653,10 @@ const makePkgLibraryStore = () =>
           const fw = parsePS5Firmware(rt?.ps5Kernel ?? null);
           const major = fw ? parseFloat(fw) : 0;
           if (major >= 12) {
-            set({
-              busyNotice:
-                "Installing on FW 12.x… ps5upload will only report success after console-side verification. If PlayGo rejects the install, the package stays staged for the PS5's Debug Settings Package Installer.",
-            });
+            const note =
+              "Installing on FW 12.x… ps5upload will only report success after console-side verification. If PlayGo rejects the install, the package stays staged for the PS5's Debug Settings Package Installer.";
+            set({ busyNotice: note });
+            hooks?.onStatus(note);
           }
         }
 
@@ -2658,6 +2697,7 @@ const makePkgLibraryStore = () =>
         // Surface the install in the global Activity bar at the bottom of the app
         // (with a live %), so it stays visible while the user browses other
         // screens — same treatment uploads/downloads already get.
+        const feed = installSampleFeed(hooks);
         const actId = useActivityHistoryStore
           .getState()
           .start("library-install", `Installing ${label}`, {
@@ -2676,7 +2716,8 @@ const makePkgLibraryStore = () =>
           // Live install %: a large title installs over minutes — feed both the
           // inline notice and the global Activity bar so progress shows
           // everywhere. Guarded so a 0 total can't divide.
-          ({ installedBytes, total }) => {
+          (sample) => {
+            const { installedBytes, total } = sample;
             useActivityHistoryStore
               .getState()
               .update(actId, { bytes: installedBytes, totalBytes: total });
@@ -2686,11 +2727,14 @@ const makePkgLibraryStore = () =>
                 Math.floor((installedBytes / total) * 100),
               );
               set({ busyNotice: `Installing on the PS5… ${pct}%` });
-              hooks?.onProgress(pct);
             }
+            feed(sample);
           },
           // Readiness-gate status (pre-install wait / DPI transient retry).
-          (msg) => set({ busyNotice: msg }),
+          (msg) => {
+            set({ busyNotice: msg });
+            hooks?.onStatus(msg);
+          },
           { size: entry?.size, fingerprint: entry?.fingerprint },
           // Lets the engine confirm an update actually raised APP_VER instead
           // of trusting Sony's return code, which is 0 either way.
@@ -2893,7 +2937,7 @@ const makePkgLibraryStore = () =>
         status: "running",
       });
       const fail = (message: string, cancelled = false) => {
-        set({ busyNotice: null });
+        set({ downloadNotice: null });
         useTaskStore
           .getState()
           .finishTask(taskId, cancelled ? "cancelled" : "failed", {
@@ -2962,7 +3006,7 @@ const makePkgLibraryStore = () =>
         const bytesPerSec = computeRate(rateSamples, now);
         const detail = describeLinkDownload(written, size, bytesPerSec);
         // The install popup and the Install screen show this line, not the task list.
-        set({ busyNotice: detail });
+        set({ downloadNotice: detail });
         useTaskStore.getState().updateTask(taskId, {
           detail,
           ...(size > 0
@@ -2976,6 +3020,7 @@ const makePkgLibraryStore = () =>
         if (st.done) break;
       }
 
+      set({ downloadNotice: null });
       useTaskStore.getState().finishTask(taskId, "done", {
         detail: "Downloaded. Installing on the PS5 from this computer…",
       });
@@ -3266,8 +3311,15 @@ const makePkgLibraryStore = () =>
             : `Stream-installing ${label} (beta) — the PS5 pulls the pkg directly over HTTP, no staging upload…`,
         });
 
+        hooks?.onStatus(
+          remoteUrl
+            ? "Reading the package from the link…"
+            : "Getting the PS5 installer ready…",
+        );
+
         const onStatus = (msg: string) => {
           set({ busyNotice: msg });
+          hooks?.onStatus(msg);
           useTaskStore.getState().updateTask(taskId, { detail: msg });
         };
 
@@ -3346,9 +3398,22 @@ const makePkgLibraryStore = () =>
                 lastDetail = detail;
                 set({ busyNotice: detail });
               }
-              if (sample.total > 0) {
+              if (sample.note) {
+                hooks?.onStatus(sample.note);
+              } else if (sample.phase === "queued" && current === 0) {
+                hooks?.onStatus("Waiting for the PS5 to start…");
+              } else if (sample.total > 0) {
                 hooks?.onProgress(
                   Math.min(99, Math.floor((current / sample.total) * 100)),
+                  {
+                    phase: sample.phase === "download" ? "transfer" : "install",
+                    current,
+                    total: sample.total,
+                    bytesPerSec,
+                    ...(sample.originRateBps && sample.originRateBps > 0
+                      ? { originBytesPerSec: sample.originRateBps }
+                      : {}),
+                  },
                 );
               }
               useTaskStore.getState().updateTask(taskId, {
@@ -3474,6 +3539,7 @@ const makePkgLibraryStore = () =>
       const label = pkg.name || contentId || "package";
       let installAttempted = false;
       // Live install %, shared by the direct-from-USB and the copy-fallback paths.
+      const feed = installSampleFeed(hooks);
       const onProgress = (sample: InstallSample) => {
         if (sample.total > 0) {
           const pct = Math.min(
@@ -3481,8 +3547,8 @@ const makePkgLibraryStore = () =>
             Math.floor((sample.installedBytes / sample.total) * 100),
           );
           set({ busyNotice: `Installing ${label} from ${pkg.drive}… ${pct}%` });
-          hooks?.onProgress(pct);
         }
+        feed(sample);
       };
       try {
         // Copy USB → internal, then install from there. We do NOT install
@@ -3504,6 +3570,10 @@ const makePkgLibraryStore = () =>
         // dropped connection no longer aborts a healthy 25 GB copy.
         const copyOpId = Math.floor(Math.random() * 0xff_ffff_ffff) + 1;
         let copying = true;
+        const copyRate: RateSample[] = [{ ts: Date.now(), bytes: 0 }];
+        hooks?.onStatus(
+          `Copying from ${pkg.drive} to internal storage first — the copy is removed after the install.`,
+        );
         const pollCopy = (async () => {
           while (copying) {
             await sleep(1500);
@@ -3516,6 +3586,14 @@ const makePkgLibraryStore = () =>
                 );
                 set({
                   busyNotice: `Staging ${label} from ${pkg.drive} to internal storage… ${pct}% (removed after install)`,
+                });
+                const now = Date.now();
+                pushRateSample(copyRate, now, s.bytes_copied);
+                hooks?.onProgress(pct, {
+                  phase: "stage",
+                  current: s.bytes_copied,
+                  total: s.total_bytes,
+                  bytesPerSec: computeRate(copyRate, now),
                 });
               }
             } catch {
@@ -3648,6 +3726,8 @@ const makePkgLibraryStore = () =>
             // staged pkg itself to detect a patch and arm the data-loss guard.
             null,
             false,
+            installSampleFeed(hooks),
+            (msg) => hooks?.onStatus(msg),
           );
         return installed
           ? { ok: true, mayNotLaunch }

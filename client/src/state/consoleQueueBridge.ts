@@ -27,8 +27,25 @@ export interface InstallResult {
   stagedFallbackRecommended?: boolean;
 }
 
+/** The numbers behind an install's percentage, so the queue row can show
+ *  what is moving and how fast instead of a bare figure. */
+export interface InstallProgress {
+  /** `stage` = copying the package onto the console's internal storage
+   *  first (USB installs); `transfer` = bytes still travelling to the PS5 (a
+   *  stream or link install); `install` = the PS5 writing the package. */
+  phase: "stage" | "transfer" | "install";
+  current: number;
+  total: number;
+  /** Smoothed rate of `current`; 0 when not yet known. */
+  bytesPerSec: number;
+  /** Link installs: the download leg (origin → this computer). */
+  originBytesPerSec?: number;
+}
+
 export interface InstallHooks {
-  onProgress: (pct: number) => void;
+  onProgress: (pct: number, progress?: InstallProgress) => void;
+  /** A sentence about what the install is doing that the numbers can't say
+   *  (waiting for the console, verifying, retrying). "" clears it. */
   onStatus: (msg: string) => void;
 }
 

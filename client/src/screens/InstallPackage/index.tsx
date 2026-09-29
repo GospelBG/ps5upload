@@ -6,7 +6,7 @@ import {
 } from "../../state/uploadQueue";
 import { isRemotePath } from "../../lib/remotePath";
 import { PackagePanel } from "../../components/PackagePanel";
-import { QueuePanel } from "../Upload/QueuePanel";
+import { QueuePanel, queueItemsForHost } from "../Upload/QueuePanel";
 import { volumeOfPkgPath } from "../../lib/pkgStorage";
 import { useLocation, useNavigate } from "react-router";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -27,6 +27,7 @@ import {
   FileText,
   Clock3,
   MapPin,
+  ChevronDown,
 } from "lucide-react";
 
 import { isAndroid } from "../../lib/platform";
@@ -35,7 +36,6 @@ import { isTauriEnv, safeUnlisten } from "../../lib/tauriEnv";
 import {
   PageHeader,
   Button,
-  Callout,
   EmptyState,
   WarningCard,
   ConnectionGate,
@@ -529,6 +529,12 @@ export default function InstallPackageScreen() {
   const installing = usePkgLibrary(host, (s) => s.installing);
   const installingAll = usePkgLibrary(host, (s) => s.installingAll);
   const busyNotice = usePkgLibrary(host, (s) => s.busyNotice);
+  const downloadNotice = usePkgLibrary(host, (s) => s.downloadNotice);
+  // Whether this console's queue is running something — its row then carries
+  // the live status, and the page-level line would only repeat it.
+  const queueRunningHere = useUploadQueueStore((s) =>
+    queueItemsForHost(s.items, host).some((it) => it.status === "running"),
+  );
   const refresh = usePkgLibrary(host, (s) => s.refresh);
   const addAndUpload = usePkgLibrary(host, (s) => s.addAndUpload);
   const install = usePkgLibrary(host, (s) => s.install);
@@ -576,19 +582,6 @@ export default function InstallPackageScreen() {
   }, [libStateKey]);
   // The row whose original file is open in the package viewer.
   const [viewEntry, setViewEntry] = useState<PkgEntry | null>(null);
-  /** Terminal outcome of the last stream install, shown IN THIS VIEW.
-   *
-   *  A streamed package is a path on the PC, not a staging-library row, so it
-   *  has no entry.lastResult to hang a result off — which is why a finished
-   *  stream install used to leave this screen completely unchanged and only
-   *  ring the in-app bell. If you navigated away or missed the toast, there
-   *  was no way to tell whether it had worked. */
-  const [streamResult, setStreamResult] = useState<{
-    ok: boolean;
-    warn: boolean;
-    message: string;
-    name: string;
-  } | null>(null);
   const [picking, setPicking] = useState(false);
   const [remoteUrl, setRemoteUrl] = useState("");
   const [dropActive, setDropActive] = useState(false);
@@ -807,44 +800,18 @@ export default function InstallPackageScreen() {
     streamName: string,
     opts?: { ephemeral?: boolean },
   ) {
-    setStreamResult(null);
     const r = await installStream(sourcePath, host);
+    // The outcome lives on the item's queue row — including its error and
+    // Retry via upload. Only a browser upload's row is dropped on failure (its
+    // staged copy is deleted, so it could never be retried): say it here.
     if (!r.ok && opts?.ephemeral) {
-      // The staged copy is deleted once this returns: its failed row could
-      // never be retried, so drop it and don't point at it.
       const q = useUploadQueueStore.getState();
       for (const id of failedStreamInstallIds(q.items, sourcePath)) q.remove(id);
-    }
-    setStreamResult({
-      ok: !!r.ok,
-      // The engine resolves a stream install to done|failed synchronously, so
-      // there is no "accepted but unverified" amber state here any more.
-      warn: false,
-      name: streamName,
-      message: r.ok
-        ? tr(
-            "install.stream.done",
-            undefined,
-            "Stream install complete — the package was fetched over HTTP, nothing was staged on the PS5.",
-          )
-        : r.message ||
-          tr(
-            "install.stream.failed",
-            undefined,
-            "The install didn't complete.",
-          ),
-    });
-    if (!r.ok && r.message) {
-      // The PS5 couldn't fetch from this computer: its row in the Queue below
-      // offers Retry via upload, which copies the file to the PS5 first.
       setPickError(
-        r.stagedFallbackRecommended && !opts?.ephemeral
-          ? `${r.message} ${tr(
-              "pkglib.stream.retry_via_upload_hint",
-              undefined,
-              "Use Retry via upload on its row in the Queue to copy it to the PS5 and install from there.",
-            )}`
-          : r.message,
+        `${streamName}: ${
+          r.message ||
+          tr("install.stream.failed", undefined, "The install didn't complete.")
+        }`,
       );
     }
   }
@@ -958,7 +925,6 @@ export default function InstallPackageScreen() {
 
   async function handleUrlInstall() {
     setPickError(null);
-    setStreamResult(null);
     const approved = await confirm({
       title: tr("pkglib.url.confirmTitle", "Start experimental link install?"),
       message: tr("pkglib.url.confirmBody", "This computer downloads the package from the link and feeds it to the PS5, so it must stay awake and connected until the install finishes. Reinstalling over an existing title may remove it if Sony's installer fails. Use only a trusted package URL you are authorized to install."),
@@ -966,22 +932,27 @@ export default function InstallPackageScreen() {
       cancelLabel: tr("pkglib.stream.fallback.cancel", "Not now"),
     });
     if (!approved) return;
+    const link = remoteUrl.trim();
+    const startedAt = Date.now();
     try {
-      const result = await installUrl(remoteUrl.trim(), host, {
+      const result = await installUrl(link, host, {
         mode: linkMode,
       });
-      const message =
-        result.message ??
-        (result.ok
-          ? tr("pkglib.url.done", "Installed from the link.")
-          : tr("pkglib.url.failed", "The link install didn't complete."));
-      setStreamResult({
-        ok: result.ok,
-        warn: false,
-        name: "Link install",
-        message,
-      });
-      if (!result.ok) setPickError(message);
+      // A link that reached the queue (as itself, or as the file a
+      // download-first produced) reports on its row. One that never got there
+      // — a malformed link, a failed download — has only this line.
+      const hasRow = queueItemsForHost(useUploadQueueStore.getState().items, host).some(
+        (it) =>
+          it.sourceKind === "install" &&
+          it.status === "failed" &&
+          (it.completedAt ?? 0) >= startedAt,
+      );
+      if (!result.ok && !hasRow) {
+        setPickError(
+          result.message ??
+            tr("pkglib.url.failed", "The link install didn't complete."),
+        );
+      }
     } catch (e) {
       setPickError(`${e}`);
     }
@@ -1447,6 +1418,41 @@ export default function InstallPackageScreen() {
       {hostReady && <QueuePanel host={host} />}
 
       <ConnectionGate require="payload">
+        {pickError && (
+          <div className="mb-4">
+            <WarningCard
+              title={tr("install.pickError", "Could not add file")}
+              detail={pickError}
+            />
+          </div>
+        )}
+        {error && (
+          <div className="mb-4">
+            <WarningCard
+              title={tr("pkglib.error", "Something went wrong")}
+              detail={error}
+            />
+          </div>
+        )}
+
+        {/* A queued install shows its own progress on its queue row, so this
+            line appears only for work the queue doesn't represent. */}
+        {busyNotice && !queueRunningHere && (
+          <div className="mb-4 flex items-center justify-between gap-3 rounded-lg border border-[var(--color-accent)] bg-[var(--color-accent-soft)] px-4 py-3 text-sm">
+            <div className="flex items-start gap-2">
+              <Spinner size={14} tone="accent" className="mt-0.5 shrink-0" />
+              <span>{busyNotice}</span>
+            </div>
+          </div>
+        )}
+        {/* "Download through this computer" runs before its install joins
+            the queue, so it reports here, next to the queue it will join. */}
+        {downloadNotice && (
+          <div className="mb-4 flex items-start gap-2 rounded-lg border border-[var(--color-accent)] bg-[var(--color-accent-soft)] px-4 py-3 text-sm">
+            <Spinner size={14} tone="accent" className="mt-0.5 shrink-0" />
+            <span>{downloadNotice}</span>
+          </div>
+        )}
         <div className="mb-4 rounded-md border border-[var(--color-border)] bg-[var(--color-surface-2)] p-3">
           <label htmlFor="pkg-remote-url" className="block text-sm font-medium text-[var(--color-text)]">
             {tr("pkglib.url.title", "Install from HTTP(S) link")}
@@ -1515,76 +1521,7 @@ export default function InstallPackageScreen() {
             </Button>
           </div>
         </div>
-        <div className="mb-4 flex items-start gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface-2)] p-3 text-[12px] text-[var(--color-muted)]">
-          <Info size={13} className="mt-0.5 shrink-0" />
-          <div>
-            <span className="font-medium text-[var(--color-text)]">
-              {tr("pkglib.installnote.title", "How installing works")}
-            </span>
-            {" — "}
-            {tr(
-              "pkglib.installnote.body",
-              "ps5upload hands the package to its own installer on the PS5 and only reports it installed once the console has read the whole package; a patch must also raise the game's version. If an install fails, the package is kept so you can retry. FW 12+ and system packages may still require the PS5's own Settings → System → Debug Settings → Game → Package Installer.",
-            )}
-          </div>
-        </div>
-
-        {/* Stated, not detected. A user installing an FPKG already knows it is
-            one, and there is no header marker that separates a fake package from
-            a retail one — every field that looked like a candidate is present on
-            genuine Sony packages too. So the note names the requirement and lets
-            the reader decide whether it applies to them. */}
-        <Callout
-          tone="warn"
-          className="mb-4"
-          title={tr(
-            "pkglib.fpkgsupport.title",
-            "Installing a fake package (FPKG)?",
-          )}
-        >
-          <div className="flex flex-col gap-1.5">
-            <div>
-              {tr(
-                "pkglib.fpkgsupport.lead",
-                "A PS5 fake package only installs when fake-package support is already loaded on the console. Load all three, in this order, before installing:",
-              )}
-            </div>
-            <ol className="ml-4 flex list-decimal flex-col gap-1">
-              <li>
-                <strong className="text-[var(--color-text)]">kstuff</strong>{" "}
-                {tr(
-                  "pkglib.fpkgsupport.kstuff",
-                  "— the build with PS5 fake-package support",
-                )}
-              </li>
-              <li>
-                <strong className="text-[var(--color-text)]">
-                  a53_ppr_install_fast.elf
-                </strong>{" "}
-                {tr(
-                  "pkglib.fpkgsupport.ppr",
-                  "— applies the PPR plaintext / no-auth patch",
-                )}
-              </li>
-              <li>
-                <strong className="text-[var(--color-text)]">
-                  shadowmountplus.elf
-                </strong>{" "}
-                {tr(
-                  "pkglib.fpkgsupport.smp",
-                  "— the mount layer that registers the installed title",
-                )}
-              </li>
-            </ol>
-            <div>
-              {tr(
-                "pkglib.fpkgsupport.tail",
-                "Without them the console refuses the install, or takes it and then fails to mount the game. Retail and debug packages need none of this — if that is what you are installing, ignore this note.",
-              )}
-            </div>
-          </div>
-        </Callout>
-
+        {hostReady && <ExternalPackages host={host} />}
         {/* Workflow options, grouped near the top where they're set before
             adding a package (not buried under the library list). Both govern the
             hands-off "add → installed → cleaned up" flow, so they read together. */}
@@ -1612,6 +1549,88 @@ export default function InstallPackageScreen() {
           />
         </div>
 
+        {/* Reference notes, below the controls they explain: read once,
+            then out of the way. */}
+        <div className="mb-4 flex items-start gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface-2)] p-3 text-[12px] text-[var(--color-muted)]">
+          <Info size={13} className="mt-0.5 shrink-0" />
+          <div>
+            <span className="font-medium text-[var(--color-text)]">
+              {tr("pkglib.installnote.title", "How installing works")}
+            </span>
+            {" — "}
+            {tr(
+              "pkglib.installnote.body",
+              "ps5upload hands the package to its own installer on the PS5 and only reports it installed once the console has read the whole package; a patch must also raise the game's version. If an install fails, the package is kept so you can retry. FW 12+ and system packages may still require the PS5's own Settings → System → Debug Settings → Game → Package Installer.",
+            )}
+          </div>
+        </div>
+
+        {/* Stated, not detected. A user installing an FPKG already knows it is
+            one, and there is no header marker that separates a fake package from
+            a retail one — every field that looked like a candidate is present on
+            genuine Sony packages too. So the note names the requirement and lets
+            the reader decide whether it applies to them. */}
+        {/* A disclosure, not a standing callout: it matters only to someone
+            installing a fake package, and they recognise the question. */}
+        <details className="group mb-4 rounded-md border border-[var(--color-warn)]/40 bg-[var(--color-warn)]/5 text-[12px] text-[var(--color-muted)]">
+          <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 font-medium text-[var(--color-warn)] [&::-webkit-details-marker]:hidden">
+            <AlertTriangle size={13} className="shrink-0" />
+            <span className="flex-1">
+              {tr(
+                "pkglib.fpkgsupport.title",
+                "Installing a fake package (FPKG)?",
+              )}
+            </span>
+            <ChevronDown
+              size={14}
+              className="shrink-0 transition-transform group-open:rotate-180"
+            />
+          </summary>
+          <div className="px-3 pb-3">
+            <div className="flex flex-col gap-1.5">
+              <div>
+                {tr(
+                  "pkglib.fpkgsupport.lead",
+                  "A PS5 fake package only installs when fake-package support is already loaded on the console. Load all three, in this order, before installing:",
+                )}
+              </div>
+              <ol className="ml-4 flex list-decimal flex-col gap-1">
+                <li>
+                  <strong className="text-[var(--color-text)]">kstuff</strong>{" "}
+                  {tr(
+                    "pkglib.fpkgsupport.kstuff",
+                    "— the build with PS5 fake-package support",
+                  )}
+                </li>
+                <li>
+                  <strong className="text-[var(--color-text)]">
+                    a53_ppr_install_fast.elf
+                  </strong>{" "}
+                  {tr(
+                    "pkglib.fpkgsupport.ppr",
+                    "— applies the PPR plaintext / no-auth patch",
+                  )}
+                </li>
+                <li>
+                  <strong className="text-[var(--color-text)]">
+                    shadowmountplus.elf
+                  </strong>{" "}
+                  {tr(
+                    "pkglib.fpkgsupport.smp",
+                    "— the mount layer that registers the installed title",
+                  )}
+                </li>
+              </ol>
+              <div>
+                {tr(
+                  "pkglib.fpkgsupport.tail",
+                  "Without them the console refuses the install, or takes it and then fails to mount the game. Retail and debug packages need none of this — if that is what you are installing, ignore this note.",
+                )}
+              </div>
+            </div>
+          </div>
+        </details>
+
         {alternativeGroups.length > 0 && (
           <div className="mb-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] px-4 py-3 text-sm leading-relaxed text-[var(--color-muted)]">
             <strong className="text-[var(--color-text)]">
@@ -1625,69 +1644,6 @@ export default function InstallPackageScreen() {
           </div>
         )}
 
-        {streamResult && (
-          <div className="mb-4">
-            <div
-              className={`flex items-start gap-2 rounded-lg border px-3 py-2.5 text-sm ${
-                streamResult.warn
-                    ? "border-[var(--color-warn)] text-[var(--color-warn)]"
-                  : streamResult.ok
-                    ? "border-[var(--color-good)] text-[var(--color-good)]"
-                    : "border-[var(--color-bad)] text-[var(--color-bad)]"
-              }`}
-              role="status"
-            >
-              {streamResult.warn ? (
-                <AlertTriangle size={16} className="mt-0.5 shrink-0" />
-              ) : streamResult.ok ? (
-                <CheckCircle2 size={15} className="mt-px shrink-0" />
-              ) : (
-                <XCircle size={15} className="mt-px shrink-0" />
-              )}
-              <div className="min-w-0">
-                <div className="font-medium break-words">{streamResult.name}</div>
-                <div className="opacity-90 break-words">
-                  {streamResult.message}
-                </div>
-              </div>
-              <button
-                type="button"
-                className="ml-auto shrink-0 opacity-70 hover:opacity-100"
-                onClick={() => setStreamResult(null)}
-                aria-label={tr("common.dismiss", undefined, "Dismiss")}
-              >
-                ×
-              </button>
-            </div>
-          </div>
-        )}
-        {pickError && (
-          <div className="mb-4">
-            <WarningCard
-              title={tr("install.pickError", "Could not add file")}
-              detail={pickError}
-            />
-          </div>
-        )}
-        {error && (
-          <div className="mb-4">
-            <WarningCard
-              title={tr("pkglib.error", "Something went wrong")}
-              detail={error}
-            />
-          </div>
-        )}
-
-        {busyNotice && (
-          <div className="mb-4 flex items-center justify-between gap-3 rounded-lg border border-[var(--color-accent)] bg-[var(--color-accent-soft)] px-4 py-3 text-sm">
-            <div className="flex items-start gap-2">
-              <Spinner size={14} tone="accent" className="mt-0.5 shrink-0" />
-              <span>{busyNotice}</span>
-            </div>
-          </div>
-        )}
-
-        {hostReady && <ExternalPackages host={host} />}
 
         {hostReady && entries.length === 0 && !loading ? (
           <EmptyState

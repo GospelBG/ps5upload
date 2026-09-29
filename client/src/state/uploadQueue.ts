@@ -43,6 +43,7 @@ import {
 import { archiveFormat, type SourceKind } from "./upload";
 import {
   runPkgInstall,
+  installSampleFeed,
   pkgLibraryStore,
   recordPkgInstalled,
   waitForConsoleReady,
@@ -83,6 +84,7 @@ import {
   registerPkgQueueApi,
   type EnqueueInstallInput,
   type EnqueuedInstall,
+  type InstallProgress,
   type InstallRequest,
   type InstallResult,
 } from "./consoleQueueBridge";
@@ -205,6 +207,13 @@ export interface QueueItem {
   installPhase?: "installing" | "done" | "warn" | "unverified" | "error" | null;
   /** Pkg-only: live install progress (0-99) while installPhase is "installing". */
   installPct?: number | null;
+  /** Install-only: the bytes, phase and rate behind `installPct`. Kept on a
+   *  finished row so it can say how big the install was. */
+  installProgress?: InstallProgress | null;
+  /** Install-only: what the install is doing that the numbers can't say
+   *  (waiting for the console, verifying…) or, once done, the installer's
+   *  closing message. Null when there is nothing to add. */
+  installNote?: string | null;
   /** Pkg-only: the installed title (or content id) the finisher resolved,
    *  shown on the done row. Null otherwise. */
   installedTitle?: string | null;
@@ -419,6 +428,15 @@ export function installOrderPriority(it: QueueItem): number {
   return 0;
 }
 
+/** What a row may swap places with when moved: waiting rows on the same
+ *  console in the same install tier. Anything else is its own group, so it
+ *  never moves. */
+export function moveGroupOf(it: QueueItem): string {
+  return it.status === "pending"
+    ? `${hostOf(it.addr)}|${installOrderPriority(it)}`
+    : `${it.id}|fixed`;
+}
+
 /** A console's library installs that are waiting or running, by staged path:
  *  Install Package shows these on the library rows (and blocks Delete). */
 /** Failed stream installs of `source` — the browser build deletes that staged
@@ -597,14 +615,30 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       throw new Error("This install can't run: its details were not kept.");
     }
     set((s) => ({
-      items: patchItem(s.items, item.id, { installPhase: "installing", installPct: 0 }),
+      items: patchItem(s.items, item.id, {
+        installPhase: "installing",
+        installPct: 0,
+        installProgress: null,
+        installNote: null,
+      }),
     }));
     const h = hostOf(item.addr);
     const running = exec(item.install, h, {
       // Progress keeps flowing even after Stop: the install is still going.
-      onProgress: (pct) =>
-        set((s) => ({ items: patchItem(s.items, item.id, { installPct: pct }) })),
-      onStatus: () => {},
+      // Fresh numbers retire a status note: "waiting for the PS5" is no
+      // longer true once bytes move.
+      onProgress: (pct, progress) =>
+        set((s) => ({
+          items: patchItem(s.items, item.id, {
+            installPct: pct,
+            installNote: null,
+            ...(progress ? { installProgress: progress } : {}),
+          }),
+        })),
+      onStatus: (msg) =>
+        set((s) => ({
+          items: patchItem(s.items, item.id, { installNote: msg || null }),
+        })),
     });
     const tracked = running.catch(() => {});
     installInFlight.set(h, tracked);
@@ -626,6 +660,9 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       registeredAs: null,
       installPhase: (r.mayNotLaunch ? "warn" : "done") as QueueItem["installPhase"],
       installedTitle: item.displayName,
+      // The installer's own closing words (e.g. "Sent to the PS5 — it
+      // downloads on its own") belong on the finished row.
+      installNote: r.message ?? null,
     };
   };
 
@@ -645,6 +682,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     registeredAs: string | null;
     installPhase: QueueItem["installPhase"];
     installedTitle: string | null;
+    installNote?: string | null;
   }> => {
     if (item.sourceKind === "install") return runInstallItem(item);
     const isFolder =
@@ -944,6 +982,22 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           set((s) => ({
             items: patchItem(s.items, item.id, { installPhase: "installing", installPct: 0 }),
           }));
+          // The row shows the install's bytes, rate and notes, like an
+          // install item does.
+          const feedRow = installSampleFeed({
+            onProgress: (pct, progress) =>
+              set((s) => ({
+                items: patchItem(s.items, item.id, {
+                  installPct: pct,
+                  installNote: null,
+                  ...(progress ? { installProgress: progress } : {}),
+                }),
+              })),
+            onStatus: (msg) =>
+              set((s) => ({
+                items: patchItem(s.items, item.id, { installNote: msg || null }),
+              })),
+          });
           try {
             // delete_staging = the per-item Auto Delete preference (captured
             // from the setting at queue-add time). When off, the engine keeps
@@ -959,7 +1013,8 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
               item.deletePkgAfterInstall !== false,
               // Surface the live install % on this console's pkg screen while a
               // large queued title installs in the background.
-              ({ installedBytes, total }) => {
+              (sample) => {
+                const { installedBytes, total } = sample;
                 if (total > 0) {
                   const pct = Math.min(
                     99,
@@ -968,13 +1023,16 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
                   pkgStore.setState({
                     busyNotice: `Installing "${item.displayName}" on the PS5… ${pct}%`,
                   });
-                  set((s) => ({
-                    items: patchItem(s.items, item.id, { installPct: pct }),
-                  }));
                 }
+                feedRow(sample);
               },
               // Readiness-gate status (pre-install wait / DPI transient retry).
-              (msg) => pkgStore.setState({ busyNotice: msg }),
+              (msg) => {
+                pkgStore.setState({ busyNotice: msg });
+                set((s) => ({
+                  items: patchItem(s.items, item.id, { installNote: msg || null }),
+                }));
+              },
               // Identity for the post-install check AND for the background
               // re-verify of an accepted-but-unverified install. Without a
               // size the re-verify has nothing to match the installed artifact
@@ -1220,6 +1278,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             registeredAs,
             installPhase,
             installedTitle,
+            installNote,
           } =
             await runOne(next, isLive);
           // Always flip to "done" once runOne returns success — the
@@ -1242,6 +1301,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
               registeredAs,
               installPhase,
               installedTitle,
+              installNote: installNote ?? null,
               recovering: false,
               recoverAttempt: 0,
               completedAt: Date.now(),
@@ -1290,7 +1350,9 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
                 errorReason: reason,
                 errorDetail: detail,
                 completedAt: Date.now(),
-                ...(isInstall ? { installPhase: "error" as const } : {}),
+                ...(isInstall
+                  ? { installPhase: "error" as const, installNote: null }
+                  : {}),
                 ...(isInstall &&
                 e instanceof InstallItemError &&
                 e.result.stagedFallbackRecommended &&
@@ -1544,6 +1606,8 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           errorDetail: null,
           installPhase: null,
           installPct: null,
+          installProgress: null,
+          installNote: null,
           fallbackToUpload: false,
           completedAt: null,
         }),
@@ -1667,18 +1731,20 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     },
 
     moveUp(id) {
-      // Reorder within the item's OWN console group — the grouped queue
-      // renders each console's rows together, so "up" means "earlier among
-      // this console's jobs," never swapping across consoles.
+      // Reorder within the item's OWN console and run tier. The panel lists
+      // a console's waiting rows in run order (base → update → DLC, then list
+      // order), so "up" must swap with the waiting row shown just above — a
+      // swap with a finished row, or across tiers, would change nothing the
+      // user can see.
       set((s) => ({
-        items: moveItemUpWithinGroup(s.items, id, (it) => hostOf(it.addr)),
+        items: moveItemUpWithinGroup(s.items, id, moveGroupOf),
       }));
       scheduleSave();
     },
 
     moveDown(id) {
       set((s) => ({
-        items: moveItemDownWithinGroup(s.items, id, (it) => hostOf(it.addr)),
+        items: moveItemDownWithinGroup(s.items, id, moveGroupOf),
       }));
       scheduleSave();
     },
@@ -1731,7 +1797,14 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       set((s) => ({
         items: resetFailedToPending(s.items).map((it) =>
           it.sourceKind === "install" && it.status === "pending" && it.installPhase
-            ? { ...it, installPhase: null, installPct: null, fallbackToUpload: false }
+            ? {
+                ...it,
+                installPhase: null,
+                installPct: null,
+                installProgress: null,
+                installNote: null,
+                fallbackToUpload: false,
+              }
             : it,
         ),
       }));

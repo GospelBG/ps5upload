@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
-import { QueueRow, queueItemsForHost } from "./QueuePanel";
+import { QueueRow, queueItemsForHost, queueSections } from "./QueuePanel";
 import en from "../../i18n/locales/en";
 import type { QueueItem } from "../../state/uploadQueue";
 
@@ -97,6 +97,86 @@ describe("Queue panel", () => {
     expect(waiting).toContain("Install from the PS5");
     expect(waiting).toContain("Queued (#1)");
     expect(waiting).not.toContain("Overwrite");
+  });
+
+  const runningInstall = (over: Record<string, unknown> = {}) =>
+    item({
+      id: "r",
+      sourceKind: "install",
+      sourcePath: "pc:/g/big.pkg",
+      displayName: "Big Game",
+      addr: "10.0.0.2:9113",
+      install: { via: "stream", source: "/g/big.pkg" },
+      status: "running",
+      installPhase: "installing",
+      ...over,
+    });
+
+  it("shows a running install's phase, bytes, rate and time left in its own row", () => {
+    const html = row(
+      runningInstall({
+        installPct: 13,
+        installProgress: {
+          phase: "install",
+          current: 13_000_000_000,
+          total: 100_000_000_000,
+          bytesPerSec: 100_000_000,
+        },
+      }),
+    );
+    expect(html).toContain("Installing on the PS5");
+    expect(html).toContain("13%");
+    expect(html).toMatch(/of [\d.]+ GiB/);
+    expect(html).toMatch(/\/s/);
+    expect(html).toContain("left");
+  });
+
+  it("names both legs of a link install", () => {
+    const html = row(
+      runningInstall({
+        installPct: 40,
+        installProgress: {
+          phase: "transfer",
+          current: 4e9,
+          total: 1e10,
+          bytesPerSec: 50e6,
+          originBytesPerSec: 90e6,
+        },
+      }),
+    );
+    expect(html).toContain("Sending to the PS5");
+    expect(html).toContain("downloading");
+    expect(html).toContain("sending");
+  });
+
+  it("says it is getting ready, with the status note, before numbers arrive", () => {
+    const html = row(runningInstall({ installNote: "Waiting for the PS5 to be ready…" }));
+    expect(html).toContain("Getting ready…");
+    expect(html).toContain("Waiting for the PS5 to be ready…");
+    expect(html).not.toContain("0%");
+  });
+
+  it("offers reorder only on waiting rows", () => {
+    expect(row(waitingLibrary, 1)).toContain("Move up");
+    expect(row(runningInstall())).not.toContain("Move up");
+    expect(row(failedStream)).not.toContain("Move up");
+  });
+
+  it("orders a console's rows: running, then waiting in run order, then finished", () => {
+    const done = item({ ...waitingLibrary, id: "d", status: "done", completedAt: 5 });
+    const update = item({ ...waitingLibrary, id: "u", category: "gp" });
+    const baseGame = item({ ...waitingLibrary, id: "g", category: "gd" });
+    const sections = queueSections([done, update, failedStream, runningInstall(), baseGame]);
+    expect(sections.map((s) => s.key)).toEqual(["now", "next", "finished"]);
+    expect(sections[0].items.map((i) => i.id)).toEqual(["r"]);
+    // base before update, whatever the list order
+    expect(sections[1].items.map((i) => i.id)).toEqual(["g", "u"]);
+    // a failure wants a decision, so it leads the finished rows
+    expect(sections[2].items.map((i) => i.id)).toEqual(["a", "d"]);
+  });
+
+  it("leaves out empty sections", () => {
+    expect(queueSections([waitingLibrary]).map((s) => s.key)).toEqual(["next"]);
   });
 
   it("titles the panel Queue", () => {
