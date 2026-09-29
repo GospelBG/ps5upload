@@ -4,6 +4,15 @@ What's new in ps5upload, written for humans.
 
 ---
 
+## 5.39.1
+
+- **Activating an offline account works again in the desktop app.** It
+  failed every time with "invalid type: string … expected u64": the account
+  id is sent as text (a 64-bit id doesn't fit a JavaScript number), and the
+  desktop app still expected a number. The web UI was not affected.
+
+---
+
 ## 5.39.0
 
 **Cheats, redesigned around your games.**
