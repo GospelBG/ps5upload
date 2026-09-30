@@ -4,6 +4,42 @@ What's new in ps5upload, written for humans.
 
 ---
 
+## 5.40.0
+
+**Refreshed for FW 13.60.** Tested on two consoles running 13.60 (a launch
+PS5 and a PS5 Pro): uploads and downloads at full speed, folders and .zip
+files, file management, mounting disk images, save backups, hardware
+readings and every screen in the app.
+
+- **Games lists your apps again.** On 13.60 the Games screen was empty: apps
+  installed by homebrew installers (Payload Manager, Shadow Mount+, WebKit
+  Autoloader…) keep their details somewhere the list didn't look. They now
+  show up with their names and icons. Menu entries and preinstalled tiles
+  that were never downloaded are left out.
+- **Honest about fake packages above FW 11.60.** Fake-package support
+  (kstuff's FPKG build and a53_ppr_install_fast.elf) only exists up to FW
+  11.60 so far. On newer firmware, Install Package says so up front instead
+  of listing payloads that don't exist for your console, Convert warns
+  before you spend time building, and Games no longer claims installs are
+  good to go.
+- **A launch that didn't happen is no longer reported as a success.** When
+  the console refused to start an app, the app still said "launched". It
+  now checks the app is actually running and shows the console's refusal.
+- **File names inside .zip files keep their characters.** Names in other
+  languages (名前, é, …) were garbled on upload, because most zips mark them
+  as UTF-8 only implicitly. File contents were never affected.
+- **Backing up an empty save no longer leaves an empty backup** in the list.
+- **The app reopens where you left off.** This had quietly stopped working
+  when Home became the start screen. Opening or refreshing What's New by its
+  address also no longer jumps back to the previous screen.
+
+**Known issue on FW 13.60: waking the console from rest mode doesn't work
+yet.** The console refuses Remote Play when the signed-in account is an
+offline-activated one, and network wake depends on Remote Play — Sony's own
+Remote Play app can't wake it either. Being worked on.
+
+---
+
 ## 5.39.1
 
 - **Activating an offline account works again in the desktop app.** It
