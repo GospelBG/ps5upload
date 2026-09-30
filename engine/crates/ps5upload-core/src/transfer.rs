@@ -2795,6 +2795,21 @@ pub const DEFAULT_ZIP_ENTRY_RAM_THRESHOLD: u64 = 512 * 1024 * 1024;
 /// transfers in the same process can't collide on `pid-index` temp names.
 static ZIP_MATERIALISER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// An entry's name, reading UTF-8 even when the zip doesn't say so.
+///
+/// The spec says a name without the UTF-8 flag (general-purpose bit 11) is
+/// CP437, and the `zip` crate decodes it that way. But zips made by macOS,
+/// Linux and most tools write UTF-8 without setting the flag, so a file
+/// called `名前 é.txt` landed on the PS5 as `σÉìσëì ├⌐.txt`. Like Info-ZIP
+/// and 7-Zip, use the raw bytes when they are valid UTF-8 and fall back to
+/// the crate's CP437 decoding only when they are not.
+pub(crate) fn zip_entry_name(raw: &[u8], decoded: &str) -> String {
+    match std::str::from_utf8(raw) {
+        Ok(s) => s.to_string(),
+        Err(_) => decoded.to_string(),
+    }
+}
+
 /// Sanitize a zip entry name into a safe POSIX-relative path (forward
 /// slashes for the PS5). Rejects traversal (`..`), NUL, backslash segments,
 /// and absolute/empty paths — the same zip-slip defense as the client's
@@ -3521,7 +3536,7 @@ pub fn transfer_zip_with_opts(
             let e = archive
                 .by_index_raw(i)
                 .with_context(|| format!("read zip entry {i}"))?;
-            (e.name().to_string(), e.size(), e.is_dir())
+            (zip_entry_name(e.name_raw(), e.name()), e.size(), e.is_dir())
         };
         if is_dir {
             continue;
@@ -6279,5 +6294,26 @@ mod source_fs_tests {
         };
         let body = materialise_body(&s, None, &mem).expect("packed shard from the source fs");
         assert!(body.ends_with(b"{}"));
+    }
+}
+
+#[cfg(test)]
+mod zip_entry_name_tests {
+    use super::zip_entry_name;
+
+    #[test]
+    fn utf8_bytes_without_the_flag_stay_utf8() {
+        let raw = "unicode 名前 é.txt".as_bytes();
+        // what the crate's CP437 decoding produced for these bytes
+        assert_eq!(
+            zip_entry_name(raw, "unicode σÉìσëì ├⌐.txt"),
+            "unicode 名前 é.txt"
+        );
+    }
+
+    #[test]
+    fn non_utf8_bytes_keep_the_cp437_decoding() {
+        // 0x82 is "é" in CP437 and not valid UTF-8 on its own.
+        assert_eq!(zip_entry_name(b"caf\x82.txt", "café.txt"), "café.txt");
     }
 }

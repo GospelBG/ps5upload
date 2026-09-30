@@ -1,3 +1,4 @@
+import { readLastRoute } from "./lib/lastRoute";
 import { Suspense, type ReactNode } from "react";
 import { useConnectionStore } from "./state/connection";
 import { Navigate, Route, Routes } from "react-router";
@@ -82,14 +83,14 @@ function ScreenLoader() {
  * Landing logic (v3): a fresh install — no console in the roster yet —
  * goes straight to Connection, because nothing in the app works before
  * a console is set up and "What's new" gave first-time users zero
- * direction. Returning users keep the changelog landing, and AppShell's
- * route-restore then takes them to wherever they last worked (it
- * triggers on "/whats-new", not on "/connection", so this redirect
- * stays out of its way).
+ * direction. Returning users go back to the screen they were last on
+ * (saved by AppShell, see lib/lastRoute), or Home.
  */
 function LandingRedirect() {
   const hasConsole = useRosterStore((s) => s.profiles.length > 0);
-  return <Navigate to={hasConsole ? "/home" : "/connection"} replace />;
+  // A returning user reopens the screen they were last on.
+  const to = hasConsole ? (readLastRoute() ?? "/home") : "/connection";
+  return <Navigate to={to} replace />;
 }
 
 /** Guards a route whose screen has NO browser-functional path at all (see

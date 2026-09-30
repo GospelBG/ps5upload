@@ -162,7 +162,7 @@ fn extract_zip(archive: &Path, sink: &mut Sink) -> Result<()> {
             }
             Err(e) => return Err(anyhow!("read zip entry {i}: {e}")),
         };
-        let name = e.name().to_string();
+        let name = crate::transfer::zip_entry_name(e.name_raw(), e.name());
         let Some(rel) = sanitize_zip_entry(&name) else {
             if e.is_dir() && name.trim_matches('/').is_empty() {
                 continue;

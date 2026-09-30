@@ -181,6 +181,8 @@ int backup_validate_tag(const char *tag) {
     return 0;
 }
 
+static int rm_rf(const char *path);
+
 int backup_snapshot(const char *tag, const char *src_path,
                     int64_t *out_timestamp, int *out_files,
                     uint64_t *out_bytes) {
@@ -229,6 +231,16 @@ int backup_snapshot(const char *tag, const char *src_path,
     if (out_timestamp) *out_timestamp = ts;
     if (out_files) *out_files = file_count;
     if (out_bytes) *out_bytes = total_bytes;
+
+    /* Nothing was copied (an empty save, or a source that vanished): the
+     * directory snapshot_dir_for made is removed, or it showed up in the
+     * backup list as a 0-file "snapshot" of a backup that failed. */
+    if (file_count == 0) {
+        rm_rf(snap);
+        char tagdir[640];
+        snprintf(tagdir, sizeof(tagdir), "%s/%s", BACKUPS_ROOT, tag);
+        rmdir(tagdir); /* only succeeds if now empty */
+    }
 
     pthread_mutex_unlock(&g_backup_lock);
     return file_count > 0 ? 0 : -1;

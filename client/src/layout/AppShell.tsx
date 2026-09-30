@@ -1,3 +1,4 @@
+import { saveLastRoute } from "../lib/lastRoute";
 import { Outlet, useLocation, useNavigate } from "react-router";
 import { useEffect, useRef, useState } from "react";
 import { Lock, RefreshCw, X } from "lucide-react";
@@ -977,53 +978,23 @@ function usePkgAutoRoute() {
   }, [navigate, location.pathname]);
 }
 
-/** Persist the last-active route across launches. On mount, if the
- *  user is at "/" or "/whats-new" but a stored route exists, restore
- *  it. The stored route is otherwise updated on every navigation
- *  with a debounce so back/forward chains don't write per click.
- *
- *  Skipped routes:
- *   - /first-run — wizard; users should re-enter through Settings
- *   - /whats-new — landing default; redundant
- */
-const LAST_ROUTE_KEY = "ps5upload.last_route";
-const SKIP_RESTORE_ROUTES = new Set(["/first-run", "/whats-new", "/"]);
+/** Save the current screen so the app reopens there (see lib/lastRoute —
+ *  the landing redirect does the reopening). Debounced so back/forward
+ *  chains don't write per click. */
 const ANDROID_STORAGE_PROMPT_DISMISSED_KEY =
   "ps5upload.android_storage_prompt.dismissed.v1";
 
 function useRoutePersistence() {
-  const navigate = useNavigate();
   const location = useLocation();
-  const restoredRef = useRef(false);
 
-  // One-time restore on first paint.
-  useEffect(() => {
-    if (restoredRef.current) return;
-    restoredRef.current = true;
-    if (typeof window === "undefined") return;
-    if (!SKIP_RESTORE_ROUTES.has(location.pathname)) return;
-    let stored: string | null;
-    try {
-      stored = safeGetItem(LAST_ROUTE_KEY);
-    } catch {
-      return;
-    }
-    if (stored && !SKIP_RESTORE_ROUTES.has(stored)) {
-      navigate(stored, { replace: true });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Debounced write of the current view, including a workspace tab encoded in
-  // the query string (for example /games?tab=files). Restoring only pathname
-  // made every workspace reopen its default view and discarded the user's
-  // place even though Back/Forward treated the tabs as distinct history.
+  // Includes a workspace tab encoded in the query string (for example
+  // /games?tab=files): restoring only the pathname made every workspace
+  // reopen its default view and discarded the user's place.
   useEffect(() => {
     if (typeof window === "undefined") return;
-    if (SKIP_RESTORE_ROUTES.has(location.pathname)) return;
     const id = window.setTimeout(() => {
       try {
-        safeSetItem(LAST_ROUTE_KEY, `${location.pathname}${location.search}`);
+        saveLastRoute(location.pathname, location.search);
       } catch {
         // best-effort
       }
