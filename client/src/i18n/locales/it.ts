@@ -3312,6 +3312,12 @@ cheats_your_version: "La tua versione",
 notifications_mark_all_read: "Segna tutto come letto",
 notifications_mark_read: "Segna come letto",
 notifications_mark_unread: "Segna come non letto",
+"fpkg.unsupported_fw.title": "Questa PS5 (FW {fw}) non può ancora installare pacchetti fake",
+"fpkg.unsupported_fw.body": "Puoi comunque creare un pacchetto qui, ma il supporto ai pacchetti fake esiste per ora solo fino al FW {last}. Installalo su una console con {last} o inferiore.",
+installed_fpkg_unsupported_fw: "L'accesso al kernel è attivo, quindi le app installate si avviano. I giochi in pacchetto fake non si possono ancora installare né avviare sul FW {fw}: il supporto ai pacchetti fake esiste solo fino al FW {last}.",
+installed_launch_fw_hint: "Sul FW {fw} app e giochi installati come pacchetti fake non possono ancora avviarsi: il supporto ai pacchetti fake esiste solo fino al FW {last}.",
+"pkglib.fpkg_unsupported_fw.title": "I pacchetti fake non si possono ancora installare sul FW {fw}",
+"pkglib.fpkg_unsupported_fw.body": "Il supporto ai pacchetti fake (FPKG) — la build FPKG di kstuff e a53_ppr_install_fast.elf — esiste per ora solo fino al FW {last}, quindi un pacchetto fake inviato a questa PS5 verrà rifiutato o non si monterà. I pacchetti retail e di debug non sono interessati.",
 };
 
 export default it;

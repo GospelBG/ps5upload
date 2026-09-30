@@ -3661,6 +3661,12 @@ cheats_your_version: "Twoja wersja",
 notifications_mark_all_read: "Oznacz wszystko jako przeczytane",
 notifications_mark_read: "Oznacz jako przeczytane",
 notifications_mark_unread: "Oznacz jako nieprzeczytane",
+"fpkg.unsupported_fw.title": "To PS5 (FW {fw}) nie może jeszcze instalować fałszywych pakietów",
+"fpkg.unsupported_fw.body": "Nadal możesz tu zbudować pakiet, ale obsługa fałszywych pakietów istnieje na razie tylko do FW {last}. Zainstaluj go na konsoli z {last} lub niższym.",
+installed_fpkg_unsupported_fw: "Dostęp do jądra jest aktywny, więc zainstalowane aplikacje się uruchamiają. Gier z fałszywych pakietów nie da się jeszcze zainstalować ani uruchomić na FW {fw} — obsługa fałszywych pakietów istnieje tylko do FW {last}.",
+installed_launch_fw_hint: "Na FW {fw} aplikacje i gry zainstalowane jako fałszywe pakiety jeszcze się nie uruchamiają — obsługa fałszywych pakietów istnieje tylko do FW {last}.",
+"pkglib.fpkg_unsupported_fw.title": "Fałszywych pakietów nie da się jeszcze zainstalować na FW {fw}",
+"pkglib.fpkg_unsupported_fw.body": "Obsługa fałszywych pakietów (FPKG) — wersja FPKG kstuff i a53_ppr_install_fast.elf — istnieje na razie tylko do FW {last}, więc fałszywy pakiet wysłany na to PS5 zostanie odrzucony albo nie da się go zamontować. Pakiety retail i debug nie są objęte.",
 };
 
 export default pl;

@@ -3392,6 +3392,12 @@ cheats_your_version: "เวอร์ชันของคุณ",
 notifications_mark_all_read: "ทำเครื่องหมายว่าอ่านทั้งหมด",
 notifications_mark_read: "ทำเครื่องหมายว่าอ่านแล้ว",
 notifications_mark_unread: "ทำเครื่องหมายว่ายังไม่อ่าน",
+"fpkg.unsupported_fw.title": "PS5 เครื่องนี้ (FW {fw}) ยังติดตั้งแพ็กเกจปลอมไม่ได้",
+"fpkg.unsupported_fw.body": "คุณยังสร้างแพ็กเกจที่นี่ได้ แต่ตอนนี้รองรับแพ็กเกจปลอมถึง FW {last} เท่านั้น ให้ติดตั้งบนเครื่องที่เป็น {last} หรือต่ำกว่า",
+installed_fpkg_unsupported_fw: "สิทธิ์เข้าถึงเคอร์เนลเปิดอยู่ แอปที่ติดตั้งจึงเปิดได้ แต่เกมแพ็กเกจปลอมยังติดตั้งหรือเปิดบน FW {fw} ไม่ได้ — ตอนนี้รองรับแพ็กเกจปลอมถึง FW {last} เท่านั้น",
+installed_launch_fw_hint: "บน FW {fw} แอปและเกมที่ติดตั้งเป็นแพ็กเกจปลอมยังเปิดไม่ได้ — รองรับแพ็กเกจปลอมถึง FW {last} เท่านั้น",
+"pkglib.fpkg_unsupported_fw.title": "ยังติดตั้งแพ็กเกจปลอมบน FW {fw} ไม่ได้",
+"pkglib.fpkg_unsupported_fw.body": "การรองรับแพ็กเกจปลอม (FPKG) — kstuff รุ่น FPKG และ a53_ppr_install_fast.elf — ตอนนี้มีถึง FW {last} เท่านั้น แพ็กเกจปลอมที่ส่งไปยัง PS5 เครื่องนี้จะถูกปฏิเสธหรือเมานต์ไม่ได้ แพ็กเกจแท้และแพ็กเกจดีบักไม่ได้รับผลกระทบ",
 };
 
 export default th;

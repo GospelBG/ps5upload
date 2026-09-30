@@ -3730,6 +3730,12 @@ cheats_your_version: "A te verziód",
 notifications_mark_all_read: "Összes megjelölése olvasottként",
 notifications_mark_read: "Megjelölés olvasottként",
 notifications_mark_unread: "Megjelölés olvasatlanként",
+"fpkg.unsupported_fw.title": "Ez a PS5 (FW {fw}) még nem tud hamis csomagot telepíteni",
+"fpkg.unsupported_fw.body": "Csomagot itt továbbra is készíthetsz, de a hamiscsomag-támogatás egyelőre csak FW {last}-ig létezik. Telepítsd egy {last} vagy régebbi rendszerű konzolra.",
+installed_fpkg_unsupported_fw: "A kernel-hozzáférés aktív, így a telepített alkalmazások elindulnak. Hamis csomagos játékot FW {fw} alatt még nem lehet telepíteni vagy elindítani — a hamiscsomag-támogatás egyelőre csak FW {last}-ig létezik.",
+installed_launch_fw_hint: "FW {fw} alatt a hamis csomagként telepített alkalmazások és játékok még nem indulnak el — a hamiscsomag-támogatás csak FW {last}-ig létezik.",
+"pkglib.fpkg_unsupported_fw.title": "FW {fw} alatt még nem lehet hamis csomagot telepíteni",
+"pkglib.fpkg_unsupported_fw.body": "A hamiscsomag-támogatás (FPKG) — a kstuff FPKG-s változata és az a53_ppr_install_fast.elf — egyelőre csak FW {last}-ig létezik, ezért az erre a PS5-re küldött hamis csomagot elutasítja, vagy nem csatolható. A kereskedelmi és hibakereső csomagokat ez nem érinti.",
 };
 
 export default hu;

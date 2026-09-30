@@ -3403,6 +3403,12 @@ cheats_your_version: "내 버전",
 notifications_mark_all_read: "모두 읽음으로 표시",
 notifications_mark_read: "읽음으로 표시",
 notifications_mark_unread: "읽지 않음으로 표시",
+"fpkg.unsupported_fw.title": "이 PS5(FW {fw})는 아직 가짜 패키지를 설치할 수 없습니다",
+"fpkg.unsupported_fw.body": "여기서 패키지를 만들 수는 있지만, 가짜 패키지 지원은 현재 FW {last}까지만 있습니다. {last} 이하 콘솔에 설치하세요.",
+installed_fpkg_unsupported_fw: "커널 접근이 활성화되어 있어 설치된 앱은 실행됩니다. FW {fw}에서는 가짜 패키지 게임을 아직 설치하거나 실행할 수 없습니다. 가짜 패키지 지원은 FW {last}까지만 있습니다.",
+installed_launch_fw_hint: "FW {fw}에서는 가짜 패키지로 설치한 앱과 게임이 아직 실행되지 않습니다. 가짜 패키지 지원은 FW {last}까지만 있습니다.",
+"pkglib.fpkg_unsupported_fw.title": "FW {fw}에서는 아직 가짜 패키지를 설치할 수 없습니다",
+"pkglib.fpkg_unsupported_fw.body": "가짜 패키지(FPKG) 지원(kstuff의 FPKG 빌드와 a53_ppr_install_fast.elf)은 현재 FW {last}까지만 있어, 이 PS5로 보낸 가짜 패키지는 거부되거나 마운트에 실패합니다. 정식 및 디버그 패키지는 영향을 받지 않습니다.",
 };
 
 export default ko;

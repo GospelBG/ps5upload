@@ -3372,6 +3372,12 @@ cheats_your_version: "Senin sürümün",
 notifications_mark_all_read: "Tümünü okundu işaretle",
 notifications_mark_read: "Okundu işaretle",
 notifications_mark_unread: "Okunmadı işaretle",
+"fpkg.unsupported_fw.title": "Bu PS5 (FW {fw}) henüz sahte paket yükleyemiyor",
+"fpkg.unsupported_fw.body": "Burada yine de paket oluşturabilirsin, ancak sahte paket desteği şimdilik yalnızca FW {last} sürümüne kadar var. {last} veya daha düşük sürümdeki bir konsola yükle.",
+installed_fpkg_unsupported_fw: "Çekirdek erişimi etkin, bu yüzden yüklü uygulamalar açılıyor. Sahte paket oyunları FW {fw} üzerinde henüz yüklenemiyor veya açılamıyor — sahte paket desteği şimdilik yalnızca FW {last} sürümüne kadar var.",
+installed_launch_fw_hint: "FW {fw} üzerinde sahte paket olarak yüklenen uygulamalar ve oyunlar henüz başlatılamıyor — sahte paket desteği yalnızca FW {last} sürümüne kadar var.",
+"pkglib.fpkg_unsupported_fw.title": "FW {fw} üzerinde henüz sahte paket yüklenemiyor",
+"pkglib.fpkg_unsupported_fw.body": "Sahte paket (FPKG) desteği — kstuff'ın FPKG sürümü ve a53_ppr_install_fast.elf — şimdilik yalnızca FW {last} sürümüne kadar var; bu PS5'e gönderilen sahte paket reddedilir veya bağlanamaz. Perakende ve hata ayıklama paketleri etkilenmez.",
 };
 
 export default tr;

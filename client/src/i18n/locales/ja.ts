@@ -3407,6 +3407,12 @@ cheats_your_version: "あなたのバージョン",
 notifications_mark_all_read: "すべて既読にする",
 notifications_mark_read: "既読にする",
 notifications_mark_unread: "未読にする",
+"fpkg.unsupported_fw.title": "この PS5（FW {fw}）はまだフェイクパッケージをインストールできません",
+"fpkg.unsupported_fw.body": "ここでパッケージを作成することはできますが、フェイクパッケージ対応は現在 FW {last} までです。{last} 以下の本体でインストールしてください。",
+installed_fpkg_unsupported_fw: "カーネルアクセスは有効なので、インストール済みアプリは起動します。FW {fw} ではフェイクパッケージのゲームはまだインストールも起動もできません。フェイクパッケージ対応は FW {last} までです。",
+installed_launch_fw_hint: "FW {fw} では、フェイクパッケージとしてインストールしたアプリやゲームはまだ起動できません。フェイクパッケージ対応は FW {last} までです。",
+"pkglib.fpkg_unsupported_fw.title": "FW {fw} ではまだフェイクパッケージをインストールできません",
+"pkglib.fpkg_unsupported_fw.body": "フェイクパッケージ（FPKG）対応（kstuff の FPKG 版と a53_ppr_install_fast.elf）は現在 FW {last} までのため、この PS5 に送ったフェイクパッケージは拒否されるか、マウントに失敗します。製品版・デバッグ版パッケージには影響しません。",
 };
 
 export default ja;

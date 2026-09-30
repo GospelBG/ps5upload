@@ -3313,6 +3313,12 @@ cheats_your_version: "你的版本",
 notifications_mark_all_read: "全部標為已讀",
 notifications_mark_read: "標為已讀",
 notifications_mark_unread: "標為未讀",
+"fpkg.unsupported_fw.title": "這台 PS5（FW {fw}）暫時無法安裝偽裝包",
+"fpkg.unsupported_fw.body": "你仍可在這裡建立套件，但目前偽裝包支援僅到 FW {last}。請在 {last} 或更低版本的主機上安裝。",
+installed_fpkg_unsupported_fw: "核心存取已啟用，所以已安裝的應用程式可以啟動。在 FW {fw} 上暫時無法安裝或啟動偽裝包遊戲——偽裝包支援目前僅到 FW {last}。",
+installed_launch_fw_hint: "在 FW {fw} 上，以偽裝包安裝的應用程式和遊戲暫時無法啟動——偽裝包支援僅到 FW {last}。",
+"pkglib.fpkg_unsupported_fw.title": "FW {fw} 暫時無法安裝偽裝包",
+"pkglib.fpkg_unsupported_fw.body": "偽裝包（FPKG）支援——kstuff 的 FPKG 版本和 a53_ppr_install_fast.elf——目前僅到 FW {last}，因此傳送到這台 PS5 的偽裝包會被拒絕或無法掛載。正式版和除錯版套件不受影響。",
 };
 
 export default zh_TW;

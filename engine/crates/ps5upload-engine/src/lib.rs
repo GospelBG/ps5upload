@@ -3751,7 +3751,8 @@ async fn serve_cached_icon(
     addr: String,
     kind: &'static str,
     identity: String,
-    remote_path: String,
+    // Tried in order; the first that has bytes wins.
+    remote_paths: Vec<String>,
     if_none_match: Option<String>,
 ) -> axum::response::Response {
     // A revalidation we can answer from cache costs no console round-trip
@@ -3773,14 +3774,29 @@ async fn serve_cached_icon(
     }
 
     let read_addr = addr.clone();
-    let result: Result<Vec<u8>, anyhow::Error> =
-        tokio::task::spawn_blocking(move || fs_read(&read_addr, &remote_path, 0, 2 * 1024 * 1024))
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|inner| inner);
+    // Ok(Some) = found; Ok(None) = every path cleanly absent; Err = at least
+    // one path failed for another reason (the console may just be busy).
+    let result: Result<Option<Vec<u8>>, anyhow::Error> = tokio::task::spawn_blocking(move || {
+        let mut transport_err = None;
+        for p in &remote_paths {
+            match fs_read(&read_addr, p, 0, 2 * 1024 * 1024) {
+                Ok(bytes) if !bytes.is_empty() => return Ok(Some(bytes)),
+                Ok(_) => {}
+                Err(e) if icon_cache::is_console_said_no(&e) => {}
+                Err(e) => transport_err = Some(e),
+            }
+        }
+        match transport_err {
+            Some(e) => Err(e),
+            None => Ok(None),
+        }
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|inner| inner);
 
     match result {
-        Ok(bytes) if !bytes.is_empty() => {
+        Ok(Some(bytes)) => {
             icon_cache::put(&addr, kind, &identity, &bytes);
             let etag = icon_cache::etag_for(&bytes);
             icon_response(bytes, &etag)
@@ -3789,16 +3805,11 @@ async fn serve_cached_icon(
         // error must NOT be: a console that was briefly unreachable would
         // otherwise be recorded as having no artwork at all, and every
         // cover would vanish for the length of the negative TTL.
-        Ok(_) => {
+        Ok(None) => {
             icon_cache::put_missing(&addr, kind, &identity);
             (StatusCode::NOT_FOUND, "no icon").into_response()
         }
-        Err(e) => {
-            if icon_cache::is_console_said_no(&e) {
-                icon_cache::put_missing(&addr, kind, &identity);
-            }
-            (StatusCode::NOT_FOUND, "no icon").into_response()
-        }
+        Err(_) => (StatusCode::NOT_FOUND, "no icon").into_response(),
     }
 }
 
@@ -3839,7 +3850,7 @@ async fn ps5_game_icon(
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    serve_cached_icon(addr, "game", path, icon_path, inm).await
+    serve_cached_icon(addr, "game", path, vec![icon_path], inm).await
 }
 
 // ─── Installed-apps inventory ─────────────────────────────────────────
@@ -3912,21 +3923,26 @@ fn looks_like_title_id(name: &str) -> bool {
 /// any failure (no metadata file — common for system apps — bad JSON,
 /// bad SFO, path denied); the caller falls back to the bare title_id.
 fn appmeta_title_name(addr: &str, title_id: &str) -> Option<String> {
-    // PS5 param.json.
-    let json_path = format!("/user/appmeta/{title_id}/param.json");
-    if let Ok(bytes) = fs_read(addr, &json_path, 0, 256 * 1024) {
-        if let Ok(meta) = parse_param_json_bytes(&bytes) {
-            if let Some(t) = meta.title.filter(|t| !t.trim().is_empty()) {
-                return Some(t);
+    // /user/appmeta/<id> first; then the app's own sce_sys, which is all a
+    // title installed by a homebrew installer has on FW 13.60.
+    for dir in [
+        format!("/user/appmeta/{title_id}"),
+        format!("/user/app/{title_id}/sce_sys"),
+    ] {
+        // PS5 param.json.
+        if let Ok(bytes) = fs_read(addr, &format!("{dir}/param.json"), 0, 256 * 1024) {
+            if let Ok(meta) = parse_param_json_bytes(&bytes) {
+                if let Some(t) = meta.title.filter(|t| !t.trim().is_empty()) {
+                    return Some(t);
+                }
             }
         }
-    }
-    // PS4 / legacy param.sfo.
-    let sfo_path = format!("/user/appmeta/{title_id}/param.sfo");
-    if let Ok(bytes) = fs_read(addr, &sfo_path, 0, 256 * 1024) {
-        if let Ok(meta) = parse_param_sfo_bytes(&bytes) {
-            if let Some(t) = meta.title.filter(|t| !t.trim().is_empty()) {
-                return Some(t);
+        // PS4 / legacy param.sfo.
+        if let Ok(bytes) = fs_read(addr, &format!("{dir}/param.sfo"), 0, 256 * 1024) {
+            if let Ok(meta) = parse_param_sfo_bytes(&bytes) {
+                if let Some(t) = meta.title.filter(|t| !t.trim().is_empty()) {
+                    return Some(t);
+                }
             }
         }
     }
@@ -3948,6 +3964,36 @@ fn appmeta_title_name(addr: &str, title_id: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Titles app.db knows are installed that the /user/appmeta scan missed,
+/// with app.db's name when it has a usable one.
+///
+/// Kept only when the app folder exists (`app_dirs`, from /user/app and the
+/// extended-storage equivalents): app.db also carries shell entries (NPXS)
+/// and preinstalled tiles whose app was never downloaded.
+fn appdb_installed_additions(
+    rows: &[(String, String)],
+    app_dirs: &std::collections::HashSet<String>,
+    seen: &std::collections::HashSet<String>,
+) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let mut taken = std::collections::HashSet::new();
+    for (id, name) in rows {
+        let tid = id.trim();
+        if !looks_like_title_id(tid)
+            || tid.starts_with("NPXS")
+            || seen.contains(tid)
+            || !app_dirs.contains(tid)
+            || !taken.insert(tid.to_string())
+        {
+            continue;
+        }
+        let n = name.trim();
+        let name = (!n.is_empty() && n != tid).then(|| n.to_string());
+        out.push((tid.to_string(), name));
+    }
+    out
 }
 
 /// GET /api/ps5/apps/installed?addr=IP:MGMT_PORT
@@ -4026,6 +4072,67 @@ async fn ps5_apps_installed(
                     });
                 }
             }
+            // app.db is the console's own record of what is installed. On FW
+            // 13.60 titles put there by homebrew installers (Payload Manager,
+            // Shadow Mount+, …) have no /user/appmeta/<id> folder, so the
+            // listing above missed every one of them and the Games screen
+            // was empty on both test consoles (2026-09-29).
+            //
+            // app.db alone over-counts, though: it also holds the console's
+            // shell entries (NPXS: All Apps, Welcome, Disc Player…) and
+            // preinstalled "push resource" tiles like ASTRO's PLAYROOM whose
+            // /user/app/<id> was never downloaded. So a title from app.db
+            // counts only when its app folder really exists, on internal or
+            // extended storage. Best-effort: if app.db or the folders can't
+            // be read, the appmeta scan alone is what we had before.
+            let mut app_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for root in ["/user/app", "/mnt/ext0/user/app", "/mnt/ext1/user/app"] {
+                if let Ok(l) = list_dir(
+                    &addr,
+                    root,
+                    ListDirOptions {
+                        offset: 0,
+                        limit: 512,
+                    },
+                ) {
+                    app_dirs.extend(l.entries.into_iter().map(|e| e.name));
+                }
+            }
+            if !app_dirs.is_empty() {
+                match appdb_query(&addr) {
+                    Ok(appdb) => {
+                        let seen: std::collections::HashSet<String> =
+                            titles.iter().map(|t| t.title_id.clone()).collect();
+                        let rows: Vec<(String, String)> = appdb
+                            .apps
+                            .into_iter()
+                            .map(|a| (a.title_id, a.name))
+                            .collect();
+                        for (tid, db_name) in appdb_installed_additions(&rows, &app_dirs, &seen) {
+                            let name = match db_name {
+                                Some(n) => n,
+                                None => {
+                                    appmeta_title_name(&addr, &tid).unwrap_or_else(|| tid.clone())
+                                }
+                            };
+                            let (origin, image_backed, source) = match reg_map.get(&tid) {
+                                Some(reg) => ("registered", reg.image_backed, reg.src.clone()),
+                                None => ("pkg", false, String::new()),
+                            };
+                            titles.push(InstalledApp {
+                                title_id: tid,
+                                title_name: name,
+                                origin: origin.to_string(),
+                                image_backed,
+                                source,
+                                system: false,
+                            });
+                        }
+                    }
+                    Err(e) => crate::log_warn!("apps/installed: app.db query failed: {e:#}"),
+                }
+            }
+
             // Stable order: registered first, then package installs; within
             // packages, system-flagged (dangerous) titles sort last; alpha
             // within each tier so the grid doesn't reshuffle between refreshes.
@@ -4087,12 +4194,19 @@ async fn ps5_app_icon(
         return (StatusCode::BAD_REQUEST, "invalid title_id").into_response();
     }
     let addr = mgmt_addr_or_default(q.addr, &state.default_ps5_addr);
-    let icon_path = format!("/user/appmeta/{}/icon0.png", q.title_id);
+    // /user/appmeta/<id> is the usual home, but on FW 13.60 titles
+    // installed by homebrew installers have none — only the app's own
+    // /user/app/<id>/sce_sys (measured on both consoles, 2026-09-29).
+    let icon_paths = vec![
+        format!("/user/appmeta/{}/icon0.png", q.title_id),
+        format!("/user/app/{}/sce_sys/icon0.png", q.title_id),
+        format!("/mnt/ext0/user/app/{}/sce_sys/icon0.png", q.title_id),
+    ];
     let inm = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    serve_cached_icon(addr, "app", q.title_id, icon_path, inm).await
+    serve_cached_icon(addr, "app", q.title_id, icon_paths, inm).await
 }
 
 /// One `.pkg` found on a connected external/USB drive.
@@ -10236,5 +10350,46 @@ mod job_stage_tests {
         assert_eq!(v["stage"]["done"], 7);
         let none = serde_json::to_value(running(None)).unwrap();
         assert!(none.get("stage").is_none());
+    }
+}
+
+#[cfg(test)]
+mod appdb_installed_additions_tests {
+    use super::appdb_installed_additions;
+    use std::collections::HashSet;
+
+    fn set(v: &[&str]) -> HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Measured on FW 13.60 (both consoles): app.db lists homebrew apps that
+    /// have no /user/appmeta folder, shell entries, and a preinstalled tile
+    /// that was never downloaded. Only the first kind is installed.
+    #[test]
+    fn keeps_real_apps_drops_shell_entries_and_undownloaded_tiles() {
+        let rows = vec![
+            ("PLDM00001".to_string(), "Payload Manager".to_string()),
+            ("NPXS40056".to_string(), "All Apps".to_string()),
+            ("PPSA01325".to_string(), "ASTRO's PLAYROOM".to_string()),
+            ("FAKE10101".to_string(), "FAKE10101".to_string()),
+            ("PLDM00001".to_string(), "Payload Manager".to_string()),
+        ];
+        let dirs = set(&["PLDM00001", "FAKE10101", "NPXS40056"]);
+        let got = appdb_installed_additions(&rows, &dirs, &HashSet::new());
+        assert_eq!(
+            got,
+            vec![
+                ("PLDM00001".to_string(), Some("Payload Manager".to_string())),
+                // name equal to the id is not a name
+                ("FAKE10101".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_titles_the_appmeta_scan_already_found() {
+        let rows = vec![("PLDM00001".to_string(), "Payload Manager".to_string())];
+        let got = appdb_installed_additions(&rows, &set(&["PLDM00001"]), &set(&["PLDM00001"]));
+        assert!(got.is_empty());
     }
 }

@@ -3373,6 +3373,12 @@ cheats_your_version: "Deine Version",
 notifications_mark_all_read: "Alle als gelesen markieren",
 notifications_mark_read: "Als gelesen markieren",
 notifications_mark_unread: "Als ungelesen markieren",
+"fpkg.unsupported_fw.title": "Diese PS5 (FW {fw}) kann noch keine Fake-Pakete installieren",
+"fpkg.unsupported_fw.body": "Du kannst hier trotzdem ein Paket bauen, aber Fake-Paket-Unterstützung gibt es bisher nur bis FW {last}. Installiere es auf einer Konsole mit {last} oder niedriger.",
+installed_fpkg_unsupported_fw: "Kernel-Zugriff ist aktiv, installierte Apps starten also. Fake-Paket-Spiele lassen sich auf FW {fw} noch nicht installieren oder starten — Fake-Paket-Unterstützung gibt es bisher nur bis FW {last}.",
+installed_launch_fw_hint: "Auf FW {fw} starten Apps und Spiele, die als Fake-Pakete installiert wurden, noch nicht — Fake-Paket-Unterstützung gibt es nur bis FW {last}.",
+"pkglib.fpkg_unsupported_fw.title": "Fake-Pakete lassen sich auf FW {fw} noch nicht installieren",
+"pkglib.fpkg_unsupported_fw.body": "Fake-Paket-Unterstützung (FPKG) — kstuffs FPKG-Build und a53_ppr_install_fast.elf — gibt es bisher nur bis FW {last}. Ein Fake-Paket für diese PS5 wird abgelehnt oder lässt sich nicht einhängen. Retail- und Debug-Pakete sind nicht betroffen.",
 };
 
 export default de;

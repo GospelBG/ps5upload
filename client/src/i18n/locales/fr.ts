@@ -3402,6 +3402,12 @@ cheats_your_version: "Votre version",
 notifications_mark_all_read: "Tout marquer comme lu",
 notifications_mark_read: "Marquer comme lu",
 notifications_mark_unread: "Marquer comme non lu",
+"fpkg.unsupported_fw.title": "Cette PS5 (FW {fw}) ne peut pas encore installer de faux paquets",
+"fpkg.unsupported_fw.body": "Vous pouvez tout de même créer un paquet ici, mais la prise en charge des faux paquets n'existe que jusqu'au FW {last} pour l'instant. Installez-le sur une console en {last} ou moins.",
+installed_fpkg_unsupported_fw: "L'accès au noyau est actif, les applis installées se lancent donc. Les jeux en faux paquet ne peuvent pas encore être installés ni lancés en FW {fw} : la prise en charge des faux paquets n'existe que jusqu'au FW {last}.",
+installed_launch_fw_hint: "En FW {fw}, les applis et jeux installés en faux paquets ne peuvent pas encore démarrer : la prise en charge des faux paquets n'existe que jusqu'au FW {last}.",
+"pkglib.fpkg_unsupported_fw.title": "Les faux paquets ne peuvent pas encore être installés en FW {fw}",
+"pkglib.fpkg_unsupported_fw.body": "La prise en charge des faux paquets (FPKG) — la version FPKG de kstuff et a53_ppr_install_fast.elf — n'existe que jusqu'au FW {last} pour l'instant : un faux paquet envoyé à cette PS5 sera refusé ou ne pourra pas être monté. Les paquets retail et de débogage ne sont pas concernés.",
 };
 
 export default fr;

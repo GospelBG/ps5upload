@@ -1867,22 +1867,35 @@ int launch_title(const char *title_id, const char **err_reason_out,
     /* PRIMARY: in-process sceSystemServiceLaunchApp, no ptrace. Only fall
      * through to the ShellUI ptrace route if this firmware lacks the symbol
      * or the launcher rejects the call outright. */
-    {
-        int rc_ss = launch_via_system_service(title_id, fg_user);
-        if (launch_sys_ok(rc_ss)) return 0;
-    }
+    int rc_ss = launch_via_system_service(title_id, fg_user);
+    if (launch_sys_ok(rc_ss)) return 0;
 
     (void)shellui_rpc_init();
     if (shellui_rpc_ready()) {
         int rc = shellui_rpc_launch_app(title_id, fg_user);
-        if (rc == 0) {
-                return 0;
-        }
-        if (rc == -2) {
-            /* Soft-success: launch was dispatched, result uncertain
-             * but game likely on screen. Don't fall through to
-             * in-process which would race the running launch. */
-                return 0;
+        if (rc == 0 || rc == -2) {
+            /* 0 / -2 mean the ShellUI request was dispatched, not that the
+             * title started. When the launcher above had already REFUSED it
+             * (a negative rc, e.g. 0x80940033 for a homebrew app on FW 13.60
+             * with no fake-package support), check before claiming success:
+             * otherwise the UI says "launched" and nothing happens (measured
+             * on the Pro, 2026-09-29). ~6 s covers a slow start; a normal
+             * launch through the primary path never reaches here. -2 is
+             * still not re-fired: that would race a launch in progress. */
+            if (rc_ss < 0 && rc_ss != -1 && !launch_took_effect(title_id) &&
+                !launch_took_effect(title_id)) {
+                fprintf(stderr,
+                        "[payload2] launch %s: launcher refused (0x%x) and the "
+                        "title never started — reporting failure\n",
+                        title_id, (unsigned)rc_ss);
+                if (reason_buf && reason_cap > 0) {
+                    snprintf(reason_buf, reason_cap, "launch_sony_error_0x%08x",
+                             (unsigned int)rc_ss);
+                    if (err_reason_out) *err_reason_out = reason_buf;
+                }
+                return -1;
+            }
+            return 0;
         }
         if (rc > 0) {
             /* One auto-retry after a brief delay — heals the

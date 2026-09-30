@@ -3402,6 +3402,12 @@ cheats_your_version: "आपका वर्ज़न",
 notifications_mark_all_read: "सभी को पढ़ा हुआ चिह्नित करें",
 notifications_mark_read: "पढ़ा हुआ चिह्नित करें",
 notifications_mark_unread: "अनपढ़ा चिह्नित करें",
+"fpkg.unsupported_fw.title": "यह PS5 (FW {fw}) अभी फ़ेक पैकेज इंस्टॉल नहीं कर सकता",
+"fpkg.unsupported_fw.body": "आप यहाँ पैकेज बना सकते हैं, पर फ़ेक पैकेज सपोर्ट अभी सिर्फ़ FW {last} तक है। इसे {last} या उससे पुराने फ़र्मवेयर वाले कंसोल पर इंस्टॉल करें।",
+installed_fpkg_unsupported_fw: "कर्नेल एक्सेस चालू है, इसलिए इंस्टॉल किए ऐप खुलते हैं। FW {fw} पर फ़ेक पैकेज गेम अभी इंस्टॉल या चालू नहीं हो सकते — फ़ेक पैकेज सपोर्ट अभी सिर्फ़ FW {last} तक है।",
+installed_launch_fw_hint: "FW {fw} पर फ़ेक पैकेज के रूप में इंस्टॉल किए ऐप और गेम अभी शुरू नहीं होते — फ़ेक पैकेज सपोर्ट सिर्फ़ FW {last} तक है।",
+"pkglib.fpkg_unsupported_fw.title": "FW {fw} पर अभी फ़ेक पैकेज इंस्टॉल नहीं हो सकते",
+"pkglib.fpkg_unsupported_fw.body": "फ़ेक पैकेज (FPKG) सपोर्ट — kstuff का FPKG बिल्ड और a53_ppr_install_fast.elf — अभी सिर्फ़ FW {last} तक है, इसलिए इस PS5 पर भेजा गया फ़ेक पैकेज अस्वीकार होगा या माउंट नहीं होगा। रिटेल और डीबग पैकेज पर असर नहीं पड़ता।",
 };
 
 export default hi;

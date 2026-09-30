@@ -3367,6 +3367,12 @@ cheats_your_version: "Phiên bản của bạn",
 notifications_mark_all_read: "Đánh dấu tất cả đã đọc",
 notifications_mark_read: "Đánh dấu đã đọc",
 notifications_mark_unread: "Đánh dấu chưa đọc",
+"fpkg.unsupported_fw.title": "PS5 này (FW {fw}) chưa cài được gói giả",
+"fpkg.unsupported_fw.body": "Bạn vẫn có thể tạo gói ở đây, nhưng hỗ trợ gói giả hiện chỉ có đến FW {last}. Hãy cài trên máy ở {last} trở xuống.",
+installed_fpkg_unsupported_fw: "Quyền truy cập kernel đang bật nên ứng dụng đã cài vẫn mở được. Trò chơi dạng gói giả chưa thể cài hay mở trên FW {fw} — hỗ trợ gói giả hiện chỉ có đến FW {last}.",
+installed_launch_fw_hint: "Trên FW {fw}, ứng dụng và trò chơi cài dưới dạng gói giả chưa thể khởi động — hỗ trợ gói giả chỉ có đến FW {last}.",
+"pkglib.fpkg_unsupported_fw.title": "Chưa thể cài gói giả trên FW {fw}",
+"pkglib.fpkg_unsupported_fw.body": "Hỗ trợ gói giả (FPKG) — bản kstuff có FPKG và a53_ppr_install_fast.elf — hiện chỉ có đến FW {last}, nên gói giả gửi đến PS5 này sẽ bị từ chối hoặc không gắn được. Gói bán lẻ và gói debug không bị ảnh hưởng.",
 };
 
 export default vi;
