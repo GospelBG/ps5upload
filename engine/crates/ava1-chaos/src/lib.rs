@@ -63,17 +63,25 @@ impl ChaosProxy {
                 tokio::spawn(async move {
                     loop {
                         let Ok((down, _)) = listener.accept().await else {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                             continue;
                         };
-                        let Ok(up) = TcpStream::connect(upstream).await else {
-                            continue;
-                        };
-                        let _ = (down.set_nodelay(true), up.set_nodelay(true));
-                        let (dr, dw) = down.into_split();
-                        let (ur, uw) = up.into_split();
-                        let a = tokio::spawn(pump(dr, uw, cfg.clone(), ctl.clone())).abort_handle();
-                        let b = tokio::spawn(pump(ur, dw, cfg.clone(), ctl.clone())).abort_handle();
-                        ctl.conns.lock().unwrap().push([a, b]);
+                        let (ctl, cfg) = (ctl.clone(), cfg.clone());
+                        tokio::spawn(async move {
+                            let Ok(up) = TcpStream::connect(upstream).await else {
+                                return;
+                            };
+                            let _ = (down.set_nodelay(true), up.set_nodelay(true));
+                            let (dr, dw) = down.into_split();
+                            let (ur, uw) = up.into_split();
+                            let a =
+                                tokio::spawn(pump(dr, uw, cfg.clone(), ctl.clone())).abort_handle();
+                            let b =
+                                tokio::spawn(pump(ur, dw, cfg.clone(), ctl.clone())).abort_handle();
+                            let mut conns = ctl.conns.lock().unwrap();
+                            conns.retain(|hs| !hs.iter().all(|h| h.is_finished()));
+                            conns.push([a, b]);
+                        });
                     }
                 })
                 .abort_handle(),
@@ -105,10 +113,15 @@ impl ChaosProxy {
 
     /// Kill only the most recently opened connection (e.g. the lane just opened).
     pub fn kill_newest(&self) {
-        if let Some(hs) = self.ctl.conns.lock().unwrap().pop() {
+        let mut conns = self.ctl.conns.lock().unwrap();
+        while let Some(hs) = conns.pop() {
+            if hs.iter().all(|h| h.is_finished()) {
+                continue;
+            }
             for h in hs {
                 h.abort();
             }
+            break;
         }
     }
 
@@ -135,12 +148,14 @@ async fn pump(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, cfg: ChaosConfig,
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         let n = match from.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) | Err(_) => {
+                // A blackhole is half-open: do not forward the FIN either.
+                wait_blackhole(&ctl).await;
+                break;
+            }
             Ok(n) => n,
         };
-        while ctl.blackhole.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_blackhole(&ctl).await;
         if !cfg.delay.is_zero() {
             tokio::time::sleep(cfg.delay).await;
         }
@@ -152,4 +167,10 @@ async fn pump(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, cfg: ChaosConfig,
         }
     }
     let _ = to.shutdown().await;
+}
+
+async fn wait_blackhole(ctl: &Ctl) {
+    while ctl.blackhole.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

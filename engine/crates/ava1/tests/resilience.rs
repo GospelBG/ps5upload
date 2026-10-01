@@ -23,13 +23,19 @@ async fn blackholed_session_is_declared_dead() {
         .await
         .expect("client noticed");
     let took = t.elapsed();
-    eprintln!("dead-peer detection took {took:?}");
     assert!(why.contains("stopped answering"), "{why}");
     assert!(took < Duration::from_millis(1200), "{took:?}"); // dead_after 500 ms + one tick
+                                                             // `s` is still alive here, so the server cannot have learned of death from a FIN.
     while ctx.sessions() > 0 && t.elapsed() < Duration::from_secs(3) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let server_took = t.elapsed();
     assert_eq!(ctx.sessions(), 0, "server noticed too");
+    assert!(
+        server_took < Duration::from_millis(1200),
+        "server took {server_took:?}"
+    );
+    drop(s);
 }
 
 #[tokio::test]
