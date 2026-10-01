@@ -109,6 +109,7 @@ ADB ?= $(ANDROID_HOME)/platform-tools/adb
 .PHONY: quality quality-full quality-hardware ci ci-full
 .PHONY: clean clean-payload clean-engine clean-client
 .PHONY: verify info install-hooks
+.PHONY: test-ava1 ava1-fuzz-c
 .PHONY: run-engine run-client dev start _check-tauri-system-deps
 .PHONY: install-engine uninstall-engine
 .PHONY: dist dist-win dist-win-arm dist-mac dist-mac-x64 dist-linux dist-linux-arm
@@ -162,6 +163,7 @@ help:
 	@echo "  make coverage-client  - Frontend coverage report only"
 	@echo "  make test-engine      - cargo test --workspace"
 	@echo "  make test-desktop     - Tauri Rust cargo check/clippy/test"
+	@echo "  make test-ava1        - AVA1 Rust + C conformance and interop tests"
 	@echo "  make test-payload     - Validate $(PAYLOAD_ELF)"
 	@echo "  make test-client      - Type-check + lint + unit tests + build client UI"
 	@echo ""
@@ -1236,3 +1238,15 @@ start: run-client
 
 release-post:
 	@node scripts/release-posts.js $(ARGS)
+
+AVA1_C := payload/ava1
+AVA1_C_CODEC := $(AVA1_C)/ava1_wire.c $(AVA1_C)/ava1_frame.c $(AVA1_C)/gen/ava1_gen.c \
+	$(AVA1_C)/ava1_keys.c $(AVA1_C)/ava1_noise.c payload/third_party/monocypher/monocypher.c
+
+test-ava1:
+	cd engine && cargo test -p ava1 -p ava1-gen -p ava1-ctest -p ava1-chaos
+
+ava1-fuzz-c:
+	$${CC:-clang} -g -O1 -fsanitize=fuzzer,address,undefined -I$(AVA1_C) -I$(AVA1_C)/gen -Ipayload/third_party/monocypher \
+		-o /tmp/ava1-fuzz-decode $(AVA1_C)/fuzz/fuzz_decode.c $(AVA1_C_CODEC)
+	/tmp/ava1-fuzz-decode -max_total_time=$${AVA1_FUZZ_SECONDS:-60} -max_len=65536

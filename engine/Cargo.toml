@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["crates/ava1/fuzz"]
 members = [
   "crates/ava1",
   "crates/ava1-gen",

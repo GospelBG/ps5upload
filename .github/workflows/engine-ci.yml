@@ -111,6 +111,37 @@ jobs:
         run: cargo test --workspace -- --nocapture
 
   # ─────────────────────────────────────────────────────────────────────
+  # AVA1: C/Rust conformance + interop runs in rust-engine (cargo test
+  # --workspace). This job adds what that one cannot: fuzzing the C decoders
+  # under ASan/UBSan and the Rust decoders with cargo-fuzz.
+  # ─────────────────────────────────────────────────────────────────────
+  ava1:
+    name: ava1 (fuzz C + Rust decoders)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install clang + libFuzzer
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-rt-18-dev
+
+      - name: Fuzz C decoders (60 s)
+        env:
+          AVA1_FUZZ_SECONDS: 60
+        run: make ava1-fuzz-c
+
+      - name: Install Rust nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+
+      - name: Fuzz Rust decoders (60 s + 30 s)
+        working-directory: engine/crates/ava1/fuzz
+        run: |
+          cargo +nightly fuzz run decode -- -max_total_time=60
+          cargo +nightly fuzz run frame_header -- -max_total_time=30
+
+  # ─────────────────────────────────────────────────────────────────────
   # Engine/core target portability. This is intentionally separate from
   # the full release matrix: PRs get a fast compile-only signal that the
   # host-side engine code still type-checks for the OS/arch combinations
@@ -664,6 +695,7 @@ jobs:
     needs:
       - version-sync
       - rust-engine
+      - ava1
       - rust-engine-targets
       - rust-desktop
       - client-frontend
