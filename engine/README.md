@@ -70,5 +70,5 @@ Anything touching real transfer behaviour still needs hardware — see
   payload commands answer that way. `client/src/api/ps5.ts` has an
   `assertOk()` for action endpoints; status endpoints keep `ok:false` as
   data because there it means "unsupported on this console".
-- **Two ports, two roles.** Transfer frames go to 9113, everything else to
-  9114. The wrong port returns `wrong_port` rather than working oddly.
+- **One port, one session.** Everything goes to 9120 as AVA1: management
+  calls on the session's control connection, bulk data on its lanes.

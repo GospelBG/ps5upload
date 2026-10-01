@@ -5,12 +5,9 @@ The C payload that runs on the PS5. Built with the
 in [`../scripts/ps5-sdk.env`](../scripts/ps5-sdk.env)), sent to the
 console's ELF loader, and left resident until reboot or rest mode.
 
-It listens on two ports:
-
-| Port | Accepts |
-|---|---|
-| **9113** | Transfer frames only |
-| **9114** | Everything else — status, filesystem, mount, app, hardware, package, shell |
+It listens on one port, **9120**, for AVA1 (`protocol/ava1/SPEC.md`):
+transfers, status, filesystem, mount, app, hardware, package and shell
+calls all travel over one encrypted session with up to 8 data lanes.
 
 A frame sent to the wrong port is answered with `wrong_port` rather than
 half-working.

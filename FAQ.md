@@ -655,8 +655,8 @@ fixes the app expects.
 
 **Q: Can multiple computers connect to the same PS5 payload at the
 same time?**
-Yes. The payload's TCP listeners on ports 9113 and 9114 accept
-concurrent connections, so two laptops both running ps5upload
+Yes. The payload's AVA1 listener on port 9120 accepts up to 16
+sessions at once (each laptop pairs once), so two laptops both running ps5upload
 against one PS5 is supported. Read-only operations (browse, hardware
 monitor) interleave cleanly. The thing to watch for is *destination
 races*: two simultaneous uploads writing to the same path will

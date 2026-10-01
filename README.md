@@ -63,7 +63,7 @@
 - **Compressed archive uploads (`.zip` / `.7z` / `.rar`)** — keep a game
   dump as a single archive on your PC (less disk, easier to move) and
   upload it directly. ps5upload decompresses on the host and streams
-  the files into the same FTX2 pipeline, so they land **already
+  the files into the same AVA1 pipeline, so they land **already
   extracted** on the PS5 — no manual unpack, no temp copy of the whole
   game. The Upload screen previews the expansion (`zipped → extracted`,
   file count, space saved) and detects the embedded game. Decompresses
@@ -92,11 +92,11 @@
   shows live progress with a working Stop button.
 - **NAS / SMB upload** — browse a Windows share or Samba NAS from the
   app, download to this computer, or **upload a file or folder
-  straight to the PS5** in one step (streamed to a host temp dir, then
-  FTX2 — no 2 GiB memory cap on that path).
+  straight to the PS5** in one step (streamed from the share over AVA1,
+  resuming where it left off — no 2 GiB memory cap on that path).
 - **FTP server on the PS5** — optional built-in FTP for FileZilla and
   other clients (default port **2122**, so it coexists with ftpsrv on
-  2121). Not a replacement for FTX2 Upload.
+  2121). Not a replacement for the Upload tab.
 - **Backport helpers** — Fakelib folder manager, BPS patch apply, and
   SDK Version Changer for folder dumps that need newer system libs.
   Runtime mount is still BackPork or ShadowMount+ (don’t run both).
@@ -423,7 +423,7 @@ port 9021 — a third-party component, not part of ps5upload.
   reboot or rest-mode cycle — send the payload again from the
   **Connection** tab.
 * Is your computer's firewall blocking outbound connections to
-  port 9113 / 9114 / 9021 on your PS5?
+  port 9120 / 9021 on your PS5?
 * Your computer and PS5 don't have to be on the same subnet, but
   there has to be a route to the IP.
 
