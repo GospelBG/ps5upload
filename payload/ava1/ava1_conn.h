@@ -20,6 +20,19 @@ typedef struct {
     uint64_t deadline_ms;
     /* A write failed part-way (or after sealing): the stream is torn, so nothing more is sent. */
     int broken;
+    /* Liveness after the handshake (SPEC.md §6). Any byte received is proof of life, so a
+     * large frame on a slow link never looks dead; set by the reader before serving. */
+    uint32_t idle_ms;     /* a read with no byte for this long fails (AVA1_E_TIMEOUT); 0 = none */
+    uint32_t min_rate;    /* bytes/s floor for one frame, after an idle_ms grace; 0 = none */
+    uint64_t last_rx_ms;  /* monotonic time of the last byte received */
+    /* While a read waits it calls tick at least every tick_ms (a due Ping, a stop check);
+     * nonzero from tick ends the read with AVA1_E_CLOSED. Reader thread only. */
+    int (*tick)(void *arg);
+    void *tick_arg;
+    uint32_t tick_ms;
+    /* Writes: a send with no progress for send_idle_ms, or slower than min_rate over the
+     * frame, fails and breaks the connection; 0 = blocking (SO_SNDTIMEO applies). */
+    uint32_t send_idle_ms;
 } ava1_conn_t;
 
 /* CLOCK_MONOTONIC in milliseconds. */

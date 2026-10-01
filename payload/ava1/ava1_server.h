@@ -17,6 +17,8 @@ typedef struct ava1_server_cfg {
     uint32_t ping_every_ms;
     uint32_t dead_after_ms;
     uint32_t handshake_ms;
+    /* Bytes/s one frame must at least move at, after a dead_after grace; 0 = 8192. */
+    uint32_t min_frame_rate;
     /* Pairing opens by itself for this long after start, but only while the peers
      * file is empty (SPEC.md §5 item 6). 0 = never by itself. */
     uint32_t pairing_window_s;

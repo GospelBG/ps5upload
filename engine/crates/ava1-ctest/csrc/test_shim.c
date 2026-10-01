@@ -37,8 +37,16 @@ static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t 
     return AVA1_STATUS_OK;
 }
 
-int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, uint32_t pairing_s,
-                           uint32_t ping_ms, uint32_t dead_ms, uint32_t handshake_ms) {
+/* Mirrored by ava1_ctest::ffi::TestOpts. */
+typedef struct {
+    uint32_t pairing_s;
+    uint32_t ping_ms;
+    uint32_t dead_ms;
+    uint32_t handshake_ms;
+    uint32_t min_frame_rate;
+} ava1_test_opts_t;
+
+int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, const ava1_test_opts_t *o) {
     ava1_server_cfg_t cfg;
     int rc;
     memset(&cfg, 0, sizeof cfg);
@@ -46,10 +54,11 @@ int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, uin
     strncpy(cfg.name, "C test server", sizeof cfg.name - 1);
     strncpy(cfg.peers_path, peers_path, sizeof cfg.peers_path - 1);
     cfg.bind_loopback = 1;
-    cfg.ping_every_ms = ping_ms;
-    cfg.dead_after_ms = dead_ms;
-    cfg.handshake_ms = handshake_ms;
-    cfg.pairing_window_s = pairing_s;
+    cfg.ping_every_ms = o->ping_ms;
+    cfg.dead_after_ms = o->dead_ms;
+    cfg.handshake_ms = o->handshake_ms;
+    cfg.min_frame_rate = o->min_frame_rate;
+    cfg.pairing_window_s = o->pairing_s;
     cfg.on_pair_request = on_pair;
     cfg.rpc = rpc;
     __atomic_store_n(&g_pair_requests, 0, __ATOMIC_SEQ_CST);

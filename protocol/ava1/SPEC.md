@@ -83,12 +83,24 @@ engine sending the ELF writes state 1 and its key into the single slot; the
 payload adds that key to its peers at startup. Exactly one slot must exist.
 
 ## 6. Liveness
-Every connection sends `Ping{seq, t_us}` every 2 s (default) on channel 0; the
-receiver answers `Pong` with the same values; the sender's RTT is now − t_us.
-A connection that has received no frame for 6 s (default) is dead and closed.
-Clocks are monotonic. A server closes a connection whose first frame does not
-arrive within the handshake timeout (10 s default). `Bye` ends a session;
-`Error` reports why and ends the connection.
+Every connection sends `Ping{seq, t_us}` every 2 s (default) on channel 0, also
+while it is in the middle of reading a large frame; the receiver answers `Pong`
+with the same values; the sender's RTT is now − t_us. A sender may skip a Ping or
+Pong while other frames are queued: they are proof of life too.
+
+Liveness counts bytes, not frames: a connection is dead after 6 s (default,
+`dead_after`) with no byte received, so a 16 MiB frame on a slow link is never
+mistaken for silence. Each frame must also move at no less than a rate floor
+(default 8 KiB/s) after a `dead_after` grace — its deadline is dead_after +
+body_len / floor — so a peer cannot drip one frame forever. Writes obey the same
+two limits: a peer that takes no bytes for `dead_after` (it stopped reading), or
+takes one frame slower than the floor, has its connection closed. A reader never
+waits on a socket write: replies are queued to the connection's writer (bounded),
+and a peer whose replies back up is disconnected.
+
+Clocks are monotonic. A server closes a connection whose handshake (first byte
+to Welcome) does not finish within the handshake timeout (10 s default). `Bye`
+ends a session; `Error` reports why and ends the connection.
 
 ## 7. RPC
 `RpcRequest{method, body}` on the control connection, channel = request id

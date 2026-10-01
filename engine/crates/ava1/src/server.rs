@@ -12,7 +12,7 @@ use crate::conn::{Frame, FrameReader, FrameWriter};
 use crate::gen::{self, Hs1, Join, JoinAck, PairConfirm, PairResult, RpcRequest, RpcResponse};
 use crate::handshake::{self, refuse};
 use crate::keys::{self, Identity, SessionKeys};
-use crate::link::{drive, SharedWriter};
+use crate::link::{drive, Full, Outbox, DELIVER_DEPTH};
 use crate::peers::PeerStore;
 use crate::session::{RpcReply, Timing};
 use crate::wire::{FrameMessage, Message};
@@ -139,12 +139,9 @@ pub async fn serve(listener: TcpListener, ctx: Arc<ServerCtx>) {
             ctx.conns.fetch_sub(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 let (_, wh) = s.into_split();
-                refuse(
-                    &mut FrameWriter::new(wh),
-                    gen::ERR_BUSY,
-                    "too many connections",
-                )
-                .await;
+                let mut w = FrameWriter::new(wh);
+                let deadline = tokio::time::Instant::now() + FAREWELL;
+                refuse_by(deadline, &mut w, gen::ERR_BUSY, "too many connections").await;
             });
             continue;
         }
@@ -178,14 +175,17 @@ async fn handle(s: TcpStream, ctx: &Arc<ServerCtx>) -> Result<(), Ava1Error> {
     s.set_nodelay(true)?;
     let (rh, wh) = s.into_split();
     let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
-    let first = tokio::time::timeout(ctx.timing.handshake, r.recv())
+    // One deadline for the whole handshake, from accept to Welcome (or JoinAck): a peer
+    // that trickles bytes cannot stretch it, and nothing before it can wait longer.
+    let deadline = tokio::time::Instant::now() + ctx.timing.handshake;
+    let first = tokio::time::timeout_at(deadline, r.recv())
         .await
         .map_err(|_| Ava1Error::Timeout)??;
     match first.ty {
-        Hs1::TYPE => control(r, w, first, ctx).await,
-        Join::TYPE => lane(r, w, first, ctx).await,
+        Hs1::TYPE => control(r, w, first, ctx, deadline).await,
+        Join::TYPE => lane(r, w, first, ctx, deadline).await,
         t => {
-            refuse(&mut w, gen::ERR_PROTOCOL, "expected Hs1 or Join").await;
+            refuse_by(deadline, &mut w, gen::ERR_PROTOCOL, "expected Hs1 or Join").await;
             Err(Ava1Error::Unexpected(t))
         }
     }
@@ -196,17 +196,18 @@ async fn control(
     mut w: FrameWriter<OwnedWriteHalf>,
     first: Frame,
     ctx: &Arc<ServerCtx>,
+    deadline: tokio::time::Instant,
 ) -> Result<(), Ava1Error> {
     // Reserve atomically before the handshake; released on every exit path by the guard.
     let Some(_slot) = SessionSlot::take(ctx) else {
-        refuse(&mut w, gen::ERR_BUSY, "too many sessions").await;
+        refuse_by(deadline, &mut w, gen::ERR_BUSY, "too many sessions").await;
         return Err(Ava1Error::Refused {
             code: gen::ERR_BUSY,
             message: "too many sessions".into(),
         });
     };
-    let est = tokio::time::timeout(
-        ctx.timing.handshake,
+    let est = tokio::time::timeout_at(
+        deadline,
         handshake::server(
             &mut r,
             &mut w,
@@ -237,10 +238,19 @@ async fn control(
     if est.pairing.is_some() {
         (ctx.notify)(&req);
     }
-    let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(w));
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let link = drive(r, writer.clone(), ctx.timing, tx);
+    let (tx, mut rx) = mpsc::channel(DELIVER_DEPTH);
+    let (link, outbox) = drive(r, w, ctx.timing, tx);
     let rpc_slots = Arc::new(tokio::sync::Semaphore::new(RPC_WORKERS));
+    // Replies from this loop are only ever queued, never awaited: a peer that sends
+    // requests but stops reading fills the queue and is disconnected (`reply`), and the
+    // writer task ends the link once it has taken nothing for `dead_after`.
+    let reply = |channel: u32, status: u16| -> bool {
+        let r = RpcResponse {
+            status,
+            body: Vec::new(),
+        };
+        outbox.try_send(channel, &r).is_ok()
+    };
     while let Some(f) = rx.recv().await {
         match f.ty {
             RpcRequest::TYPE => {
@@ -249,11 +259,7 @@ async fn control(
                 };
                 let channel = f.channel;
                 if !entry.paired.load(Ordering::SeqCst) {
-                    let resp = RpcResponse {
-                        status: gen::ERR_NOT_PAIRED,
-                        body: Vec::new(),
-                    };
-                    if writer.lock().await.send_msg(channel, &resp).await.is_err() {
+                    if !reply(channel, gen::ERR_NOT_PAIRED) {
                         break;
                     }
                     continue;
@@ -268,35 +274,19 @@ async fn control(
                         }
                         Err(_) => gen::ERR_PROTOCOL,
                     };
-                    let _ = writer
-                        .lock()
-                        .await
-                        .send_msg(
-                            channel,
-                            &RpcResponse {
-                                status,
-                                body: Vec::new(),
-                            },
-                        )
-                        .await;
+                    if !reply(channel, status) {
+                        break;
+                    }
                     continue;
                 }
                 // Calls run on workers; the reader (and so liveness) never waits for one.
                 let Ok(permit) = rpc_slots.clone().try_acquire_owned() else {
-                    let _ = writer
-                        .lock()
-                        .await
-                        .send_msg(
-                            channel,
-                            &RpcResponse {
-                                status: gen::ERR_BUSY,
-                                body: Vec::new(),
-                            },
-                        )
-                        .await;
+                    if !reply(channel, gen::ERR_BUSY) {
+                        break;
+                    }
                     continue;
                 };
-                let (ctx, writer) = (ctx.clone(), writer.clone());
+                let (ctx, outbox) = (ctx.clone(), outbox.clone());
                 tokio::spawn(async move {
                     let reply = tokio::task::spawn_blocking(move || (ctx.rpc)(q.method, &q.body))
                         .await
@@ -304,10 +294,9 @@ async fn control(
                             status: gen::ERR_INTERNAL,
                             body: Vec::new(),
                         });
-                    let _ = writer
-                        .lock()
-                        .await
-                        .send_msg(
+                    // Waits for room (bounded: a stuck peer ends the link, which fails this).
+                    let _ = outbox
+                        .send(
                             channel,
                             &RpcResponse {
                                 status: reply.status,
@@ -329,28 +318,17 @@ async fn control(
                             .add(req.peer_key, &req.peer_name)
                             .is_ok());
                 entry.paired.store(accepted, Ordering::SeqCst);
-                let _ = writer
-                    .lock()
-                    .await
-                    .send_msg(
-                        f.channel,
-                        &PairResult {
-                            accepted: u8::from(accepted),
-                        },
-                    )
-                    .await;
-                if !accepted {
+                let result = PairResult {
+                    accepted: u8::from(accepted),
+                };
+                if outbox.try_send(f.channel, &result).is_err() || !accepted {
+                    outbox.flush(FAREWELL).await;
                     break;
                 }
             }
             _ if f.ignorable() => {}
             _ => {
-                refuse(
-                    &mut *writer.lock().await,
-                    gen::ERR_PROTOCOL,
-                    "unexpected frame",
-                )
-                .await;
+                refuse_on(&outbox, gen::ERR_PROTOCOL, "unexpected frame").await;
                 break;
             }
         }
@@ -358,6 +336,31 @@ async fn control(
     ctx.sessions.lock().unwrap().remove(&est.session_id);
     drop(link);
     Ok(())
+}
+
+/// The longest a connection's last words (an Error, a PairResult) may take to leave.
+const FAREWELL: Duration = Duration::from_secs(1);
+
+/// Writes `Error{code, message}` on a connection not yet handed to a link, giving up at
+/// the handshake deadline.
+async fn refuse_by(
+    deadline: tokio::time::Instant,
+    w: &mut FrameWriter<OwnedWriteHalf>,
+    code: u16,
+    message: &str,
+) {
+    let _ = tokio::time::timeout_at(deadline, refuse(w, code, message)).await;
+}
+
+/// Queues `Error{code, message}` and gives it up to `FAREWELL` to go out.
+async fn refuse_on(outbox: &Outbox, code: u16, message: &str) {
+    let e = gen::Error {
+        code,
+        message: message.into(),
+    };
+    if outbox.try_send(0, &e) != Err(Full::Closed) {
+        outbox.flush(FAREWELL).await;
+    }
 }
 
 /// The nonces a session remembers, so a captured Join cannot be replayed.
@@ -368,6 +371,7 @@ async fn lane(
     mut w: FrameWriter<OwnedWriteHalf>,
     first: Frame,
     ctx: &Arc<ServerCtx>,
+    deadline: tokio::time::Instant,
 ) -> Result<(), Ava1Error> {
     let j: Join = first.decode()?;
     let entry = ctx.sessions.lock().unwrap().get(&j.session_id).cloned();
@@ -376,13 +380,13 @@ async fn lane(
         message: "join refused".into(),
     };
     let Some(entry) = entry else {
-        refuse(&mut w, gen::ERR_BAD_JOIN, "unknown session").await;
+        refuse_by(deadline, &mut w, gen::ERR_BAD_JOIN, "unknown session").await;
         return Err(refused(gen::ERR_BAD_JOIN));
     };
     let want = keys::join_tag(&entry.keys.c2s, &j.session_id, j.lane_id, &j.client_nonce);
     let lane_ok = (1..=gen::MAX_LANES as u16).contains(&j.lane_id);
     if !lane_ok || !keys::ct_eq16(&want, &j.tag) {
-        refuse(&mut w, gen::ERR_BAD_JOIN, "join refused").await;
+        refuse_by(deadline, &mut w, gen::ERR_BAD_JOIN, "join refused").await;
         return Err(refused(gen::ERR_BAD_JOIN));
     }
     let fresh = {
@@ -397,11 +401,11 @@ async fn lane(
         fresh
     };
     if !fresh {
-        refuse(&mut w, gen::ERR_BAD_JOIN, "join replayed").await;
+        refuse_by(deadline, &mut w, gen::ERR_BAD_JOIN, "join replayed").await;
         return Err(refused(gen::ERR_BAD_JOIN));
     }
     if !entry.paired.load(Ordering::SeqCst) {
-        refuse(&mut w, gen::ERR_NOT_PAIRED, "pair first").await;
+        refuse_by(deadline, &mut w, gen::ERR_NOT_PAIRED, "pair first").await;
         return Err(Ava1Error::NotPaired);
     }
     let lane = j.lane_id as usize;
@@ -415,20 +419,18 @@ async fn lane(
     let server_nonce: [u8; 16] = keys::random_bytes()?;
     let (cn, sn) = (j.client_nonce, server_nonce);
     let tag = keys::join_ack_tag(&entry.keys.s2c, &j.session_id, j.lane_id, &cn, &sn);
-    w.send_msg(
-        0,
-        &JoinAck {
-            lane_id: j.lane_id,
-            server_nonce,
-            tag,
-        },
-    )
-    .await?;
+    let ack = JoinAck {
+        lane_id: j.lane_id,
+        server_nonce,
+        tag,
+    };
+    tokio::time::timeout_at(deadline, w.send_msg(0, &ack))
+        .await
+        .map_err(|_| Ava1Error::Timeout)??;
     r.set_key(keys::lane_key(&entry.keys.c2s, j.lane_id, &cn, &sn));
     w.set_key(keys::lane_key(&entry.keys.s2c, j.lane_id, &cn, &sn));
-    let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(w));
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let link = drive(r, writer, ctx.timing, tx);
+    let (tx, mut rx) = mpsc::channel(DELIVER_DEPTH);
+    let (link, _outbox) = drive(r, w, ctx.timing, tx);
     loop {
         tokio::select! {
             f = rx.recv() => if f.is_none() { break },

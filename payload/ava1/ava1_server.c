@@ -395,51 +395,66 @@ static int handle_frame(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane
     return 1;
 }
 
-/* Liveness: dead only after dead_after with no frame received. A Ping goes out when
- * the writer is free; a slow or blocked write is never a reason to close. */
+/* The default slowest a frame may arrive (after a dead_after grace) before the peer
+ * counts as dead: slow links are fine, a peer dripping one frame forever is not (§6). */
+#define MIN_FRAME_RATE 8192u
+
+typedef struct {
+    conn_t *k;
+    int idx;
+    const uint8_t *sid;
+    uint16_t lane;
+    uint32_t gen;
+    uint64_t last_ping;
+    uint32_t ping_seq;
+} serve_t;
+
+/* Runs while the reader waits for bytes, also between the pieces of one large frame:
+ * sends a due Ping (never waiting for the write lock: whoever holds it is sending data,
+ * which is proof of life) and ends the connection on stop or when superseded. */
+static int serve_tick(void *arg) {
+    serve_t *x = arg;
+    uint64_t t = now_ms();
+    if (S.stopping) return 1;
+    if (x->lane != 0 && !lane_current(x->idx, x->sid, x->lane, x->gen)) return 1;
+    if (t - x->last_ping >= S.cfg.ping_every_ms) {
+        if (send_liveness(&x->k->io, AVA1_TYPE_PING, ++x->ping_seq, t * 1000u) == AVA1_E_IO) return 1;
+        x->last_ping = t;
+    }
+    return 0;
+}
+
+/* Liveness: dead after dead_after with no byte received (a frame in progress counts),
+ * or when a frame arrives slower than MIN_FRAME_RATE. Writes wait at most dead_after
+ * for the peer to make room, so no reply can wedge this reader: a peer that stops
+ * reading has its connection broken (shut down), which ends the read below too. */
 static void serve_loop(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane, uint32_t gen, uint8_t *buf) {
-    uint64_t last_rx = now_ms(), last_ping = 0;
-    uint32_t ping_seq = 0;
-    /* Handshake over: no deadline, and no send timeout (a timed-out write tears a frame;
-     * the liveness check below ends a dead connection and shutdown() frees any writer). */
+    serve_t x;
+    memset(&x, 0, sizeof x);
+    x.k = k;
+    x.idx = idx;
+    x.sid = sid;
+    x.lane = lane;
+    x.gen = gen;
     k->io.deadline_ms = 0;
-    set_timeouts(k->io.fd, 0);
-    {
-        struct timeval tv;
-        tv.tv_sec = (time_t)(S.cfg.dead_after_ms / 1000u);
-        tv.tv_usec = (suseconds_t)((S.cfg.dead_after_ms % 1000u) * 1000u);
-        (void)setsockopt(k->io.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    set_timeouts(k->io.fd, S.cfg.dead_after_ms);
+    pthread_mutex_lock(&k->io.wmu);
+    k->io.send_idle_ms = S.cfg.dead_after_ms;
+    k->io.min_rate = S.cfg.min_frame_rate ? S.cfg.min_frame_rate : MIN_FRAME_RATE;
+    pthread_mutex_unlock(&k->io.wmu);
+    k->io.idle_ms = S.cfg.dead_after_ms;
+    k->io.last_rx_ms = now_ms();
+    k->io.tick = serve_tick;
+    k->io.tick_arg = &x;
+    k->io.tick_ms = S.cfg.ping_every_ms;
+    while (serve_tick(&x) == 0) {
+        uint8_t type, flags;
+        uint32_t ch;
+        size_t len;
+        if (ava1_conn_recv(&k->io, &type, &flags, &ch, buf, CTRL_MAX - AVA1_TAG_LEN, &len) != 0) break;
+        if (handle_frame(k, idx, sid, lane, type, flags, ch, buf, len) != 0) break;
     }
-    while (!S.stopping) {
-        struct pollfd p;
-        uint64_t t = now_ms(), since;
-        int wait, pr;
-        if (t - last_rx > S.cfg.dead_after_ms) return;
-        if (lane != 0 && !lane_current(idx, sid, lane, gen)) return;
-        if (t - last_ping >= S.cfg.ping_every_ms) {
-            if (send_liveness(&k->io, AVA1_TYPE_PING, ++ping_seq, t * 1000u) == AVA1_E_IO) return;
-            last_ping = t;
-        }
-        since = now_ms() - last_ping;
-        wait = since >= S.cfg.ping_every_ms ? 1 : (int)(S.cfg.ping_every_ms - since);
-        p.fd = k->io.fd;
-        p.events = POLLIN;
-        p.revents = 0;
-        pr = poll(&p, 1, wait);
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            return;
-        }
-        if (pr == 0) continue;
-        {
-            uint8_t type, flags;
-            uint32_t ch;
-            size_t len;
-            if (ava1_conn_recv(&k->io, &type, &flags, &ch, buf, CTRL_MAX - AVA1_TAG_LEN, &len) != 0) return;
-            last_rx = now_ms();
-            if (handle_frame(k, idx, sid, lane, type, flags, ch, buf, len) != 0) return;
-        }
-    }
+    k->io.tick = NULL;
 }
 
 static int send_noise(ava1_conn_t *c, uint8_t type, const uint8_t *msg, size_t n) {

@@ -16,6 +16,7 @@ pub fn fast() -> Timing {
         ping_every: Duration::from_millis(100),
         dead_after: Duration::from_millis(500),
         handshake: Duration::from_millis(500),
+        ..Timing::default()
     }
 }
 
@@ -56,6 +57,52 @@ pub async fn paired() -> (
     Arc<Identity>,
     Arc<Mutex<PeerStore>>,
 ) {
+    paired_with(fast()).await
+}
+
+pub type RawReader = ava1::conn::FrameReader<tokio::net::tcp::OwnedReadHalf>;
+pub type RawWriter = ava1::conn::FrameWriter<tokio::net::tcp::OwnedWriteHalf>;
+
+/// A hand-driven client: connects (with a small receive buffer, so a peer's replies back
+/// up quickly when nobody reads them) and completes the handshake, nothing more — no
+/// heartbeats, no reading unless the test reads.
+pub async fn raw_session(addr: SocketAddr, me: &Identity) -> (RawReader, RawWriter) {
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(4096).unwrap();
+    let stream = sock.connect(addr).await.unwrap();
+    let (rh, wh) = stream.into_split();
+    let (mut r, mut w) = (
+        ava1::conn::FrameReader::new(rh),
+        ava1::conn::FrameWriter::new(wh),
+    );
+    let est = ava1::handshake::client(&mut r, &mut w, me, "raw", |_| true)
+        .await
+        .unwrap();
+    assert!(est.pairing.is_none(), "raw sessions are for paired devices");
+    (r, w)
+}
+
+/// Waits (up to `limit`) for `cond`; returns how long it took, or None.
+pub async fn wait_for(limit: Duration, mut cond: impl FnMut() -> bool) -> Option<Duration> {
+    let t = std::time::Instant::now();
+    while !cond() {
+        if t.elapsed() > limit {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Some(t.elapsed())
+}
+
+/// `paired()` with other timing.
+pub async fn paired_with(
+    timing: Timing,
+) -> (
+    SocketAddr,
+    Arc<ServerCtx>,
+    Arc<Identity>,
+    Arc<Mutex<PeerStore>>,
+) {
     let (s_id, c_id) = (
         Identity::generate().unwrap(),
         Arc::new(Identity::generate().unwrap()),
@@ -70,7 +117,7 @@ pub async fn paired() -> (
         s_peers,
         node_info_rpc("Rust test server"),
     )
-    .with_timing(fast());
+    .with_timing(timing);
     let (addr, ctx) = start(ctx).await;
     (addr, ctx, c_id, Arc::new(Mutex::new(c_peers)))
 }

@@ -13,7 +13,7 @@ use crate::conn::{Frame, FrameReader, FrameWriter};
 use crate::gen::{self, Bye, Join, JoinAck, PairConfirm, PairResult, RpcRequest, RpcResponse};
 use crate::handshake::{self, Established};
 use crate::keys::{self, Identity};
-use crate::link::{drive, Link, SharedWriter};
+use crate::link::{drive, Link, Outbox, DELIVER_DEPTH};
 use crate::peers::PeerStore;
 use crate::wire::{FrameMessage, Message};
 use crate::Ava1Error;
@@ -21,8 +21,12 @@ use crate::Ava1Error;
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     pub ping_every: Duration,
+    /// No byte received (or taken by the peer) for this long: the connection is dead.
     pub dead_after: Duration,
+    /// The whole handshake, from accept/connect to Welcome.
     pub handshake: Duration,
+    /// Bytes/s one frame must at least move at, after a `dead_after` grace (SPEC.md §6).
+    pub min_frame_rate: u32,
 }
 
 impl Default for Timing {
@@ -31,6 +35,7 @@ impl Default for Timing {
             ping_every: Duration::from_secs(2),
             dead_after: Duration::from_secs(6),
             handshake: Duration::from_secs(10),
+            min_frame_rate: crate::link::MIN_FRAME_RATE,
         }
     }
 }
@@ -48,7 +53,7 @@ pub struct Session {
     pub(crate) timing: Timing,
     pub(crate) est: Established,
     peers: Arc<Mutex<PeerStore>>,
-    writer: SharedWriter,
+    outbox: Outbox,
     link: Link,
     pending: Pending,
     next_req: AtomicU32,
@@ -81,10 +86,7 @@ async fn within<T>(
         .map_err(|_| Ava1Error::Timeout)?
 }
 
-/// Sends one frame from a task of its own: a caller that drops the future (a timeout,
-/// a `select!`) must never cancel a write midway, which would leave a partial sealed
-/// frame on the wire and desynchronise the stream. Dropping the join handle does not
-/// cancel the task.
+/// Removes a pending request on every exit, including the caller dropping the future.
 struct PendingEntry<'a> {
     pending: &'a Pending,
     id: u32,
@@ -94,17 +96,6 @@ impl Drop for PendingEntry<'_> {
     fn drop(&mut self) {
         self.pending.lock().unwrap().remove(&self.id);
     }
-}
-
-async fn send_owned<M: FrameMessage + Send + Sync + 'static>(
-    writer: &SharedWriter,
-    channel: u32,
-    m: M,
-) -> Result<(), Ava1Error> {
-    let mut guard = writer.clone().lock_owned().await;
-    tokio::spawn(async move { guard.send_msg(channel, &m).await })
-        .await
-        .map_err(|e| Ava1Error::Lost(format!("send task failed: {e}")))?
 }
 
 pub async fn connect(
@@ -129,9 +120,8 @@ pub async fn connect(
         }),
     )
     .await?;
-    let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(w));
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let link = drive(r, writer.clone(), timing, tx);
+    let (tx, mut rx) = mpsc::channel(DELIVER_DEPTH);
+    let (link, outbox) = drive(r, w, timing, tx);
     let pending: Pending = Arc::default();
     let p2 = pending.clone();
     let dispatcher = tokio::spawn(async move {
@@ -151,7 +141,7 @@ pub async fn connect(
         timing,
         est,
         peers,
-        writer,
+        outbox,
         link,
         pending,
         next_req: AtomicU32::new(1),
@@ -199,7 +189,8 @@ impl Session {
             pending: &self.pending,
             id,
         };
-        send_owned(&self.writer, id, m).await?;
+        // Queued whole or not at all: dropping this future never tears a frame.
+        self.outbox.send(id, &m).await?;
         let mut rx = rx;
         tokio::select! {
             f = &mut rx => f.map_err(|_| Ava1Error::Lost(self.link.reason())),
@@ -277,15 +268,19 @@ impl Session {
         Ok(())
     }
 
+    /// Says goodbye and ends the session. Bounded: a peer that has stopped reading
+    /// cannot hold it up for more than about a second.
     pub async fn close(self) {
-        let _ = send_owned(&self.writer, 0, Bye { reason: 0 }).await;
+        let limit = self.timing.dead_after.min(Duration::from_secs(1));
+        let _ = tokio::time::timeout(limit, self.outbox.send(0, &Bye { reason: 0 })).await;
+        self.outbox.flush(limit).await;
     }
 }
 
 pub struct Lane {
     pub id: u16,
     link: Link,
-    _writer: SharedWriter,
+    _outbox: Outbox,
     _slot: Option<LaneSlot>,
 }
 
@@ -342,11 +337,11 @@ impl Session {
             live: self.lanes_live.clone(),
             id,
         };
-        let (link, writer) = self.join(id, addr).await?;
+        let (link, outbox) = self.join(id, addr).await?;
         Ok(Lane {
             id,
             link,
-            _writer: writer,
+            _outbox: outbox,
             _slot: Some(slot),
         })
     }
@@ -355,16 +350,16 @@ impl Session {
     /// dropped lane looks like to the server. Tests only.
     #[doc(hidden)]
     pub async fn reopen_lane_for_test(&self, id: u16) -> Result<Lane, Ava1Error> {
-        let (link, writer) = self.join(id, self.addr).await?;
+        let (link, outbox) = self.join(id, self.addr).await?;
         Ok(Lane {
             id,
             link,
-            _writer: writer,
+            _outbox: outbox,
             _slot: None,
         })
     }
 
-    async fn join(&self, id: u16, addr: SocketAddr) -> Result<(Link, SharedWriter), Ava1Error> {
+    async fn join(&self, id: u16, addr: SocketAddr) -> Result<(Link, Outbox), Ava1Error> {
         let t = self.timing.handshake;
         let stream = within(t, async { Ok(TcpStream::connect(addr).await?) }).await?;
         stream.set_nodelay(true)?;
@@ -394,12 +389,11 @@ impl Session {
         }
         w.set_key(keys::lane_key(&k.c2s, id, &client_nonce, &ack.server_nonce));
         r.set_key(keys::lane_key(&k.s2c, id, &client_nonce, &ack.server_nonce));
-        let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(w));
-        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
-        let link = drive(r, writer.clone(), self.timing, tx);
+        let (tx, mut rx) = mpsc::channel::<Frame>(DELIVER_DEPTH);
+        let (link, outbox) = drive(r, w, self.timing, tx);
         // Project 1 lanes carry heartbeats only; data frames arrive in project 2.
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        Ok((link, writer))
+        Ok((link, outbox))
     }
 }
 

@@ -413,8 +413,66 @@ async fn a_cancelled_call_does_not_break_the_session() {
         let _ = tokio::time::timeout(Duration::from_millis(5), s.rpc(5, &big)).await;
     }
     stall.store(false, Ordering::SeqCst);
-    assert_eq!(s.node_info().await.unwrap().name, "s");
+    // The frames queued before the cancellations still reach the server and occupy its
+    // workers for a moment (answered ERR_BUSY past four): wait for a free worker rather
+    // than for a fixed time. What matters is that the stream was never torn.
+    let t = Instant::now();
+    let info = loop {
+        match tokio::time::timeout(Duration::from_secs(10), s.node_info()).await {
+            Ok(Err(Ava1Error::Refused { code, .. })) if code == gen::ERR_BUSY => {
+                assert!(t.elapsed() < Duration::from_secs(10), "workers never freed");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(r) => break r.unwrap(),
+            Err(_) => panic!("node.info hung after the stall"),
+        }
+    };
+    assert_eq!(info.name, "s");
     assert!(!s.is_closed(), "{}", s.closed().await);
+}
+
+#[tokio::test]
+async fn close_returns_even_when_the_peer_stopped_reading() {
+    use std::sync::atomic::Ordering;
+    let (s_id, c_id) = (
+        Identity::generate().unwrap(),
+        Arc::new(Identity::generate().unwrap()),
+    );
+    let mut sp = PeerStore::in_memory();
+    sp.add(c_id.public(), "c").unwrap();
+    let mut cp = PeerStore::in_memory();
+    cp.add(s_id.public(), "s").unwrap();
+    let timing = ava1::session::Timing {
+        dead_after: Duration::from_secs(20),
+        ..fast()
+    };
+    let (addr, _ctx) =
+        start(ServerCtx::new(s_id, "s", sp, node_info_rpc("s")).with_timing(timing)).await;
+    let (relay, stall) = stallable_relay(addr).await;
+    let s = connect(
+        &relay.to_string(),
+        c_id,
+        Arc::new(Mutex::new(cp)),
+        "c",
+        timing,
+    )
+    .await
+    .unwrap();
+    stall.store(true, Ordering::SeqCst);
+    // Fill the socket buffers and the send queue: these calls can never be written out.
+    let big = vec![7u8; 60_000];
+    for _ in 0..300 {
+        let _ = tokio::time::timeout(Duration::from_millis(5), s.rpc(5, &big)).await;
+    }
+    let t = Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), s.close())
+        .await
+        .expect("close() hung on a stuck write");
+    assert!(
+        t.elapsed() < Duration::from_millis(2500),
+        "{:?}",
+        t.elapsed()
+    );
 }
 
 #[tokio::test]

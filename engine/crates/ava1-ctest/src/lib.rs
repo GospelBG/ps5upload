@@ -141,14 +141,23 @@ pub mod ffi {
         pub n: c_int,
     }
 
+    /// Mirrors ava1_test_opts_t in csrc/test_shim.c.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct TestOpts {
+        pub pairing_s: u32,
+        pub ping_ms: u32,
+        pub dead_ms: u32,
+        pub handshake_ms: u32,
+        /// 0 = the server's default.
+        pub min_frame_rate: u32,
+    }
+
     extern "C" {
         pub fn ava1_test_server_start(
             secret: *const u8,
             peers_path: *const c_char,
-            pairing_s: u32,
-            ping_ms: u32,
-            dead_ms: u32,
-            handshake_ms: u32,
+            opts: *const TestOpts,
         ) -> c_int;
         pub fn ava1_test_pair_requests() -> u32;
         pub fn ava1_test_last_pair_code() -> u32;
@@ -320,18 +329,23 @@ impl CServer {
         dead_ms: u32,
         handshake_ms: u32,
     ) -> Self {
-        let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
-        let p = CString::new(peers_path.to_str().unwrap()).unwrap();
-        let rc = unsafe {
-            ffi::ava1_test_server_start(
-                secret.as_ptr(),
-                p.as_ptr(),
+        Self::start_with(
+            secret,
+            peers_path,
+            ffi::TestOpts {
                 pairing_s,
                 ping_ms,
                 dead_ms,
                 handshake_ms,
-            )
-        };
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn start_with(secret: [u8; 32], peers_path: &Path, opts: ffi::TestOpts) -> Self {
+        let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        let p = CString::new(peers_path.to_str().unwrap()).unwrap();
+        let rc = unsafe { ffi::ava1_test_server_start(secret.as_ptr(), p.as_ptr(), &opts) };
         assert!(rc > 0, "C server failed to start: {rc}");
         CServer {
             port: rc as u16,

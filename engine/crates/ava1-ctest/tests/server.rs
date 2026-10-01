@@ -21,6 +21,7 @@ fn fast() -> Timing {
         ping_every: Duration::from_millis(100),
         dead_after: Duration::from_millis(500),
         handshake: Duration::from_millis(500),
+        ..Timing::default()
     }
 }
 
@@ -433,4 +434,159 @@ async fn the_c_server_never_reuses_a_lane_key() {
         s.lane_keys_for_test(4, &j.client_nonce, &sn1),
         s.lane_keys_for_test(4, &j.client_nonce, &sn2)
     );
+}
+
+type RawW = FrameWriter<tokio::net::tcp::OwnedWriteHalf>;
+type RawR = FrameReader<tokio::net::tcp::OwnedReadHalf>;
+
+/// A paired client driven by hand: handshake only, small receive buffer, no heartbeats.
+async fn raw_session(addr: &str, me: &Identity) -> (RawR, RawW) {
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(4096).unwrap();
+    let stream = sock.connect(addr.parse().unwrap()).await.unwrap();
+    let (rh, wh) = stream.into_split();
+    let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+    let est = ava1::handshake::client(&mut r, &mut w, me, "raw", |_| true)
+        .await
+        .unwrap();
+    assert!(est.pairing.is_none());
+    (r, w)
+}
+
+fn half_frame_header() -> Vec<u8> {
+    ava1::frame::Header {
+        ty: gen::RpcRequest::TYPE,
+        flags: ava1::frame::FLAG_SEALED,
+        channel: 2,
+        body_len: 60_000,
+    }
+    .encode()
+    .to_vec()
+}
+
+use ava1::wire::FrameMessage;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_max_size_frame_slower_than_dead_after_keeps_the_c_session() {
+    let d = dir("bigframe");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 200, 1000, 3000);
+    let cfg = ChaosConfig {
+        bytes_per_sec: Some(16 * 1024),
+        ..ChaosConfig::default()
+    };
+    let proxy = ChaosProxy::start(srv.addr().parse().unwrap(), cfg)
+        .await
+        .unwrap();
+    let t = Timing {
+        ping_every: Duration::from_millis(200),
+        dead_after: Duration::from_millis(1000),
+        handshake: Duration::from_secs(3),
+        ..Timing::default()
+    };
+    let s = connect(&proxy.addr.to_string(), me, peers, "laptop", t)
+        .await
+        .unwrap();
+    let start = Instant::now();
+    let r = s
+        .rpc(gen::METHOD_NODE_INFO, &vec![0x5a; 65_000])
+        .await
+        .unwrap();
+    assert_eq!(r.status, gen::STATUS_OK);
+    assert!(start.elapsed() > t.dead_after * 3, "{:?}", start.elapsed());
+    // The C server kept pinging while it read the frame, so the client stayed alive too.
+    assert!(!s.is_closed(), "client side");
+    assert_eq!(srv.conns(), 1, "server side");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_drops_a_peer_that_stops_mid_frame() {
+    let d = dir("midframe");
+    let (me, _peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let (_r, w) = raw_session(&srv.addr(), &me).await;
+    let mut stream = w.into_inner();
+    let mut raw = half_frame_header();
+    raw.extend_from_slice(&[0u8; 1000]);
+    stream.write_all(&raw).await.unwrap();
+    let t = Instant::now();
+    wait_conns(&srv, 0).await;
+    assert!(
+        t.elapsed() < Duration::from_millis(2000),
+        "{:?}",
+        t.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_drops_a_dripping_frame_by_the_rate_floor() {
+    let d = dir("drip");
+    let (me, _peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start_with(
+        SECRET,
+        &d.join("peers"),
+        ffi::TestOpts {
+            ping_ms: 100,
+            dead_ms: 500,
+            handshake_ms: 500,
+            min_frame_rate: 64 * 1024,
+            ..Default::default()
+        },
+    );
+    let (_r, w) = raw_session(&srv.addr(), &me).await;
+    let mut stream = w.into_inner();
+    stream.write_all(&half_frame_header()).await.unwrap();
+    let drip = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if stream.write_all(&[0]).await.is_err() {
+                return;
+            }
+        }
+    });
+    let t = Instant::now();
+    while srv.conns() > 0 && t.elapsed() < Duration::from_secs(8) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(srv.conns(), 0, "the rate floor ends a dripping frame");
+    assert!(
+        t.elapsed() > Duration::from_millis(900),
+        "{:?}",
+        t.elapsed()
+    );
+    drip.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_drops_a_peer_that_never_reads_its_replies() {
+    let d = dir("noread");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let (_r, mut w) = raw_session(&srv.addr(), &me).await; // _r is never read
+    let flood = tokio::spawn(async move {
+        let q = gen::RpcRequest {
+            method: gen::METHOD_NODE_INFO,
+            body: Vec::new(),
+        };
+        let mut id = 1u32;
+        while w.send_msg(id, &q).await.is_ok() {
+            id = id.wrapping_add(1);
+        }
+    });
+    let t = Instant::now();
+    while srv.conns() > 0 && t.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        srv.conns(),
+        0,
+        "the C server drops a peer that stopped reading"
+    );
+    flood.abort();
+    connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap()
+        .node_info()
+        .await
+        .unwrap();
 }

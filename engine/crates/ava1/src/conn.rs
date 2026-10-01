@@ -1,4 +1,8 @@
 //! Frames on a byte stream, sealed after the handshake (SPEC.md §2, §4.4).
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::frame::{
@@ -30,10 +34,33 @@ impl Frame {
     }
 }
 
+/// Microseconds on a process-wide monotonic clock.
+pub(crate) fn now_us() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+/// How slow a connection may be before the peer counts as gone (SPEC.md §6): no byte
+/// moved for `idle`, or one frame slower than `min_rate` bytes/s after an `idle` grace.
+#[derive(Debug, Clone, Copy)]
+pub struct Pace {
+    pub idle: Duration,
+    pub min_rate: u32,
+}
+
+impl Pace {
+    fn frame_budget(&self, len: usize) -> Duration {
+        self.idle + Duration::from_millis(len as u64 * 1000 / u64::from(self.min_rate.max(1)))
+    }
+}
+
 pub struct FrameWriter<W> {
     w: W,
     key: Option<[u8; 32]>,
     ctr: u64,
+    pace: Option<Pace>,
+    /// A write failed or stalled part-way: the stream is torn and nothing more is sent.
+    broken: bool,
 }
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
@@ -42,7 +69,15 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
             w,
             key: None,
             ctr: 0,
+            pace: None,
+            broken: false,
         }
+    }
+
+    /// Bounds every write: a peer that takes no bytes for `idle`, or takes one frame
+    /// slower than the floor, fails the send and breaks the writer.
+    pub fn set_pace(&mut self, pace: Pace) {
+        self.pace = Some(pace);
     }
 
     /// Seal every following frame with `key`; the counter restarts at 0.
@@ -71,6 +106,9 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         channel: u32,
         body: &[u8],
     ) -> Result<(), Ava1Error> {
+        if self.broken {
+            return Err(Ava1Error::Lost("an earlier write failed part-way".into()));
+        }
         let mac = if self.key.is_some() { MAC_LEN } else { 0 };
         let total = body.len() + mac;
         let body_len =
@@ -96,8 +134,37 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
             self.ctr += 1;
         }
         out.extend_from_slice(&sealed);
-        self.w.write_all(&out).await?;
-        self.w.flush().await?;
+        // Broken until proven whole: a failure (or a dropped future) anywhere below leaves
+        // a partial frame or a spent counter, after which nothing more may be sent.
+        self.broken = true;
+        match self.pace {
+            None => {
+                self.w.write_all(&out).await?;
+                self.w.flush().await?;
+            }
+            Some(p) => {
+                let deadline = tokio::time::Instant::now() + p.frame_budget(out.len());
+                let mut at = 0;
+                while at < out.len() {
+                    // One write() call either moves bytes or none, so bounding each call
+                    // is exact: a timeout means the peer took nothing for that long.
+                    let limit = p
+                        .idle
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                    let n = tokio::time::timeout(limit, self.w.write(&out[at..]))
+                        .await
+                        .map_err(|_| Ava1Error::Timeout)??;
+                    if n == 0 {
+                        return Err(Ava1Error::Closed);
+                    }
+                    at += n;
+                }
+                tokio::time::timeout(p.idle, self.w.flush())
+                    .await
+                    .map_err(|_| Ava1Error::Timeout)??;
+            }
+        }
+        self.broken = false;
         Ok(())
     }
 
@@ -125,6 +192,9 @@ pub struct FrameReader<R> {
     key: Option<[u8; 32]>,
     ctr: u64,
     max_body: u32,
+    /// Stamped (`now_us`) whenever bytes arrive, so liveness sees a large frame in progress.
+    progress: Option<Arc<AtomicU64>>,
+    pace: Option<Pace>,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
@@ -135,7 +205,32 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             key: None,
             ctr: 0,
             max_body: CONTROL_MAX_BODY,
+            progress: None,
+            pace: None,
         }
+    }
+
+    /// Stamp `progress` with `now_us()` on every byte received, and give each frame body a
+    /// deadline of `pace.idle + len / pace.min_rate` (a peer may be slow, but must not
+    /// drip one frame forever). Silence between frames is the owner's to judge.
+    pub fn set_pace(&mut self, progress: Arc<AtomicU64>, pace: Pace) {
+        self.progress = Some(progress);
+        self.pace = Some(pace);
+    }
+
+    async fn fill(&mut self, buf: &mut [u8]) -> Result<(), Ava1Error> {
+        let mut at = 0;
+        while at < buf.len() {
+            let n = self.r.read(&mut buf[at..]).await?;
+            if n == 0 {
+                return Err(Ava1Error::Closed);
+            }
+            if let Some(p) = &self.progress {
+                p.store(now_us(), Ordering::Relaxed);
+            }
+            at += n;
+        }
+        Ok(())
     }
 
     pub fn set_key(&mut self, key: [u8; 32]) {
@@ -149,13 +244,27 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 
     pub async fn recv(&mut self) -> Result<Frame, Ava1Error> {
         let mut hb = [0u8; HEADER_LEN];
-        self.r.read_exact(&mut hb).await.map_err(eof_is_closed)?;
+        self.fill(&mut hb).await?;
         let h = Header::decode(&hb)?;
         if h.body_len > self.max_body {
             return Err(HeaderError::TooLong(h.body_len).into());
         }
         let mut body = vec![0u8; h.body_len as usize];
-        self.r.read_exact(&mut body).await.map_err(eof_is_closed)?;
+        match self.pace {
+            None => self.fill(&mut body).await?,
+            Some(p) => {
+                let budget = p.frame_budget(body.len());
+                tokio::time::timeout(budget, self.fill(&mut body))
+                    .await
+                    .map_err(|_| {
+                        Ava1Error::Lost(format!(
+                            "a {}-byte frame took over {} ms to arrive",
+                            body.len(),
+                            budget.as_millis()
+                        ))
+                    })??;
+            }
+        }
         let sealed = h.flags & FLAG_SEALED != 0;
         match &self.key {
             Some(k) => {
@@ -173,14 +282,6 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             channel: h.channel,
             body,
         })
-    }
-}
-
-fn eof_is_closed(e: std::io::Error) -> Ava1Error {
-    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-        Ava1Error::Closed
-    } else {
-        Ava1Error::Io(e)
     }
 }
 

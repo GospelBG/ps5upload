@@ -159,10 +159,26 @@ async fn pump(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, cfg: ChaosConfig,
         if !cfg.delay.is_zero() {
             tokio::time::sleep(cfg.delay).await;
         }
-        if let Some(bps) = cfg.bytes_per_sec {
-            tokio::time::sleep(Duration::from_secs_f64(n as f64 / bps.max(1) as f64)).await;
+        // Under a cap the bytes go out in slices of about 20 ms each, as a slow link would
+        // deliver them, not as one burst after a long pause.
+        let slice = match cfg.bytes_per_sec {
+            Some(bps) => ((bps / 50).max(1) as usize).min(n),
+            None => n,
+        };
+        let mut failed = false;
+        for part in buf[..n].chunks(slice) {
+            if let Some(bps) = cfg.bytes_per_sec {
+                tokio::time::sleep(Duration::from_secs_f64(
+                    part.len() as f64 / bps.max(1) as f64,
+                ))
+                .await;
+            }
+            if to.write_all(part).await.is_err() {
+                failed = true;
+                break;
+            }
         }
-        if to.write_all(&buf[..n]).await.is_err() {
+        if failed {
             break;
         }
     }
