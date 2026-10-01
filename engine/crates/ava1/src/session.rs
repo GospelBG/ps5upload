@@ -286,7 +286,19 @@ pub struct Lane {
     pub id: u16,
     link: Link,
     _writer: SharedWriter,
-    live: Option<Arc<Mutex<[bool; 9]>>>,
+    _slot: Option<LaneSlot>,
+}
+
+/// Holds a lane id in `lanes_live`; frees it on every exit, including a dropped future.
+struct LaneSlot {
+    live: Arc<Mutex<[bool; 9]>>,
+    id: u16,
+}
+
+impl Drop for LaneSlot {
+    fn drop(&mut self) {
+        self.live.lock().unwrap()[self.id as usize] = false;
+    }
 }
 
 impl Lane {
@@ -303,17 +315,15 @@ impl Lane {
     }
 }
 
-impl Drop for Lane {
-    fn drop(&mut self) {
-        if let Some(live) = &self.live {
-            live.lock().unwrap()[self.id as usize] = false;
-        }
-    }
-}
-
 impl Session {
     /// Opens a data lane on the lowest free id (1..=8).
     pub async fn open_lane(&self) -> Result<Lane, Ava1Error> {
+        self.open_lane_at(self.addr).await
+    }
+
+    /// `open_lane` against another address. Tests only.
+    #[doc(hidden)]
+    pub async fn open_lane_at(&self, addr: SocketAddr) -> Result<Lane, Ava1Error> {
         if self.est.pairing.is_some() {
             return Err(Ava1Error::NotPaired);
         }
@@ -328,36 +338,35 @@ impl Session {
             live[i] = true;
             i as u16
         };
-        match self.join(id).await {
-            Ok((link, writer)) => Ok(Lane {
-                id,
-                link,
-                _writer: writer,
-                live: Some(self.lanes_live.clone()),
-            }),
-            Err(e) => {
-                self.lanes_live.lock().unwrap()[id as usize] = false;
-                Err(e)
-            }
-        }
+        let slot = LaneSlot {
+            live: self.lanes_live.clone(),
+            id,
+        };
+        let (link, writer) = self.join(id, addr).await?;
+        Ok(Lane {
+            id,
+            link,
+            _writer: writer,
+            _slot: Some(slot),
+        })
     }
 
     /// Joins `id` again while it is still open here — what a reconnect after a
     /// dropped lane looks like to the server. Tests only.
     #[doc(hidden)]
     pub async fn reopen_lane_for_test(&self, id: u16) -> Result<Lane, Ava1Error> {
-        let (link, writer) = self.join(id).await?;
+        let (link, writer) = self.join(id, self.addr).await?;
         Ok(Lane {
             id,
             link,
             _writer: writer,
-            live: None,
+            _slot: None,
         })
     }
 
-    async fn join(&self, id: u16) -> Result<(Link, SharedWriter), Ava1Error> {
+    async fn join(&self, id: u16, addr: SocketAddr) -> Result<(Link, SharedWriter), Ava1Error> {
         let t = self.timing.handshake;
-        let stream = within(t, async { Ok(TcpStream::connect(self.addr).await?) }).await?;
+        let stream = within(t, async { Ok(TcpStream::connect(addr).await?) }).await?;
         stream.set_nodelay(true)?;
         let (rh, wh) = stream.into_split();
         let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
@@ -391,5 +400,20 @@ impl Session {
         // Project 1 lanes carry heartbeats only; data frames arrive in project 2.
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         Ok((link, writer))
+    }
+}
+
+impl Session {
+    /// The Join a client would send for `lane_id` with `nonce`. Tests only.
+    #[doc(hidden)]
+    pub fn join_frame_for_test(&self, lane_id: u16, nonce: [u8; 16]) -> Join {
+        let sid = self.est.session_id;
+        let tag = keys::join_tag(&self.est.keys.c2s, b"join", &sid, lane_id, &nonce);
+        Join {
+            session_id: sid,
+            lane_id,
+            nonce,
+            tag,
+        }
     }
 }
