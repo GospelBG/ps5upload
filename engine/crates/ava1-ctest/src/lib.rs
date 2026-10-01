@@ -25,6 +25,7 @@ pub mod ffi {
             cap: usize,
             out_len: *mut usize,
         ) -> c_int;
+        pub fn ava1_utf8_valid(s: *const u8, n: usize) -> c_int;
         pub fn ava1_crc32c(p: *const u8, n: usize) -> u32;
         pub fn ava1_header_encode(h: *const CHeader, out: *mut u8);
         pub fn ava1_header_decode(inp: *const u8, h: *mut CHeader) -> c_int;
@@ -84,4 +85,8 @@ pub fn c_header_decode(b: &[u8; 16]) -> Result<Header, i32> {
         }),
         e => Err(e),
     }
+}
+
+pub fn c_utf8_valid(b: &[u8]) -> bool {
+    unsafe { ffi::ava1_utf8_valid(b.as_ptr(), b.len()) != 0 }
 }
