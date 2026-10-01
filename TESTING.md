@@ -97,8 +97,8 @@ curl -X POST http://127.0.0.1:19113/api/ps5/cleanup \
   -d '{"addr":"'"$PS5_HOST"':9114","path":"/data/ps5upload/tests/manual"}'
 ```
 
-**Use a live console when touching:** the payload C runtime, FTX2
-framing, transfer/reconcile/resume, storage, mount, cleanup, the file
+**Use a live console when touching:** the payload C runtime, AVA1
+(`payload/ava1/`), transfer/reconcile/resume, storage, mount, cleanup, the file
 browser, volume commands, or anything performance-sensitive.
 
 ### Hardware testing has teeth

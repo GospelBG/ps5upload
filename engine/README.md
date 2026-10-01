@@ -3,24 +3,26 @@
 The Rust workspace: everything between the desktop app and the PS5.
 
 The engine is a local HTTP service. The Tauri app doesn't talk to the
-console directly — it calls the engine, which speaks FTX2 to the payload.
+console directly — it calls the engine, which speaks AVA1 to the payload.
 That split is deliberate: the same API is reachable from a browser, a
 script, or CI, so nothing the app can do is locked inside the app. See
 the self-hosted-engine entries in [`../FAQ.md`](../FAQ.md).
 
 ```
 client (Tauri/React)  ──HTTP──▶  ps5upload-engine :19113
-                                      │ FTX2 binary framing
+                                      │ AVA1 (Noise XX, sealed frames)
                                       ▼
-                            payload  :9113 transfer
-                                     :9114 management
+                            payload  :9120
 ```
 
 ## Crates
 
 | Crate | What it is |
 |---|---|
-| `ftx2-proto` | Wire format: frame type IDs, header layout, constants. Shared by everything that speaks FTX2. |
+| `ava1` | The AVA1 protocol: frames, generated message codecs, Noise handshake, sessions, lanes, pairing. Spec: `protocol/ava1/SPEC.md`. |
+| `ava1-gen` | Generates the Rust and C codecs from `protocol/ava1/schema/ava1.toml`. Run it after editing the schema. |
+| `ava1-ctest` | Builds the payload's AVA1 C on the host so `cargo test` checks C against Rust. |
+| `ava1-chaos` | A misbehaving TCP proxy (latency, bandwidth caps, blackholes, kills) for resilience tests. |
 | `ps5upload-core` | The bulk of the logic — connection handling and socket tuning, transfer/resume/verification, filesystem and app RPCs, volume parsing, package install, saves, cheats, hardware, SMB, BPS patching. |
 | `ps5upload-engine` | The Axum HTTP service (~100 routes), job tracking, SSE progress events, and the desktop + mobile entry points. |
 | `ps5upload-pkg` | `.pkg` parsing — headers, entries, split-file sets. |

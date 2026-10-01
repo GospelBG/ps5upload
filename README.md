@@ -49,8 +49,10 @@
 
 ## What it does
 
-- **Fast transfer** — FTX2 binary protocol with BLAKE3 per-shard
-  verification, small-file packing, and resume on disconnect.
+- **Fast transfer** — the AVA1 protocol (Adaptive Verified Assembly):
+  several connections per transfer, every file verified end to end with
+  BLAKE3, tiny files bundled and applied in parallel, and resume after any
+  interruption — Wi-Fi drops, console rest mode, app restarts.
   Uses your LAN flat-out. Pack worker absorbs transient
   `EIO`/`EMFILE` hiccups so a 200k-file game upload doesn't get
   killed by one unlucky syscall.
@@ -300,15 +302,16 @@ client/ (Tauri 2 · React · TypeScript)
    │
    └── spawns ── ps5upload-engine (HTTP :19113)
                           │
-                          ▼  FTX2 binary framing
-                payload/ps5upload.elf  (PS5 C payload, ports 9113 + 9114)
+                          ▼  AVA1 (Noise-encrypted, port 9120)
+                payload/ps5upload.elf  (PS5 C payload)
 ```
 
 Three layers:
 
 - **`payload/`** — C payload that runs on the PS5 (FreeBSD 11).
-  Ports 9113 (transfer) + 9114 (management). Handles FTX2 framing,
-  BLAKE3 verification, mount pipelines, and FS ops.
+  Port 9120 (AVA1). Handles transfers, BLAKE3 verification, mount
+  pipelines, FS ops and every management call. The protocol spec is
+  [`protocol/ava1/SPEC.md`](protocol/ava1/SPEC.md).
 - **`engine/`** — Rust workspace with the protocol types, transfer
   logic, HTTP service, lab CLI, mock server, and benchmarks.
 - **`client/`** — Tauri 2 desktop app. Tauri IPC commands proxy to the
@@ -366,8 +369,8 @@ cross-platform, and live-PS5 validation workflow.
 - **Engine** — Rust (edition 2021), tokio + axum 0.8
 - **Desktop client** — Tauri 2, React, TypeScript, Zustand,
   Tailwind CSS v4, Vite
-- **Protocol** — FTX2 (custom binary framing, BLAKE3 shard
-  verification)
+- **Protocol** — AVA1 (binary frames generated from one schema for C and
+  Rust; Noise XX handshake, ChaCha20-Poly1305, BLAKE3 file verification)
 
 ## Supported platforms
 
@@ -452,10 +455,10 @@ port 9021 — a third-party component, not part of ps5upload.
   experience.
 
 **Q: Can I use this over the Internet?**
-* Yes, technically. If you forward ports 9113 / 9114 to your PS5
-  it will work. However, the FTX2 protocol is optimised for speed,
-  not for authentication — we don't recommend exposing an
-  exploited PS5 to the open Internet.
+* Technically yes — AVA1 (port 9120) encrypts and authenticates every
+  byte and only talks to paired devices. We still don't recommend
+  exposing an exploited PS5 to the open Internet; use a VPN to reach
+  your home network instead.
 
 **Q: How do I install / launch a game from the Library tab?**
 * The Library row exposes **Mount** for `.exfat` / `.ffpkg` /
@@ -531,7 +534,7 @@ port 9021 — a third-party component, not part of ps5upload.
   11, Zen 2) and calls PS5-only kernel entry points.
 
 **Q: What about older firmware (≤ 9.00)?**
-* The FTX2 payload itself doesn't call firmware-gated APIs, but
+* The payload's transfer code doesn't call firmware-gated APIs, but
   the ELF loader workflow on port 9021 depends on what your
   jailbreak exposes. Patches welcome.
 

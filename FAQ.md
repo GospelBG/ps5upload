@@ -34,8 +34,8 @@ If those terms aren't acceptable, do not use this software.
 **Q: What is ps5upload?**
 A cross-platform desktop app for moving files, game folders, and
 disk images from your computer to a jailbroken PS5. Built around a
-small custom payload that runs on the PS5 and speaks a binary
-protocol (FTX2) over your LAN.
+small custom payload that runs on the PS5 and speaks its own
+encrypted transfer protocol (AVA1) over your LAN.
 
 **Q: What does it actually do?**
 - **Transfer** files and folders at near-wire speed, with BLAKE3
@@ -1651,13 +1651,13 @@ It starts a small **FTP server on the PS5** (like `ftpsrv.elf`), so
 FileZilla, curl, or another PC can connect **to the console**. Default
 port is **2122** so it does not fight with ftpsrv on **2121**. Use this
 for interop with other tools — for bulk game uploads, prefer the
-Upload tab (FTX2 is faster and resumes).
+Upload tab (AVA1 is faster and resumes).
 
 **Q: What is the SMB Browser for?**
 It browses a **Windows share or Samba NAS from your computer** (not
 on the PS5). You can download a file to this PC, or **upload a file
 or whole folder straight to the PS5** in one step: the engine streams
-from the share into a temp folder, then FTX2 transfers it. Destination
+straight to the PS5 over AVA1, resuming if the link drops. Destination
 works like Upload — set a parent path such as `/data/homebrew` and the
 source name is appended.
 
@@ -1745,12 +1745,12 @@ on `localhost:19113`. The desktop app uses it under the hood; CLI
 users can hit the `/api/*` endpoints directly.
 
 **Q: Can I write my own client against the payload?**
-Yes. The FTX2 binary protocol is defined in
-`engine/crates/ftx2-proto/src/lib.rs` — all frame types, body
-shapes, and flag bits are documented there. The mock server in
-`engine/crates/ps5upload-tests/tests/mock_server.rs` is a
-reference implementation of the minimum subset needed for
-transfer, which you can read as example protocol code.
+Yes. AVA1 is specified in [`protocol/ava1/SPEC.md`](protocol/ava1/SPEC.md);
+every message is defined once in `protocol/ava1/schema/ava1.toml`, and
+`engine/crates/ava1-gen` generates codecs from it (it already emits Rust
+and C). `protocol/ava1/vectors/` holds byte-exact test vectors your
+implementation must reproduce. You will need to pair with the console:
+it shows a six-digit code that your client must display too.
 
 **Q: How do I contribute a translation?**
 Edit the strings in `client/src/i18n.ts` or use the helper script at

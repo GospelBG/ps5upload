@@ -19,8 +19,10 @@ half-working.
 
 `src/main.c` handles startup: credential elevation, runtime ownership,
 the management thread, the transfer loop, and cleanup. `src/runtime.c` is
-the FTX2 runtime itself — framing, the transaction journal, resume,
-direct and spooled writes, and most command handlers. `src/takeover.c`
+the runtime — the transaction journal, resume, direct and spooled writes,
+and most command handlers. `ava1/` is the AVA1 protocol in C (frames,
+generated codecs in `ava1/gen/`, Noise handshake, server); never edit
+`ava1/gen/` by hand. `src/takeover.c`
 asks an older resident payload to stand down before binding.
 
 The rest of `src/` is one module per capability: registration and launch,
