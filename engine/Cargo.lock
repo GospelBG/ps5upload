@@ -2236,6 +2236,7 @@ dependencies = [
  "aes-gcm 0.11.0",
  "anyhow",
  "async-trait",
+ "ava1",
  "axum",
  "base64",
  "blake3",
@@ -2288,8 +2289,11 @@ name = "ps5upload-lab"
 version = "5.41.0"
 dependencies = [
  "anyhow",
+ "ava1",
+ "ava1-chaos",
  "ftx2-proto",
  "ps5upload-core",
+ "tokio",
 ]
 
 [[package]]

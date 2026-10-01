@@ -283,6 +283,18 @@ async fn do_payload_send(ip: &str, path: &str, target_port: u16) -> Result<u64, 
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     }
 
+    // A ps5upload helper is sent from memory so its AVA1 trust slot can be stamped.
+    let helper_bytes = if target_port == PS5_LOADER_PORT && sending_ps5upload {
+        let mut v = Vec::with_capacity(size as usize);
+        file.read_to_end(&mut v)
+            .await
+            .map_err(|e| format!("read {path}: {e}"))?;
+        stamp_ava1_trust(&mut v).await;
+        Some(v)
+    } else {
+        None
+    };
+
     let addr = format!("{ip}:{target_port}");
     let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
         .await
@@ -291,24 +303,32 @@ async fn do_payload_send(ip: &str, path: &str, target_port: u16) -> Result<u64, 
     let sent = timeout(SEND_TIMEOUT, async {
         let mut buf = [0u8; 64 * 1024];
         let mut total = 0u64;
-        loop {
-            let n = file
-                .read(&mut buf)
-                .await
-                .map_err(|e| format!("read {path}: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            total = total.saturating_add(n as u64);
-            if total > PAYLOAD_SEND_MAX_BYTES {
-                return Err(format!(
-                    "payload exceeded {PAYLOAD_SEND_MAX_BYTES} bytes while streaming"
-                ));
-            }
+        if let Some(v) = &helper_bytes {
             stream
-                .write_all(&buf[..n])
+                .write_all(v)
                 .await
                 .map_err(|e| format!("write: {e}"))?;
+            total = v.len() as u64;
+        } else {
+            loop {
+                let n = file
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| format!("read {path}: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                total = total.saturating_add(n as u64);
+                if total > PAYLOAD_SEND_MAX_BYTES {
+                    return Err(format!(
+                        "payload exceeded {PAYLOAD_SEND_MAX_BYTES} bytes while streaming"
+                    ));
+                }
+                stream
+                    .write_all(&buf[..n])
+                    .await
+                    .map_err(|e| format!("write: {e}"))?;
+            }
         }
         // Bound the half-close FIN: if the PS5 loader's TCP stack
         // doesn't promptly ACK our FIN (e.g. its keepalive interval
@@ -372,12 +392,35 @@ pub async fn payload_send(ip: String, path: String, port: Option<u16>) -> serde_
     }
 }
 
+/// Stamps this engine's AVA1 key into a ps5upload helper ELF so the console trusts this
+/// engine without pairing (SPEC.md §5.1). An unreachable engine or an ELF without a slot
+/// (an older build) is sent unchanged; the console then opens its pairing window instead.
+async fn stamp_ava1_trust(bytes: &mut [u8]) {
+    let url = format!("{}/api/ava1/identity", crate::engine::url());
+    let key = async {
+        let client = crate::engine_http::engine_client_builder().build().ok()?;
+        let v: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+        let k = ava1::hex::decode(v.get("public_key")?.as_str()?)?;
+        <[u8; 32]>::try_from(k).ok()
+    }
+    .await;
+    match key {
+        Some(k) => {
+            if let Err(e) = ava1::trust::stamp(bytes, &k) {
+                eprintln!("[payload_send] AVA1 trust not stamped: {e}");
+            }
+        }
+        None => eprintln!("[payload_send] AVA1 trust not stamped: engine identity unavailable"),
+    }
+}
+
 /// Launch the ELF at `path` through Payload Manager (:8084). The stored copy
 /// is removed once it has been launched; the payload keeps running.
 async fn payload_send_via_payload_manager(ip: &str, path: &str) -> Result<u64, String> {
-    let bytes = tokio::fs::read(path)
+    let mut bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("read {path}: {e}"))?;
+    stamp_ava1_trust(&mut bytes).await;
     // Our own name, never the file's: Payload Manager files uploads under a
     // folder derived from the name and its cleanup clears that folder, so a
     // user's own "ps5upload" entry must not be the one we land in.

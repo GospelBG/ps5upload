@@ -8,3 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 ftx2-proto = { path = "../ftx2-proto" }
 ps5upload-core = { path = "../ps5upload-core" }
+ava1 = { path = "../ava1" }
+ava1-chaos = { path = "../ava1-chaos" }
+tokio = { workspace = true, features = ["net", "time", "io-util", "rt-multi-thread", "macros", "io-std"] }

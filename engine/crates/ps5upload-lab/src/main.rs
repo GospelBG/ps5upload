@@ -466,7 +466,225 @@ fn do_send_shard(addr: &str, tx_id_hex: &str, shard_seq: u64) -> Result<()> {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
+mod ava1_cmds {
+    use std::io::{BufRead, Write};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use anyhow::{anyhow, bail, Context, Result};
+    use ava1::keys::Identity;
+    use ava1::peers::PeerStore;
+    use ava1::session::{connect, Session, Timing};
+
+    /// Same files the engine uses (`<data dir>/ava/`), so a lab-stamped payload trusts the engine.
+    fn ava_dir() -> PathBuf {
+        if let Ok(p) = std::env::var("AVA1_DIR") {
+            return PathBuf::from(p);
+        }
+        let base = std::env::var("PS5UPLOAD_DATA_DIR")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".ps5upload")
+            });
+        base.join("ava")
+    }
+
+    fn identity() -> Result<Arc<Identity>> {
+        let p = ava_dir().join("identity");
+        Ok(Arc::new(
+            Identity::load_or_create(&p).with_context(|| format!("identity {}", p.display()))?,
+        ))
+    }
+
+    /// `192.168.1.5` or `192.168.1.5:9113` → `192.168.1.5:9120` (`AVA1_PORT` overrides the
+    /// port, e.g. to go through a local chaos proxy).
+    pub fn ava1_addr(addr: &str) -> String {
+        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+        let port = std::env::var("AVA1_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(ava1::gen::DEFAULT_PORT);
+        format!("{host}:{port}")
+    }
+
+    async fn session(addr: &str) -> Result<Session> {
+        let peers = Arc::new(Mutex::new(PeerStore::load(&ava_dir().join("peers"))?));
+        let mut s = connect(
+            &ava1_addr(addr),
+            identity()?,
+            peers,
+            "ps5upload-lab",
+            Timing::default(),
+        )
+        .await?;
+        if let Some(code) = s.pairing_code() {
+            print!(
+                "Pairing with {} — code {code:06}. Does the console show the same code? [y/N] ",
+                s.peer_name()
+            );
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line)?;
+            if !line.trim().eq_ignore_ascii_case("y") {
+                bail!("pairing not confirmed");
+            }
+            s.confirm_pairing().await?;
+            println!("paired");
+        }
+        Ok(s)
+    }
+
+    pub async fn ping(addr: &str, seconds: u64) -> Result<()> {
+        let s = session(addr).await?;
+        let info = s.node_info().await?;
+        println!(
+            "node.info: {} {} {} fw={}",
+            info.name,
+            info.platform,
+            info.version,
+            info.firmware.unwrap_or_default()
+        );
+        for i in 0..seconds {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if s.is_closed() {
+                bail!("session ended after {i} s: {}", s.closed().await);
+            }
+            println!("{:>4} s  rtt {:?}", i + 1, s.rtt());
+        }
+        s.close().await;
+        println!("ok");
+        Ok(())
+    }
+
+    pub async fn lanes(addr: &str, n: usize, seconds: u64) -> Result<()> {
+        let s = session(addr).await?;
+        let mut lanes = Vec::new();
+        for _ in 0..n {
+            lanes.push(s.open_lane().await?);
+        }
+        println!("{} lanes open", lanes.len());
+        for i in 0..seconds {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let dead = lanes.iter().filter(|l| l.is_closed()).count();
+            if dead > 0 || s.is_closed() {
+                bail!(
+                    "after {i} s: {dead} lanes closed, session closed: {}",
+                    s.is_closed()
+                );
+            }
+        }
+        println!("ok");
+        Ok(())
+    }
+
+    /// Asks the console to accept new pairings for `seconds` (this machine must be paired).
+    pub async fn pairing_open(addr: &str, seconds: u16) -> Result<()> {
+        let s = session(addr).await?;
+        s.open_pairing(seconds).await?;
+        println!("pairing open on {} for {seconds} s", s.peer_name());
+        s.close().await;
+        Ok(())
+    }
+
+    /// ChaCha20-Poly1305 cost on the console (sealed in its memory) and on this computer.
+    pub async fn cryptobench(addr: &str, mib: u16) -> Result<()> {
+        use ava1::wire::Message;
+        let s = session(addr).await?;
+        let body = ava1::gen::CryptoBench { mib }.to_bytes()?;
+        let r = s.rpc(ava1::gen::METHOD_CRYPTO_BENCH, &body).await?;
+        if r.status != ava1::gen::STATUS_OK {
+            bail!("crypto.bench failed with status {}", r.status);
+        }
+        let res = ava1::gen::CryptoBenchResult::decode(&r.body)?;
+        let console = res.bytes as f64 / res.micros.max(1) as f64; // bytes per µs = MB/s
+        let mut buf = vec![0x5au8; 1 << 20];
+        let t = std::time::Instant::now();
+        for i in 0..u64::from(mib.max(1)) {
+            ava1::keys::seal(&[0x11; 32], i, &[], &mut buf);
+            buf.truncate(1 << 20);
+        }
+        let here =
+            f64::from(u32::from(mib.max(1))) * 1_048_576.0 / t.elapsed().as_micros().max(1) as f64;
+        println!(
+            "console: {console:.0} MB/s on one core ({} MiB)",
+            res.bytes >> 20
+        );
+        println!("this computer: {here:.0} MB/s on one core");
+        println!(
+            "110 MB/s of transfer costs {:.1}% of one console core (target: at most 15%)",
+            110.0 / console * 100.0
+        );
+        s.close().await;
+        Ok(())
+    }
+
+    pub fn stamp(input: &str, output: &str) -> Result<()> {
+        let mut b = std::fs::read(input).with_context(|| format!("read {input}"))?;
+        let key = identity()?.public();
+        ava1::trust::stamp(&mut b, &key).map_err(|e| anyhow!("{input}: {e}"))?;
+        std::fs::write(output, &b).with_context(|| format!("write {output}"))?;
+        println!("stamped {output} with {}", ava1::hex::encode(&key));
+        Ok(())
+    }
+
+    pub async fn chaos(listen_port: u16, upstream: &str, args: &[String]) -> Result<()> {
+        let mut cfg = ava1_chaos::ChaosConfig::default();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            let v: u64 = it
+                .next()
+                .ok_or_else(|| anyhow!("{a} needs a value"))?
+                .parse()?;
+            match a.as_str() {
+                "--delay-ms" => cfg.delay = Duration::from_millis(v),
+                "--kbps" => cfg.bytes_per_sec = Some(v * 1024),
+                "--kill-every-s" => cfg.kill_every = Some(Duration::from_secs(v)),
+                other => bail!("unknown option {other}"),
+            }
+        }
+        let up = tokio::net::lookup_host(upstream)
+            .await?
+            .next()
+            .ok_or_else(|| anyhow!("resolve {upstream}"))?;
+        let p =
+            ava1_chaos::ChaosProxy::start_on(&format!("0.0.0.0:{listen_port}"), up, cfg).await?;
+        println!(
+            "chaos proxy {} -> {up}. Enter: b = toggle blackhole, k = kill all, q = quit",
+            p.addr
+        );
+        let mut on = false;
+        for line in std::io::stdin().lock().lines() {
+            match line?.trim() {
+                "b" => {
+                    on = !on;
+                    p.blackhole(on);
+                    println!("blackhole {on}");
+                }
+                "k" => {
+                    p.kill_all();
+                    println!("killed");
+                }
+                "q" => break,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 fn usage() -> ! {
+    eprintln!(
+        "  ava1-ping [SECONDS]            AVA1 handshake (pairs if needed), node.info, heartbeats"
+    );
+    eprintln!("  ava1-lanes N [SECONDS]         open N data lanes and keep them up");
+    eprintln!("  ava1-cryptobench [MIB]         ChaCha20 cost on the console vs this computer");
+    eprintln!("  ava1-pairing-open [SECONDS]    let another device pair with the console");
+    eprintln!("  ava1-stamp IN.elf OUT.elf      stamp this machine's AVA1 key into a payload");
+    eprintln!("  chaos-proxy PORT HOST:PORT [--delay-ms N] [--kbps N] [--kill-every-s N]");
     eprintln!("Usage: ps5upload-lab [ADDR] COMMAND [ARGS...]");
     eprintln!("  Default ADDR: {DEFAULT_ADDR}");
     eprintln!("Commands:");
@@ -630,6 +848,56 @@ fn main() -> Result<()> {
     }
 
     match rest[0].as_str() {
+        "ava1-ping" | "ava1-lanes" | "ava1-cryptobench" | "ava1-pairing-open" | "chaos-proxy" => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                match rest[0].as_str() {
+                    "ava1-cryptobench" => {
+                        ava1_cmds::cryptobench(
+                            addr,
+                            rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(256),
+                        )
+                        .await
+                    }
+                    "ava1-pairing-open" => {
+                        ava1_cmds::pairing_open(
+                            addr,
+                            rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(120),
+                        )
+                        .await
+                    }
+                    "ava1-ping" => {
+                        ava1_cmds::ping(
+                            addr,
+                            rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(10),
+                        )
+                        .await
+                    }
+                    "ava1-lanes" => {
+                        let n = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(8);
+                        ava1_cmds::lanes(
+                            addr,
+                            n,
+                            rest.get(2).and_then(|s| s.parse().ok()).unwrap_or(30),
+                        )
+                        .await
+                    }
+                    _ => {
+                        let port: u16 = rest
+                            .get(1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or_else(|| usage());
+                        let up = rest.get(2).map(|s| s.as_str()).unwrap_or_else(|| usage());
+                        ava1_cmds::chaos(port, up, &rest[3..]).await
+                    }
+                }
+            })
+        }
+        "ava1-stamp" => {
+            let i = rest.get(1).map(|s| s.as_str()).unwrap_or_else(|| usage());
+            let o = rest.get(2).map(|s| s.as_str()).unwrap_or_else(|| usage());
+            ava1_cmds::stamp(i, o)
+        }
         "hello" => do_hello(addr),
         "status" => do_status(addr),
         "volumes" => do_volumes(addr),
@@ -817,5 +1085,20 @@ fn main() -> Result<()> {
             do_shell(addr, session, cwd, &cmd)
         }
         cmd => bail!("unknown command: {cmd}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ava1_commands_use_port_9120() {
+        assert_eq!(
+            super::ava1_cmds::ava1_addr("192.168.86.100:9113"),
+            "192.168.86.100:9120"
+        );
+        assert_eq!(
+            super::ava1_cmds::ava1_addr("192.168.86.100"),
+            "192.168.86.100:9120"
+        );
     }
 }
