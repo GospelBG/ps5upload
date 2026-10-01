@@ -106,3 +106,12 @@ joins; and `ERR_NOT_PAIRED` while the session is not paired. Otherwise it sends
 everything after with lane_key(c2s|s2c, n) (§4.3). A join of a lane id that is
 still live supersedes the older connection. Lanes end with their session.
 In version 1 project 1, lanes carry only heartbeats.
+
+## 10. Version 1 scope
+Project 1 (this spec): framing, codecs, keys, handshake, pairing, trust slot,
+heartbeats, RPC `node.info`, data lanes carrying heartbeats only. Not yet in
+version 1: data frames, jobs, journals, resume, bundles (project 2); Ed25519
+signing keys and tickets, cross-network encryption, session parking (project 2);
+management RPCs replacing FTX2 (project 3). Unknown frame types on a control
+connection are a protocol error; new frame types require a version bump or a
+negotiated `caps` bit.
