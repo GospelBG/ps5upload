@@ -26,3 +26,26 @@ Encoders write extensions in ascending tag order. Decoders skip unknown tags,
 reject a repeated known tag, reject invalid UTF-8, and reject trailing bytes
 (both in the body and inside an extension value). The canonical encodings in
 `vectors/messages.txt` must round-trip byte for byte.
+
+## 4. Keys and sealing
+4.1 Identity: a static X25519 key pair per node.
+
+4.2 Handshake: `Noise_XX_25519_ChaChaPoly_BLAKE2b` (Noise revision 34), prologue
+"AVA1 v1"; the client is the initiator. Implementations must reproduce
+`vectors/noise_xx.json` (from the cacophony set). After message 3, Split() gives
+c2s (initiator → responder) and s2c; `h` is the handshake hash.
+
+4.3 Lane keys: lane_key(dir, n) = BLAKE2b-256(key = dir, "AVA1 lane" ‖ u16le(n));
+lane 0 is the control connection.
+
+4.4 Sealed frames: body = ChaCha20-Poly1305(lane key of this direction, nonce =
+4 zero bytes ‖ u64le(counter), AD = header bytes 0..11) followed by the 16-byte
+MAC; the counter is per lane and direction from 0. A frame that fails to open
+closes the connection.
+
+4.5 Join proofs: BLAKE2b-128(key = BLAKE2b-256(key = dir, "AVA1 join"),
+label ‖ session_id ‖ u16le(lane) ‖ nonce), label "join" with c2s, "join-ack"
+with s2c.
+
+4.6 Pairing code: u32le(BLAKE2b-256("AVA1 pairing" ‖ h)[0..4]) mod 10⁶, shown as
+six digits. A man in the middle yields different h, so different codes.

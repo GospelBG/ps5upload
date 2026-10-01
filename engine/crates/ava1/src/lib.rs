@@ -4,4 +4,5 @@ pub mod frame;
 pub mod hex;
 #[rustfmt::skip]
 pub mod gen;
+pub mod keys;
 pub mod wire;
