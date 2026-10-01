@@ -8,6 +8,10 @@ pub mod gen;
 pub mod handshake;
 pub mod hex;
 pub mod keys;
+mod link;
+pub mod peers;
+pub mod server;
+pub mod session;
 pub mod wire;
 
 pub use error::Ava1Error;

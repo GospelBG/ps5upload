@@ -77,3 +77,21 @@ six digits. A man in the middle yields different h, so different codes.
 state (0 empty, 1 stamped), 6 zero bytes, 32-byte X25519 key, 16 zero bytes. An
 engine sending the ELF writes state 1 and its key into the single slot; the
 payload adds that key to its peers at startup. Exactly one slot must exist.
+
+## 6. Liveness
+Every connection sends `Ping{seq, t_us}` every 2 s (default) on channel 0; the
+receiver answers `Pong` with the same values; the sender's RTT is now − t_us.
+A connection that has received no frame for 6 s (default) is dead and closed.
+Clocks are monotonic. A server closes a connection whose first frame does not
+arrive within the handshake timeout (10 s default). `Bye` ends a session;
+`Error` reports why and ends the connection.
+
+## 7. RPC
+`RpcRequest{method, body}` on the control connection, channel = request id
+(chosen by the client, unique among its outstanding requests). The server
+answers `RpcResponse{status, body}` on the same channel. status 0 = OK; error
+statuses are the `ERR_*` constants. Methods: 1 = node.info → body `NodeInfo`.
+
+## 8. Limits
+A server accepts at most 64 connections and 16 sessions; past either it sends
+`Error(ERR_BUSY)` and closes. The accept loop never stops on an accept error.
