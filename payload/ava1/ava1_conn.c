@@ -1,6 +1,8 @@
 #include "ava1_conn.h"
 
 #include <errno.h>
+#include <poll.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -17,7 +19,13 @@
 #define SEND_FLAGS 0
 #endif
 
-static int write_all(int fd, const uint8_t *p, size_t n) {
+uint64_t ava1_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static int write_all(int fd, const uint8_t *p, size_t n, size_t *sent) {
     while (n > 0) {
         ssize_t k = send(fd, p, n, SEND_FLAGS);
         if (k < 0) {
@@ -26,13 +34,31 @@ static int write_all(int fd, const uint8_t *p, size_t n) {
         }
         p += k;
         n -= (size_t)k;
+        *sent += (size_t)k;
     }
     return 0;
 }
 
-static int read_all(int fd, uint8_t *p, size_t n) {
+static int read_all(ava1_conn_t *c, uint8_t *p, size_t n) {
+    int fd = c->fd;
     while (n > 0) {
-        ssize_t k = recv(fd, p, n, 0);
+        ssize_t k;
+        if (c->deadline_ms) {
+            struct pollfd pf;
+            uint64_t now = ava1_now_ms();
+            int pr;
+            if (now >= c->deadline_ms) return AVA1_E_TIMEOUT;
+            pf.fd = fd;
+            pf.events = POLLIN;
+            pf.revents = 0;
+            pr = poll(&pf, 1, (int)(c->deadline_ms - now));
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                return AVA1_E_IO;
+            }
+            if (pr == 0) return AVA1_E_TIMEOUT;
+        }
+        k = recv(fd, p, n, 0);
         if (k == 0) return AVA1_E_CLOSED;
         if (k < 0) {
             if (errno == EINTR) continue;
@@ -61,7 +87,9 @@ static int send_locked(ava1_conn_t *c, uint8_t type, uint32_t channel, const uin
     ava1_header_t h;
     size_t mac = c->keyed ? AVA1_TAG_LEN : 0, total = AVA1_HEADER_LEN + len + mac;
     uint8_t *frame;
+    size_t sent = 0;
     int rc;
+    if (c->broken) return AVA1_E_IO;
     if (len + mac > AVA1_MAX_BODY) return AVA1_E_TOOLONG;
     frame = malloc(total);
     if (!frame) return AVA1_E_IO;
@@ -75,7 +103,12 @@ static int send_locked(ava1_conn_t *c, uint8_t type, uint32_t channel, const uin
         ava1_seal(c->send_key, c->send_ctr++, frame, 12, frame + AVA1_HEADER_LEN, len,
                   frame + AVA1_HEADER_LEN + len);
     }
-    rc = write_all(c->fd, frame, total);
+    rc = write_all(c->fd, frame, total, &sent);
+    if (rc != 0 && (sent > 0 || c->keyed)) {
+        /* Half a frame, or a counter spent on a frame the peer never got. */
+        c->broken = 1;
+        shutdown(c->fd, SHUT_RDWR);
+    }
     free(frame);
     return rc;
 }
@@ -101,7 +134,7 @@ int ava1_conn_recv(ava1_conn_t *c, uint8_t *type, uint8_t *flags, uint32_t *chan
     uint8_t hb[AVA1_HEADER_LEN], mac[AVA1_TAG_LEN];
     ava1_header_t h;
     size_t body;
-    int rc = read_all(c->fd, hb, sizeof hb);
+    int rc = read_all(c, hb, sizeof hb);
     if (rc != 0) return rc;
     rc = ava1_header_decode(hb, &h);
     if (rc != 0) return rc;
@@ -113,10 +146,10 @@ int ava1_conn_recv(ava1_conn_t *c, uint8_t *type, uint8_t *flags, uint32_t *chan
         body = h.body_len;
     }
     if (body > cap) return AVA1_E_TOOLONG;
-    rc = read_all(c->fd, buf, body);
+    rc = read_all(c, buf, body);
     if (rc != 0) return rc;
     if (c->keyed) {
-        rc = read_all(c->fd, mac, sizeof mac);
+        rc = read_all(c, mac, sizeof mac);
         if (rc != 0) return rc;
         if (ava1_open(c->recv_key, c->recv_ctr, hb, 12, buf, body, mac) != 0) return AVA1_E_TAG;
         c->recv_ctr++;

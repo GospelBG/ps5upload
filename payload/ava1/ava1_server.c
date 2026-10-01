@@ -42,6 +42,7 @@ typedef struct {
 
 typedef struct {
     int used;
+    int reserved; /* claimed by a handshake in progress; not yet joinable */
     uint8_t sid[16];
     uint8_t c2s[32];
     uint8_t s2c[32];
@@ -71,11 +72,7 @@ static struct {
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* Monotonic only: a settimeofday jump on the console must not age or revive anything. */
-static uint64_t now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
-}
+static uint64_t now_ms(void) { return ava1_now_ms(); }
 
 static void set_timeouts(int fd, uint32_t ms) {
     struct timeval tv;
@@ -156,27 +153,44 @@ static void clean_name(const uint8_t *p, uint16_t n, char out[64]) {
     out[k] = 0;
 }
 
-static int sess_add(const uint8_t sid[16], const uint8_t c2s[32], const uint8_t s2c[32], int paired,
-                    const uint8_t peer[32], const char *name) {
+/* Claims a slot before any handshake work, so the limit is enforced up front. */
+static int sess_reserve(void) {
     int i, idx = -1;
     pthread_mutex_lock(&mu);
     for (i = 0; i < MAX_SESSIONS; i++) {
-        if (!S.sessions[i].used) {
-            sess_t *s = &S.sessions[i];
-            memset(s, 0, sizeof *s);
-            s->used = 1;
-            memcpy(s->sid, sid, 16);
-            memcpy(s->c2s, c2s, 32);
-            memcpy(s->s2c, s2c, 32);
-            s->paired = paired;
-            memcpy(s->peer_key, peer, 32);
-            snprintf(s->peer_name, sizeof s->peer_name, "%s", name);
+        if (!S.sessions[i].used && !S.sessions[i].reserved) {
+            memset(&S.sessions[i], 0, sizeof S.sessions[i]);
+            S.sessions[i].reserved = 1;
             idx = i;
             break;
         }
     }
     pthread_mutex_unlock(&mu);
     return idx;
+}
+
+static void sess_release(int idx) {
+    pthread_mutex_lock(&mu);
+    if (!S.sessions[idx].used) S.sessions[idx].reserved = 0;
+    pthread_mutex_unlock(&mu);
+}
+
+/* Fills a slot from sess_reserve. */
+static void sess_fill(int idx, const uint8_t sid[16], const uint8_t c2s[32], const uint8_t s2c[32],
+                      int paired, const uint8_t peer[32], const char *name) {
+    pthread_mutex_lock(&mu);
+    {
+        sess_t *s = &S.sessions[idx];
+        memset(s, 0, sizeof *s);
+        s->used = 1;
+        memcpy(s->sid, sid, 16);
+        memcpy(s->c2s, c2s, 32);
+        memcpy(s->s2c, s2c, 32);
+        s->paired = paired;
+        memcpy(s->peer_key, peer, 32);
+        snprintf(s->peer_name, sizeof s->peer_name, "%s", name);
+    }
+    pthread_mutex_unlock(&mu);
 }
 
 static void sess_remove(int idx, const uint8_t sid[16]) {
@@ -312,9 +326,11 @@ static int do_rpc(conn_t *k, int idx, const uint8_t sid[16], uint32_t ch, const 
     if (q.method == AVA1_METHOD_PAIRING_OPEN) {
         ava1_pairing_open_t o;
         uint16_t st = AVA1_ERR_PROTOCOL;
-        pthread_mutex_lock(&mu);
-        S.sessions[idx].rpc_inflight--;
-        pthread_mutex_unlock(&mu);
+        if (slot) {
+            pthread_mutex_lock(&mu);
+            S.sessions[idx].rpc_inflight--;
+            pthread_mutex_unlock(&mu);
+        }
         if (ava1_pairing_open_decode(q.body, q.body_len, &o) == 0) {
             ava1_server_open_pairing(o.seconds > MAX_PAIRING_WINDOW_S ? MAX_PAIRING_WINDOW_S : o.seconds);
             st = AVA1_STATUS_OK;
@@ -384,7 +400,16 @@ static int handle_frame(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane
 static void serve_loop(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane, uint32_t gen, uint8_t *buf) {
     uint64_t last_rx = now_ms(), last_ping = 0;
     uint32_t ping_seq = 0;
-    set_timeouts(k->io.fd, S.cfg.dead_after_ms);
+    /* Handshake over: no deadline, and no send timeout (a timed-out write tears a frame;
+     * the liveness check below ends a dead connection and shutdown() frees any writer). */
+    k->io.deadline_ms = 0;
+    set_timeouts(k->io.fd, 0);
+    {
+        struct timeval tv;
+        tv.tv_sec = (time_t)(S.cfg.dead_after_ms / 1000u);
+        tv.tv_usec = (suseconds_t)((S.cfg.dead_after_ms % 1000u) * 1000u);
+        (void)setsockopt(k->io.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    }
     while (!S.stopping) {
         struct pollfd p;
         uint64_t t = now_ms(), since;
@@ -410,7 +435,7 @@ static void serve_loop(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane,
             uint8_t type, flags;
             uint32_t ch;
             size_t len;
-            if (ava1_conn_recv(&k->io, &type, &flags, &ch, buf, CTRL_MAX, &len) != 0) return;
+            if (ava1_conn_recv(&k->io, &type, &flags, &ch, buf, CTRL_MAX - AVA1_TAG_LEN, &len) != 0) return;
             last_rx = now_ms();
             if (handle_frame(k, idx, sid, lane, type, flags, ch, buf, len) != 0) return;
         }
@@ -445,17 +470,24 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     uint8_t type, flags;
     uint32_t ch;
     ava1_w_t w;
-    int known, open, idx;
+    int known, open, idx, filled = 0;
 
     memset(&ns, 0, sizeof ns);
     memset(&eph, 0, sizeof eph);
+    memset(c2s, 0, sizeof c2s);
+    memset(s2c, 0, sizeof s2c);
+    idx = sess_reserve();
+    if (idx < 0) {
+        (void)send_error(&k->io, AVA1_ERR_BUSY, "too many sessions");
+        return;
+    }
     if (ava1_hs1_decode(buf, len, &m1) != 0) {
         (void)send_error(&k->io, AVA1_ERR_PROTOCOL, "bad Hs1");
-        return;
+        goto out;
     }
     if (ava1_platform_random(secret, 32) != 0 || ava1_platform_random(sid, 16) != 0) {
         (void)send_error(&k->io, AVA1_ERR_INTERNAL, "no random source");
-        return;
+        goto out;
     }
     ava1_identity_from_secret(&eph, secret);
     crypto_wipe(secret, sizeof secret);
@@ -503,15 +535,13 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     ava1_w_init(&w, pl, sizeof pl);
     if (ava1_welcome_encode(&wel, &w) != 0 || ava1_conn_send(&k->io, AVA1_TYPE_WELCOME, 0, pl, w.len) != 0)
         goto out;
-    idx = sess_add(sid, c2s, s2c, known, ns.rs, peer_name);
-    if (idx < 0) {
-        (void)send_error(&k->io, AVA1_ERR_BUSY, "too many sessions");
-        goto out;
-    }
+    sess_fill(idx, sid, c2s, s2c, known, ns.rs, peer_name);
+    filled = 1;
     if (!known && S.cfg.on_pair_request) S.cfg.on_pair_request(peer_name, ava1_pairing_code(ns.h));
     serve_loop(k, idx, sid, 0, 0, buf);
     sess_remove(idx, sid);
 out:
+    if (!filled) sess_release(idx);
     crypto_wipe(&ns, sizeof ns);
     crypto_wipe(&eph, sizeof eph);
     crypto_wipe(c2s, sizeof c2s);
@@ -572,6 +602,7 @@ static void *conn_main(void *arg) {
     conn_t *k = arg;
     uint8_t *buf = malloc(CTRL_MAX);
     set_timeouts(k->io.fd, S.cfg.handshake_ms);
+    k->io.deadline_ms = now_ms() + S.cfg.handshake_ms;
     if (buf) {
         uint8_t type, flags;
         uint32_t ch;

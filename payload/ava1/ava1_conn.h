@@ -15,7 +15,15 @@ typedef struct {
     uint64_t send_ctr;
     uint64_t recv_ctr;
     pthread_mutex_t wmu;
+    /* Monotonic ms after which reads fail with AVA1_E_TIMEOUT; 0 = none. Bounds the whole
+     * handshake, which SO_RCVTIMEO alone cannot (it restarts on every byte). */
+    uint64_t deadline_ms;
+    /* A write failed part-way (or after sealing): the stream is torn, so nothing more is sent. */
+    int broken;
 } ava1_conn_t;
+
+/* CLOCK_MONOTONIC in milliseconds. */
+uint64_t ava1_now_ms(void);
 
 void ava1_conn_init(ava1_conn_t *c, int fd);
 /* Wipes keys and destroys the lock; does not close fd. */
