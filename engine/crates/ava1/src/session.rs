@@ -83,6 +83,21 @@ async fn within<T>(
         .map_err(|_| Ava1Error::Timeout)?
 }
 
+/// Sends one frame from a task of its own: a caller that drops the future (a timeout,
+/// a `select!`) must never cancel a write midway, which would leave a partial sealed
+/// frame on the wire and desynchronise the stream. Dropping the join handle does not
+/// cancel the task.
+async fn send_owned<M: FrameMessage + Send + Sync + 'static>(
+    writer: &SharedWriter,
+    channel: u32,
+    m: M,
+) -> Result<(), Ava1Error> {
+    let mut guard = writer.clone().lock_owned().await;
+    tokio::spawn(async move { guard.send_msg(channel, &m).await })
+        .await
+        .map_err(|e| Ava1Error::Lost(format!("send task failed: {e}")))?
+}
+
 pub async fn connect(
     addr: &str,
     me: Arc<Identity>,
@@ -163,11 +178,17 @@ impl Session {
         self.link.closed().await
     }
 
-    async fn request<M: FrameMessage>(&self, m: &M) -> Result<Frame, Ava1Error> {
+    async fn request<M: FrameMessage + Send + Sync + 'static>(
+        &self,
+        m: M,
+    ) -> Result<Frame, Ava1Error> {
         let id = self.next_req.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        self.writer.lock().await.send_msg(id, m).await?;
+        if let Err(e) = send_owned(&self.writer, id, m).await {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(e);
+        }
         let mut rx = rx;
         tokio::select! {
             f = &mut rx => f.map_err(|_| Ava1Error::Lost(self.link.reason())),
@@ -187,7 +208,7 @@ impl Session {
 
     pub async fn rpc(&self, method: u16, body: &[u8]) -> Result<RpcReply, Ava1Error> {
         let f = self
-            .request(&RpcRequest {
+            .request(RpcRequest {
                 method,
                 body: body.to_vec(),
             })
@@ -230,7 +251,7 @@ impl Session {
             return Ok(());
         };
         if p.server_must_confirm {
-            let r: PairResult = self.request(&PairConfirm {}).await?.decode()?;
+            let r: PairResult = self.request(PairConfirm {}).await?.decode()?;
             if r.accepted == 0 {
                 return Err(Ava1Error::Refused {
                     code: gen::ERR_PAIRING_CLOSED,

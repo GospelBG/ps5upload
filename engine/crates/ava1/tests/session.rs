@@ -328,3 +328,109 @@ fn peer_store_keeps_at_most_32_and_replaces_by_key() {
     assert_eq!(again.list().last().unwrap().name, "renamed line");
     assert_eq!(again.list().len(), ava1::peers::MAX_PEERS);
 }
+
+#[tokio::test]
+async fn a_cancelled_call_does_not_break_the_session() {
+    let (s_id, c_id) = (
+        Identity::generate().unwrap(),
+        Arc::new(Identity::generate().unwrap()),
+    );
+    let mut sp = PeerStore::in_memory();
+    sp.add(c_id.public(), "c").unwrap();
+    let mut cp = PeerStore::in_memory();
+    cp.add(s_id.public(), "s").unwrap();
+    let info = node_info_rpc("s");
+    let rpc: ava1::server::RpcHandler = Box::new(move |method, body| {
+        if method == 77 {
+            std::thread::sleep(Duration::from_millis(300));
+            return ava1::session::RpcReply {
+                status: gen::STATUS_OK,
+                body: Vec::new(),
+            };
+        }
+        info(method, body)
+    });
+
+    let (addr, _ctx) = start(ServerCtx::new(s_id, "s", sp, rpc).with_timing(fast())).await;
+    let s = connect(
+        &addr.to_string(),
+        c_id,
+        Arc::new(Mutex::new(cp)),
+        "c",
+        fast(),
+    )
+    .await
+    .unwrap();
+    // Three cancelled calls at a time (the server runs 4 calls per session), then let
+    // the sleepers drain; repeat so a drop is likely to land mid-send at least once.
+    for batch in 0..4u64 {
+        for i in 0..3u64 {
+            let big = vec![7u8; 60_000];
+            let _ = tokio::time::timeout(
+                Duration::from_micros(30 + (batch * 3 + i) * 60),
+                s.rpc(77, &big),
+            )
+            .await;
+            s.node_info().await.unwrap();
+            assert!(!s.is_closed(), "batch {batch} round {i}");
+        }
+        tokio::time::sleep(Duration::from_millis(350)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_session_limit_holds_under_a_handshake_storm() {
+    let (s_id, c_id) = (
+        Identity::generate().unwrap(),
+        Arc::new(Identity::generate().unwrap()),
+    );
+    let mut sp = PeerStore::in_memory();
+    sp.add(c_id.public(), "c").unwrap();
+    let mut cp = PeerStore::in_memory();
+    cp.add(s_id.public(), "s").unwrap();
+    let cp = Arc::new(Mutex::new(cp));
+    let timing = ava1::session::Timing {
+        handshake: Duration::from_secs(5),
+        ..fast()
+    };
+    let (addr, ctx) =
+        start(ServerCtx::new(s_id, "s", sp, node_info_rpc("s")).with_timing(timing)).await;
+    let n = ava1::server::MAX_SESSIONS + 4;
+    let a = addr.to_string();
+    let results = futures_join_all((0..n).map(|_| {
+        let (a, c_id, cp) = (a.clone(), c_id.clone(), cp.clone());
+        async move { connect(&a, c_id, cp, "c", timing).await }
+    }))
+    .await;
+    let (ok, bad): (Vec<_>, Vec<_>) = results.into_iter().partition(|r| r.is_ok());
+    assert_eq!(ok.len(), ava1::server::MAX_SESSIONS);
+    for r in bad {
+        assert!(
+            matches!(r, Err(Ava1Error::Refused { code, .. }) if code == gen::ERR_BUSY),
+            "{r:?}"
+        );
+    }
+    assert!(ctx.sessions() <= ava1::server::MAX_SESSIONS);
+    for r in ok {
+        r.unwrap().close().await;
+    }
+    let t = Instant::now();
+    while ctx.sessions() > 0 && t.elapsed() < Duration::from_secs(3) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    connect(&a, c_id, cp, "c", timing).await.unwrap();
+}
+
+async fn futures_join_all<F: std::future::Future + Send + 'static>(
+    it: impl Iterator<Item = F>,
+) -> Vec<F::Output>
+where
+    F::Output: Send + 'static,
+{
+    let hs: Vec<_> = it.map(tokio::spawn).collect();
+    let mut out = Vec::new();
+    for h in hs {
+        out.push(h.await.unwrap());
+    }
+    out
+}

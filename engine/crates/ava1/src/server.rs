@@ -55,6 +55,7 @@ pub struct ServerCtx {
     rpc: RpcHandler,
     pub(crate) sessions: Mutex<HashMap<[u8; 16], Arc<SessionEntry>>>,
     conns: AtomicUsize,
+    session_slots: AtomicUsize,
 }
 
 impl ServerCtx {
@@ -70,6 +71,7 @@ impl ServerCtx {
             rpc,
             sessions: Mutex::default(),
             conns: AtomicUsize::new(0),
+            session_slots: AtomicUsize::new(0),
         }
     }
 
@@ -156,6 +158,24 @@ pub async fn serve(listener: TcpListener, ctx: Arc<ServerCtx>) {
     }
 }
 
+struct SessionSlot(Arc<ServerCtx>);
+
+impl SessionSlot {
+    fn take(ctx: &Arc<ServerCtx>) -> Option<Self> {
+        if ctx.session_slots.fetch_add(1, Ordering::SeqCst) >= MAX_SESSIONS {
+            ctx.session_slots.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self(ctx.clone()))
+    }
+}
+
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        self.0.session_slots.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 async fn handle(s: TcpStream, ctx: &Arc<ServerCtx>) -> Result<(), Ava1Error> {
     s.set_nodelay(true)?;
     let (rh, wh) = s.into_split();
@@ -179,13 +199,14 @@ async fn control(
     first: Frame,
     ctx: &Arc<ServerCtx>,
 ) -> Result<(), Ava1Error> {
-    if ctx.sessions() >= MAX_SESSIONS {
+    // Reserve atomically before the handshake; released on every exit path by the guard.
+    let Some(_slot) = SessionSlot::take(ctx) else {
         refuse(&mut w, gen::ERR_BUSY, "too many sessions").await;
         return Err(Ava1Error::Refused {
             code: gen::ERR_BUSY,
             message: "too many sessions".into(),
         });
-    }
+    };
     let est = tokio::time::timeout(
         ctx.timing.handshake,
         handshake::server(
