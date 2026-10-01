@@ -213,7 +213,7 @@ fn c_and_rust_agree_on_mutated_messages() {
     }
     let mut total = 0usize;
     let mut accepted = 0usize;
-    for _ in 0..400 {
+    for _ in 0..800 {
         let mut round: Vec<(String, Vec<u8>)> = gen::ALL
             .iter()
             .map(|n| (n.to_string(), gen::sample(n, &mut rng).unwrap()))
