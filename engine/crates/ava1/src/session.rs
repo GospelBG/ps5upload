@@ -370,15 +370,15 @@ impl Session {
         stream.set_nodelay(true)?;
         let (rh, wh) = stream.into_split();
         let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
-        let nonce: [u8; 16] = keys::random_bytes()?;
+        let client_nonce: [u8; 16] = keys::random_bytes()?;
         let (k, sid) = (&self.est.keys, self.est.session_id);
-        let tag = keys::join_tag(&k.c2s, b"join", &sid, id, &nonce);
+        let tag = keys::join_tag(&k.c2s, &sid, id, &client_nonce);
         w.send_msg(
             0,
             &Join {
                 session_id: sid,
                 lane_id: id,
-                nonce,
+                client_nonce,
                 tag,
             },
         )
@@ -388,12 +388,12 @@ impl Session {
             return Err(handshake::refused(&f));
         }
         let ack: JoinAck = f.decode()?;
-        let want = keys::join_tag(&k.s2c, b"join-ack", &sid, id, &nonce);
+        let want = keys::join_ack_tag(&k.s2c, &sid, id, &client_nonce, &ack.server_nonce);
         if ack.lane_id != id || !keys::ct_eq16(&ack.tag, &want) {
             return Err(Ava1Error::BadTag);
         }
-        w.set_key(keys::lane_key(&k.c2s, id));
-        r.set_key(keys::lane_key(&k.s2c, id));
+        w.set_key(keys::lane_key(&k.c2s, id, &client_nonce, &ack.server_nonce));
+        r.set_key(keys::lane_key(&k.s2c, id, &client_nonce, &ack.server_nonce));
         let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(w));
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
         let link = drive(r, writer.clone(), self.timing, tx);
@@ -404,16 +404,31 @@ impl Session {
 }
 
 impl Session {
-    /// The Join a client would send for `lane_id` with `nonce`. Tests only.
+    /// The Join a client would send for `lane_id` with `client_nonce`. Tests only.
     #[doc(hidden)]
-    pub fn join_frame_for_test(&self, lane_id: u16, nonce: [u8; 16]) -> Join {
+    pub fn join_frame_for_test(&self, lane_id: u16, client_nonce: [u8; 16]) -> Join {
         let sid = self.est.session_id;
-        let tag = keys::join_tag(&self.est.keys.c2s, b"join", &sid, lane_id, &nonce);
+        let tag = keys::join_tag(&self.est.keys.c2s, &sid, lane_id, &client_nonce);
         Join {
             session_id: sid,
             lane_id,
-            nonce,
+            client_nonce,
             tag,
         }
+    }
+
+    /// The (c2s, s2c) keys a lane joined with these nonces uses. Tests only.
+    #[doc(hidden)]
+    pub fn lane_keys_for_test(
+        &self,
+        lane_id: u16,
+        client_nonce: &[u8; 16],
+        server_nonce: &[u8; 16],
+    ) -> ([u8; 32], [u8; 32]) {
+        let k = &self.est.keys;
+        (
+            keys::lane_key(&k.c2s, lane_id, client_nonce, server_nonce),
+            keys::lane_key(&k.s2c, lane_id, client_nonce, server_nonce),
+        )
     }
 }

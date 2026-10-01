@@ -180,21 +180,65 @@ fn mac16(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 16] {
     o
 }
 
-/// The key a lane uses in one direction: keyed BLAKE2b-256(dir, "AVA1 lane" ‖ u16le(lane)).
-pub fn lane_key(dir: &[u8; 32], lane: u16) -> [u8; 32] {
-    mac32(dir, &[b"AVA1 lane", &lane.to_le_bytes()])
+/// The key a connection uses in one direction (SPEC.md §4.3): keyed BLAKE2b-256(dir,
+/// "AVA1 lane" ‖ u16le(lane) ‖ client_nonce ‖ server_nonce). Both nonces are fresh
+/// random per lane join, so a re-join (or a replayed Join) of the same lane id never
+/// reuses a key with its counters restarted at 0. The control connection (lane 0) is
+/// keyed once per handshake and uses all-zero nonces (`control_key`).
+pub fn lane_key(
+    dir: &[u8; 32],
+    lane: u16,
+    client_nonce: &[u8; 16],
+    server_nonce: &[u8; 16],
+) -> [u8; 32] {
+    mac32(
+        dir,
+        &[
+            b"AVA1 lane",
+            &lane.to_le_bytes(),
+            client_nonce,
+            server_nonce,
+        ],
+    )
 }
 
-/// Join proofs: keyed BLAKE2b-128(BLAKE2b-256(dir, "AVA1 join"), label ‖ sid ‖ u16le(lane) ‖ nonce).
-pub fn join_tag(
-    dir: &[u8; 32],
-    label: &[u8],
+/// The control connection's key in one direction: `lane_key(dir, 0, 0¹⁶, 0¹⁶)`.
+pub fn control_key(dir: &[u8; 32]) -> [u8; 32] {
+    lane_key(dir, 0, &[0; 16], &[0; 16])
+}
+
+fn join_mac(dir: &[u8; 32], parts: &[&[u8]]) -> [u8; 16] {
+    let mut jk = mac32(dir, &[b"AVA1 join"]);
+    let t = mac16(&jk, parts);
+    jk.fill(0);
+    t
+}
+
+/// A Join's proof (SPEC.md §4.5): keyed BLAKE2b-128(BLAKE2b-256(c2s, "AVA1 join"),
+/// "join" ‖ sid ‖ u16le(lane) ‖ client_nonce).
+pub fn join_tag(c2s: &[u8; 32], sid: &[u8; 16], lane: u16, client_nonce: &[u8; 16]) -> [u8; 16] {
+    join_mac(c2s, &[b"join", sid, &lane.to_le_bytes(), client_nonce])
+}
+
+/// A JoinAck's proof: keyed BLAKE2b-128(BLAKE2b-256(s2c, "AVA1 join"),
+/// "join-ack" ‖ sid ‖ u16le(lane) ‖ client_nonce ‖ server_nonce).
+pub fn join_ack_tag(
+    s2c: &[u8; 32],
     sid: &[u8; 16],
     lane: u16,
-    nonce: &[u8; 16],
+    client_nonce: &[u8; 16],
+    server_nonce: &[u8; 16],
 ) -> [u8; 16] {
-    let jk = mac32(dir, &[b"AVA1 join"]);
-    mac16(&jk, &[label, sid, &lane.to_le_bytes(), nonce])
+    join_mac(
+        s2c,
+        &[
+            b"join-ack",
+            sid,
+            &lane.to_le_bytes(),
+            client_nonce,
+            server_nonce,
+        ],
+    )
 }
 
 /// The six-digit code both devices show while pairing, bound to this handshake.
@@ -363,15 +407,53 @@ mod tests {
     }
 
     #[test]
-    fn derived_keys_differ_by_lane_and_label() {
+    fn derived_keys_differ_by_lane_label_and_nonce() {
         let d = [9u8; 32];
-        assert_ne!(lane_key(&d, 0), lane_key(&d, 1));
-        let (sid, nonce) = ([1u8; 16], [2u8; 16]);
+        let (cn, sn) = ([1u8; 16], [2u8; 16]);
+        assert_ne!(lane_key(&d, 0, &cn, &sn), lane_key(&d, 1, &cn, &sn));
+        assert_eq!(control_key(&d), lane_key(&d, 0, &[0; 16], &[0; 16]));
+        // Two joins of the same lane id never share a key: either nonce changes it.
+        assert_ne!(lane_key(&d, 1, &cn, &sn), lane_key(&d, 1, &cn, &[3; 16]));
+        assert_ne!(lane_key(&d, 1, &cn, &sn), lane_key(&d, 1, &[3; 16], &sn));
+        let sid = [1u8; 16];
         assert_ne!(
-            join_tag(&d, b"join", &sid, 1, &nonce),
-            join_tag(&d, b"join-ack", &sid, 1, &nonce)
+            join_tag(&d, &sid, 1, &cn),
+            join_ack_tag(&d, &sid, 1, &cn, &sn)
+        );
+        assert_ne!(
+            join_ack_tag(&d, &sid, 1, &cn, &sn),
+            join_ack_tag(&d, &sid, 1, &cn, &[3; 16])
         );
         assert!(ct_eq16(&[7; 16], &[7; 16]) && !ct_eq16(&[7; 16], &[8; 16]));
+    }
+
+    #[test]
+    fn the_key_vectors_reproduce() {
+        let mut n = 0;
+        for l in include_str!("../../../../protocol/ava1/vectors/keys.txt").lines() {
+            if l.starts_with('#') || l.trim().is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let h16 = |s: &str| -> [u8; 16] { hex::decode(s).unwrap().try_into().unwrap() };
+            let h32 = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
+            let lane: u16 = f[2].parse().unwrap();
+            let got = match f[0] {
+                "lane_key" => hex::encode(&lane_key(&h32(f[1]), lane, &h16(f[3]), &h16(f[4]))),
+                "join_tag" => hex::encode(&join_tag(&h32(f[1]), &h16(f[5]), lane, &h16(f[3]))),
+                "join_ack_tag" => hex::encode(&join_ack_tag(
+                    &h32(f[1]),
+                    &h16(f[5]),
+                    lane,
+                    &h16(f[3]),
+                    &h16(f[4]),
+                )),
+                k => panic!("unknown vector kind {k}"),
+            };
+            assert_eq!(got, *f.last().unwrap(), "{l}");
+            n += 1;
+        }
+        assert!(n >= 5);
     }
 
     #[test]

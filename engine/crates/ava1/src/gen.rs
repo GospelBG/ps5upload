@@ -225,7 +225,7 @@ impl FrameMessage for PairResult {
 pub struct Join {
     pub session_id: [u8; 16],
     pub lane_id: u16,
-    pub nonce: [u8; 16],
+    pub client_nonce: [u8; 16],
     pub tag: [u8; 16],
 }
 
@@ -235,7 +235,7 @@ impl Message for Join {
     fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.fixed(&self.session_id);
         w.u16(self.lane_id);
-        w.fixed(&self.nonce);
+        w.fixed(&self.client_nonce);
         w.fixed(&self.tag);
         w.u16(0);
         Ok(())
@@ -246,7 +246,7 @@ impl Message for Join {
         let mut m = Self::default();
         m.session_id = r.fixed::<16>()?;
         m.lane_id = r.u16()?;
-        m.nonce = r.fixed::<16>()?;
+        m.client_nonce = r.fixed::<16>()?;
         m.tag = r.fixed::<16>()?;
         let ext_n = r.u16()?;
         for _ in 0..ext_n {
@@ -267,6 +267,7 @@ impl FrameMessage for Join {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct JoinAck {
     pub lane_id: u16,
+    pub server_nonce: [u8; 16],
     pub tag: [u8; 16],
 }
 
@@ -275,6 +276,7 @@ impl Message for JoinAck {
 
     fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.u16(self.lane_id);
+        w.fixed(&self.server_nonce);
         w.fixed(&self.tag);
         w.u16(0);
         Ok(())
@@ -284,6 +286,7 @@ impl Message for JoinAck {
         let mut r = Reader::new(b);
         let mut m = Self::default();
         m.lane_id = r.u16()?;
+        m.server_nonce = r.fixed::<16>()?;
         m.tag = r.fixed::<16>()?;
         let ext_n = r.u16()?;
         for _ in 0..ext_n {
@@ -796,8 +799,8 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "Welcome" => Welcome { knows_you: rng.next_u64() as u8, }.to_bytes().ok(),
         "PairConfirm" => PairConfirm { }.to_bytes().ok(),
         "PairResult" => PairResult { accepted: rng.next_u64() as u8, }.to_bytes().ok(),
-        "Join" => Join { session_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, lane_id: rng.next_u64() as u16, nonce: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, tag: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, }.to_bytes().ok(),
-        "JoinAck" => JoinAck { lane_id: rng.next_u64() as u16, tag: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, }.to_bytes().ok(),
+        "Join" => Join { session_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, lane_id: rng.next_u64() as u16, client_nonce: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, tag: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, }.to_bytes().ok(),
+        "JoinAck" => JoinAck { lane_id: rng.next_u64() as u16, server_nonce: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, tag: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, }.to_bytes().ok(),
         "Ping" => Ping { seq: rng.next_u64() as u32, t_us: rng.next_u64(), }.to_bytes().ok(),
         "Pong" => Pong { seq: rng.next_u64() as u32, t_us: rng.next_u64(), }.to_bytes().ok(),
         "Error" => Error { code: rng.next_u64() as u16, message: rng.ascii(20), }.to_bytes().ok(),

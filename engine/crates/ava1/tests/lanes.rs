@@ -92,7 +92,7 @@ async fn forged_and_unknown_joins_are_refused() {
     let forged = Join {
         session_id: [7; 16],
         lane_id: 1,
-        nonce: [1; 16],
+        client_nonce: [1; 16],
         tag: [2; 16],
     };
     assert_eq!(raw_join(addr, &forged).await.code, gen::ERR_BAD_JOIN);
@@ -196,7 +196,7 @@ async fn a_replayed_join_is_refused() {
     for i in 0..100u8 {
         let junk = Join {
             tag: [i; 16],
-            nonce: [i; 16],
+            client_nonce: [i; 16],
             ..good
         };
         assert_eq!(raw_join(addr, &junk).await.code, gen::ERR_BAD_JOIN);
@@ -207,4 +207,44 @@ async fn a_replayed_join_is_refused() {
         gen::ERR_BAD_JOIN,
         "replay refused even after junk joins"
     );
+}
+
+/// Sends `j` on a fresh connection; returns the JoinAck's server nonce or the refusal code.
+async fn join_ack(addr: std::net::SocketAddr, j: &Join) -> Result<[u8; 16], u16> {
+    let (rh, wh) = TcpStream::connect(addr).await.unwrap().into_split();
+    let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+    w.send_msg(0, j).await.unwrap();
+    let f = r.recv().await.unwrap();
+    if f.ty == gen::Error::TYPE {
+        return Err(f.decode::<gen::Error>().unwrap().code);
+    }
+    let ack: gen::JoinAck = f.decode().unwrap();
+    assert_eq!(ack.lane_id, j.lane_id);
+    Ok(ack.server_nonce)
+}
+
+#[tokio::test]
+async fn two_joins_of_one_lane_id_never_share_a_key() {
+    let (addr, _ctx, me, peers) = paired().await;
+    let s = connect(&addr.to_string(), me, peers, "c", fast())
+        .await
+        .unwrap();
+    let j = s.join_frame_for_test(2, [0x51; 16]);
+    let sn1 = join_ack(addr, &j).await.unwrap();
+    // Push the original Join out of the server's 64-entry replay window with valid joins.
+    for i in 0..70u8 {
+        join_ack(addr, &s.join_frame_for_test(2, [i; 16]))
+            .await
+            .unwrap();
+    }
+    // The replay is no longer remembered, so it is acked — but with a new server nonce,
+    // so the lane keys differ from the original join's and no (key, counter) repeats.
+    let sn2 = join_ack(addr, &j).await.unwrap();
+    assert_ne!(sn1, sn2);
+    let (a, b) = (
+        s.lane_keys_for_test(2, &j.client_nonce, &sn1),
+        s.lane_keys_for_test(2, &j.client_nonce, &sn2),
+    );
+    assert_ne!(a.0, b.0);
+    assert_ne!(a.1, b.1);
 }

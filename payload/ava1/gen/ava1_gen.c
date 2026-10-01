@@ -138,7 +138,7 @@ int ava1_pair_result_decode(const uint8_t *buf, size_t len, ava1_pair_result_t *
 int ava1_join_encode(const ava1_join_t *m, ava1_w_t *w) {
     ava1_w_fixed(w, m->session_id, 16);
     ava1_w_u16(w, m->lane_id);
-    ava1_w_fixed(w, m->nonce, 16);
+    ava1_w_fixed(w, m->client_nonce, 16);
     ava1_w_fixed(w, m->tag, 16);
     ava1_w_u16(w, 0);
     return w->err;
@@ -151,7 +151,7 @@ int ava1_join_decode(const uint8_t *buf, size_t len, ava1_join_t *m) {
     ava1_r_init(&r, buf, len);
     ava1_r_fixed(&r, m->session_id, 16);
     m->lane_id = ava1_r_u16(&r);
-    ava1_r_fixed(&r, m->nonce, 16);
+    ava1_r_fixed(&r, m->client_nonce, 16);
     ava1_r_fixed(&r, m->tag, 16);
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {
@@ -165,6 +165,7 @@ int ava1_join_decode(const uint8_t *buf, size_t len, ava1_join_t *m) {
 
 int ava1_join_ack_encode(const ava1_join_ack_t *m, ava1_w_t *w) {
     ava1_w_u16(w, m->lane_id);
+    ava1_w_fixed(w, m->server_nonce, 16);
     ava1_w_fixed(w, m->tag, 16);
     ava1_w_u16(w, 0);
     return w->err;
@@ -176,6 +177,7 @@ int ava1_join_ack_decode(const uint8_t *buf, size_t len, ava1_join_ack_t *m) {
     memset(m, 0, sizeof(*m));
     ava1_r_init(&r, buf, len);
     m->lane_id = ava1_r_u16(&r);
+    ava1_r_fixed(&r, m->server_nonce, 16);
     ava1_r_fixed(&r, m->tag, 16);
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {

@@ -96,13 +96,15 @@ name = "PairResult"
 type = 0x06
 fields = [{ name = "accepted", ty = "u8" }]
 
+# A data lane (SPEC.md §9). Both nonces are fresh random per join and feed the lane
+# keys, so no two joins of one lane id ever share a key (§4.3).
 [[message]]
 name = "Join"
 type = 0x07
 fields = [
   { name = "session_id", ty = "b16" },
   { name = "lane_id", ty = "u16" },
-  { name = "nonce", ty = "b16" },
+  { name = "client_nonce", ty = "b16" },
   { name = "tag", ty = "b16" },
 ]
 
@@ -111,6 +113,7 @@ name = "JoinAck"
 type = 0x08
 fields = [
   { name = "lane_id", ty = "u16" },
+  { name = "server_nonce", ty = "b16" },
   { name = "tag", ty = "b16" },
 ]
 

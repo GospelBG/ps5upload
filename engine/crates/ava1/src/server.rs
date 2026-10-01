@@ -379,7 +379,7 @@ async fn lane(
         refuse(&mut w, gen::ERR_BAD_JOIN, "unknown session").await;
         return Err(refused(gen::ERR_BAD_JOIN));
     };
-    let want = keys::join_tag(&entry.keys.c2s, b"join", &j.session_id, j.lane_id, &j.nonce);
+    let want = keys::join_tag(&entry.keys.c2s, &j.session_id, j.lane_id, &j.client_nonce);
     let lane_ok = (1..=gen::MAX_LANES as u16).contains(&j.lane_id);
     if !lane_ok || !keys::ct_eq16(&want, &j.tag) {
         refuse(&mut w, gen::ERR_BAD_JOIN, "join refused").await;
@@ -387,12 +387,12 @@ async fn lane(
     }
     let fresh = {
         let mut n = entry.nonces.lock().unwrap();
-        let fresh = !n.contains(&j.nonce);
+        let fresh = !n.contains(&j.client_nonce);
         if fresh {
             if n.len() >= JOIN_NONCES {
                 n.pop_front();
             }
-            n.push_back(j.nonce);
+            n.push_back(j.client_nonce);
         }
         fresh
     };
@@ -410,23 +410,22 @@ async fn lane(
         g[lane] += 1;
         g[lane]
     };
-    let tag = keys::join_tag(
-        &entry.keys.s2c,
-        b"join-ack",
-        &j.session_id,
-        j.lane_id,
-        &j.nonce,
-    );
+    // A fresh server nonce per join: even a replayed Join (one older than the nonce
+    // window) gets keys never used before, so no (key, counter) pair repeats.
+    let server_nonce: [u8; 16] = keys::random_bytes()?;
+    let (cn, sn) = (j.client_nonce, server_nonce);
+    let tag = keys::join_ack_tag(&entry.keys.s2c, &j.session_id, j.lane_id, &cn, &sn);
     w.send_msg(
         0,
         &JoinAck {
             lane_id: j.lane_id,
+            server_nonce,
             tag,
         },
     )
     .await?;
-    r.set_key(keys::lane_key(&entry.keys.c2s, j.lane_id));
-    w.set_key(keys::lane_key(&entry.keys.s2c, j.lane_id));
+    r.set_key(keys::lane_key(&entry.keys.c2s, j.lane_id, &cn, &sn));
+    w.set_key(keys::lane_key(&entry.keys.s2c, j.lane_id, &cn, &sn));
     let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(w));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let link = drive(r, writer, ctx.timing, tx);

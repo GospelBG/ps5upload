@@ -62,15 +62,26 @@ pub mod ffi {
     extern "C" {
         pub fn ava1_test_sizeof_noise() -> usize;
         pub fn ava1_identity_from_secret(id: *mut CIdentity, secret: *const u8);
-        pub fn ava1_lane_key(dir: *const u8, lane: u16, out: *mut u8);
+        pub fn ava1_lane_key(dir: *const u8, lane: u16, cn: *const u8, sn: *const u8, out: *mut u8);
+        pub fn ava1_control_key(dir: *const u8, out: *mut u8);
         pub fn ava1_join_tag(
             dir: *const u8,
-            label: *const c_char,
             sid: *const u8,
             lane: u16,
-            nonce: *const u8,
+            cn: *const u8,
             out: *mut u8,
         );
+        pub fn ava1_join_ack_tag(
+            dir: *const u8,
+            sid: *const u8,
+            lane: u16,
+            cn: *const u8,
+            sn: *const u8,
+            out: *mut u8,
+        );
+        /// Feeds `frame` to the C reader of a connection keyed with `key` (counter 0).
+        /// 0 = opened; AVA1_E_* otherwise.
+        pub fn ava1_test_conn_open_frame(key: *const u8, frame: *const u8, len: usize) -> c_int;
         pub fn ava1_pairing_code(hash: *const u8) -> u32;
         pub fn ava1_noise_init(
             ns: *mut CNoise,

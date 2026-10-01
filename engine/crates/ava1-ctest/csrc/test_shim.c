@@ -1,6 +1,10 @@
 /* Starts the payload's AVA1 server on the host with a node.info handler (tests only). */
 #include <stdint.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "ava1_conn.h"
 
 #include "ava1_gen.h"
 #include "ava1_server.h"
@@ -56,3 +60,25 @@ int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, uin
 
 uint32_t ava1_test_pair_requests(void) { return __atomic_load_n(&g_pair_requests, __ATOMIC_SEQ_CST); }
 uint32_t ava1_test_last_pair_code(void) { return __atomic_load_n(&g_last_code, __ATOMIC_SEQ_CST); }
+
+int ava1_test_conn_open_frame(const uint8_t key[32], const uint8_t *frame, size_t len) {
+    int sv[2], rc;
+    ava1_conn_t c;
+    uint8_t type, flags, buf[256];
+    uint32_t ch;
+    size_t n;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -100;
+    if (write(sv[1], frame, len) != (ssize_t)len) {
+        close(sv[0]);
+        close(sv[1]);
+        return -101;
+    }
+    close(sv[1]);
+    ava1_conn_init(&c, sv[0]);
+    memcpy(c.recv_key, key, 32);
+    c.keyed = 1;
+    rc = ava1_conn_recv(&c, &type, &flags, &ch, buf, sizeof buf, &n);
+    ava1_conn_destroy(&c);
+    close(sv[0]);
+    return rc;
+}

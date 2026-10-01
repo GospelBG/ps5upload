@@ -35,17 +35,21 @@ reject a repeated known tag, reject invalid UTF-8, and reject trailing bytes
 `vectors/noise_xx.json` (from the cacophony set). After message 3, Split() gives
 c2s (initiator → responder) and s2c; `h` is the handshake hash.
 
-4.3 Lane keys: lane_key(dir, n) = BLAKE2b-256(key = dir, "AVA1 lane" ‖ u16le(n));
-lane 0 is the control connection.
+4.3 Lane keys: lane_key(dir, n, cn, sn) = BLAKE2b-256(key = dir, "AVA1 lane" ‖
+u16le(n) ‖ cn ‖ sn), where cn and sn are the 16-byte client and server nonces of
+the lane's join (§9). Both are fresh random per join, so a re-join of lane n — or a
+replayed Join, even one the server no longer remembers — never gets a key already
+used with counters restarted at 0. The control connection is lane 0, keyed once per
+handshake, with cn = sn = 16 zero bytes. `vectors/keys.txt` pins these derivations.
 
 4.4 Sealed frames: body = ChaCha20-Poly1305(lane key of this direction, nonce =
 4 zero bytes ‖ u64le(counter), AD = header bytes 0..11) followed by the 16-byte
 MAC; the counter is per lane and direction from 0. A frame that fails to open
 closes the connection.
 
-4.5 Join proofs: BLAKE2b-128(key = BLAKE2b-256(key = dir, "AVA1 join"),
-label ‖ session_id ‖ u16le(lane) ‖ nonce), label "join" with c2s, "join-ack"
-with s2c.
+4.5 Join proofs: BLAKE2b-128(key = BLAKE2b-256(key = dir, "AVA1 join"), m):
+the Join tag uses dir = c2s and m = "join" ‖ session_id ‖ u16le(lane) ‖ cn; the
+JoinAck tag uses dir = s2c and m = "join-ack" ‖ session_id ‖ u16le(lane) ‖ cn ‖ sn.
 
 4.6 Pairing code: u32le(BLAKE2b-256("AVA1 pairing" ‖ h)[0..4]) mod 10⁶, shown as
 six digits. A man in the middle yields different h, so different codes.
@@ -97,13 +101,15 @@ A server accepts at most 64 connections and 16 sessions; past either it sends
 `Error(ERR_BUSY)` and closes. The accept loop never stops on an accept error.
 
 ## 9. Data lanes
-A client opens lane n (1..=8) by connecting and sending, untagged,
-`Join{session_id, lane_id, nonce, tag = MAC(c2s, "join" ‖ session_id ‖ u16(n) ‖
-nonce)}`. The server refuses (`Error(ERR_BAD_JOIN)`) an unknown session, a lane
-id outside 1..=8, a wrong tag, or a nonce it has seen in this session's last 64
-joins; and `ERR_NOT_PAIRED` while the session is not paired. Otherwise it sends
-`JoinAck{lane_id, MAC(s2c, "join-ack" ‖ …)}` untagged, and both sides tag
-everything after with lane_key(c2s|s2c, n) (§4.3). A join of a lane id that is
+A client opens lane n (1..=8) by connecting and sending, unsealed,
+`Join{session_id, lane_id, client_nonce, tag}` with a fresh random client_nonce
+and the Join tag of §4.5. The server refuses (`Error(ERR_BAD_JOIN)`) an unknown
+session, a lane id outside 1..=8, a wrong tag, or a client_nonce it has seen in
+this session's last 64 joins; and `ERR_NOT_PAIRED` while the session is not
+paired. Otherwise it draws a fresh random server_nonce and sends, unsealed,
+`JoinAck{lane_id, server_nonce, tag}` (JoinAck tag, §4.5); the client checks the
+tag. Both sides then seal everything after with lane_key(c2s|s2c, n, client_nonce,
+server_nonce) (§4.3), counters from 0. A join of a lane id that is
 still live supersedes the older connection. Lanes end with their session.
 In version 1 project 1, lanes carry only heartbeats.
 

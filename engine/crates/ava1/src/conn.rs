@@ -113,6 +113,11 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         self.w.shutdown().await
     }
+
+    /// The underlying stream (tests capture written frames this way).
+    pub fn into_inner(self) -> W {
+        self.w
+    }
 }
 
 pub struct FrameReader<R> {
@@ -176,5 +181,40 @@ fn eof_is_closed(e: std::io::Error) -> Ava1Error {
         Ava1Error::Closed
     } else {
         Ava1Error::Io(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn sealed_frame(key: [u8; 32]) -> Vec<u8> {
+        let mut w = FrameWriter::new(Vec::new());
+        w.set_key(key);
+        w.send(0x09, 7, b"heartbeat body").await.unwrap();
+        w.into_inner()
+    }
+
+    #[tokio::test]
+    async fn a_sealed_frame_whose_header_was_altered_does_not_open() {
+        let key = [0x21u8; 32];
+        let frame = sealed_frame(key).await;
+        let mut r = FrameReader::new(&frame[..]);
+        r.set_key(key);
+        assert_eq!(r.recv().await.unwrap().body, b"heartbeat body");
+        // Type, flags-free bytes of the channel: each change gets a valid CRC, so only the
+        // AEAD's associated data (header bytes 0..12) can catch it.
+        for at in [2usize, 4, 7] {
+            let mut t = frame.clone();
+            t[at] ^= 0x01;
+            let crc = crate::crc32c::crc32c(&t[..12]);
+            t[12..16].copy_from_slice(&crc.to_le_bytes());
+            let mut r = FrameReader::new(&t[..]);
+            r.set_key(key);
+            assert!(
+                matches!(r.recv().await, Err(Ava1Error::BadTag)),
+                "header byte {at}"
+            );
+        }
     }
 }

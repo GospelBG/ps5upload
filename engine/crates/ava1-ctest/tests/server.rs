@@ -196,7 +196,7 @@ async fn the_c_server_rejects_forged_and_replayed_frames() {
         &gen::Join {
             session_id: [1; 16],
             lane_id: 1,
-            nonce: [2; 16],
+            client_nonce: [2; 16],
             tag: [3; 16],
         },
     )
@@ -398,4 +398,39 @@ async fn c_server_refuses_a_17th_session_before_the_handshake() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_never_reuses_a_lane_key() {
+    let d = dir("rejoin");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    async fn ack(addr: &str, j: &gen::Join) -> [u8; 16] {
+        let (rh, wh) = TcpStream::connect(addr).await.unwrap().into_split();
+        let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+        w.send_msg(0, j).await.unwrap();
+        r.recv()
+            .await
+            .unwrap()
+            .decode::<gen::JoinAck>()
+            .unwrap()
+            .server_nonce
+    }
+    let j = s.join_frame_for_test(4, [0x61; 16]);
+    let sn1 = ack(&srv.addr(), &j).await;
+    for i in 0..70u8 {
+        ack(&srv.addr(), &s.join_frame_for_test(4, [i; 16])).await;
+        // One lane connection at a time, so the per-address limit never applies.
+        wait_conns(&srv, 1).await;
+    }
+    // Past the 64-entry window the replay is acked again, but with fresh keys.
+    let sn2 = ack(&srv.addr(), &j).await;
+    assert_ne!(sn1, sn2);
+    assert_ne!(
+        s.lane_keys_for_test(4, &j.client_nonce, &sn1),
+        s.lane_keys_for_test(4, &j.client_nonce, &sn2)
+    );
 }

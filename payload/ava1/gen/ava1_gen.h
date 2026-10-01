@@ -87,7 +87,7 @@ int ava1_pair_result_decode(const uint8_t *buf, size_t len, ava1_pair_result_t *
 typedef struct {
     uint8_t session_id[16];
     uint16_t lane_id;
-    uint8_t nonce[16];
+    uint8_t client_nonce[16];
     uint8_t tag[16];
 } ava1_join_t;
 
@@ -96,6 +96,7 @@ int ava1_join_decode(const uint8_t *buf, size_t len, ava1_join_t *m);
 
 typedef struct {
     uint16_t lane_id;
+    uint8_t server_nonce[16];
     uint8_t tag[16];
 } ava1_join_ack_t;
 

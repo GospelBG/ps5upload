@@ -2,7 +2,6 @@
 use ava1::hex;
 use ava1::keys::{self, Handshake, Identity};
 use ava1_ctest::{ffi, CHandshake};
-use std::ffi::CString;
 
 fn v() -> serde_json::Value {
     serde_json::from_str(include_str!(
@@ -101,28 +100,42 @@ fn c_derivations_and_sealing_match_rust() {
     let dir = [0x11u8; 32];
     let mut out32 = [0u8; 32];
     let mut out16 = [0u8; 16];
+    let (cn, sn, sid) = ([4u8; 16], [5u8; 16], [3u8; 16]);
     for lane in [0u16, 1, 8, 0xffff] {
-        unsafe { ffi::ava1_lane_key(dir.as_ptr(), lane, out32.as_mut_ptr()) };
-        assert_eq!(out32, keys::lane_key(&dir, lane));
-    }
-    let (sid, nonce) = ([3u8; 16], [4u8; 16]);
-    for label in ["join", "join-ack"] {
-        let l = CString::new(label).unwrap();
         unsafe {
-            ffi::ava1_join_tag(
+            ffi::ava1_lane_key(
                 dir.as_ptr(),
-                l.as_ptr(),
-                sid.as_ptr(),
-                5,
-                nonce.as_ptr(),
-                out16.as_mut_ptr(),
+                lane,
+                cn.as_ptr(),
+                sn.as_ptr(),
+                out32.as_mut_ptr(),
             )
         };
-        assert_eq!(
-            out16,
-            keys::join_tag(&dir, label.as_bytes(), &sid, 5, &nonce)
-        );
+        assert_eq!(out32, keys::lane_key(&dir, lane, &cn, &sn));
     }
+    unsafe { ffi::ava1_control_key(dir.as_ptr(), out32.as_mut_ptr()) };
+    assert_eq!(out32, keys::control_key(&dir));
+    unsafe {
+        ffi::ava1_join_tag(
+            dir.as_ptr(),
+            sid.as_ptr(),
+            5,
+            cn.as_ptr(),
+            out16.as_mut_ptr(),
+        )
+    };
+    assert_eq!(out16, keys::join_tag(&dir, &sid, 5, &cn));
+    unsafe {
+        ffi::ava1_join_ack_tag(
+            dir.as_ptr(),
+            sid.as_ptr(),
+            5,
+            cn.as_ptr(),
+            sn.as_ptr(),
+            out16.as_mut_ptr(),
+        )
+    };
+    assert_eq!(out16, keys::join_ack_tag(&dir, &sid, 5, &cn, &sn));
     let hash = [0x77u8; 64];
     assert_eq!(
         unsafe { ffi::ava1_pairing_code(hash.as_ptr()) },
@@ -165,6 +178,24 @@ fn c_derivations_and_sealing_match_rust() {
             0
         );
         assert_eq!(ct, body);
+        // The header is the AD: a frame whose header was altered (CRC fixed up) never opens.
+        let mut bad_ad = ad;
+        bad_ad[4] ^= 1;
+        let mut tampered = rust[..len].to_vec();
+        assert_ne!(
+            unsafe {
+                ffi::ava1_open(
+                    dir.as_ptr(),
+                    42,
+                    bad_ad.as_ptr(),
+                    bad_ad.len(),
+                    tampered.as_mut_ptr(),
+                    tampered.len(),
+                    tag.as_ptr(),
+                )
+            },
+            0
+        );
         let mut forged = rust[..len].to_vec();
         assert_ne!(
             unsafe {
@@ -198,4 +229,76 @@ fn c_refuses_garbage_and_out_of_turn_messages() {
     let mut m2 = resp.write(b"").unwrap();
     m2[50] ^= 1;
     assert!(init.read(&m2).is_err(), "a tampered message 2 is refused");
+}
+
+#[test]
+fn c_key_derivations_reproduce_the_vectors() {
+    let h = |s: &str| hex::decode(s).unwrap();
+    let mut n = 0;
+    for l in include_str!("../../../../protocol/ava1/vectors/keys.txt").lines() {
+        if l.starts_with('#') || l.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let (dir, lane) = (h(f[1]), f[2].parse::<u16>().unwrap());
+        let cn = h(f[3]);
+        let mut out = vec![0u8; if f[0] == "lane_key" { 32 } else { 16 }];
+        unsafe {
+            match f[0] {
+                "lane_key" => ffi::ava1_lane_key(
+                    dir.as_ptr(),
+                    lane,
+                    cn.as_ptr(),
+                    h(f[4]).as_ptr(),
+                    out.as_mut_ptr(),
+                ),
+                "join_tag" => ffi::ava1_join_tag(
+                    dir.as_ptr(),
+                    h(f[5]).as_ptr(),
+                    lane,
+                    cn.as_ptr(),
+                    out.as_mut_ptr(),
+                ),
+                "join_ack_tag" => ffi::ava1_join_ack_tag(
+                    dir.as_ptr(),
+                    h(f[5]).as_ptr(),
+                    lane,
+                    cn.as_ptr(),
+                    h(f[4]).as_ptr(),
+                    out.as_mut_ptr(),
+                ),
+                k => panic!("unknown vector kind {k}"),
+            }
+        }
+        assert_eq!(hex::encode(&out), *f.last().unwrap(), "{l}");
+        n += 1;
+    }
+    assert!(n >= 5);
+}
+
+/// A sealed frame from the Rust writer, read back by the C reader: as sent it opens; with
+/// any header byte changed (CRC recomputed, so only the AD check can catch it) it does not.
+#[test]
+fn the_c_reader_refuses_a_frame_whose_header_was_altered() {
+    use ava1::conn::FrameWriter;
+    let key = [0x21u8; 32];
+    let frame = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut w = FrameWriter::new(Vec::new());
+            w.set_key(key);
+            w.send(0x09, 7, b"heartbeat body").await.unwrap();
+            w.into_inner()
+        });
+    let open =
+        |f: &[u8]| unsafe { ffi::ava1_test_conn_open_frame(key.as_ptr(), f.as_ptr(), f.len()) };
+    assert_eq!(open(&frame), 0, "the untouched frame opens");
+    for at in [2usize, 4, 7] {
+        let mut t = frame.clone();
+        t[at] ^= 0x01; // type, channel
+        let crc = ava1::crc32c::crc32c(&t[..12]);
+        t[12..16].copy_from_slice(&crc.to_le_bytes());
+        assert_ne!(open(&t), 0, "header byte {at} altered");
+    }
 }

@@ -98,8 +98,8 @@ where
     )
     .await?;
     let keys = hs.finish();
-    w.set_key(keys::lane_key(&keys.c2s, 0));
-    r.set_key(keys::lane_key(&keys.s2c, 0));
+    w.set_key(keys::control_key(&keys.c2s));
+    r.set_key(keys::control_key(&keys.s2c));
     let f = r.recv().await?;
     if f.ty == gen::Error::TYPE {
         return Err(refused(&f));
@@ -168,8 +168,8 @@ where
     let ci = ClientInfo::decode(&hs.read(&m3.noise)?)?;
     let peer_key = hs.remote_static().ok_or(Ava1Error::WeakKey)?;
     let keys = hs.finish();
-    w.set_key(keys::lane_key(&keys.s2c, 0));
-    r.set_key(keys::lane_key(&keys.c2s, 0));
+    w.set_key(keys::control_key(&keys.s2c));
+    r.set_key(keys::control_key(&keys.c2s));
     let known = knows(&peer_key);
     if !known && !pairing_open {
         refuse(
@@ -356,7 +356,7 @@ mod tests {
             crate::frame::FLAG_SEALED
         );
         // Replay: resetting the key restarts the counter at 0, which the receiver has passed.
-        cw.set_key(keys::lane_key(&est.keys.c2s, 0));
+        cw.set_key(keys::control_key(&est.keys.c2s));
         cw.send_msg(0, &gen::Ping { seq: 2, t_us: 2 })
             .await
             .unwrap();

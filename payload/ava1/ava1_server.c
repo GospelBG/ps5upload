@@ -519,8 +519,8 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
         goto out;
     clean_name(ci.name, ci.has_name ? ci.name_len : 0, peer_name);
     ava1_noise_split(&ns, c2s, s2c);
-    ava1_lane_key(c2s, 0, k->io.recv_key);
-    ava1_lane_key(s2c, 0, k->io.send_key);
+    ava1_control_key(c2s, k->io.recv_key);
+    ava1_control_key(s2c, k->io.send_key);
     k->io.keyed = 1;
     pthread_mutex_lock(&mu);
     known = ava1_peers_contains(&S.peers, ns.rs);
@@ -565,11 +565,11 @@ static void run_lane(conn_t *k, uint8_t *buf, size_t len) {
     idx = sess_find_locked(j.session_id);
     if (idx >= 0) {
         sess_t *s = &S.sessions[idx];
-        ava1_join_tag(s->c2s, "join", j.session_id, j.lane_id, j.nonce, expect);
+        ava1_join_tag(s->c2s, j.session_id, j.lane_id, j.client_nonce, expect);
         verified = crypto_verify16(expect, j.tag) == 0;
-        fresh = verified && !nonce_seen(s, j.nonce);
+        fresh = verified && !nonce_seen(s, j.client_nonce);
         if (fresh) {
-            nonce_add(s, j.nonce);
+            nonce_add(s, j.client_nonce);
             paired = s->paired;
         }
         if (fresh && paired) {
@@ -586,14 +586,21 @@ static void run_lane(conn_t *k, uint8_t *buf, size_t len) {
     }
     memset(&ack, 0, sizeof ack);
     ack.lane_id = j.lane_id;
-    ava1_join_tag(s2c, "join-ack", j.session_id, j.lane_id, j.nonce, ack.tag);
+    /* A fresh server nonce per join: a replayed Join (even one older than the nonce
+     * window) still gets keys never used before (SPEC.md §4.3). */
+    if (ava1_platform_random(ack.server_nonce, sizeof ack.server_nonce) != 0) {
+        (void)send_error(&k->io, AVA1_ERR_INTERNAL, "no random source");
+        goto wipe;
+    }
+    ava1_join_ack_tag(s2c, j.session_id, j.lane_id, j.client_nonce, ack.server_nonce, ack.tag);
     ava1_w_init(&w, out, sizeof out);
     if (ava1_join_ack_encode(&ack, &w) == 0 && ava1_conn_send(&k->io, AVA1_TYPE_JOIN_ACK, 0, out, w.len) == 0) {
-        ava1_lane_key(c2s, j.lane_id, k->io.recv_key);
-        ava1_lane_key(s2c, j.lane_id, k->io.send_key);
+        ava1_lane_key(c2s, j.lane_id, j.client_nonce, ack.server_nonce, k->io.recv_key);
+        ava1_lane_key(s2c, j.lane_id, j.client_nonce, ack.server_nonce, k->io.send_key);
         k->io.keyed = 1;
         serve_loop(k, idx, j.session_id, j.lane_id, gen, buf);
     }
+wipe:
     crypto_wipe(c2s, sizeof c2s);
     crypto_wipe(s2c, sizeof s2c);
 }
