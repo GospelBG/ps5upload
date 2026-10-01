@@ -1,8 +1,13 @@
 //! AVA1 — Adaptive Verified Assembly, version 1. Normative spec: `protocol/ava1/SPEC.md`.
+pub mod conn;
 pub mod crc32c;
+mod error;
 pub mod frame;
-pub mod hex;
 #[rustfmt::skip]
 pub mod gen;
+pub mod handshake;
+pub mod hex;
 pub mod keys;
 pub mod wire;
+
+pub use error::Ava1Error;

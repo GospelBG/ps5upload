@@ -49,3 +49,31 @@ with s2c.
 
 4.6 Pairing code: u32le(BLAKE2b-256("AVA1 pairing" ‖ h)[0..4]) mod 10⁶, shown as
 six digits. A man in the middle yields different h, so different codes.
+
+## 5. Handshake and pairing
+1. Client → `Hs1{noise}` (unsealed): Noise message 1, payload `HelloInfo`
+   (version range, caps 0).
+2. Server: no common version → `Error(ERR_UNSUPPORTED_VERSION)` unsealed, close.
+   Else → `Hs2{noise}`: message 2, payload `ServerInfo` (version, caps, random
+   session_id, name).
+3. Client → `Hs3{noise}`: message 3, payload `ClientInfo` (name). Both sides
+   now key lane 0 (§4.3) and every further frame is sealed.
+4. The server learned the client's key in message 3. Unknown key and pairing
+   closed → sealed `Error(ERR_PAIRING_CLOSED)`, close. Else → sealed
+   `Welcome{knows_you}`.
+5. Pairing: while either side does not know the other, both show the pairing
+   code (§4.6). After the user confirms, a client whose server sent knows_you = 0
+   sends `PairConfirm` (channel = request id); the server answers
+   `PairResult{accepted}` on the same channel, accepting only while its pairing
+   window is open and its owner approves, then stores the client's key. Until
+   accepted, RPCs answer `ERR_NOT_PAIRED` and lanes are refused.
+6. Pairing window: opens by itself for 5 minutes after start only while the node
+   has no paired peer; otherwise `pairing.open` (method 2, body `PairingOpen`,
+   ≤ 600 s) from a paired session opens it.
+7. Peer stores: `<64 hex key> <unix seconds> <name>` per line, ≤ 32 peers (oldest
+   dropped), written atomically (temp file + rename in the same directory).
+
+5.1 Trust slot: the payload ELF carries a 64-byte array — "AVA1TRUST" (9 bytes),
+state (0 empty, 1 stamped), 6 zero bytes, 32-byte X25519 key, 16 zero bytes. An
+engine sending the ELF writes state 1 and its key into the single slot; the
+payload adds that key to its peers at startup. Exactly one slot must exist.

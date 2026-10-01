@@ -176,6 +176,7 @@ dependencies = [
  "serde_json",
  "snow",
  "thiserror",
+ "tokio",
  "x25519-dalek",
 ]
 
