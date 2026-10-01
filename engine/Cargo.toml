@@ -2,6 +2,7 @@
 members = [
   "crates/ava1",
   "crates/ava1-gen",
+  "crates/ava1-chaos",
   "crates/ava1-ctest",
   "crates/ftx2-proto",
   "crates/ps5upload-core",

@@ -170,6 +170,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "ava1"
 version = "5.41.0"
 dependencies = [
+ "ava1-chaos",
  "blake2 0.10.6",
  "chacha20poly1305",
  "getrandom 0.4.3",
@@ -178,6 +179,13 @@ dependencies = [
  "thiserror",
  "tokio",
  "x25519-dalek",
+]
+
+[[package]]
+name = "ava1-chaos"
+version = "5.41.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
