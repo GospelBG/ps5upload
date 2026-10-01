@@ -15,3 +15,14 @@ body_len ≤ 16 MiB (receivers may enforce a lower cap: 64 KiB on control
 connections). Bad magic or CRC: close the connection. Flags: bit 0 SEALED (the
 body is AEAD ciphertext + 16-byte MAC, §4.4), bit 1 IGNORABLE (a receiver that
 does not know the type skips the frame).
+
+## 3. Message encoding
+Messages are defined in `schema/ava1.toml` and generated for each language by
+`ava1-gen`; never hand-encode. A body is the message's fixed fields in schema
+order — u8/u16/u32/u64 little-endian; b16/b32 raw; bytes = u32 length + bytes;
+str = u16 length + UTF-8 — followed by an extension block: u16 count, then per
+extension u16 tag, u32 value length, value (encoded as a field of its type).
+Encoders write extensions in ascending tag order. Decoders skip unknown tags,
+reject a repeated known tag, reject invalid UTF-8, and reject trailing bytes
+(both in the body and inside an extension value). The canonical encodings in
+`vectors/messages.txt` must round-trip byte for byte.

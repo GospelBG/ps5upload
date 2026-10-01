@@ -1,0 +1,6 @@
+# name hex — canonical encodings; decode then re-encode must reproduce the bytes exactly.
+Ping 0500000008070605040302010000
+Error 020102006e6f0000
+RpcRequest 010002000000aabb0000
+PairConfirm 0000
+NodeInfo 0100350300707335030050726f0100010007000000050031332e3630

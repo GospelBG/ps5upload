@@ -1,0 +1,205 @@
+# AVA1 messages (SPEC.md §3). After editing: `cargo run -p ava1-gen` from engine/.
+# Field types: u8 u16 u32 u64, b16 b32 (fixed bytes), bytes (u32 length), str (u16 length, UTF-8).
+# `ext` fields are optional and tagged; decoders skip unknown tags.
+
+[[const]]
+name = "PROTOCOL_VERSION"
+ty = "u16"
+value = 1
+[[const]]
+name = "DEFAULT_PORT"
+ty = "u16"
+value = 9120
+[[const]]
+name = "MAX_LANES"
+ty = "u8"
+value = 8
+[[const]]
+name = "METHOD_NODE_INFO"
+ty = "u16"
+value = 1
+[[const]]
+name = "METHOD_PAIRING_OPEN"
+ty = "u16"
+value = 2
+[[const]]
+name = "METHOD_CRYPTO_BENCH"
+ty = "u16"
+value = 3
+[[const]]
+name = "STATUS_OK"
+ty = "u16"
+value = 0
+[[const]]
+name = "ERR_NOT_PAIRED"
+ty = "u16"
+value = 1
+[[const]]
+name = "ERR_PAIRING_CLOSED"
+ty = "u16"
+value = 2
+[[const]]
+name = "ERR_UNSUPPORTED_VERSION"
+ty = "u16"
+value = 3
+[[const]]
+name = "ERR_PROTOCOL"
+ty = "u16"
+value = 4
+[[const]]
+name = "ERR_BAD_JOIN"
+ty = "u16"
+value = 5
+[[const]]
+name = "ERR_UNKNOWN_METHOD"
+ty = "u16"
+value = 6
+[[const]]
+name = "ERR_INTERNAL"
+ty = "u16"
+value = 7
+[[const]]
+name = "ERR_BUSY"
+ty = "u16"
+value = 8
+
+# Noise XX handshake messages (SPEC.md §5). `noise` is the raw Noise message; its
+# payload is the struct named in the comment, encoded with these same rules.
+[[message]]
+name = "Hs1"
+type = 0x01
+fields = [{ name = "noise", ty = "bytes" }]   # payload: HelloInfo (plaintext under XX)
+
+[[message]]
+name = "Hs2"
+type = 0x02
+fields = [{ name = "noise", ty = "bytes" }]   # payload: ServerInfo (encrypted)
+
+[[message]]
+name = "Hs3"
+type = 0x03
+fields = [{ name = "noise", ty = "bytes" }]   # payload: ClientInfo (encrypted)
+
+# First sealed frame from the server, after Hs3: under XX the server learns the
+# client's key only in message 3, so "do I know you" cannot travel earlier.
+[[message]]
+name = "Welcome"
+type = 0x04
+fields = [{ name = "knows_you", ty = "u8" }]
+
+[[message]]
+name = "PairConfirm"
+type = 0x05
+
+[[message]]
+name = "PairResult"
+type = 0x06
+fields = [{ name = "accepted", ty = "u8" }]
+
+[[message]]
+name = "Join"
+type = 0x07
+fields = [
+  { name = "session_id", ty = "b16" },
+  { name = "lane_id", ty = "u16" },
+  { name = "nonce", ty = "b16" },
+  { name = "tag", ty = "b16" },
+]
+
+[[message]]
+name = "JoinAck"
+type = 0x08
+fields = [
+  { name = "lane_id", ty = "u16" },
+  { name = "tag", ty = "b16" },
+]
+
+[[message]]
+name = "Ping"
+type = 0x09
+fields = [
+  { name = "seq", ty = "u32" },
+  { name = "t_us", ty = "u64" },
+]
+
+[[message]]
+name = "Pong"
+type = 0x0A
+fields = [
+  { name = "seq", ty = "u32" },
+  { name = "t_us", ty = "u64" },
+]
+
+[[message]]
+name = "Error"
+type = 0x0B
+fields = [
+  { name = "code", ty = "u16" },
+  { name = "message", ty = "str" },
+]
+
+[[message]]
+name = "Bye"
+type = 0x0C
+fields = [{ name = "reason", ty = "u8" }]
+
+[[message]]
+name = "RpcRequest"
+type = 0x60
+fields = [
+  { name = "method", ty = "u16" },
+  { name = "body", ty = "bytes" },
+]
+
+[[message]]
+name = "RpcResponse"
+type = 0x61
+fields = [
+  { name = "status", ty = "u16" },
+  { name = "body", ty = "bytes" },
+]
+
+[[struct]]
+name = "NodeInfo"
+fields = [
+  { name = "version", ty = "str" },
+  { name = "platform", ty = "str" },
+  { name = "name", ty = "str" },
+]
+ext = [{ tag = 1, name = "firmware", ty = "str" }]
+
+[[struct]]
+name = "HelloInfo"
+fields = [
+  { name = "version_min", ty = "u16" },
+  { name = "version_max", ty = "u16" },
+  { name = "caps", ty = "u64" },
+]
+
+[[struct]]
+name = "ServerInfo"
+fields = [
+  { name = "version", ty = "u16" },
+  { name = "caps", ty = "u64" },
+  { name = "session_id", ty = "b16" },
+]
+ext = [{ tag = 1, name = "name", ty = "str" }]
+
+[[struct]]
+name = "ClientInfo"
+ext = [{ tag = 1, name = "name", ty = "str" }]
+
+[[struct]]
+name = "PairingOpen"
+fields = [{ name = "seconds", ty = "u16" }]
+
+[[struct]]
+name = "CryptoBench"
+fields = [{ name = "mib", ty = "u16" }]
+
+[[struct]]
+name = "CryptoBenchResult"
+fields = [
+  { name = "bytes", ty = "u64" },
+  { name = "micros", ty = "u64" },
+]

@@ -2,3 +2,6 @@
 pub mod crc32c;
 pub mod frame;
 pub mod hex;
+#[rustfmt::skip]
+pub mod gen;
+pub mod wire;

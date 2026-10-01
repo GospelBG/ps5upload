@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/ava1",
+  "crates/ava1-gen",
   "crates/ftx2-proto",
   "crates/ps5upload-core",
   "crates/ps5upload-lab",
