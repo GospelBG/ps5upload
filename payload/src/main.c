@@ -21,6 +21,7 @@
 #include "hw_info.h"
 #include "wake_watchdog.h"
 #include "fakelib_overlay.h"
+#include "ava1_glue.h"
 
 #include "proc_identity.h"
 /* Sony "debugger" / system-process authid. Setting our process's
@@ -708,6 +709,10 @@ int main(void) {
         return 1;
     }
     state.mgmt_thread_started = 1;
+    {
+        int ava1_rc = ava1_payload_start();
+        if (ava1_rc != 0) fprintf(stderr, "ava1: server did not start (%d); FTX2 continues\n", ava1_rc);
+    }
     startup_trace("MGMT_THREAD_SPAWNED");
 
     rc = runtime_server_loop(&state);

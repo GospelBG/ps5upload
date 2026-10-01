@@ -493,6 +493,8 @@ jobs:
             echo "::error::payload ELF is smaller than expected — build may have failed silently"
             exit 1
           fi
+          # AVA1: the engine stamps its key into exactly one trust slot (SPEC.md §5.1).
+          python3 -c "d=open('payload/ps5upload.elf','rb').read(); n=d.count(b'AVA1TRUST'); assert n==1, n"
           dpi_size_bytes=$(stat -c '%s' payload/installer/ps5upload-installer.elf)
           echo "ps5upload-installer.elf: ${dpi_size_bytes} bytes"
           if [ "$dpi_size_bytes" -lt 50000 ]; then

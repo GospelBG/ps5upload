@@ -42,6 +42,13 @@ SQLITE_DIR := third_party/sqlite3
 # while the build step runs as the normal user. Writing the object beside
 # the sources would fail with EACCES there.
 SQLITE_OBJ := sqlite3.o
+# Monocypher (X25519 + constant-time helpers for AVA1), compiled like SQLite: third-party
+# code is not held to our -Werror policy.
+MONO_DIR := third_party/monocypher
+MONO_OBJ := monocypher.o
+AVA1_SRCS := ava1/ava1_wire.c ava1/ava1_frame.c ava1/ava1_keys.c ava1/ava1_noise.c ava1/ava1_conn.c \
+             ava1/ava1_store.c ava1/ava1_server.c ava1/ava1_trust.c ava1/platform_ps5.c \
+             ava1/gen/ava1_gen.c src/ava1_glue.c
 
 # Only the compile-time options that are safe with the *prebuilt*
 # amalgamation. SQLite's grammar-affecting SQLITE_OMIT_* flags (OMIT_VACUUM,
@@ -73,7 +80,7 @@ SQLITE_CFLAGS := -Os -g0 \
                  -DSQLITE_DQS=0 \
                  -DSQLITE_UNTESTABLE=1
 
-INCLUDES := -Iinclude -I$(BLAKE3_DIR) -I$(SQLITE_DIR) -Ithird_party/tiny_aes
+INCLUDES := -Iinclude -I$(BLAKE3_DIR) -I$(SQLITE_DIR) -Ithird_party/tiny_aes -Iava1 -Iava1/gen -Ithird_party/monocypher
 CFLAGS := -Wall -Wextra -Werror -g $(INCLUDES)
 
 # Sony sprx linkage. The payload calls sceLncUtilLaunchApp +
@@ -141,14 +148,14 @@ SRCS := src/main.c src/runtime.c src/shell_builtin.c src/takeover.c src/register
         src/wake_watchdog.c src/cheats.c src/xml_encoding.c src/activity.c src/sdk_changer.c src/fakelib_overlay.c \
         src/tmdb.c src/fw_spoof.c src/ftp_server.c src/focus_probe.c \
         src/content_db.c \
-        third_party/tiny_aes/aes.c \
+        third_party/tiny_aes/aes.c $(AVA1_SRCS) \
         $(BLAKE3_SRCS)
 
 # Headers as Make prerequisites so editing a .h triggers a rebuild. This
 # is belt-and-braces given the recipe below re-compiles every .c every
 # time, but it guards against the one case where the build system
 # otherwise misses: `touch include/foo.h` alone, with no .c change.
-HEADERS := $(wildcard include/*.h) $(wildcard $(BLAKE3_DIR)/*.h)
+HEADERS := $(wildcard include/*.h) $(wildcard $(BLAKE3_DIR)/*.h) $(wildcard ava1/*.h) $(wildcard ava1/gen/*.h)
 
 all: $(ELF) $(ELF).gz
 
@@ -159,6 +166,9 @@ all: $(ELF) $(ELF).gz
 $(SQLITE_OBJ): $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h
 	$(CC) $(SQLITE_CFLAGS) -c -o $@ $<
 
+$(MONO_OBJ): $(MONO_DIR)/monocypher.c $(MONO_DIR)/monocypher.h
+	$(CC) -O2 -g0 -I$(MONO_DIR) -c -o $@ $<
+
 $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h:
 	@echo "ERROR: SQLite sources are missing from $(SQLITE_DIR)." >&2
 	@echo "       Run scripts/install-ps5-sdk.sh to fetch them." >&2
@@ -168,8 +178,8 @@ $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h:
 # without this a change to either printed "Built" while leaving the previous
 # link in place. Adding -lSceIpmi did exactly that — the stale ELF had no
 # libSceIpmi in DT_NEEDED until the sources were touched.
-$(ELF): $(SRCS) $(HEADERS) $(SQLITE_OBJ) Makefile
-	$(CC) $(CFLAGS) -o $@ $(SRCS) $(SQLITE_OBJ) $(LIBS)
+$(ELF): $(SRCS) $(HEADERS) $(SQLITE_OBJ) $(MONO_OBJ) Makefile
+	$(CC) $(CFLAGS) -o $@ $(SRCS) $(SQLITE_OBJ) $(MONO_OBJ) $(LIBS)
 
 # Gzipped copy for the Tauri bundle resource. linuxdeploy (Linux
 # AppImage bundler) walks every ELF in the AppDir and tries to
@@ -183,7 +193,7 @@ $(ELF).gz: $(ELF)
 	gzip -kf $<
 
 clean:
-	rm -f $(ELF) $(ELF).gz $(SQLITE_OBJ)
+	rm -f $(ELF) $(ELF).gz $(SQLITE_OBJ) $(MONO_OBJ)
 
 send: $(ELF)
 	@echo "Sending $(ELF) to $(PS5_HOST):$(PS5_PORT) ..."
