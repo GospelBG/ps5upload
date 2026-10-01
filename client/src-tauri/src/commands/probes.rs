@@ -392,18 +392,26 @@ pub async fn payload_send(ip: String, path: String, port: Option<u16>) -> serde_
     }
 }
 
+/// This engine's AVA1 public key, or `None` if the engine is unreachable or silent.
+async fn fetch_ava1_key(url: &str) -> Option<[u8; 32]> {
+    // A wedged engine must not hang the send: give up after 2 s and send unstamped.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let client = crate::engine_http::engine_client_builder().build().ok()?;
+        let v: serde_json::Value = client.get(url).send().await.ok()?.json().await.ok()?;
+        let k = ava1::hex::decode(v.get("public_key")?.as_str()?)?;
+        <[u8; 32]>::try_from(k).ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Stamps this engine's AVA1 key into a ps5upload helper ELF so the console trusts this
 /// engine without pairing (SPEC.md §5.1). An unreachable engine or an ELF without a slot
 /// (an older build) is sent unchanged; the console then opens its pairing window instead.
 async fn stamp_ava1_trust(bytes: &mut [u8]) {
     let url = format!("{}/api/ava1/identity", crate::engine::url());
-    let key = async {
-        let client = crate::engine_http::engine_client_builder().build().ok()?;
-        let v: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
-        let k = ava1::hex::decode(v.get("public_key")?.as_str()?)?;
-        <[u8; 32]>::try_from(k).ok()
-    }
-    .await;
+    let key = fetch_ava1_key(&url).await;
     match key {
         Some(k) => {
             if let Err(e) = ava1::trust::stamp(bytes, &k) {
@@ -743,6 +751,24 @@ fn is_ps5upload_payload(path: &str, head: &[u8]) -> bool {
     base.contains("ps5upload")
         || memmem_ascii(head, b"ps5upload")
         || memmem_ascii(head, b"PS5UPLOAD")
+}
+
+#[cfg(test)]
+mod ava1_fetch_tests {
+    #[tokio::test]
+    async fn a_silent_engine_does_not_hang_the_fetch() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api/ava1/identity", l.local_addr().unwrap());
+        let _hold = tokio::spawn(async move {
+            let mut keep = Vec::new();
+            while let Ok(c) = l.accept().await {
+                keep.push(c);
+            }
+        });
+        let t = std::time::Instant::now();
+        assert!(super::fetch_ava1_key(&url).await.is_none());
+        assert!(t.elapsed() < std::time::Duration::from_secs(3));
+    }
 }
 
 #[cfg(test)]

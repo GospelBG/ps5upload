@@ -487,8 +487,11 @@ mod ava1_cmds {
             .filter(|v| !v.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-                    .join(".ps5upload")
+                // Same order as the engine's data_dir(): HOME, then USERPROFILE.
+                let home = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_else(|_| ".".into());
+                PathBuf::from(home).join(".ps5upload")
             });
         base.join("ava")
     }

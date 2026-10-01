@@ -1,25 +1,27 @@
 //! This engine's AVA1 identity: one key pair in `<data dir>/ava/identity` (SPEC.md §5).
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 pub fn identity() -> Option<Arc<ava1::keys::Identity>> {
-    static ID: OnceLock<Option<Arc<ava1::keys::Identity>>> = OnceLock::new();
-    ID.get_or_init(|| {
+    // Only a success is cached: a transient failure (data dir not there yet) retries next call.
+    static ID: Mutex<Option<Arc<ava1::keys::Identity>>> = Mutex::new(None);
+    let mut slot = ID.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
         let path = crate::remote::store::data_dir()?
             .join("ava")
             .join("identity");
         match ava1::keys::Identity::load_or_create(&path) {
-            Ok(i) => Some(Arc::new(i)),
+            Ok(i) => *slot = Some(Arc::new(i)),
             Err(e) => {
                 crate::log_warn!("ava1: no identity at {}: {e}", path.display());
-                None
+                return None;
             }
         }
-    })
-    .clone()
+    }
+    slot.clone()
 }
 
 /// `GET /api/ava1/identity` — the public key an app stamps into the helper ELF.
