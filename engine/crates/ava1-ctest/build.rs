@@ -23,6 +23,7 @@ fn main() {
             ava1.join("ava1_conn.c"),
             ava1.join("ava1_store.c"),
             ava1.join("ava1_server.c"),
+            ava1.join("ava1_trust.c"),
             ava1.join("platform_posix.c"),
             ava1.join("gen/ava1_gen.c"),
             here.join("csrc/sizes.c"),

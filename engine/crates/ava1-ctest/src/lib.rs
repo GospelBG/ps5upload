@@ -55,6 +55,11 @@ pub mod ffi {
     }
 
     extern "C" {
+        pub static mut ava1_trust_slot: [u8; 64];
+        pub fn ava1_trust_slot_key(out: *mut u8) -> c_int;
+    }
+
+    extern "C" {
         pub fn ava1_test_sizeof_noise() -> usize;
         pub fn ava1_identity_from_secret(id: *mut CIdentity, secret: *const u8);
         pub fn ava1_lane_key(dir: *const u8, lane: u16, out: *mut u8);

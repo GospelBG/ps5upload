@@ -12,6 +12,7 @@ mod link;
 pub mod peers;
 pub mod server;
 pub mod session;
+pub mod trust;
 pub mod wire;
 
 pub use error::Ava1Error;
