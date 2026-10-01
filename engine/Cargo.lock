@@ -139,6 +139,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ava1-ctest"
+version = "5.41.0"
+dependencies = [
+ "ava1",
+ "cc",
+]
+
+[[package]]
 name = "ava1-gen"
 version = "5.41.0"
 dependencies = [
