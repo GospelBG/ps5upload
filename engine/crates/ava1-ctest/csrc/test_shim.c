@@ -1,0 +1,58 @@
+/* Starts the payload's AVA1 server on the host with a node.info handler (tests only). */
+#include <stdint.h>
+#include <string.h>
+
+#include "ava1_gen.h"
+#include "ava1_server.h"
+
+static uint32_t g_pair_requests, g_last_code;
+
+static void on_pair(const char *name, uint32_t code) {
+    (void)name;
+    __atomic_add_fetch(&g_pair_requests, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_last_code, code, __ATOMIC_SEQ_CST);
+}
+
+static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap,
+               size_t *out_len) {
+    ava1_node_info_t ni;
+    ava1_w_t w;
+    (void)body;
+    (void)body_len;
+    if (method != AVA1_METHOD_NODE_INFO) return AVA1_ERR_UNKNOWN_METHOD;
+    memset(&ni, 0, sizeof ni);
+    ni.version = (const uint8_t *)"test";
+    ni.version_len = 4;
+    ni.platform = (const uint8_t *)"host";
+    ni.platform_len = 4;
+    ni.name = (const uint8_t *)"C test server";
+    ni.name_len = 13;
+    ava1_w_init(&w, out, cap);
+    if (ava1_node_info_encode(&ni, &w) != 0) return AVA1_ERR_INTERNAL;
+    *out_len = w.len;
+    return AVA1_STATUS_OK;
+}
+
+int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, uint32_t pairing_s,
+                           uint32_t ping_ms, uint32_t dead_ms, uint32_t handshake_ms) {
+    ava1_server_cfg_t cfg;
+    int rc;
+    memset(&cfg, 0, sizeof cfg);
+    ava1_identity_from_secret(&cfg.identity, secret);
+    strncpy(cfg.name, "C test server", sizeof cfg.name - 1);
+    strncpy(cfg.peers_path, peers_path, sizeof cfg.peers_path - 1);
+    cfg.bind_loopback = 1;
+    cfg.ping_every_ms = ping_ms;
+    cfg.dead_after_ms = dead_ms;
+    cfg.handshake_ms = handshake_ms;
+    cfg.pairing_window_s = pairing_s;
+    cfg.on_pair_request = on_pair;
+    cfg.rpc = rpc;
+    __atomic_store_n(&g_pair_requests, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_last_code, 0, __ATOMIC_SEQ_CST);
+    rc = ava1_server_start(&cfg);
+    return rc != 0 ? rc : (int)ava1_server_port();
+}
+
+uint32_t ava1_test_pair_requests(void) { return __atomic_load_n(&g_pair_requests, __ATOMIC_SEQ_CST); }
+uint32_t ava1_test_last_pair_code(void) { return __atomic_load_n(&g_last_code, __ATOMIC_SEQ_CST); }

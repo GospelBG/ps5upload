@@ -13,3 +13,5 @@ cc = "1"
 
 [dev-dependencies]
 serde_json.workspace = true
+ava1-chaos = { path = "../ava1-chaos" }
+tokio = { workspace = true, features = ["net", "time", "io-util", "macros", "rt-multi-thread"] }

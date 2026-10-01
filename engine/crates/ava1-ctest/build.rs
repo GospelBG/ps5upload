@@ -20,8 +20,13 @@ fn main() {
             ava1.join("ava1_frame.c"),
             ava1.join("ava1_keys.c"),
             ava1.join("ava1_noise.c"),
+            ava1.join("ava1_conn.c"),
+            ava1.join("ava1_store.c"),
+            ava1.join("ava1_server.c"),
+            ava1.join("platform_posix.c"),
             ava1.join("gen/ava1_gen.c"),
             here.join("csrc/sizes.c"),
+            here.join("csrc/test_shim.c"),
         ])
         .include(&ava1)
         .include(ava1.join("gen"))
@@ -30,6 +35,9 @@ fn main() {
         .extra_warnings(true)
         .warnings_into_errors(true)
         .compile("ava1c");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-lib=pthread");
+    }
     println!("cargo:rerun-if-changed={}", ava1.display());
     println!("cargo:rerun-if-changed={}", mono.display());
     println!("cargo:rerun-if-changed=csrc");

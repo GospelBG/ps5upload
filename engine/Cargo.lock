@@ -193,8 +193,10 @@ name = "ava1-ctest"
 version = "5.41.0"
 dependencies = [
  "ava1",
+ "ava1-chaos",
  "cc",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

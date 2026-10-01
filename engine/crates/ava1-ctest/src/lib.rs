@@ -111,6 +111,37 @@ pub mod ffi {
             mac: *const u8,
         ) -> c_int;
     }
+
+    #[repr(C)]
+    pub struct CPeer {
+        pub key: [u8; 32],
+        pub added_unix: u64,
+        pub name: [c_char; 64],
+    }
+
+    #[repr(C)]
+    pub struct CPeers {
+        pub p: [CPeer; 32],
+        pub n: c_int,
+    }
+
+    extern "C" {
+        pub fn ava1_test_server_start(
+            secret: *const u8,
+            peers_path: *const c_char,
+            pairing_s: u32,
+            ping_ms: u32,
+            dead_ms: u32,
+            handshake_ms: u32,
+        ) -> c_int;
+        pub fn ava1_test_pair_requests() -> u32;
+        pub fn ava1_test_last_pair_code() -> u32;
+        pub fn ava1_server_stop();
+        pub fn ava1_server_conns() -> c_int;
+        pub fn ava1_identity_load_or_create(path: *const c_char, id: *mut CIdentity) -> c_int;
+        pub fn ava1_peers_load(ps: *mut CPeers, path: *const c_char) -> c_int;
+        pub fn ava1_peers_contains(ps: *const CPeers, key: *const u8) -> c_int;
+    }
 }
 
 pub fn c_roundtrip(name: &str, input: &[u8]) -> Result<Vec<u8>, i32> {
@@ -250,5 +281,91 @@ impl CHandshake {
         let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
         unsafe { ffi::ava1_noise_split(&*self.0, a.as_mut_ptr(), b.as_mut_ptr()) };
         (a, b)
+    }
+}
+
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
+
+static C_SERVER: Mutex<()> = Mutex::new(());
+
+/// The payload's server, running on 127.0.0.1. One at a time per process.
+pub struct CServer {
+    pub port: u16,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl CServer {
+    pub fn start(
+        secret: [u8; 32],
+        peers_path: &Path,
+        pairing_s: u32,
+        ping_ms: u32,
+        dead_ms: u32,
+        handshake_ms: u32,
+    ) -> Self {
+        let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        let p = CString::new(peers_path.to_str().unwrap()).unwrap();
+        let rc = unsafe {
+            ffi::ava1_test_server_start(
+                secret.as_ptr(),
+                p.as_ptr(),
+                pairing_s,
+                ping_ms,
+                dead_ms,
+                handshake_ms,
+            )
+        };
+        assert!(rc > 0, "C server failed to start: {rc}");
+        CServer {
+            port: rc as u16,
+            _lock: lock,
+        }
+    }
+
+    pub fn addr(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+
+    pub fn conns(&self) -> i32 {
+        unsafe { ffi::ava1_server_conns() }
+    }
+
+    pub fn pair_requests(&self) -> (u32, u32) {
+        unsafe {
+            (
+                ffi::ava1_test_pair_requests(),
+                ffi::ava1_test_last_pair_code(),
+            )
+        }
+    }
+}
+
+impl Drop for CServer {
+    fn drop(&mut self) {
+        unsafe { ffi::ava1_server_stop() };
+    }
+}
+
+pub fn c_identity_load_or_create(path: &Path) -> Result<[u8; 32], i32> {
+    let p = CString::new(path.to_str().unwrap()).unwrap();
+    let mut id = ffi::CIdentity {
+        secret: [0; 32],
+        public: [0; 32],
+    };
+    match unsafe { ffi::ava1_identity_load_or_create(p.as_ptr(), &mut id) } {
+        0 => Ok(id.public),
+        e => Err(e),
+    }
+}
+
+/// (number of peers loaded, whether `key` is among them)
+pub fn c_peers_load(path: &Path, key: &[u8; 32]) -> (i32, bool) {
+    let p = CString::new(path.to_str().unwrap()).unwrap();
+    let mut ps: Box<std::mem::MaybeUninit<ffi::CPeers>> = Box::new(std::mem::MaybeUninit::uninit());
+    unsafe {
+        assert_eq!(ffi::ava1_peers_load(ps.as_mut_ptr(), p.as_ptr()), 0);
+        let ps = ps.assume_init_ref();
+        (ps.n, ffi::ava1_peers_contains(ps, key.as_ptr()) != 0)
     }
 }

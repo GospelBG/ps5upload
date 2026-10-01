@@ -1,0 +1,401 @@
+#![cfg(unix)]
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use ava1::conn::{FrameReader, FrameWriter};
+use ava1::gen;
+use ava1::keys::Identity;
+use ava1::peers::PeerStore;
+use ava1::session::{connect, Timing};
+use ava1::Ava1Error;
+use ava1_chaos::{ChaosConfig, ChaosProxy};
+use ava1_ctest::*;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+const SECRET: [u8; 32] = [0x42; 32];
+
+fn fast() -> Timing {
+    Timing {
+        ping_every: Duration::from_millis(100),
+        dead_after: Duration::from_millis(500),
+        handshake: Duration::from_millis(500),
+    }
+}
+
+fn dir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("ava1-c-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// A client the C server already knows, and that knows the C server.
+fn paired_client(peers_file: &std::path::Path) -> (Arc<Identity>, Arc<Mutex<PeerStore>>) {
+    let me = Arc::new(Identity::generate().unwrap());
+    PeerStore::load(peers_file)
+        .unwrap()
+        .add(me.public(), "rust client")
+        .unwrap();
+    let mut mine = PeerStore::in_memory();
+    mine.add(Identity::from_secret(SECRET).public(), "C test server")
+        .unwrap();
+    (me, Arc::new(Mutex::new(mine)))
+}
+
+async fn wait_conns(s: &CServer, n: i32) {
+    let t = Instant::now();
+    while s.conns() > n && t.elapsed() < Duration::from_secs(3) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        s.conns() <= n,
+        "C server still has {} connections",
+        s.conns()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rust_client_talks_to_the_c_server() {
+    let d = dir("basic");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    assert_eq!(s.pairing_code(), None);
+    assert_eq!(s.peer_name(), "C test server");
+    assert_eq!(s.node_info().await.unwrap().name, "C test server");
+    assert_eq!(
+        s.rpc(999, &[]).await.unwrap().status,
+        gen::ERR_UNKNOWN_METHOD
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(!s.is_closed() && s.rtt().is_some(), "heartbeats both ways");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_with_the_c_server() {
+    let d = dir("pair");
+    let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);
+    let me = Arc::new(Identity::generate().unwrap());
+    let peers = Arc::new(Mutex::new(PeerStore::in_memory()));
+    let mut s = connect(&srv.addr(), me.clone(), peers.clone(), "laptop", fast())
+        .await
+        .unwrap();
+    let code = s.pairing_code().unwrap();
+    // The server shows the code once it has checked our Auth; connect() can return first.
+    let t = Instant::now();
+    while srv.pair_requests().0 == 0 && t.elapsed() < Duration::from_secs(1) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        srv.pair_requests(),
+        (1, code),
+        "the console shows the same code"
+    );
+    assert_eq!(
+        s.rpc(gen::METHOD_NODE_INFO, &[]).await.unwrap().status,
+        gen::ERR_NOT_PAIRED
+    );
+    assert!(matches!(s.open_lane().await, Err(Ava1Error::NotPaired)));
+    s.confirm_pairing().await.unwrap();
+    s.node_info().await.unwrap();
+    let file = std::fs::read_to_string(d.join("peers")).unwrap();
+    assert!(
+        file.contains(&ava1::hex::encode(&me.public())) && file.contains(" laptop"),
+        "{file}"
+    );
+    // Rust reads what C wrote.
+    assert!(PeerStore::load(&d.join("peers"))
+        .unwrap()
+        .contains(&me.public()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_refuses_strangers_when_pairing_is_closed() {
+    let d = dir("closed");
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let r = connect(
+        &srv.addr(),
+        Arc::new(Identity::generate().unwrap()),
+        Arc::new(Mutex::new(PeerStore::in_memory())),
+        "x",
+        fast(),
+    )
+    .await;
+    assert!(matches!(r, Err(Ava1Error::Refused { code, .. }) if code == gen::ERR_PAIRING_CLOSED));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_window_stays_shut_once_paired_until_a_peer_opens_it() {
+    let d = dir("window");
+    let (me, peers) = paired_client(&d.join("peers"));
+    // pairing_s = 60, but the peers file is not empty: no automatic window (design review, flaw 2).
+    let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);
+    let stranger = Arc::new(Identity::generate().unwrap());
+    let none = Arc::new(Mutex::new(PeerStore::in_memory()));
+    let r = connect(&srv.addr(), stranger.clone(), none.clone(), "phone", fast()).await;
+    assert!(
+        matches!(r, Err(Ava1Error::Refused { code, .. }) if code == gen::ERR_PAIRING_CLOSED),
+        "{r:?}"
+    );
+    let s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    s.open_pairing(60).await.unwrap();
+    let p = connect(&srv.addr(), stranger, none, "phone", fast())
+        .await
+        .unwrap();
+    assert!(p.pairing_code().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lanes_on_the_c_server() {
+    let d = dir("lanes");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    let mut lanes = Vec::new();
+    for _ in 0..gen::MAX_LANES {
+        lanes.push(s.open_lane().await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(lanes.iter().all(|l| !l.is_closed() && l.rtt().is_some()));
+    // Superseding: the same id again replaces the old connection.
+    let old = lanes.remove(2);
+    let _new = s.reopen_lane_for_test(old.id).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), old.closed())
+        .await
+        .expect("old lane closed by the C server");
+    // Lanes end with their session.
+    s.close().await;
+    for l in &lanes {
+        tokio::time::timeout(Duration::from_secs(2), l.closed())
+            .await
+            .expect("lane ended with session");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_rejects_forged_and_replayed_frames() {
+    let d = dir("forged");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let _s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    // A forged Join.
+    let (rh, wh) = TcpStream::connect(srv.addr()).await.unwrap().into_split();
+    let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+    w.send_msg(
+        0,
+        &gen::Join {
+            session_id: [1; 16],
+            lane_id: 1,
+            nonce: [2; 16],
+            tag: [3; 16],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        r.recv().await.unwrap().decode::<gen::Error>().unwrap().code,
+        gen::ERR_BAD_JOIN
+    );
+    // A tagged frame with the wrong key on a fresh control connection: the C server just closes.
+    let (rh, wh) = TcpStream::connect(srv.addr()).await.unwrap().into_split();
+    let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+    w.set_key([9; 32]);
+    w.send_msg(0, &gen::Ping { seq: 1, t_us: 1 }).await.unwrap();
+    assert!(r.recv().await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c_server_drops_a_silent_half_handshake() {
+    // Review focus 1.
+    let d = dir("slow");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 300);
+    let mut raw = TcpStream::connect(srv.addr()).await.unwrap();
+    raw.write_all(b"A1\x01\x00\x00").await.unwrap();
+    let t = Instant::now();
+    let mut b = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(3), raw.read(&mut b))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(n, 0);
+    assert!(
+        t.elapsed() < Duration::from_millis(1200),
+        "{:?}",
+        t.elapsed()
+    );
+    connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c_server_refuses_a_storm_then_recovers() {
+    // Review focus 2.
+    let d = dir("storm");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 2000);
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        held.push(TcpStream::connect(srv.addr()).await.unwrap());
+    }
+    let t = Instant::now();
+    while srv.conns() < 64 && t.elapsed() < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let r = connect(&srv.addr(), me.clone(), peers.clone(), "laptop", fast()).await;
+    assert!(
+        matches!(r, Err(Ava1Error::Refused { code, .. }) if code == gen::ERR_BUSY),
+        "{r:?}"
+    );
+    drop(held);
+    wait_conns(&srv, 0).await;
+    connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c_server_drops_a_blackholed_session() {
+    // Review focus 3.
+    let d = dir("blackhole");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let proxy = ChaosProxy::start(srv.addr().parse().unwrap(), ChaosConfig::default())
+        .await
+        .unwrap();
+    let s = connect(&proxy.addr.to_string(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    let _lane = s.open_lane().await.unwrap();
+    assert_eq!(srv.conns(), 2);
+    proxy.blackhole(true);
+    let t = Instant::now();
+    wait_conns(&srv, 0).await;
+    assert!(
+        t.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        t.elapsed()
+    );
+    let why = tokio::time::timeout(Duration::from_secs(2), s.closed())
+        .await
+        .unwrap();
+    assert!(why.contains("stopped answering"), "{why}");
+}
+
+#[test]
+fn c_store_rejects_bad_identity_and_skips_bad_peers() {
+    // Review focus 4.
+    let d = dir("store");
+    let id = d.join("identity");
+    let a = c_identity_load_or_create(&id).unwrap();
+    assert_eq!(c_identity_load_or_create(&id).unwrap(), a);
+    assert_eq!(
+        Identity::load_or_create(&id).unwrap().public(),
+        a,
+        "Rust reads C's identity file"
+    );
+    std::fs::write(&id, [7u8; 33]).unwrap();
+    assert!(c_identity_load_or_create(&id).is_err());
+    assert_eq!(std::fs::read(&id).unwrap(), vec![7u8; 33], "never replaced");
+
+    let peers = d.join("peers");
+    let good = "cd".repeat(32);
+    std::fs::write(
+        &peers,
+        format!("junk\n{good} 1700000000 Phat\nxx\n{good}9 1 y\n\n"),
+    )
+    .unwrap();
+    assert_eq!(c_peers_load(&peers, &[0xcd; 32]), (1, true));
+    assert_eq!(c_peers_load(&d.join("missing"), &[0; 32]), (0, false));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c_server_drops_a_trickling_handshake() {
+    // The handshake deadline is absolute: a client that keeps feeding bytes is still cut.
+    let d = dir("trickle");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let mut raw = TcpStream::connect(srv.addr()).await.unwrap();
+    let t = Instant::now();
+    let mut header = [0u8; 16];
+    header[..3].copy_from_slice(b"A1\x01");
+    let mut closed = false;
+    for b in header {
+        if raw.write_all(&[b]).await.is_err() {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if t.elapsed() > Duration::from_millis(1200) {
+            break;
+        }
+    }
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), raw.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert!(closed || n == 0 || n > 0, "unreachable");
+    assert_eq!(n, 0, "the server closed the trickling connection");
+    assert!(
+        t.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        t.elapsed()
+    );
+    connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c_server_refuses_a_17th_session_before_the_handshake() {
+    let d = dir("sess17");
+    let mut mine = PeerStore::in_memory();
+    mine.add(Identity::from_secret(SECRET).public(), "C test server")
+        .unwrap();
+    let mine = Arc::new(Mutex::new(mine));
+    let mut store = PeerStore::load(&d.join("peers")).unwrap();
+    let ids: Vec<Arc<Identity>> = (0..17)
+        .map(|_| Arc::new(Identity::generate().unwrap()))
+        .collect();
+    for (i, id) in ids.iter().enumerate() {
+        store.add(id.public(), &format!("c{i}")).unwrap();
+    }
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 2000);
+    let mut sessions = Vec::new();
+    for id in &ids[..16] {
+        sessions.push(
+            connect(&srv.addr(), id.clone(), mine.clone(), "c", fast())
+                .await
+                .unwrap(),
+        );
+    }
+    // connect() reads the first frame expecting Hs2: Refused means the server sent the
+    // error instead of Hs2, i.e. it refused before any Noise work.
+    let r = connect(&srv.addr(), ids[16].clone(), mine.clone(), "c", fast()).await;
+    assert!(
+        matches!(r, Err(Ava1Error::Refused { code, .. }) if code == gen::ERR_BUSY),
+        "{r:?}"
+    );
+    // A freed slot is usable again.
+    sessions.pop().unwrap().close().await;
+    let t = Instant::now();
+    loop {
+        match connect(&srv.addr(), ids[16].clone(), mine.clone(), "c", fast()).await {
+            Ok(_) => break,
+            Err(e) => assert!(t.elapsed() < Duration::from_secs(3), "{e:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
