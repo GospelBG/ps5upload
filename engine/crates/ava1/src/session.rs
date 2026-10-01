@@ -87,6 +87,17 @@ async fn within<T>(
 /// a `select!`) must never cancel a write midway, which would leave a partial sealed
 /// frame on the wire and desynchronise the stream. Dropping the join handle does not
 /// cancel the task.
+struct PendingEntry<'a> {
+    pending: &'a Pending,
+    id: u32,
+}
+
+impl Drop for PendingEntry<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
 async fn send_owned<M: FrameMessage + Send + Sync + 'static>(
     writer: &SharedWriter,
     channel: u32,
@@ -185,10 +196,12 @@ impl Session {
         let id = self.next_req.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        if let Err(e) = send_owned(&self.writer, id, m).await {
-            self.pending.lock().unwrap().remove(&id);
-            return Err(e);
-        }
+        // Removes the entry on every exit, including the caller dropping this future.
+        let _entry = PendingEntry {
+            pending: &self.pending,
+            id,
+        };
+        send_owned(&self.writer, id, m).await?;
         let mut rx = rx;
         tokio::select! {
             f = &mut rx => f.map_err(|_| Ava1Error::Lost(self.link.reason())),
@@ -197,7 +210,6 @@ impl Session {
                 // that answers and hangs up): the dispatcher drains the frames already
                 // delivered, then drops our sender. Give it that moment before giving up.
                 let late = tokio::time::timeout(Duration::from_millis(250), rx).await;
-                self.pending.lock().unwrap().remove(&id);
                 match late {
                     Ok(Ok(f)) => Ok(f),
                     _ => Err(Ava1Error::Lost(why)),
@@ -268,11 +280,6 @@ impl Session {
     }
 
     pub async fn close(self) {
-        let _ = self
-            .writer
-            .lock()
-            .await
-            .send_msg(0, &Bye { reason: 0 })
-            .await;
+        let _ = send_owned(&self.writer, 0, Bye { reason: 0 }).await;
     }
 }

@@ -329,8 +329,55 @@ fn peer_store_keeps_at_most_32_and_replaces_by_key() {
     assert_eq!(again.list().len(), ava1::peers::MAX_PEERS);
 }
 
+/// A relay between client and server whose client-to-server direction can be stalled
+/// (it stops reading the client socket, so the client's send buffer fills).
+async fn stallable_relay(
+    server: std::net::SocketAddr,
+) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let stall = Arc::new(AtomicBool::new(false));
+    let flag = stall.clone();
+    tokio::spawn(async move {
+        let (c, _) = l.accept().await.unwrap();
+        let s = TcpStream::connect(server).await.unwrap();
+        let (mut cr, mut cw) = c.into_split();
+        let (mut sr, mut sw) = s.into_split();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                while flag.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                match cr.read(&mut buf).await {
+                    Ok(n) if n > 0 => {
+                        if sw.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => return,
+                }
+            }
+        });
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match sr.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    if cw.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    });
+    (addr, stall)
+}
+
 #[tokio::test]
 async fn a_cancelled_call_does_not_break_the_session() {
+    use std::sync::atomic::Ordering;
     let (s_id, c_id) = (
         Identity::generate().unwrap(),
         Arc::new(Identity::generate().unwrap()),
@@ -339,43 +386,35 @@ async fn a_cancelled_call_does_not_break_the_session() {
     sp.add(c_id.public(), "c").unwrap();
     let mut cp = PeerStore::in_memory();
     cp.add(s_id.public(), "s").unwrap();
-    let info = node_info_rpc("s");
-    let rpc: ava1::server::RpcHandler = Box::new(move |method, body| {
-        if method == 77 {
-            std::thread::sleep(Duration::from_millis(300));
-            return ava1::session::RpcReply {
-                status: gen::STATUS_OK,
-                body: Vec::new(),
-            };
-        }
-        info(method, body)
-    });
-
-    let (addr, _ctx) = start(ServerCtx::new(s_id, "s", sp, rpc).with_timing(fast())).await;
+    // The stalled relay stops the client's pings reaching the server; allow that.
+    let timing = ava1::session::Timing {
+        dead_after: Duration::from_secs(20),
+        ..fast()
+    };
+    let (addr, _ctx) =
+        start(ServerCtx::new(s_id, "s", sp, node_info_rpc("s")).with_timing(timing)).await;
+    let (relay, stall) = stallable_relay(addr).await;
     let s = connect(
-        &addr.to_string(),
+        &relay.to_string(),
         c_id,
         Arc::new(Mutex::new(cp)),
         "c",
-        fast(),
+        timing,
     )
     .await
     .unwrap();
-    // Three cancelled calls at a time (the server runs 4 calls per session), then let
-    // the sleepers drain; repeat so a drop is likely to land mid-send at least once.
-    for batch in 0..4u64 {
-        for i in 0..3u64 {
-            let big = vec![7u8; 60_000];
-            let _ = tokio::time::timeout(
-                Duration::from_micros(30 + (batch * 3 + i) * 60),
-                s.rpc(77, &big),
-            )
-            .await;
-            s.node_info().await.unwrap();
-            assert!(!s.is_closed(), "batch {batch} round {i}");
-        }
-        tokio::time::sleep(Duration::from_millis(350)).await;
+
+    stall.store(true, Ordering::SeqCst);
+    let big = vec![7u8; 60_000];
+    // Each call is cancelled after 5 ms: first while waiting for a reply that the stalled
+    // relay never delivers, then, once the socket buffers are full, while its send is
+    // blocked mid-frame. 300 x 60 KB is far more than loopback buffers hold.
+    for _ in 0..300 {
+        let _ = tokio::time::timeout(Duration::from_millis(5), s.rpc(5, &big)).await;
     }
+    stall.store(false, Ordering::SeqCst);
+    assert_eq!(s.node_info().await.unwrap().name, "s");
+    assert!(!s.is_closed(), "{}", s.closed().await);
 }
 
 #[tokio::test]
