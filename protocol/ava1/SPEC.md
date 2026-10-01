@@ -95,3 +95,14 @@ statuses are the `ERR_*` constants. Methods: 1 = node.info → body `NodeInfo`.
 ## 8. Limits
 A server accepts at most 64 connections and 16 sessions; past either it sends
 `Error(ERR_BUSY)` and closes. The accept loop never stops on an accept error.
+
+## 9. Data lanes
+A client opens lane n (1..=8) by connecting and sending, untagged,
+`Join{session_id, lane_id, nonce, tag = MAC(c2s, "join" ‖ session_id ‖ u16(n) ‖
+nonce)}`. The server refuses (`Error(ERR_BAD_JOIN)`) an unknown session, a lane
+id outside 1..=8, a wrong tag, or a nonce it has seen in this session's last 64
+joins; and `ERR_NOT_PAIRED` while the session is not paired. Otherwise it sends
+`JoinAck{lane_id, MAC(s2c, "join-ack" ‖ …)}` untagged, and both sides tag
+everything after with lane_key(c2s|s2c, n) (§4.3). A join of a lane id that is
+still live supersedes the older connection. Lanes end with their session.
+In version 1 project 1, lanes carry only heartbeats.

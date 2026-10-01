@@ -10,9 +10,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 use crate::conn::{Frame, FrameReader, FrameWriter};
-use crate::gen::{self, Bye, PairConfirm, PairResult, RpcRequest, RpcResponse};
+use crate::gen::{self, Bye, Join, JoinAck, PairConfirm, PairResult, RpcRequest, RpcResponse};
 use crate::handshake::{self, Established};
-use crate::keys::Identity;
+use crate::keys::{self, Identity};
 use crate::link::{drive, Link, SharedWriter};
 use crate::peers::PeerStore;
 use crate::wire::{FrameMessage, Message};
@@ -43,8 +43,6 @@ pub struct RpcReply {
 
 type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<Frame>>>>;
 
-// Task 7 (lanes) reads addr, timing and lanes_live; it removes this allow.
-#[allow(dead_code)]
 pub struct Session {
     pub(crate) addr: SocketAddr,
     pub(crate) timing: Timing,
@@ -281,5 +279,117 @@ impl Session {
 
     pub async fn close(self) {
         let _ = send_owned(&self.writer, 0, Bye { reason: 0 }).await;
+    }
+}
+
+pub struct Lane {
+    pub id: u16,
+    link: Link,
+    _writer: SharedWriter,
+    live: Option<Arc<Mutex<[bool; 9]>>>,
+}
+
+impl Lane {
+    pub async fn closed(&self) -> String {
+        self.link.closed().await
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.link.is_closed()
+    }
+
+    pub fn rtt(&self) -> Option<Duration> {
+        self.link.rtt()
+    }
+}
+
+impl Drop for Lane {
+    fn drop(&mut self) {
+        if let Some(live) = &self.live {
+            live.lock().unwrap()[self.id as usize] = false;
+        }
+    }
+}
+
+impl Session {
+    /// Opens a data lane on the lowest free id (1..=8).
+    pub async fn open_lane(&self) -> Result<Lane, Ava1Error> {
+        if self.est.pairing.is_some() {
+            return Err(Ava1Error::NotPaired);
+        }
+        let id = {
+            let mut live = self.lanes_live.lock().unwrap();
+            let Some(i) = (1..=gen::MAX_LANES as usize).find(|i| !live[*i]) else {
+                return Err(Ava1Error::Refused {
+                    code: gen::ERR_BUSY,
+                    message: "all 8 lanes are open".into(),
+                });
+            };
+            live[i] = true;
+            i as u16
+        };
+        match self.join(id).await {
+            Ok((link, writer)) => Ok(Lane {
+                id,
+                link,
+                _writer: writer,
+                live: Some(self.lanes_live.clone()),
+            }),
+            Err(e) => {
+                self.lanes_live.lock().unwrap()[id as usize] = false;
+                Err(e)
+            }
+        }
+    }
+
+    /// Joins `id` again while it is still open here — what a reconnect after a
+    /// dropped lane looks like to the server. Tests only.
+    #[doc(hidden)]
+    pub async fn reopen_lane_for_test(&self, id: u16) -> Result<Lane, Ava1Error> {
+        let (link, writer) = self.join(id).await?;
+        Ok(Lane {
+            id,
+            link,
+            _writer: writer,
+            live: None,
+        })
+    }
+
+    async fn join(&self, id: u16) -> Result<(Link, SharedWriter), Ava1Error> {
+        let t = self.timing.handshake;
+        let stream = within(t, async { Ok(TcpStream::connect(self.addr).await?) }).await?;
+        stream.set_nodelay(true)?;
+        let (rh, wh) = stream.into_split();
+        let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+        let nonce: [u8; 16] = keys::random_bytes()?;
+        let (k, sid) = (&self.est.keys, self.est.session_id);
+        let tag = keys::join_tag(&k.c2s, b"join", &sid, id, &nonce);
+        w.send_msg(
+            0,
+            &Join {
+                session_id: sid,
+                lane_id: id,
+                nonce,
+                tag,
+            },
+        )
+        .await?;
+        let f = within(t, r.recv()).await?;
+        if f.ty == gen::Error::TYPE {
+            return Err(handshake::refused(&f));
+        }
+        let ack: JoinAck = f.decode()?;
+        let want = keys::join_tag(&k.s2c, b"join-ack", &sid, id, &nonce);
+        if ack.lane_id != id || !keys::ct_eq16(&ack.tag, &want) {
+            return Err(Ava1Error::BadTag);
+        }
+        w.set_key(keys::lane_key(&k.c2s, id));
+        r.set_key(keys::lane_key(&k.s2c, id));
+        let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(w));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        let link = drive(r, writer.clone(), self.timing, tx);
+        // Project 1 lanes carry heartbeats only; data frames arrive in project 2.
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        Ok((link, writer))
     }
 }

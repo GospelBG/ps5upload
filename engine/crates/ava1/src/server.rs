@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::conn::{Frame, FrameReader, FrameWriter};
-use crate::gen::{self, Hs1, Join, PairConfirm, PairResult, RpcRequest, RpcResponse};
+use crate::gen::{self, Hs1, Join, JoinAck, PairConfirm, PairResult, RpcRequest, RpcResponse};
 use crate::handshake::{self, refuse};
 use crate::keys::{self, Identity, SessionKeys};
 use crate::link::{drive, SharedWriter};
@@ -35,8 +35,6 @@ pub type RpcHandler = Box<dyn Fn(u16, &[u8]) -> RpcReply + Send + Sync>;
 pub type PairHook = Box<dyn Fn(&PairRequest) -> bool + Send + Sync>;
 pub type NotifyHook = Box<dyn Fn(&PairRequest) + Send + Sync>;
 
-// Task 7 (lanes) reads keys, lane_gen and nonces; it removes this allow.
-#[allow(dead_code)]
 pub(crate) struct SessionEntry {
     pub(crate) keys: SessionKeys,
     pub(crate) paired: AtomicBool,
@@ -362,16 +360,88 @@ async fn control(
     Ok(())
 }
 
-/// Data lanes arrive in Task 7; until then a Join is refused.
+/// The nonces a session remembers, so a captured Join cannot be replayed.
+const JOIN_NONCES: usize = 64;
+
 async fn lane(
-    _r: FrameReader<OwnedReadHalf>,
+    mut r: FrameReader<OwnedReadHalf>,
     mut w: FrameWriter<OwnedWriteHalf>,
-    _first: Frame,
-    _ctx: &Arc<ServerCtx>,
+    first: Frame,
+    ctx: &Arc<ServerCtx>,
 ) -> Result<(), Ava1Error> {
-    refuse(&mut w, gen::ERR_BAD_JOIN, "lanes are not supported yet").await;
-    Err(Ava1Error::Refused {
-        code: gen::ERR_BAD_JOIN,
-        message: "lanes are not supported yet".into(),
-    })
+    let j: Join = first.decode()?;
+    let entry = ctx.sessions.lock().unwrap().get(&j.session_id).cloned();
+    let refused = |code: u16| Ava1Error::Refused {
+        code,
+        message: "join refused".into(),
+    };
+    let Some(entry) = entry else {
+        refuse(&mut w, gen::ERR_BAD_JOIN, "unknown session").await;
+        return Err(refused(gen::ERR_BAD_JOIN));
+    };
+    let want = keys::join_tag(&entry.keys.c2s, b"join", &j.session_id, j.lane_id, &j.nonce);
+    let lane_ok = (1..=gen::MAX_LANES as u16).contains(&j.lane_id);
+    if !lane_ok || !keys::ct_eq16(&want, &j.tag) {
+        refuse(&mut w, gen::ERR_BAD_JOIN, "join refused").await;
+        return Err(refused(gen::ERR_BAD_JOIN));
+    }
+    let fresh = {
+        let mut n = entry.nonces.lock().unwrap();
+        let fresh = !n.contains(&j.nonce);
+        if fresh {
+            if n.len() >= JOIN_NONCES {
+                n.pop_front();
+            }
+            n.push_back(j.nonce);
+        }
+        fresh
+    };
+    if !fresh {
+        refuse(&mut w, gen::ERR_BAD_JOIN, "join replayed").await;
+        return Err(refused(gen::ERR_BAD_JOIN));
+    }
+    if !entry.paired.load(Ordering::SeqCst) {
+        refuse(&mut w, gen::ERR_NOT_PAIRED, "pair first").await;
+        return Err(Ava1Error::NotPaired);
+    }
+    let lane = j.lane_id as usize;
+    let gen_no = {
+        let mut g = entry.lane_gen.lock().unwrap();
+        g[lane] += 1;
+        g[lane]
+    };
+    let tag = keys::join_tag(
+        &entry.keys.s2c,
+        b"join-ack",
+        &j.session_id,
+        j.lane_id,
+        &j.nonce,
+    );
+    w.send_msg(
+        0,
+        &JoinAck {
+            lane_id: j.lane_id,
+            tag,
+        },
+    )
+    .await?;
+    r.set_key(keys::lane_key(&entry.keys.c2s, j.lane_id));
+    w.set_key(keys::lane_key(&entry.keys.s2c, j.lane_id));
+    let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(w));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let link = drive(r, writer, ctx.timing, tx);
+    loop {
+        tokio::select! {
+            f = rx.recv() => if f.is_none() { break },
+            _ = tokio::time::sleep(ctx.timing.ping_every) => {
+                let superseded = entry.lane_gen.lock().unwrap()[lane] != gen_no;
+                let session_gone = !ctx.sessions.lock().unwrap().contains_key(&j.session_id);
+                if superseded || session_gone {
+                    break;
+                }
+            }
+        }
+    }
+    drop(link);
+    Ok(())
 }
