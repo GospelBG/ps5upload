@@ -257,7 +257,7 @@ pub fn parse(src: &str) -> Result<Schema, String> {
             match (f.ty, f.of.as_deref()) {
                 (Ty::Records, Some(of)) if of == m.name => {
                     return Err(format!(
-                        "{}.{}: a struct cannot list itself",
+                        "{}.{}: records cannot list its own type",
                         m.name, f.name
                     ))
                 }

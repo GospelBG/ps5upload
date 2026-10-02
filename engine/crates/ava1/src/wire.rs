@@ -71,6 +71,8 @@ impl Writer {
         Ok(())
     }
     /// A list of messages: u32 total length, then `u32 len ‖ item` per item (SPEC.md §3).
+    /// An error leaves the buffer undefined — completed items, a zeroed length and part
+    /// of the item that failed — so drop the writer, as with `ext`.
     pub fn records<M: Message>(&mut self, items: &[M]) -> Result<(), EncodeError> {
         let at = self.buf.len();
         self.u32(0);

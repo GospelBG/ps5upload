@@ -27,7 +27,18 @@ reject a repeated known tag, reject invalid UTF-8, and reject trailing bytes
 (both in the body and inside an extension value). The canonical encodings in
 `vectors/messages.txt` must round-trip byte for byte.
 
-**Records.** A field of type `records` holds a list of one struct. It is encoded as a
+Decoders accept a superset of what encoders write — inside a records item, an
+extension may be unknown or out of order, and the decoder drops it — so a
+re-encoder is only bound to canonical input, which is all an encoder ever
+produces: it must reproduce canonical bytes exactly. For a message it accepted but
+would not itself have written, a re-encoder may reproduce the captured item bytes
+verbatim (the C decoder holds them) or re-encode each item canonically (the Rust
+one does); the two agree wherever the input is canonical, and nothing in the
+protocol re-encodes a peer's bytes.
+
+**Records.** A field of type `records` holds a list of one struct — an *item* is that
+struct's encoding per this section (its fields, then its extension block), and the
+length written before it is exactly that. It is encoded as a
 `bytes` field whose content is, for each item in order, `u32le(item length) ‖ item`.
 An empty list is `00000000`. A decoder validates every item (a bad item makes the whole
 message malformed). Records are not allowed as extensions. C decoders keep a pointer to
