@@ -17,6 +17,7 @@ pub mod server;
 pub mod session;
 pub mod source;
 pub mod trust;
+pub mod verify;
 pub mod wire;
 
 pub use error::Ava1Error;

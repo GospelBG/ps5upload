@@ -281,3 +281,25 @@ and not yet `Received`.
 synced → `Durable`. `JobDone` follows the last durable commit (and the staging rename).
 A failure after every byte is durable (`ERR_EXISTS`, `ERR_CROSS_DEVICE` on the final
 rename) is reported in `JobDone` and never causes a resend.
+
+## 13. Verification
+
+13.1 A file's root is its standard BLAKE3 hash. Files are hashed in groups of 1 MiB
+(`GROUP_SHIFT` = 20): group i covers bytes [i·2^20, (i+1)·2^20). For a file of two or more
+groups, each group's chaining value (BLAKE3 `finalize_non_root` of that subtree) is
+computed where its bytes are, and the root is merged from the group CVs along BLAKE3's
+tree (left subtree = the largest power of two of groups strictly less than the count).
+A file of zero or one group: root = BLAKE3(bytes).
+
+13.2 Senders compute the root while reading. Small files carry it in their
+`BundleRecord`; large files send `FileRoot` once their last group is read (or, on a
+resume, once all group CVs are known from the sender's outboard).
+
+13.3 Receivers compute each group's CV from the bytes they write and store it in an
+outboard (32 bytes per group, in the job directory). At commit the root merged from the
+outboard must equal the sender's root; otherwise the file is reset and `FileRetry` sent.
+
+13.4 Resume verification: before answering a resumed job's map, the receiver re-hashes
+each partial file's groups from its last durable batch and compares them with the
+outboard; a mismatch drops those ranges from the map. Older durable groups are trusted
+from the journal. The verify policy re-hashes whole files.
