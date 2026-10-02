@@ -304,3 +304,26 @@ outboard must equal the sender's root; otherwise the file is reset and `FileRetr
 each partial file's groups from its last durable batch and compares them with the
 outboard; a mismatch drops those ranges from the map. Older durable groups are trusted
 from the journal. The verify policy re-hashes whole files.
+
+## 14. Journal and resume
+
+14.1 The journal: `<job dir>/journal` = magic `AVA1JNL1` (8 bytes), then records
+`u32le(len) ‖ u8 kind ‖ body ‖ u32le(crc32c(kind ‖ body))`, `len` = 1 + body length. Kinds:
+1 `JnlOpen`, 2 `JnlBatch`, 3 `JnlReset`, 4 `JnlSnapshot`, 5 `JnlDone` (bodies are the generated
+structs). Replay stops at the first record whose length runs past the file, whose CRC fails, or
+that the visitor refuses; the file is truncated there before the next append. Every append is
+followed by `fsync`. When the file passes 1 MiB it is compacted: `journal.tmp` =
+magic + `JnlOpen` + `JnlSnapshot(current state)`, `fsync`, `rename` over `journal` (same
+directory), `fsync` of the directory. The job's manifest is stored once as `<job dir>/manifest`:
+exactly the content of a `records(ManifestEntry)` field (written as `manifest.tmp` → `fsync` →
+rename).
+
+14.2 State: a `JnlBatch` marks files done (dropping their ranges), adds durable ranges and
+records roots; `JnlReset` forgets one file; `JnlSnapshot` replaces the whole state; `JnlDone`
+records the job's final status. The map answered for a resume is the replayed state (done files;
+durable ranges of the others), after the check in §13.4.
+
+14.3 Location: the console keeps job directories under `/data/ps5upload/ava/jobs/`, an engine
+under `<data dir>/ava/jobs/`. Each holds `journal`, `manifest` and one `<file_id>.ob` outboard
+per large file. A directory is removed 7 days after its last write (directory or journal mtime),
+on start.

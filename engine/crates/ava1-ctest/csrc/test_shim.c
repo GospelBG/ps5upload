@@ -1,6 +1,7 @@
 /* Starts the payload's AVA1 server on the host with a node.info handler (tests only). */
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -10,6 +11,7 @@
 #include "ava1_platform.h"
 
 #include "ava1_gen.h"
+#include "ava1_journal.h"
 #include "ava1_ranges.h"
 #include "ava1_server.h"
 
@@ -424,4 +426,168 @@ size_t ava1_test_bits_runs(uint32_t n, const uint32_t *set, size_t nset, uint32_
     ava1_bits_free(&b);
     free(blob);
     return k;
+}
+
+/* Builds the same text the Rust test's c_style_dump builds, from a C replay. */
+typedef struct {
+    char *out;
+    size_t cap, len;
+    uint8_t done[4096];
+    ava1_rset_t ranges[2048];
+    uint8_t roots[2048][32];
+    uint8_t has_root[2048];
+    int finished;
+    uint16_t status;
+} jdump_t;
+
+static void jdump_say(jdump_t *d, const char *s) {
+    size_t n = strlen(s);
+    if (d->len + n < d->cap) {
+        memcpy(d->out + d->len, s, n);
+        d->len += n;
+    }
+}
+
+/* 0 on success; nonzero if a records list does not decode (treated as torn, like Rust). */
+static int jdump_batch(jdump_t *d, const ava1_jnl_batch_t *b) {
+    ava1_r_t it;
+    ava1_file_run_t r;
+    ava1_file_range_t g;
+    ava1_root_item_t ri;
+    int rc;
+    ava1_r_init(&it, b->files, b->files_len);
+    while ((rc = ava1_file_run_next(&it, &r)) == 1) {
+        uint32_t f;
+        for (f = r.first; f < r.first + r.count && f < 4096; f++) {
+            d->done[f] = 1;
+            if (f < 2048) ava1_rset_clear(&d->ranges[f]);
+        }
+    }
+    if (rc < 0) return 1;
+    ava1_r_init(&it, b->ranges, b->ranges_len);
+    while ((rc = ava1_file_range_next(&it, &g)) == 1)
+        if (g.file_id < 2048) (void)ava1_rset_add(&d->ranges[g.file_id], g.offset, g.offset + g.len);
+    if (rc < 0) return 1;
+    ava1_r_init(&it, b->roots, b->roots_len);
+    while ((rc = ava1_root_item_next(&it, &ri)) == 1)
+        if (ri.file_id < 2048) {
+            memcpy(d->roots[ri.file_id], ri.root, 32);
+            d->has_root[ri.file_id] = 1;
+        }
+    return rc < 0 ? 1 : 0;
+}
+
+static int jdump_visit(void *ctx, uint8_t kind, const uint8_t *body, size_t len) {
+    jdump_t *d = ctx;
+    if (kind == AVA1_JNL_BATCH) {
+        ava1_jnl_batch_t b;
+        if (ava1_jnl_batch_decode(body, len, &b) != 0) return 1;
+        if (jdump_batch(d, &b) != 0) return 1;
+    } else if (kind == AVA1_JNL_RESET) {
+        ava1_jnl_reset_t r;
+        if (ava1_jnl_reset_decode(body, len, &r) != 0 || r.file_id >= 2048) return 1;
+        d->done[r.file_id] = 0;
+        ava1_rset_clear(&d->ranges[r.file_id]);
+        d->has_root[r.file_id] = 0;
+    } else if (kind == AVA1_JNL_DONE) {
+        ava1_jnl_done_t x;
+        if (ava1_jnl_done_decode(body, len, &x) != 0) return 1;
+        d->finished = 1;
+        d->status = x.status;
+    } else if (kind == AVA1_JNL_SNAPSHOT) {
+        /* Test-only visitor: Rust's replay applies a snapshot, but the cross-tests never
+         * write one. Accept it so replay does not stop; the real C replay (Task 13) must
+         * apply it. */
+    } else if (kind != AVA1_JNL_OPEN) {
+        return 1; /* unknown kind: torn from here on, same as Rust's Record::decode */
+    }
+    return 0;
+}
+
+/* Test-only: dump_t is calloc'd, which is what the ava1_rset_t zero-init contract requires. */
+size_t ava1_test_journal_dump(const char *dir, char *out, size_t cap) {
+    jdump_t *d = calloc(1, sizeof *d);
+    ava1_jnl_t j;
+    char line[96];
+    uint32_t f;
+    size_t i, n;
+    if (!d) return 0;
+    d->out = out;
+    d->cap = cap;
+    if (ava1_jnl_open(&j, dir, jdump_visit, d) == 0) ava1_jnl_close(&j);
+    for (f = 0; f < 4096; f++)
+        if (d->done[f]) {
+            snprintf(line, sizeof line, "done %u\n", f);
+            jdump_say(d, line);
+        }
+    for (f = 0; f < 2048; f++)
+        for (i = 0; i < d->ranges[f].n; i++) {
+            snprintf(line, sizeof line, "range %u %llu %llu\n", f,
+                     (unsigned long long)d->ranges[f].v[2 * i],
+                     (unsigned long long)d->ranges[f].v[2 * i + 1]);
+            jdump_say(d, line);
+        }
+    for (f = 0; f < 2048; f++)
+        if (d->has_root[f]) {
+            snprintf(line, sizeof line, "root %u %02x\n", f, d->roots[f][0]);
+            jdump_say(d, line);
+        }
+    if (d->finished) snprintf(line, sizeof line, "finished=%u", d->status);
+    else snprintf(line, sizeof line, "finished=none");
+    jdump_say(d, line);
+    for (f = 0; f < 2048; f++) ava1_rset_clear(&d->ranges[f]);
+    n = d->len;
+    free(d);
+    return n;
+}
+
+/* Test-only: writes a journal a Rust replay can read. Returns 0 or a negative error, so a
+ * failed create/append cannot masquerade as an empty journal. */
+int ava1_test_journal_write_sample(const char *dir) {
+    ava1_jnl_t j;
+    ava1_jnl_open_t o;
+    uint8_t body[256], blob[64];
+    ava1_w_t w, bw;
+    uint32_t i;
+    int rc;
+    memset(&o, 0, sizeof o);
+    o.kind = 1;
+    o.root = (const uint8_t *)"/data/c";
+    o.root_len = 7;
+    rc = ava1_jnl_create(&j, dir, &o);
+    if (rc != 0) return rc;
+    for (i = 0; i < 10; i++) {
+        ava1_jnl_batch_t b;
+        ava1_file_run_t r;
+        memset(&b, 0, sizeof b);
+        memset(&r, 0, sizeof r);
+        r.first = i;
+        r.count = 1;
+        ava1_w_init(&bw, blob, sizeof blob);
+        rc = ava1_file_run_append(&bw, &r);
+        if (rc != 0) break;
+        b.files = blob;
+        b.files_len = (uint32_t)bw.len;
+        ava1_w_init(&w, body, sizeof body);
+        rc = ava1_jnl_batch_encode(&b, &w);
+        if (rc != 0) break;
+        rc = ava1_jnl_append(&j, AVA1_JNL_BATCH, body, w.len);
+        if (rc != 0) break;
+    }
+    if (rc == 0) {
+        ava1_jnl_reset_t r;
+        r.file_id = 3;
+        ava1_w_init(&w, body, sizeof body);
+        rc = ava1_jnl_reset_encode(&r, &w);
+        if (rc == 0) rc = ava1_jnl_append(&j, AVA1_JNL_RESET, body, w.len);
+    }
+    if (rc == 0) {
+        ava1_jnl_done_t x;
+        x.status = 0;
+        ava1_w_init(&w, body, sizeof body);
+        rc = ava1_jnl_done_encode(&x, &w);
+        if (rc == 0) rc = ava1_jnl_append(&j, AVA1_JNL_DONE, body, w.len);
+    }
+    ava1_jnl_close(&j);
+    return rc;
 }

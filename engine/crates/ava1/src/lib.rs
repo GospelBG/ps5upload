@@ -7,6 +7,7 @@ pub mod frame;
 pub mod gen;
 pub mod handshake;
 pub mod hex;
+pub mod journal;
 pub mod keys;
 pub mod launch;
 mod link;

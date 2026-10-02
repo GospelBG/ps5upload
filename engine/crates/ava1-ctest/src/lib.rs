@@ -218,6 +218,8 @@ pub mod ffi {
             out: *mut u64,
             cap: usize,
         ) -> usize;
+        pub fn ava1_test_journal_dump(dir: *const c_char, out: *mut u8, cap: usize) -> usize;
+        pub fn ava1_test_journal_write_sample(dir: *const c_char) -> c_int;
         pub fn ava1_test_bits_runs(
             n: u32,
             set: *const u32,
@@ -586,4 +588,19 @@ pub fn c_bits_runs(n: u32, set: &[u32]) -> Vec<(u32, u32)> {
         ffi::ava1_test_bits_runs(n, set.as_ptr(), set.len(), out.as_mut_ptr(), n as usize + 1)
     };
     out.chunks(2).take(k).map(|p| (p[0], p[1])).collect()
+}
+
+/// The C replay of the journal at `dir`, as the text `c_style_dump` builds for the
+/// same state.
+pub fn c_journal_dump(dir: &Path) -> String {
+    let d = CString::new(dir.to_str().unwrap()).unwrap();
+    let mut out = vec![0u8; 1 << 20];
+    let n = unsafe { ffi::ava1_test_journal_dump(d.as_ptr(), out.as_mut_ptr(), out.len()) };
+    String::from_utf8(out[..n].to_vec()).unwrap()
+}
+
+/// Writes a sample journal from C; 0 or a negative error.
+pub fn c_journal_write_sample(dir: &Path) -> i32 {
+    let d = CString::new(dir.to_str().unwrap()).unwrap();
+    unsafe { ffi::ava1_test_journal_write_sample(d.as_ptr()) }
 }
