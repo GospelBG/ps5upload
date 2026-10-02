@@ -854,6 +854,52 @@ static int g_same_device = 1;
 static ava1_job_t *g_job;
 static const uint8_t TEST_JOB[16] = { 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 };
 static const uint8_t TEST_OWNER[32] = { 1 };
+static int g_trace;           /* record hook points as events */
+static uint8_t *g_dup;        /* a chunk to apply again at its file's commit */
+static size_t g_dup_len;
+static uint32_t g_dup_id;
+static uint64_t g_dup_off;
+
+static void ev_add(const char *s, int done);
+
+static void t_hook(ava1_job_t *j, int point, uint32_t id) {
+    if (__atomic_load_n(&g_trace, __ATOMIC_SEQ_CST)) {
+        char line[64];
+        snprintf(line, sizeof line, "hook %d %u\n", point, id);
+        ev_add(line, 0);
+    }
+    if (point == AVA1_HOOK_COMMIT_VERIFIED && g_dup && id == g_dup_id) {
+        uint8_t *own = g_dup;
+        size_t n = g_dup_len;
+        g_dup = NULL;
+        if (ava1_apply_reserve(j, n) != 0) {
+            free(own);
+            return;
+        }
+        (void)ava1_apply_chunk(j, own, n, id, g_dup_off, own, n);
+        /* wait until a worker has applied it */
+        pthread_mutex_lock(&j->mu);
+        while (j->q_len || j->busy) {
+            pthread_mutex_unlock(&j->mu);
+            ava1_platform_sleep_ms(1);
+            pthread_mutex_lock(&j->mu);
+        }
+        pthread_mutex_unlock(&j->mu);
+    }
+}
+
+void ava1_test_apply_trace(int on) { __atomic_store_n(&g_trace, on, __ATOMIC_SEQ_CST); }
+
+int ava1_test_apply_dup_on_commit(uint32_t id, uint64_t off, const uint8_t *d, size_t len) {
+    uint8_t *own = malloc(len ? len : 1);
+    if (!own) return -1;
+    memcpy(own, d, len);
+    g_dup_id = id;
+    g_dup_off = off;
+    g_dup_len = len;
+    g_dup = own; /* set before any chunk of the file is sent: no race with the hook */
+    return 0;
+}
 
 /* Read by the data layer's same_device hook from the job's threads. */
 void ava1_test_set_same_device(int v) { __atomic_store_n(&g_same_device, v, __ATOMIC_SEQ_CST); }
@@ -943,6 +989,8 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
     cfg.fsync_delay_us = fsync_delay_us;
     cfg.crash_at = crash_at;
     if (ava1_data_start(&cfg) != 0) return -1;
+    g_trace = 0;
+    ava1_apply_hook = t_hook;
     pthread_mutex_lock(&g_ev_mu);
     g_ev_len = 0;
     g_ev_done = 0;
@@ -1043,11 +1091,28 @@ int ava1_test_apply_record(uint32_t id, const uint8_t *d, size_t len, const uint
     memset(&b, 0, sizeof b);
     b.records = own;
     b.records_len = (uint32_t)w.len;
+    b.records_count = 1;
     if (ava1_apply_reserve(g_job, cap) != 0) {
         free(own);
         return -3;
     }
     return ava1_apply_bundle(g_job, own, cap, &b);
+}
+
+int ava1_test_apply_bundle_raw(const uint8_t *d, size_t len, uint32_t count) {
+    ava1_bundle_t b;
+    uint8_t *own = malloc(len ? len : 1);
+    if (!own) return -1;
+    memcpy(own, d, len);
+    memset(&b, 0, sizeof b);
+    b.records = own;
+    b.records_len = (uint32_t)len;
+    b.records_count = count;
+    if (ava1_apply_reserve(g_job, len) != 0) {
+        free(own);
+        return -3;
+    }
+    return ava1_apply_bundle(g_job, own, len, &b);
 }
 
 int ava1_test_apply_root(uint32_t id, const uint8_t root[32]) { return ava1_apply_root(g_job, id, root); }
@@ -1084,5 +1149,9 @@ void ava1_test_apply_end(void) {
     if (g_job) ava1_job_put(g_job);
     g_job = NULL;
     ava1_data_stop();
+    ava1_apply_hook = NULL;
+    g_trace = 0;
+    free(g_dup);
+    g_dup = NULL;
     ava1_test_set_same_device(1);
 }

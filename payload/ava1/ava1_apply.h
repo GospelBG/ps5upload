@@ -41,4 +41,13 @@ void ava1_apply_reset(ava1_job_t *j, uint32_t id, uint16_t reason);
 /* Rewrite the journal as Open + Snapshot of the job's state (mid-job: no Done). */
 void ava1_apply_compact(ava1_job_t *j);
 
+/* Tests only (NULL in the payload): called at these points of a commit, in this order.
+ * `id` is the file, or UINT32_MAX for the staged tree's rename. */
+#define AVA1_HOOK_COMMIT_VERIFIED 1 /* root matched; the commit is about to proceed */
+#define AVA1_HOOK_RENAMED 2         /* the rename into place */
+#define AVA1_HOOK_DIR_SYNCED 3      /* its directory fsynced */
+#define AVA1_HOOK_JOURNALED 4       /* the file's done Batch appended */
+#define AVA1_HOOK_OB_UNLINKED 5     /* its outboard removed */
+extern void (*ava1_apply_hook)(ava1_job_t *j, int point, uint32_t id);
+
 #endif

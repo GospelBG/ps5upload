@@ -306,6 +306,9 @@ pub mod ffi {
         pub fn ava1_test_apply_wait(timeout_ms: u32) -> c_int;
         pub fn ava1_test_apply_events(out: *mut u8, cap: usize) -> usize;
         pub fn ava1_test_apply_end();
+        pub fn ava1_test_apply_bundle_raw(d: *const u8, len: usize, count: u32) -> c_int;
+        pub fn ava1_test_apply_trace(on: c_int);
+        pub fn ava1_test_apply_dup_on_commit(id: u32, off: u64, d: *const u8, len: usize) -> c_int;
     }
 }
 
@@ -931,17 +934,47 @@ impl CApplyJob {
     }
 
     pub fn chunk(&self, id: u32, off: u64, d: &[u8]) {
+        assert_eq!(self.try_chunk(id, off, d), 0);
+    }
+
+    /// ava1_apply_chunk's answer (0, or a negative AVA1_E_*).
+    pub fn try_chunk(&self, id: u32, off: u64, d: &[u8]) -> i32 {
+        unsafe { ffi::ava1_test_apply_chunk(id, off, d.as_ptr(), d.len()) }
+    }
+
+    pub fn record(&self, id: u32, d: &[u8], root: [u8; 32]) {
+        assert_eq!(self.try_record(id, d, root), 0);
+    }
+
+    /// ava1_apply_bundle's answer for a one-record bundle.
+    pub fn try_record(&self, id: u32, d: &[u8], root: [u8; 32]) -> i32 {
+        unsafe { ffi::ava1_test_apply_record(id, d.as_ptr(), d.len(), root.as_ptr()) }
+    }
+
+    /// ava1_apply_bundle's answer for raw record bytes claiming `count` records.
+    pub fn raw_bundle(&self, records: &[u8], count: u32) -> i32 {
+        unsafe { ffi::ava1_test_apply_bundle_raw(records.as_ptr(), records.len(), count) }
+    }
+
+    /// Record the apply engine's test hooks as "hook <point> <file id>" event lines.
+    pub fn trace(&self, on: bool) {
+        unsafe { ffi::ava1_test_apply_trace(on as c_int) }
+    }
+
+    /// Once file `id`'s root is verified at commit, and before the commit goes on, apply
+    /// this chunk again (a late duplicate racing the commit).
+    pub fn dup_on_commit(&self, id: u32, off: u64, d: &[u8]) {
         assert_eq!(
-            unsafe { ffi::ava1_test_apply_chunk(id, off, d.as_ptr(), d.len()) },
+            unsafe { ffi::ava1_test_apply_dup_on_commit(id, off, d.as_ptr(), d.len()) },
             0
         );
     }
 
-    pub fn record(&self, id: u32, d: &[u8], root: [u8; 32]) {
-        assert_eq!(
-            unsafe { ffi::ava1_test_apply_record(id, d.as_ptr(), d.len(), root.as_ptr()) },
-            0
-        );
+    /// Stops and frees the job now (still under the lock) and returns every event it
+    /// emitted.
+    pub fn end(self) -> String {
+        unsafe { ffi::ava1_test_apply_end() };
+        self.events()
     }
 
     pub fn root(&self, id: u32, root: [u8; 32]) {

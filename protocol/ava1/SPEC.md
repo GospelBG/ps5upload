@@ -280,7 +280,9 @@ and not yet `Received`.
 12.6 `Durable{files, ranges}` follows the order: data synced → journal appended and
 synced → `Durable`. `JobDone` follows the last durable commit (and the staging rename).
 A failure after every byte is durable (`ERR_EXISTS`, `ERR_CROSS_DEVICE` on the final
-rename) is reported in `JobDone` and never causes a resend.
+rename) is reported in `JobDone` and never causes a resend. A rename is durable only once its
+directory is synced: the receiver fsyncs the parent directory after every commit or staging
+rename, before it journals that commit.
 
 ## 13. Verification
 

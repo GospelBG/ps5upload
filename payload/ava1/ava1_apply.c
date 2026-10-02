@@ -26,6 +26,33 @@ typedef struct {
     uint32_t idx;
 } wctx_t;
 
+void (*ava1_apply_hook)(ava1_job_t *j, int point, uint32_t id);
+#define HOOK(j, point, id) \
+    do { \
+        if (ava1_apply_hook) ava1_apply_hook((j), (point), (id)); \
+    } while (0)
+
+static int is_stopping(ava1_job_t *j) {
+    int s;
+    pthread_mutex_lock(&j->mu);
+    s = j->stopping;
+    pthread_mutex_unlock(&j->mu);
+    return s;
+}
+
+/* A rename is durable only once its directory is synced (SPEC.md §12.6). 0 or an errno;
+ * a filesystem that cannot sync a directory (EINVAL, ENOTSUP) is not an error. */
+static int sync_dir(const char *dir) {
+    int fd = open(dir, O_RDONLY | O_DIRECTORY), rc = 0;
+    if (fd < 0) return errno;
+    if (fsync(fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP) rc = errno;
+    close(fd);
+    return rc;
+}
+
+/* A final rename that failed because something is already where it goes. */
+static int in_the_way(int e) { return e == EEXIST || e == ENOTEMPTY || e == ENOTDIR || e == EISDIR; }
+
 static uint64_t groups_of(uint64_t size) { return (size + AVA1_GROUP_LEN - 1) / AVA1_GROUP_LEN; }
 
 /* A path that does not fit comes back empty (open() then fails) rather than truncated
@@ -214,6 +241,18 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
     emit_done(j);
 }
 
+/* Workers never end the job themselves: they record the first failure here (a nonzero
+ * final_status on an unfinished job) and the job thread ends it, so JobDone has one
+ * emitter and can never overtake a Durable the job thread is still sending. */
+static void worker_fail(ava1_job_t *j, uint16_t status, const char *what, int err) {
+    pthread_mutex_lock(&j->mu);
+    if (!j->finished && !j->final_status) {
+        j->final_status = status;
+        snprintf(j->message, sizeof j->message, "%s%s%s", what, err ? ": " : "", err ? strerror(err) : "");
+    }
+    pthread_mutex_unlock(&j->mu);
+}
+
 /* ---- credit ------------------------------------------------------------------------ */
 
 int ava1_apply_reserve(ava1_job_t *j, size_t n) {
@@ -294,7 +333,27 @@ int ava1_apply_chunk(ava1_job_t *j, uint8_t *owned, size_t owned_len, uint32_t f
 }
 
 int ava1_apply_bundle(ava1_job_t *j, uint8_t *owned, size_t owned_len, const ava1_bundle_t *b) {
-    ava1_work_t *w = calloc(1, sizeof *w);
+    ava1_work_t *w;
+    ava1_r_t it;
+    ava1_bundle_record_t r;
+    uint32_t n = 0;
+    int k;
+    /* The whole bundle up front: every record well formed and naming a file, and as many
+     * as it claims. A bad one is refused here, never half-applied by a worker. */
+    ava1_r_init(&it, b->records, b->records_len);
+    while ((k = ava1_bundle_record_next(&it, &r)) == 1) {
+        if (r.file_id >= j->m.n || j->m.e[r.file_id].kind != AVA1_ENTRY_FILE) {
+            k = -1;
+            break;
+        }
+        n++;
+    }
+    if (k != 0 || n != b->records_count) {
+        free(owned);
+        give_back(j, owned_len);
+        return AVA1_E_PROTO;
+    }
+    w = calloc(1, sizeof *w);
     if (!w) {
         free(owned);
         give_back(j, owned_len);
@@ -332,6 +391,7 @@ int ava1_apply_root(ava1_job_t *j, uint32_t file_id, const uint8_t root[32]) {
 
 int ava1_apply_parallel(ava1_job_t *j, void (*fn)(ava1_job_t *, void *, uint32_t), void *arg, uint32_t n) {
     uint32_t i;
+    int dropped = 0;
     pthread_mutex_lock(&j->mu);
     j->calls_left += n;
     pthread_mutex_unlock(&j->mu);
@@ -363,6 +423,7 @@ int ava1_apply_parallel(ava1_job_t *j, void (*fn)(ava1_job_t *, void *, uint32_t
                     if (j->q_tail == w) j->q_tail = prev;
                     j->q_len--;
                     j->calls_left--;
+                    dropped = 1;
                     free(w);
                 } else {
                     prev = w;
@@ -374,7 +435,7 @@ int ava1_apply_parallel(ava1_job_t *j, void (*fn)(ava1_job_t *, void *, uint32_t
         pthread_cond_wait(&j->cv, &j->mu);
     }
     pthread_mutex_unlock(&j->mu);
-    return 0;
+    return dropped ? -1 : 0;
 }
 
 /* ---- applying ---------------------------------------------------------------------- */
@@ -529,11 +590,14 @@ static int apply_record(ava1_job_t *j, const ava1_bundle_record_t *r) {
         emit_retry(j, r->file_id, AVA1_RETRY_VERIFY);
         return 0;
     }
+    ava1_apply_path(j, r->file_id, 0, path, sizeof path);
+    /* Right before the O_TRUNC: a duplicate must not truncate a file that is already
+     * durable, or written and waiting for its batch. */
     pthread_mutex_lock(&j->mu);
     rc = ava1_bits_get(&j->done, r->file_id);
+    for (fd = 0; !rc && (uint32_t)fd < j->pend_n; fd++) rc = j->pend_small[fd] == r->file_id;
     pthread_mutex_unlock(&j->mu);
-    if (rc) return 0; /* already durable: a duplicate after a requeue */
-    ava1_apply_path(j, r->file_id, 0, path, sizeof path);
+    if (rc) return 0;
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0 && errno == ENOENT && mkparents(path) == 0) fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0) return -errno;
@@ -562,8 +626,9 @@ static void run_work(ava1_job_t *j, ava1_work_t *w) {
         ava1_r_init(&it, w->data, w->len);
         while (rc == 0 && (k = ava1_bundle_record_next(&it, &r)) == 1) rc = apply_record(j, &r);
     }
-    if (rc == -ENOSPC) ava1_apply_fail(j, AVA1_ERR_NO_SPACE, "the destination drive is full", ENOSPC, 0);
-    else if (rc < 0) ava1_apply_fail(j, AVA1_ERR_IO, "write failed", -rc, 0);
+    if (rc == -ENOSPC) worker_fail(j, AVA1_ERR_NO_SPACE, "the destination drive is full", ENOSPC);
+    else if (rc == BAD_RECORD) worker_fail(j, AVA1_ERR_PROTOCOL, "a bundle record names no file", 0);
+    else if (rc < 0) worker_fail(j, AVA1_ERR_IO, "write failed", -rc);
     free(w->owned);
     give_back(j, w->owned_len);
 }
@@ -620,16 +685,24 @@ static int add_workers(ava1_job_t *j, uint8_t n) {
 typedef struct {
     int *fds;
     uint32_t n, stripes;
-    int err;
+    int err, cut; /* cut: a stripe gave up because the job is stopping */
 } fdlist_t;
 
 static void sync_stripe(ava1_job_t *j, void *arg, uint32_t i) {
     fdlist_t *l = arg;
     uint32_t k;
     uint32_t delay = ava1_data_cfg()->fsync_delay_us;
-    (void)j;
     for (k = i; k < l->n; k += l->stripes) {
-        if (delay) ava1_platform_sleep_ms(delay / 1000u ? delay / 1000u : 1u);
+        uint32_t ms = delay ? (delay / 1000u ? delay / 1000u : 1u) : 0;
+        while (ms && !is_stopping(j)) { /* a slow disk, in slices a stop can cut */
+            uint32_t step = ms < 50u ? ms : 50u;
+            ava1_platform_sleep_ms(step);
+            ms -= step;
+        }
+        if (is_stopping(j)) {
+            __atomic_store_n(&l->cut, 1, __ATOMIC_RELAXED);
+            return;
+        }
         if (fsync(l->fds[k]) != 0) __atomic_store_n(&l->err, errno, __ATOMIC_RELAXED);
     }
 }
@@ -670,7 +743,9 @@ static void sync_batch(ava1_job_t *j) {
     for (i = 0; i < j->m.n; i++) {
         ava1_lfile_t *lf = j->lf[i];
         if (!lf) continue;
-        if (lf->written.n) {
+        if (lf->committed || lf->fd < 0) {
+            ava1_rset_clear(&lf->written); /* a late duplicate's range: nothing left to sync */
+        } else if (lf->written.n) {
             cap_g += (uint32_t)lf->written.n;
             nlf++;
         }
@@ -716,7 +791,8 @@ static void sync_batch(ava1_job_t *j) {
 
     /* 1. data sync, spread over the workers */
     l.stripes = j->want_workers ? j->want_workers : 1;
-    if (l.n) ava1_apply_parallel(j, sync_stripe, &l, l.stripes);
+    /* A stop mid-sync: some data may be unsynced, so nothing is journaled or acknowledged. */
+    if ((l.n && ava1_apply_parallel(j, sync_stripe, &l, l.stripes) != 0) || l.cut || is_stopping(j)) goto out;
     if (l.err) {
         ava1_apply_fail(j, AVA1_ERR_IO, "fsync failed", l.err, 0);
         goto out;
@@ -957,9 +1033,12 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
         ava1_apply_fail(j, AVA1_ERR_IO, "path too long", ENAMETOOLONG, 0);
         return;
     }
-    /* From here on a late duplicate chunk is dropped (write_chunk checks `committed`). */
+    HOOK(j, AVA1_HOOK_COMMIT_VERIFIED, id);
+    /* From here on a late duplicate chunk is dropped (write_chunk checks `committed`), and
+     * one that slipped in before this point is forgotten: the fd is about to close. */
     pthread_mutex_lock(&j->mu);
     lf->committed = 1;
+    ava1_rset_clear(&lf->written);
     pthread_mutex_unlock(&j->mu);
     /* Truncate (preallocate may have reserved more) before the mtime: on Linux ftruncate
      * itself sets the mtime. The fsync makes all three durable. */
@@ -985,12 +1064,18 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
             return;
         }
         if (rename(part, fin) != 0) {
-            ava1_apply_fail(j, AVA1_ERR_IO, "rename into place failed", errno, 1);
+            int e = errno;
+            if (in_the_way(e)) ava1_apply_fail(j, AVA1_ERR_EXISTS, "something is already where the file goes", e, 1);
+            else ava1_apply_fail(j, AVA1_ERR_IO, "rename into place failed", e, 1);
             return;
         }
+        HOOK(j, AVA1_HOOK_RENAMED, id);
+        if ((err = sync_dir(parent)) != 0) {
+            ava1_apply_fail(j, AVA1_ERR_IO, "syncing the folder failed", err, 1);
+            return;
+        }
+        HOOK(j, AVA1_HOOK_DIR_SYNCED, id);
     }
-    ob_path(j, id, ob, sizeof ob);
-    (void)unlink(ob);
     {
         ava1_jnl_batch_t b;
         ava1_file_run_t r = { id, 1 };
@@ -1006,6 +1091,11 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
             ava1_apply_fail(j, AVA1_ERR_IO, "journal append failed", EIO, 0);
             return;
         }
+        HOOK(j, AVA1_HOOK_JOURNALED, id);
+        /* only once the commit is journaled: until then a replay may still need the CVs */
+        ob_path(j, id, ob, sizeof ob);
+        (void)unlink(ob);
+        HOOK(j, AVA1_HOOK_OB_UNLINKED, id);
         pthread_mutex_lock(&j->mu);
         ava1_bits_set(&j->done, id);
         j->files_done++;
@@ -1034,6 +1124,7 @@ static void finish(ava1_job_t *j) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
     char parent[PATH_CAP];
     struct stat st;
+    int e;
     if (j->staged && !(j->flags & AVA1_JF_SINGLE_FILE)) {
         parent_of(j->root, parent, sizeof parent);
         if (stat(j->root, &st) == 0) {
@@ -1045,9 +1136,17 @@ static void finish(ava1_job_t *j) {
             return;
         }
         if (rename(j->base, j->root) != 0) {
-            ava1_apply_fail(j, AVA1_ERR_IO, "renaming the finished folder failed", errno, 1);
+            int e = errno;
+            if (in_the_way(e)) ava1_apply_fail(j, AVA1_ERR_EXISTS, "the destination appeared during the upload; the files are in .ava-part", 0, 1);
+            else ava1_apply_fail(j, AVA1_ERR_IO, "renaming the finished folder failed", e, 1);
             return;
         }
+        HOOK(j, AVA1_HOOK_RENAMED, UINT32_MAX);
+        if ((e = sync_dir(parent)) != 0) {
+            ava1_apply_fail(j, AVA1_ERR_IO, "syncing the folder failed", e, 1);
+            return;
+        }
+        HOOK(j, AVA1_HOOK_DIR_SYNCED, UINT32_MAX);
     }
     ava1_apply_fail(j, AVA1_STATUS_OK, "", 0, 1); /* the success path: see ava1_apply_fail */
 }
@@ -1055,7 +1154,7 @@ static void finish(ava1_job_t *j) {
 static int all_done(ava1_job_t *j) {
     int d;
     pthread_mutex_lock(&j->mu);
-    d = j->prepared && !j->finished && j->files_done >= j->m.files && j->pend_n == 0 && j->q_len == 0 && j->busy == 0;
+    d = j->prepared && !j->finished && !j->final_status && j->files_done >= j->m.files && j->pend_n == 0 && j->q_len == 0 && j->busy == 0;
     pthread_mutex_unlock(&j->mu);
     return d;
 }
@@ -1081,7 +1180,9 @@ static void *job_main(void *arg) {
     ava1_job_t *j = arg;
     for (;;) {
         uint64_t now, flush;
-        int ev, batch;
+        int ev, batch, failed;
+        uint16_t fail_status = 0;
+        char fail_msg[sizeof j->message];
         ava1_platform_sleep_ms(TICK_MS);
         now = ava1_mono_ms();
         pthread_mutex_lock(&j->mu);
@@ -1098,10 +1199,16 @@ static void *job_main(void *arg) {
         ev = j->ev_end || j->ev_resume;
         flush = j->credit_back;
         j->credit_back = 0;
-        batch = j->prepared && !j->finished &&
+        failed = !j->finished && j->final_status != 0; /* a worker's failure (worker_fail) */
+        if (failed) {
+            fail_status = j->final_status;
+            memcpy(fail_msg, j->message, sizeof fail_msg);
+        }
+        batch = j->prepared && !j->finished && !failed &&
                 (j->pend_n >= j->batch_max || j->unsynced_bytes >= BATCH_BYTES ||
                  ((j->pend_n || j->unsynced_bytes || j->roots_new) && now - j->last_batch_ms >= BATCH_MS));
         pthread_mutex_unlock(&j->mu);
+        if (failed) ava1_apply_fail(j, fail_status, fail_msg, 0, 0);
         if (ev && j->on_events) j->on_events(j);
         if (j->on_tick) j->on_tick(j);
         if (flush) emit_credit(j, flush);
