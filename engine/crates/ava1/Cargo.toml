@@ -8,13 +8,17 @@ license.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "time", "sync", "io-util"] }
 blake2 = "0.10"
-chacha20poly1305 = "0.10"
 getrandom = "0.4"
+# Frame AEAD: assembly ChaCha20-Poly1305 (NEON on aarch64/armv7, AVX2 on x86-64). Already
+# in the tree through snow and rustls, so it builds for every shipped target.
+ring = { version = "0.17", default-features = false }
 snow = { version = "0.10", features = ["risky-raw-split"] }
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 zeroize = "1"
 
 [dev-dependencies]
+# The frame AEAD before ring: the differential oracle in tests/aead.rs.
+chacha20poly1305 = "0.10"
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "time", "sync", "io-util", "macros", "rt-multi-thread", "test-util"] }
 ava1-chaos = { path = "../ava1-chaos" }

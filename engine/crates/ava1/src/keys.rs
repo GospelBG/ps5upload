@@ -6,8 +6,7 @@ use std::path::Path;
 use blake2::digest::consts::{U16, U32};
 use blake2::digest::{KeyInit, Mac};
 use blake2::{Blake2b, Blake2bMac, Digest};
-use chacha20poly1305::aead::AeadInPlace;
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
+use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, CHACHA20_POLY1305};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
@@ -300,23 +299,48 @@ fn nonce(n: u64) -> [u8; 12] {
 
 /// ChaCha20-Poly1305 in place; appends the 16-byte MAC.
 pub fn seal(key: &[u8; 32], n: u64, ad: &[u8], buf: &mut Vec<u8>) {
-    let tag = ChaCha20Poly1305::new(Key::from_slice(key))
-        .encrypt_in_place_detached(Nonce::from_slice(&nonce(n)), ad, buf)
-        .expect("frames are far below ChaCha20's length limit");
-    buf.extend_from_slice(&tag);
+    seal_nonce(key, &nonce(n), ad, buf)
 }
 
 /// Verifies and decrypts in place, stripping the MAC. `false` = forged, reordered or damaged.
 pub fn open(key: &[u8; 32], n: u64, ad: &[u8], buf: &mut Vec<u8>) -> bool {
+    open_nonce(key, &nonce(n), ad, buf)
+}
+
+/// RFC 8439 AEAD with an explicit 96-bit nonce (`seal` uses 0⁴ ‖ u64le(n)). For the
+/// published test vectors.
+#[doc(hidden)]
+pub fn seal_nonce(key: &[u8; 32], nonce: &[u8; 12], ad: &[u8], buf: &mut Vec<u8>) {
+    let tag = aead_key(key)
+        .seal_in_place_separate_tag(Nonce::assume_unique_for_key(*nonce), Aad::from(ad), buf)
+        .expect("frames are far below ChaCha20's length limit");
+    buf.extend_from_slice(tag.as_ref());
+}
+
+#[doc(hidden)]
+pub fn open_nonce(key: &[u8; 32], nonce: &[u8; 12], ad: &[u8], buf: &mut Vec<u8>) -> bool {
     if buf.len() < MAC_LEN {
         return false;
     }
     let at = buf.len() - MAC_LEN;
-    let tag = Tag::clone_from_slice(&buf[at..]);
+    let tag: [u8; MAC_LEN] = buf[at..].try_into().expect("16 bytes");
     buf.truncate(at);
-    ChaCha20Poly1305::new(Key::from_slice(key))
-        .decrypt_in_place_detached(Nonce::from_slice(&nonce(n)), ad, buf, &tag)
+    // ring compares the tag in constant time and zeroes `buf` when it does not match,
+    // so unauthenticated plaintext never reaches a caller.
+    aead_key(key)
+        .open_in_place_separate_tag(
+            Nonce::assume_unique_for_key(*nonce),
+            Aad::from(ad),
+            Tag::from(tag),
+            buf,
+            0..,
+        )
         .is_ok()
+}
+
+/// ring's key schedule is a copy of the 32 bytes, so a key per frame costs nothing.
+fn aead_key(key: &[u8; 32]) -> LessSafeKey {
+    LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).expect("32-byte key"))
 }
 
 pub fn ct_eq16(a: &[u8; 16], b: &[u8; 16]) -> bool {
