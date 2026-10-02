@@ -21,7 +21,9 @@ int ava1_aead_open(const uint8_t key[32], const uint8_t nonce[12], const uint8_t
 /* "avx2" or "portable": the ChaCha20 path in use (crypto.bench reports it). */
 const char *ava1_aead_backend(void);
 
-/* The two primitives, for the RFC 8439 vectors (§2.4.2, §2.5.2) and tests. */
+/* The two primitives, for the RFC 8439 vectors (§2.4.2, §2.5.2) and tests. The block
+ * counter wraps within 32 bits (Monocypher carries into the nonce instead); AVA1 frames
+ * use at most about 2^18 blocks, so the difference is never reached. */
 void ava1_chacha20_xor(const uint8_t key[32], const uint8_t nonce[12], uint32_t counter, uint8_t *buf,
                        size_t len);
 void ava1_poly1305(uint8_t mac[16], const uint8_t *msg, size_t len, const uint8_t key[32]);

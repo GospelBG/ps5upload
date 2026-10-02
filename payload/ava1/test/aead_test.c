@@ -94,6 +94,45 @@ static void rfc_vectors(void) {
         CHECK(memcmp(mac, want, 16) == 0, "RFC 8439 2.5.2 poly1305");
     }
 
+    /* Appendix A.3 #5-#11: Poly1305 edge cases random inputs never reach (h >= p, the
+     * 2^130-5 wraparound, carry propagation). */
+    {
+        static const struct {
+            const char *key, *msg, *tag;
+        } a3[] = {
+            {"02000000000000000000000000000000" "00000000000000000000000000000000",
+             "ffffffffffffffffffffffffffffffff", "03000000000000000000000000000000"},
+            {"02000000000000000000000000000000" "ffffffffffffffffffffffffffffffff",
+             "02000000000000000000000000000000", "03000000000000000000000000000000"},
+            {"01000000000000000000000000000000" "00000000000000000000000000000000",
+             "ffffffffffffffffffffffffffffffff" "f0ffffffffffffffffffffffffffffff"
+             "11000000000000000000000000000000",
+             "05000000000000000000000000000000"},
+            {"01000000000000000000000000000000" "00000000000000000000000000000000",
+             "ffffffffffffffffffffffffffffffff" "fbfefefefefefefefefefefefefefefe"
+             "01010101010101010101010101010101",
+             "00000000000000000000000000000000"},
+            {"02000000000000000000000000000000" "00000000000000000000000000000000",
+             "fdffffffffffffffffffffffffffffff", "faffffffffffffffffffffffffffffff"},
+            {"01000000000000000400000000000000" "00000000000000000000000000000000",
+             "e33594d7505e43b90000000000000000" "3394d7505e4379cd0100000000000000"
+             "00000000000000000000000000000000" "01000000000000000000000000000000",
+             "14000000000000005500000000000000"},
+            {"01000000000000000400000000000000" "00000000000000000000000000000000",
+             "e33594d7505e43b90000000000000000" "3394d7505e4379cd0100000000000000"
+             "00000000000000000000000000000000",
+             "13000000000000000000000000000000"},
+        };
+        uint8_t pk[32], msg[64];
+        for (i = 0; i < sizeof a3 / sizeof a3[0]; i++) {
+            unhex(a3[i].key, pk);
+            n = unhex(a3[i].msg, msg);
+            unhex(a3[i].tag, want);
+            ava1_poly1305(mac, msg, n, pk);
+            CHECK(memcmp(mac, want, 16) == 0, "RFC 8439 A.3 poly1305 edge vector");
+        }
+    }
+
     /* §2.8.2: the AEAD. */
     for (i = 0; i < 32; i++) key[i] = (uint8_t)(0x80 + i);
     unhex("070000004041424344454647", nonce);

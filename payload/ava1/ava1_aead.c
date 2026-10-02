@@ -381,10 +381,11 @@ int ava1_aead_open(const uint8_t key[32], const uint8_t nonce[12], const uint8_t
                    uint8_t *buf, size_t len, const uint8_t mac[16]) {
     uint32_t st[16];
     poly_t p;
-    uint8_t want[16];
+    uint8_t want[16], tag[16];
     unsigned diff = 0;
     size_t off, n;
     int i;
+    memcpy(tag, mac, sizeof tag); /* before buf changes, in case a caller's mac lies inside it */
     /* MAC and decrypt each chunk while it is hot. A bad tag re-applies the same keystream,
      * which puts the ciphertext back: the caller never sees unauthenticated plaintext and
      * buf ends exactly as it came in, as with Monocypher's verify-then-decrypt. */
@@ -395,7 +396,7 @@ int ava1_aead_open(const uint8_t key[32], const uint8_t nonce[12], const uint8_t
         chacha_xor(st, buf + off, n);
     }
     aead_end(&p, ad_len, len, want);
-    for (i = 0; i < 16; i++) diff |= (unsigned)(want[i] ^ mac[i]);
+    for (i = 0; i < 16; i++) diff |= (unsigned)(want[i] ^ tag[i]);
     wipe(want, sizeof want);
     if (diff != 0) {
         st[12] = 1;
