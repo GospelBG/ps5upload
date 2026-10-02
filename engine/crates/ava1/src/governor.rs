@@ -102,6 +102,9 @@ fn idx(m: Mode) -> usize {
     }
 }
 
+/// How much a lane may have outstanding, in bytes (SPEC §12.5): two seconds of that lane's
+/// throughput, never below a whole chunk. `lane_rate` is **bytes per second** — the caller
+/// must pass a rate, not a per-lane byte count or a chunk size.
 pub fn inflight_cap(chunk: u32, lane_rate: f64) -> u64 {
     ((lane_rate * 2.0) as u64).max(chunk as u64)
 }

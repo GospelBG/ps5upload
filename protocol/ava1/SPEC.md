@@ -335,12 +335,15 @@ numbers they are fed, so both are tested against models rather than sockets.
 
 - Lanes: add one while the bottleneck is the network and the last addition raised throughput by
   ≥ 10 %; otherwise revert it and hold for 30 s. A tick with a lane death or requeue drops one
-  lane (min 1) and halves the chunk.
+  lane (min 1) and halves the chunk. At most 8 lanes: on a link that scales past that the count
+  simply stops growing.
 - Chunk: 1–15 MiB in whole groups; halved on a stall, doubled after 10 stable ticks; never more
   than half a second of one lane's throughput (min 1 MiB). 15 MiB, not 16: the frame cap (§2)
   counts the header and the MAC, which a 16 MiB body would not fit under.
-- Bundle target: a quarter second of one lane's throughput, clamped to 256 KiB–15 MiB. Grow
-  while the network is the limit, shrink while receiver workers wait.
+- Bundle target: a quarter second of one lane's throughput, clamped to 256 KiB–15 MiB. It moves
+  with that rate; the effect is that it grows while the network is the limit and shrinks when
+  the rate falls (a receiver whose workers wait shows up as a receiver-reported bottleneck, §16.9
+  — the target itself is not fed by worker pressure).
 - In-flight cap per lane: `max(chunk, lane rate × 2 s)` — the same bound §12.5 states.
 - Mixing check: once per job — after 3 warm-up ticks, if both classes still have work queued,
   the sender probes 5 s mixed, 5 s stream-only, 5 s bundle-only, then picks sequential if its
