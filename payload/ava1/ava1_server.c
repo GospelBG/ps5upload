@@ -211,8 +211,12 @@ static void conn_put(conn_t *k) {
     }
     pthread_mutex_unlock(&mu);
     if (!last) return;
-    close(k->io.fd);
+    /* The writer is joined before the fd is closed: an in-flight send must not be able
+     * to hit an fd number the accept loop has already reused. Every path to the last
+     * reference has shut the socket down first (conn_main, supersede_locked), so the
+     * join is bounded. */
     ava1_conn_destroy(&k->io);
+    close(k->io.fd);
     crypto_wipe(k, sizeof *k);
     free(k);
 }
@@ -614,7 +618,7 @@ static int handle_frame(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane
         if (lane != 0) return 0; /* lane data frames are handled in serve_loop */
         pthread_mutex_lock(&mu);
         paired = sess_is_locked(idx, sid) && S.sessions[idx].paired;
-        memcpy(peer, S.sessions[idx].peer_key, 32);
+        if (paired) memcpy(peer, S.sessions[idx].peer_key, 32);
         pthread_mutex_unlock(&mu);
         if (!paired || !S.cfg.data || !S.cfg.data->on_control) return 0;
         return S.cfg.data->on_control(sid, peer, type, flags, body, len) != 0;
@@ -932,7 +936,7 @@ static void run_lane(conn_t *k, uint8_t *buf, size_t len) {
      * connection takes the lane over (ending an older connection of the same id) only
      * once its first sealed frame has opened under the new lane key, within the
      * handshake deadline still in force. Until then the older connection stays. */
-    if (ava1_conn_recv(&k->io, &type, &flags, &ch, buf, CTRL_MAX - AVA1_TAG_LEN, &len) != 0) goto wipe;
+    if (ava1_conn_recv(&k->io, &type, &flags, &ch, buf, CTRL_MAX, &len) != 0) goto wipe;
     pthread_mutex_lock(&mu);
     if (sess_is_locked(idx, j.session_id) && !S.sessions[idx].superseded) {
         gen = ++S.sessions[idx].lane_gen[j.lane_id];

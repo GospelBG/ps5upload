@@ -156,8 +156,8 @@ void ava1_conn_destroy(ava1_conn_t *c) {
         c->q_closed = 1;
         pthread_cond_broadcast(&c->qcv);
         pthread_mutex_unlock(&c->qmu);
-        /* The writer's send in flight is bounded (pacing, and the socket is shut down
-         * or closed before this connection is freed), so the join cannot wedge. */
+        /* The writer's send in flight is bounded (pacing, and the socket has been shut
+         * down before this connection is freed), so the join cannot wedge. */
         pthread_join(c->q_thread, NULL);
     }
     pthread_cond_destroy(&c->qcv);

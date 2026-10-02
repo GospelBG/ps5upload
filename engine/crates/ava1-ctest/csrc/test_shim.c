@@ -288,10 +288,11 @@ int ava1_test_server_start_echo(const uint8_t secret[32], const char *peers_path
     return rc != 0 ? rc : (int)ava1_server_port();
 }
 
-/* The post queue (ava1_conn_post): fill it while the writer cannot drain (wmu held,
- * nothing read), so every post returns although nothing can be written; then read
- * every frame back whole and in order. A second conn proves the bound: one post too
- * many returns AVA1_E_BUSY and breaks the connection. 0 = ok, negative = which check. */
+/* The post queue (ava1_conn_post): post while the writer cannot send (wmu held,
+ * nothing read), so nothing can be written; then read every frame back whole and in
+ * order. A second conn proves the bound: with the writer parked (it pops under qmu,
+ * then waits for wmu), the queue itself holds AVA1_Q_ENTRIES frames, one post more
+ * returns AVA1_E_BUSY and breaks the connection. 0 = ok, negative = which check. */
 int ava1_test_post_queue(const uint8_t key[32]) {
     int sv[2], rc = 0;
     ava1_conn_t c, peer;
@@ -308,7 +309,7 @@ int ava1_test_post_queue(const uint8_t key[32]) {
     memcpy(peer.recv_key, key, 32);
     c.keyed = 1;
     peer.keyed = 1;
-    pthread_mutex_lock(&c.wmu); /* the writer cannot drain: the queue fills deterministically */
+    pthread_mutex_lock(&c.wmu); /* the writer takes one frame, then waits here */
     for (i = 0; i < AVA1_Q_ENTRIES; i++) {
         memset(body, (int)i, sizeof body);
         if (ava1_conn_post(&c, AVA1_TYPE_CHUNK, 0, i, body, sizeof body) != 0) {
@@ -335,22 +336,38 @@ out:
     close(sv[1]);
     if (rc != 0) return rc;
 
-    /* The bound, on a fresh conn: one post too many refuses and breaks it. */
+    /* The bound, on a fresh conn: the writer pops under qmu and only then waits for
+     * wmu, so let it take one frame first — parked, it cannot free room again, and
+     * the queue itself is what one post more than AVA1_Q_ENTRIES must exceed. */
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -104;
     ava1_conn_init(&c, sv[0]);
     memcpy(c.send_key, key, 32);
     memcpy(c.recv_key, key, 32);
     c.keyed = 1;
     pthread_mutex_lock(&c.wmu);
+    memset(body, 0, sizeof body);
+    if (ava1_conn_post(&c, AVA1_TYPE_CHUNK, 0, 0, body, sizeof body) != 0) {
+        rc = -105;
+        goto bound_out;
+    }
+    for (;;) {
+        pthread_mutex_lock(&c.qmu);
+        n = c.q_n;
+        pthread_mutex_unlock(&c.qmu);
+        if (!n) break;
+        ava1_platform_sleep_ms(1);
+    }
     for (i = 0; i < AVA1_Q_ENTRIES; i++) {
         memset(body, (int)i, sizeof body);
-        if (ava1_conn_post(&c, AVA1_TYPE_CHUNK, 0, i, body, sizeof body) != 0) {
+        if (ava1_conn_post(&c, AVA1_TYPE_CHUNK, 0, i + 1, body, sizeof body) != 0) {
             rc = -105;
             goto bound_out;
         }
     }
     if (ava1_conn_post(&c, AVA1_TYPE_CHUNK, 0, 0xffffffffu, body, sizeof body) != AVA1_E_BUSY) rc = -106;
-    else if (!c.broken) rc = -107;
+    if (rc == 0 && !c.broken) rc = -107; /* a full queue breaks the connection */
+    if (rc == 0 && ava1_conn_post(&c, AVA1_TYPE_CHUNK, 0, 0xffffffffu, body, sizeof body) != AVA1_E_IO)
+        rc = -108; /* and a broken one refuses everything */
 bound_out:
     pthread_mutex_unlock(&c.wmu);
     ava1_conn_destroy(&c);

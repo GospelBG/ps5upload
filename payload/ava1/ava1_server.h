@@ -62,7 +62,8 @@ typedef struct ava1_server_cfg {
     /* Runs on a worker thread. Returns an AVA1 status; writes the body to out. */
     int (*rpc)(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap,
                size_t *out_len);
-    /* NULL: data-plane frames are ignored and CAP_DATA_PLANE is not advertised. */
+    /* NULL: CAP_DATA_PLANE is not advertised; a lane data frame closes the lane, a
+     * control data frame is ignored. */
     const ava1_data_hooks_t *data;
     uint64_t caps; /* advertised in ServerInfo */
 } ava1_server_cfg_t;

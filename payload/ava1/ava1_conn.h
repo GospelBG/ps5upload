@@ -1,17 +1,19 @@
 /* Frames on a socket, sealed after the handshake (SPEC.md §2, §4.4). One reader
- * thread per connection; writers (that thread, RPC workers and job threads) share
- * `wmu`. */
+ * thread per connection; writers (that thread, RPC workers, job threads and the post
+ * queue's writer) share `wmu`. */
 #ifndef AVA1_CONN_H
 #define AVA1_CONN_H
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "ava1_frame.h"
 
-/* ava1_conn_post's queue: at most this many frames (or bytes) in flight. A full
- * queue breaks the connection (the peer is not draining, so it is of no use). */
+/* ava1_conn_post's queue: at most this many frames (or bytes) queued — a frame the
+ * writer has already taken to send does not count. A full queue breaks the
+ * connection (the peer is not draining, so it is of no use). */
 #define AVA1_Q_ENTRIES 64u
 #define AVA1_Q_BYTES (4u * 1024u * 1024u)
 
@@ -35,8 +37,9 @@ typedef struct {
     /* Monotonic ms after which reads fail with AVA1_E_TIMEOUT; 0 = none. Bounds the whole
      * handshake, which SO_RCVTIMEO alone cannot (it restarts on every byte). */
     uint64_t deadline_ms;
-    /* A write failed part-way (or after sealing): the stream is torn, so nothing more is sent. */
-    int broken;
+    /* A write failed part-way (or after sealing): the stream is torn, so nothing more
+     * is sent. Read and written from several threads. */
+    _Atomic int broken;
     /* Liveness after the handshake (SPEC.md §6). Any byte received is proof of life, so a
      * large frame on a slow link never looks dead; set by the reader before serving. */
     uint32_t idle_ms;     /* a read with no byte for this long fails (AVA1_E_TIMEOUT); 0 = none */
@@ -71,7 +74,8 @@ uint64_t ava1_now_ms(void);
 
 void ava1_conn_init(ava1_conn_t *c, int fd);
 /* Wipes keys, ends the post queue's writer thread and destroys the locks; does not
- * close fd. */
+ * close fd — close it only after this returns, so the writer cannot touch an fd
+ * number that has been reused. */
 void ava1_conn_destroy(ava1_conn_t *c);
 int ava1_conn_send(ava1_conn_t *c, uint8_t type, uint32_t channel, const uint8_t *body, size_t len);
 /* Like send, with frame flags of the caller's choosing. */
