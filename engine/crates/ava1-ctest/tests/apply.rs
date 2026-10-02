@@ -380,3 +380,81 @@ fn chunks_outside_the_group_rules_are_refused() {
     assert_eq!(job.try_chunk(7, 0, &[0; 1]), E_PROTO); // no such file
     assert_eq!(job.try_chunk(1, 3 * g, &[0; 5]), 0); // the short final chunk is fine
 }
+
+#[test]
+fn new_small_files_have_their_directories_synced_before_the_journal() {
+    // two directories gain new entries in one batch: data fsync, then each directory once,
+    // then the journal
+    let t = tmp("newdirsync");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let m = Manifest {
+        entries: vec![
+            dir("a"),
+            file("a/1", 1),
+            file("a/2", 1),
+            dir("b"),
+            file("b/1", 1),
+            file("b/2", 1),
+        ],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    job.trace(true);
+    job.hold_batches(true);
+    for id in [1, 2, 4, 5] {
+        job.record(id, b"x", *blake3::hash(b"x").as_bytes());
+    }
+    job.wait_pending(4, 5000);
+    job.hold_batches(false);
+    assert_eq!(job.wait(10_000), 0, "{}", job.events());
+    let ev = job.events();
+    lines_in_order(
+        &ev,
+        &["hook 6 ", "hook 7 ", "hook 7 ", "hook 8 ", "durable"],
+    );
+    assert_eq!(ev.matches("hook 7 ").count(), 2, "{ev}");
+    let dirs: Vec<&str> = ev
+        .lines()
+        .filter_map(|l| l.strip_prefix("hook 7 "))
+        .collect();
+    assert_ne!(dirs[0], dirs[1], "{ev}");
+}
+
+#[test]
+fn a_worker_failure_ends_the_job_once_after_its_durables() {
+    let t = tmp("workerfail");
+    let root = t.join("dest");
+    std::fs::create_dir_all(root.join("f1")).unwrap(); // file 1's path is a folder: EISDIR
+    let m = Manifest {
+        entries: vec![file("f0", 1), file("f1", 1), file("f2", 1)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    job.record(0, b"a", *blake3::hash(b"a").as_bytes());
+    job.wait_event("durable", 5000);
+    job.record(1, b"b", *blake3::hash(b"b").as_bytes());
+    job.record(2, b"c", *blake3::hash(b"c").as_bytes());
+    assert_eq!(job.wait(10_000), ava1::gen::ERR_IO as i32);
+    std::thread::sleep(std::time::Duration::from_millis(600)); // any late message would show
+    let ev = job.events();
+    assert_eq!(ev.matches("done ").count(), 1, "{ev}");
+    let done_at = ev.find("done ").unwrap();
+    assert!(
+        ev.rfind("durable").is_none_or(|d| d < done_at),
+        "a Durable after JobDone: {ev}"
+    );
+}
+
+#[test]
+fn a_parent_sync_failure_after_the_staging_rename_still_reports_the_tree() {
+    let t = tmp("syncfault");
+    let root = t.join("staged");
+    let m = Manifest {
+        entries: vec![file("s", 1)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    job.fail_dir_sync(u32::MAX); // the staging rename's parent sync fails with EIO
+    job.record(0, b"s", *blake3::hash(b"s").as_bytes());
+    assert_eq!(job.wait(10_000), 0, "{}", job.events());
+    assert_eq!(std::fs::read(root.join("s")).unwrap(), b"s");
+    assert!(job.events().contains("msg "), "{}", job.events());
+}

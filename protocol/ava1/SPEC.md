@@ -254,7 +254,10 @@ sender falls back to `JobOpen`. A map larger than one control frame is sent as s
 11.6 Staging: when the job root does not exist, the receiver writes the whole tree under
 `<root>.ava-part/` and, after the last file, renames it to `<root>` (same parent, `st_dev`
 checked). When the root exists, files are written in place; large files through
-`<name>.ava-part` and a same-directory rename. `JF_SINGLE_FILE` writes `<root>.ava-part`.
+`<name>.ava-part` and a same-directory rename. `JF_SINGLE_FILE` writes `<root>.ava-part`. A staging
+receiver takes `<root>` with `mkdir` before it journals the job (an existing `<root>` then
+refuses it, `ERR_EXISTS`) and records that in `JnlOpen.staged` bit 1, so on resume the empty
+`<root>` is its own; the final rename replaces only that empty folder (not empty: `ERR_EXISTS`).
 
 ## 12. Data frames and credit
 
@@ -282,7 +285,8 @@ synced → `Durable`. `JobDone` follows the last durable commit (and the staging
 A failure after every byte is durable (`ERR_EXISTS`, `ERR_CROSS_DEVICE` on the final
 rename) is reported in `JobDone` and never causes a resend. A rename is durable only once its
 directory is synced: the receiver fsyncs the parent directory after every commit or staging
-rename, before it journals that commit.
+rename, before it journals that commit. Likewise for new names: before a batch is journaled, every directory
+that gained a file in it is synced once, after the file data.
 
 ## 13. Verification
 

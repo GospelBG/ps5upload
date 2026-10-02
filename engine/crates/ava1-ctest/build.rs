@@ -50,6 +50,7 @@ fn main() {
             ava1.join("ava1_job.c"),
             ava1.join("ava1_data.c"),
             ava1.join("ava1_apply.c"),
+            ava1.join("ava1_recv.c"),
             ava1.join("ava1_b3.c"),
             ava1.join("platform_posix.c"),
             ava1.join("gen/ava1_gen.c"),

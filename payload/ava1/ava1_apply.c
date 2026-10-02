@@ -11,6 +11,7 @@
 #include "ava1_b3.h"
 #include "ava1_data.h"
 #include "ava1_frame.h" /* AVA1_FLAG_IGNORABLE */
+#include "ava1_internal.h"
 #include "ava1_platform.h"
 #include "ava1_thread.h"
 
@@ -19,7 +20,7 @@
 #define BATCH_MS 250u
 #define TICK_MS 25u
 #define MAX_ITEMS 2000u
-#define PATH_CAP (2 * AVA1_MAX_PATH + 64) /* base (root + .ava-part) / entry path + .ava-part */
+#define PATH_CAP AVA1_PATH_CAP
 
 typedef struct {
     ava1_job_t *j;
@@ -27,6 +28,8 @@ typedef struct {
 } wctx_t;
 
 void (*ava1_apply_hook)(ava1_job_t *j, int point, uint32_t id);
+int (*ava1_apply_fault)(ava1_job_t *j, int point, uint32_t id);
+int ava1_apply_hold_batches;
 #define HOOK(j, point, id) \
     do { \
         if (ava1_apply_hook) ava1_apply_hook((j), (point), (id)); \
@@ -40,9 +43,7 @@ static int is_stopping(ava1_job_t *j) {
     return s;
 }
 
-/* A rename is durable only once its directory is synced (SPEC.md §12.6). 0 or an errno;
- * a filesystem that cannot sync a directory (EINVAL, ENOTSUP) is not an error. */
-static int sync_dir(const char *dir) {
+int ava1_sync_dir(const char *dir) {
     int fd = open(dir, O_RDONLY | O_DIRECTORY), rc = 0;
     if (fd < 0) return errno;
     if (fsync(fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP) rc = errno;
@@ -53,7 +54,10 @@ static int sync_dir(const char *dir) {
 /* A final rename that failed because something is already where it goes. */
 static int in_the_way(int e) { return e == EEXIST || e == ENOTEMPTY || e == ENOTDIR || e == EISDIR; }
 
-static uint64_t groups_of(uint64_t size) { return (size + AVA1_GROUP_LEN - 1) / AVA1_GROUP_LEN; }
+#define groups_of ava1_groups_of
+#define sync_dir ava1_sync_dir
+#define parent_of ava1_parent_of
+#define mkparents ava1_mkparents
 
 /* A path that does not fit comes back empty (open() then fails) rather than truncated
  * (which would name some other file). */
@@ -70,25 +74,45 @@ static void ob_path(const ava1_job_t *j, uint32_t id, char *out, size_t cap) {
     snprintf(out, cap, "%s/%u.ob", j->dir, id);
 }
 
-static void parent_of(const char *p, char *out, size_t cap) {
+void ava1_parent_of(const char *p, char *out, size_t cap) {
     const char *s = strrchr(p, '/');
     if (!s) snprintf(out, cap, ".");
     else if (s == p) snprintf(out, cap, "/");
     else snprintf(out, cap, "%.*s", (int)(s - p), p);
 }
 
-static int mkparents(const char *path) {
-    char p[PATH_CAP];
-    size_t i;
-    if (!path[0] || strlen(path) >= sizeof p) return -ENAMETOOLONG;
+/* mkdir -p up to the last '/' (and of the whole path when `self`). */
+static int mkdirs_to(const char *path, int self, int sync) {
+    char p[PATH_CAP], parent[PATH_CAP];
+    size_t i, n;
+    if (!path[0] || (n = strlen(path)) >= sizeof p) return -ENAMETOOLONG;
     snprintf(p, sizeof p, "%s", path);
-    for (i = 1; p[i]; i++) {
-        if (p[i] != '/') continue;
+    for (i = 1; i <= n; i++) {
+        int rc;
+        if (i < n ? p[i] != '/' : !self) continue;
         p[i] = 0;
-        if (mkdir(p, 0755) != 0 && errno != EEXIST) return -errno;
-        p[i] = '/';
+        if (mkdir(p, 0755) == 0) {
+            if (sync) {
+                parent_of(p, parent, sizeof parent);
+                if ((rc = sync_dir(parent)) != 0) return -rc;
+            }
+        } else if (errno != EEXIST) {
+            return -errno;
+        }
+        if (i < n) p[i] = '/';
     }
     return 0;
+}
+
+int ava1_mkparents(const char *path) { return mkdirs_to(path, 0, 0); }
+int ava1_mkdirs(const char *path, int sync) { return mkdirs_to(path, 1, sync); }
+
+ava1_lfile_t *ava1_lfile_get(ava1_job_t *j, uint32_t id) {
+    if (!j->lf[id]) {
+        j->lf[id] = calloc(1, sizeof(ava1_lfile_t));
+        if (j->lf[id]) j->lf[id]->fd = j->lf[id]->ob_fd = -1;
+    }
+    return j->lf[id];
 }
 
 static int write_all(int fd, const uint8_t *p, size_t n) {
@@ -221,15 +245,21 @@ void ava1_apply_status(ava1_job_t *j) {
  * one place sets `finished`, journals Done and sends JobDone, exactly once. */
 void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, int journal_done) {
     int first;
+    uint64_t credit = 0;
     pthread_mutex_lock(&j->mu);
     first = !j->finished;
     if (first) {
         j->finished = 1;
         j->final_status = status;
         snprintf(j->message, sizeof j->message, "%s%s%s", what, err ? ": " : "", err ? strerror(err) : "");
+        /* An ended job takes no more frames (reserve now fails): its credit goes back to
+         * the data budget at once, not when the job is finally freed. */
+        credit = j->credit;
+        j->credit = 0;
     }
     pthread_mutex_unlock(&j->mu);
     if (!first) return;
+    if (credit) ava1_budget_give(credit);
     if (journal_done) {
         ava1_jnl_done_t d;
         uint8_t b[16];
@@ -239,6 +269,10 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
         if (ava1_jnl_done_encode(&d, &w) == 0) (void)ava1_jnl_append(&j->jnl, AVA1_JNL_DONE, b, w.len);
     }
     emit_done(j);
+}
+
+void ava1_apply_done_again(ava1_job_t *j) {
+    if (j->finished) emit_done(j);
 }
 
 /* Workers never end the job themselves: they record the first failure here (a nonzero
@@ -373,11 +407,7 @@ int ava1_apply_root(ava1_job_t *j, uint32_t file_id, const uint8_t root[32]) {
     if (file_id >= j->m.n || j->m.e[file_id].kind != AVA1_ENTRY_FILE) {
         rc = AVA1_E_PROTO;
     } else {
-        if (!j->lf[file_id]) {
-            j->lf[file_id] = calloc(1, sizeof(ava1_lfile_t));
-            if (j->lf[file_id]) j->lf[file_id]->fd = j->lf[file_id]->ob_fd = -1;
-        }
-        if (!j->lf[file_id]) rc = AVA1_E_IO;
+        if (!ava1_lfile_get(j, file_id)) rc = AVA1_E_IO;
         else if (!j->lf[file_id]->has_root || memcmp(j->lf[file_id]->root, root, 32) != 0) {
             memcpy(j->lf[file_id]->root, root, 32);
             j->lf[file_id]->has_root = 1;
@@ -442,19 +472,14 @@ int ava1_apply_parallel(ava1_job_t *j, void (*fn)(ava1_job_t *, void *, uint32_t
 
 /* The large file's state with open descriptors; caller holds j->mu. NULL + *err on failure. */
 static ava1_lfile_t *lfile_open(ava1_job_t *j, uint32_t id, int *err) {
-    ava1_lfile_t *lf = j->lf[id];
+    ava1_lfile_t *lf = ava1_lfile_get(j, id);
     const ava1_ment_t *e = &j->m.e[id];
     char path[PATH_CAP];
     struct stat st;
     *err = 0;
     if (!lf) {
-        lf = calloc(1, sizeof *lf);
-        if (!lf) {
-            *err = ENOMEM;
-            return NULL;
-        }
-        lf->fd = lf->ob_fd = -1;
-        j->lf[id] = lf;
+        *err = ENOMEM;
+        return NULL;
     }
     if (lf->fd >= 0) return lf;
     ava1_apply_path(j, id, 1, path, sizeof path);
@@ -713,19 +738,64 @@ static int u32cmp(const void *a, const void *b) {
 }
 
 /* Tests: stop dead between two steps of the durability chain, as a power cut would. */
-static void crash(ava1_job_t *j) {
+void ava1_apply_crash(ava1_job_t *j) {
     pthread_mutex_lock(&j->mu);
     j->stopping = 1;
     pthread_cond_broadcast(&j->cv);
     pthread_mutex_unlock(&j->mu);
 }
 
-/* The durability chain (SPEC.md §12.6), in this order and no other: (1) data fsync,
- * (2) journal append + fsync, (3) state, then Durable. */
+static int dirent_cmp(const void *a, const void *b) {
+    return strcmp(((const ava1_dirent_t *)a)->dir, ((const ava1_dirent_t *)b)->dir);
+}
+
+int ava1_sync_dirset(ava1_job_t *j, ava1_dirent_t *d, uint32_t n, int hook_point) {
+    uint32_t i;
+    int rc = 0;
+    if (n) qsort(d, n, sizeof *d, dirent_cmp);
+    for (i = 0; i < n && !rc; i++) {
+        if (i && strcmp(d[i].dir, d[i - 1].dir) == 0) continue;
+        if (is_stopping(j)) rc = -1;
+        else if ((rc = sync_dir(d[i].dir)) == 0 && hook_point) HOOK(j, hook_point, d[i].id);
+    }
+    for (i = 0; i < n; i++) free(d[i].dir);
+    return rc;
+}
+
+/* Syncs, once each, the directories that gained an entry in this batch: the small files'
+ * (every one was just created or truncated) and the part files opened for the first time.
+ * 0, an errno, or -1 when the job is stopping. */
+static int sync_new_dirs(ava1_job_t *j, const uint32_t *small, uint32_t n_small, const uint32_t *large,
+                         uint32_t n_large) {
+    ava1_dirent_t *d = calloc((size_t)n_small + n_large + 1, sizeof *d);
+    char p[PATH_CAP], parent[PATH_CAP];
+    uint32_t i, n = 0;
+    int rc = 0;
+    if (!d) return ENOMEM;
+    for (i = 0; i < n_small + n_large && !rc; i++) {
+        uint32_t id = i < n_small ? small[i] : large[i - n_small];
+        ava1_apply_path(j, id, i >= n_small, p, sizeof p);
+        if (!p[0]) continue; /* its write failed already */
+        parent_of(p, parent, sizeof parent);
+        if (!(d[n].dir = strdup(parent))) rc = ENOMEM;
+        else d[n++].id = id;
+    }
+    if (rc) {
+        for (i = 0; i < n; i++) free(d[i].dir);
+    } else {
+        rc = ava1_sync_dirset(j, d, n, AVA1_HOOK_BATCH_DIR_SYNCED);
+    }
+    free(d);
+    return rc;
+}
+
+/* The durability chain (SPEC.md §12.6), in this order and no other: (1) data fsync, then
+ * the directories that gained entries, (2) journal append + fsync, (3) state, then Durable. */
 static void sync_batch(ava1_job_t *j) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
-    uint32_t *ids, n_small, i, nr = 0, ng = 0, nroots = 0, cap_g = 0, nlf = 0;
-    int *sfds;
+    uint32_t *ids, n_small, i, nr = 0, ng = 0, nroots = 0, cap_g = 0, nlf = 0, nnew = 0;
+    uint32_t *newlf = NULL; /* large files whose part file's directory entry is not yet synced */
+    int *sfds, rc;
     ava1_file_run_t *runs = NULL;
     ava1_file_range_t *rg = NULL;
     ava1_root_item_t *roots = NULL;
@@ -755,7 +825,8 @@ static void sync_batch(ava1_job_t *j) {
     rg = malloc(((size_t)cap_g + 1u) * sizeof *rg);
     roots = malloc(((size_t)nroots + 1u) * sizeof *roots);
     runs = malloc(((size_t)n_small + 1u) * sizeof *runs);
-    if (!l.fds || !rg || !roots || !runs) {
+    newlf = malloc(((size_t)nlf + 1u) * sizeof *newlf);
+    if (!l.fds || !rg || !roots || !runs || !newlf) {
         pthread_mutex_unlock(&j->mu);
         ava1_apply_fail(j, AVA1_ERR_IO, "out of memory in a sync batch", ENOMEM, 0);
         goto out;
@@ -777,6 +848,7 @@ static void sync_batch(ava1_job_t *j) {
             ava1_rset_clear(&lf->written);
             l.fds[l.n++] = lf->fd;
             if (lf->ob_fd >= 0) l.fds[l.n++] = lf->ob_fd;
+            if (!lf->dir_synced) newlf[nnew++] = i;
         }
         if (lf->has_root && !lf->root_journaled) {
             roots[nroots].file_id = i;
@@ -797,8 +869,18 @@ static void sync_batch(ava1_job_t *j) {
         ava1_apply_fail(j, AVA1_ERR_IO, "fsync failed", l.err, 0);
         goto out;
     }
+    HOOK(j, AVA1_HOOK_BATCH_SYNCED, UINT32_MAX);
+    /* A new file's bytes are durable, its name only once its directory is synced. */
+    if ((rc = sync_new_dirs(j, ids, n_small, newlf, nnew)) != 0) {
+        if (rc > 0) ava1_apply_fail(j, AVA1_ERR_IO, "syncing a folder failed", rc, 0);
+        goto out; /* rc < 0: stopped */
+    }
+    pthread_mutex_lock(&j->mu);
+    for (i = 0; i < nnew; i++)
+        if (j->lf[newlf[i]]) j->lf[newlf[i]]->dir_synced = 1;
+    pthread_mutex_unlock(&j->mu);
     if (cfg->crash_at == AVA1_CRASH_AFTER_SYNC) {
-        crash(j);
+        ava1_apply_crash(j);
         goto out;
     }
 
@@ -849,8 +931,9 @@ static void sync_batch(ava1_job_t *j) {
             goto out;
         }
     }
+    HOOK(j, AVA1_HOOK_BATCH_JOURNALED, UINT32_MAX);
     if (cfg->crash_at == AVA1_CRASH_AFTER_JOURNAL) {
-        crash(j);
+        ava1_apply_crash(j);
         goto out;
     }
 
@@ -890,6 +973,7 @@ out:
     free(rg);
     free(roots);
     free(runs);
+    free(newlf);
     free(body);
 }
 
@@ -905,7 +989,7 @@ void ava1_apply_compact(ava1_job_t *j) {
     memcpy(o.manifest_hash, j->manifest_hash, 32);
     o.kind = j->kind;
     o.flags = j->flags;
-    o.staged = (uint8_t)j->staged;
+    o.staged = (uint8_t)((j->staged ? 1 : 0) | (j->dest_held ? AVA1_STAGED_HELD : 0));
     o.root = (const uint8_t *)j->root;
     o.root_len = (uint16_t)strlen(j->root);
     ava1_w_init(&ow, ob, sizeof ob);
@@ -1127,7 +1211,9 @@ static void finish(ava1_job_t *j) {
     int e;
     if (j->staged && !(j->flags & AVA1_JF_SINGLE_FILE)) {
         parent_of(j->root, parent, sizeof parent);
-        if (stat(j->root, &st) == 0) {
+        /* A held root is our own empty lock folder (SPEC.md §11.6): the rename below
+         * replaces it only while it is still empty. */
+        if (!j->dest_held && stat(j->root, &st) == 0) {
             ava1_apply_fail(j, AVA1_ERR_EXISTS, "the destination appeared during the upload; the files are in .ava-part", 0, 1);
             return;
         }
@@ -1136,19 +1222,46 @@ static void finish(ava1_job_t *j) {
             return;
         }
         if (rename(j->base, j->root) != 0) {
-            int e = errno;
-            if (in_the_way(e)) ava1_apply_fail(j, AVA1_ERR_EXISTS, "the destination appeared during the upload; the files are in .ava-part", 0, 1);
+            e = errno;
+            if (in_the_way(e)) ava1_apply_fail(j, AVA1_ERR_EXISTS, "the destination is not empty; the files are in .ava-part", e, 1);
             else ava1_apply_fail(j, AVA1_ERR_IO, "renaming the finished folder failed", e, 1);
             return;
         }
         HOOK(j, AVA1_HOOK_RENAMED, UINT32_MAX);
-        if ((e = sync_dir(parent)) != 0) {
-            ava1_apply_fail(j, AVA1_ERR_IO, "syncing the folder failed", e, 1);
+        e = ava1_apply_fault ? ava1_apply_fault(j, AVA1_HOOK_DIR_SYNCED, UINT32_MAX) : 0;
+        if (!e) e = sync_dir(parent);
+        if (e) {
+            /* The tree is in place and complete; only the rename's own durability is in
+             * doubt. Reporting ERR_IO would make the sender resend a finished tree. */
+            ava1_apply_fail(j, AVA1_STATUS_OK, "the folder is in place; syncing its parent failed", e, 1);
             return;
         }
         HOOK(j, AVA1_HOOK_DIR_SYNCED, UINT32_MAX);
     }
     ava1_apply_fail(j, AVA1_STATUS_OK, "", 0, 1); /* the success path: see ava1_apply_fail */
+}
+
+void ava1_apply_quiesce(ava1_job_t *j) {
+    uint32_t i;
+    int pend, ok;
+    pthread_mutex_lock(&j->mu);
+    while ((j->q_len || j->busy) && !j->stopping) {
+        pthread_mutex_unlock(&j->mu);
+        ava1_platform_sleep_ms(2);
+        pthread_mutex_lock(&j->mu);
+    }
+    pend = j->pend_n || j->unsynced_bytes || j->roots_new;
+    ok = j->prepared && !j->finished && !j->final_status && !j->stopping;
+    pthread_mutex_unlock(&j->mu);
+    if (pend && ok) sync_batch(j);
+    /* Whatever could not be made durable is dropped: it is not in the map, so it is sent again. */
+    pthread_mutex_lock(&j->mu);
+    for (i = 0; i < j->pend_n; i++) close(j->pend_fd[i]);
+    j->pend_n = 0;
+    for (i = 0; j->lf && i < j->m.n; i++)
+        if (j->lf[i]) ava1_rset_clear(&j->lf[i]->written);
+    j->unsynced_bytes = 0;
+    pthread_mutex_unlock(&j->mu);
 }
 
 static int all_done(ava1_job_t *j) {
@@ -1204,7 +1317,7 @@ static void *job_main(void *arg) {
             fail_status = j->final_status;
             memcpy(fail_msg, j->message, sizeof fail_msg);
         }
-        batch = j->prepared && !j->finished && !failed &&
+        batch = j->prepared && !j->finished && !failed && !__atomic_load_n(&ava1_apply_hold_batches, __ATOMIC_SEQ_CST) &&
                 (j->pend_n >= j->batch_max || j->unsynced_bytes >= BATCH_BYTES ||
                  ((j->pend_n || j->unsynced_bytes || j->roots_new) && now - j->last_batch_ms >= BATCH_MS));
         pthread_mutex_unlock(&j->mu);

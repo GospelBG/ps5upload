@@ -16,6 +16,7 @@
 #define AVA1_PEND_MAX 512u          /* small-file fds held open until their batch */
 #define AVA1_CRASH_AFTER_SYNC 1     /* tests: die after fsync, before the journal */
 #define AVA1_CRASH_AFTER_JOURNAL 2  /* tests: die after the journal, before Durable */
+#define AVA1_CRASH_AFTER_TAKE 3     /* tests: die after taking <root>, before the journal (Task 13) */
 
 /* `owned` buffers are freed by the apply engine (always, including on error); their
  * length returns to the sender as credit. */
@@ -40,6 +41,11 @@ void ava1_apply_status(ava1_job_t *j);                  /* emit one Status now *
 void ava1_apply_reset(ava1_job_t *j, uint32_t id, uint16_t reason);
 /* Rewrite the journal as Open + Snapshot of the job's state (mid-job: no Done). */
 void ava1_apply_compact(ava1_job_t *j);
+/* Job thread only: waits until no work is queued or running, then makes what was applied
+ * durable (one sync batch) and drops what could not be, so the manifest can change. */
+void ava1_apply_quiesce(ava1_job_t *j);
+/* Sends a finished job's JobDone again (a sender that lost the first one asks again). */
+void ava1_apply_done_again(ava1_job_t *j);
 
 /* Tests only (NULL in the payload): called at these points of a commit, in this order.
  * `id` is the file, or UINT32_MAX for the staged tree's rename. */
@@ -48,6 +54,15 @@ void ava1_apply_compact(ava1_job_t *j);
 #define AVA1_HOOK_DIR_SYNCED 3      /* its directory fsynced */
 #define AVA1_HOOK_JOURNALED 4       /* the file's done Batch appended */
 #define AVA1_HOOK_OB_UNLINKED 5     /* its outboard removed */
+/* And at these points of every sync batch (id UINT32_MAX, or a file in the directory). */
+#define AVA1_HOOK_BATCH_SYNCED 6    /* the batch's file data fsynced */
+#define AVA1_HOOK_BATCH_DIR_SYNCED 7 /* one directory that gained an entry, fsynced */
+#define AVA1_HOOK_BATCH_JOURNALED 8 /* the batch appended to the journal */
 extern void (*ava1_apply_hook)(ava1_job_t *j, int point, uint32_t id);
+/* Tests only (NULL in the payload): an errno to inject at a point instead of doing the work.
+ * Consulted at AVA1_HOOK_DIR_SYNCED of the staged tree's rename. */
+extern int (*ava1_apply_fault)(ava1_job_t *j, int point, uint32_t id);
+/* Tests only (0 in the payload): while nonzero, the job thread starts no sync batch. */
+extern int ava1_apply_hold_batches;
 
 #endif

@@ -1,5 +1,6 @@
 /* AVA1 jobs: the in-memory table every data-plane task drives (SPEC.md §13).
- * The struct is written once here; Tasks 12–19 are built against these fields. */
+ * Task 11 wrote the struct; later tasks add their own fields (T13: replay_done,
+ * replay_status, dest_held, ava1_lfile_t.dir_synced; T14 adds more). */
 #ifndef AVA1_JOB_H
 #define AVA1_JOB_H
 
@@ -15,6 +16,9 @@
 
 #define AVA1_MAX_JOBS 32
 #define AVA1_PARK_MS (10u * 60u * 1000u)
+/* JnlOpen.staged: bit 0 = staged under <root>.ava-part; bit 1 = the receiver created the
+ * empty <root> as its lock (SPEC.md §11.6), so an empty <root> on resume is its own. */
+#define AVA1_STAGED_HELD 2
 
 typedef struct ava1_job ava1_job_t;
 /* Where a job's outgoing messages go: a session (network jobs) or a recorder (local, tests). */
@@ -27,6 +31,7 @@ typedef struct {        /* one large file being assembled */
     int has_root, root_journaled;
     uint8_t root[32];
     int committed;
+    int dir_synced;        /* its part file's directory entry is durable (Task 13) */
 } ava1_lfile_t;
 
 typedef struct ava1_work { /* a unit for the worker pool */
@@ -50,6 +55,7 @@ struct ava1_job {
     uint8_t kind, policy;
     uint32_t flags;
     int staged;
+    int dest_held;                  /* staged and <root> is our empty lock folder (Task 13) */
     char root[AVA1_MAX_PATH + 1];   /* the job root as requested */
     char base[AVA1_MAX_PATH + 16];  /* where entries land: root, or root.ava-part */
     char dir[512];                  /* job directory (journal, manifest, outboards) */
@@ -57,6 +63,8 @@ struct ava1_job {
     ava1_mstore_t m;                /* the manifest; file ids index everything below */
     ava1_mstore_t m_in;             /* pages of a JobOpen still arriving (Task 13) */
     int have_manifest;
+    int replay_done;                /* the journal ended with JnlDone (Task 13) */
+    uint16_t replay_status;         /* ... and this status */
     uint8_t manifest_hash[32];
     ava1_jnl_t jnl;
     ava1_bits_t done;               /* committed (small: synced; large: renamed) */
@@ -108,6 +116,7 @@ void ava1_job_put(ava1_job_t *j);
 void ava1_job_park_session(const uint8_t sid[16]); /* every job attached to sid detaches */
 void ava1_job_reap(uint64_t now_ms);               /* frees parked jobs older than AVA1_PARK_MS */
 void ava1_job_free_all(void);
+void ava1_job_free_one(const uint8_t id[16]);      /* unlists it and drops the table's reference */
 void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len);
 
 #endif

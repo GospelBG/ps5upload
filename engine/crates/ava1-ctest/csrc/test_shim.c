@@ -2,6 +2,7 @@
 #define _GNU_SOURCE /* pthread_getattr_np on glibc */
 #endif
 /* Starts the payload's AVA1 server on the host with a node.info handler (tests only). */
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,6 +13,7 @@
 #include <unistd.h>
 
 #include "ava1_apply.h"
+#include "ava1_recv.h"
 #include "ava1_conn.h"
 #include "ava1_data.h"
 #include "ava1_platform.h"
@@ -890,6 +892,23 @@ static void t_hook(ava1_job_t *j, int point, uint32_t id) {
 
 void ava1_test_apply_trace(int on) { __atomic_store_n(&g_trace, on, __ATOMIC_SEQ_CST); }
 
+static uint32_t g_fault_id = UINT32_MAX - 1; /* no file: no fault */
+static int t_fault(ava1_job_t *j, int point, uint32_t id) {
+    (void)j;
+    return point == AVA1_HOOK_DIR_SYNCED && id == __atomic_load_n(&g_fault_id, __ATOMIC_SEQ_CST) ? EIO : 0;
+}
+void ava1_test_apply_fail_dir_sync(uint32_t id) { __atomic_store_n(&g_fault_id, id, __ATOMIC_SEQ_CST); }
+
+void ava1_test_apply_hold(int on) { __atomic_store_n(&ava1_apply_hold_batches, on, __ATOMIC_SEQ_CST); }
+
+uint32_t ava1_test_apply_pending(void) {
+    uint32_t n;
+    pthread_mutex_lock(&g_job->mu);
+    n = g_job->pend_n;
+    pthread_mutex_unlock(&g_job->mu);
+    return n;
+}
+
 int ava1_test_apply_dup_on_commit(uint32_t id, uint64_t off, const uint8_t *d, size_t len) {
     uint8_t *own = malloc(len ? len : 1);
     if (!own) return -1;
@@ -954,8 +973,24 @@ static void rec_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *
     } else if (type == AVA1_TYPE_JOB_DONE) {
         ava1_job_done_t d;
         if (ava1_job_done_decode(body, len, &d) != 0) return;
-        snprintf(line, sizeof line, "done %u\n", d.status);
+        /* one ev_add: a waiter released by the done flag also sees the message */
+        if (d.has_message)
+            snprintf(line, sizeof line, "done %u\nmsg %.*s\n", d.status, (int)d.message_len, (const char *)d.message);
+        else
+            snprintf(line, sizeof line, "done %u\n", d.status);
         ev_add(line, 1);
+    } else if (type == AVA1_TYPE_JOB_MAP) {
+        ava1_job_map_t m;
+        ava1_r_t it;
+        ava1_file_run_t r;
+        size_t at;
+        if (ava1_job_map_decode(body, len, &m) != 0) return;
+        at = (size_t)snprintf(line, sizeof line, "map status=%u last=%u done=", m.status, m.last);
+        ava1_r_init(&it, m.done, m.done_len);
+        while (ava1_file_run_next(&it, &r) == 1 && at < sizeof line - 40)
+            at += (size_t)snprintf(line + at, sizeof line - at, "%u+%u,", r.first, r.count);
+        snprintf(line + at, sizeof line - at, " partial=%u\n", m.partial_count);
+        ev_add(line, 0);
     }
 }
 
@@ -991,6 +1026,7 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
     if (ava1_data_start(&cfg) != 0) return -1;
     g_trace = 0;
     ava1_apply_hook = t_hook;
+    ava1_apply_fault = t_fault;
     pthread_mutex_lock(&g_ev_mu);
     g_ev_len = 0;
     g_ev_done = 0;
@@ -1045,7 +1081,7 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
         rc = -5;
         goto fail;
     }
-    g_job->credit = 1ull << 32;
+    g_job->credit = ava1_budget_take(ava1_data_cfg()->budget, 1); /* the whole budget, taken */
     g_job->emit = rec_emit;
     g_job->prepared = 1;
     if (ava1_apply_start(g_job) != 0) {
@@ -1150,8 +1186,106 @@ void ava1_test_apply_end(void) {
     g_job = NULL;
     ava1_data_stop();
     ava1_apply_hook = NULL;
+    ava1_apply_fault = NULL;
+    ava1_test_apply_fail_dir_sync(UINT32_MAX - 1);
+    ava1_test_apply_hold(0);
     g_trace = 0;
     free(g_dup);
     g_dup = NULL;
     ava1_test_set_same_device(1);
+}
+
+/* ---- the receiver driven directly (Task 13) --------------------------------------- */
+/* Shares g_job, the recorder and the apply calls above; one job at a time (the Rust side
+ * holds the C server lock). */
+
+static ava1_data_cfg_t g_cfg;
+static char g_root[1024];
+static uint32_t g_flags, g_entries;
+static uint8_t g_policy;
+static ava1_job_open_ack_t g_ack;
+
+static void ev_reset(void) {
+    pthread_mutex_lock(&g_ev_mu);
+    g_ev_len = 0;
+    g_ev_done = 0;
+    pthread_mutex_unlock(&g_ev_mu);
+}
+
+static int recv_open_now(void) {
+    ava1_recv_spec_t s;
+    char msg[160];
+    memset(&s, 0, sizeof s);
+    memcpy(s.id, TEST_JOB, 16);
+    memcpy(s.owner, TEST_OWNER, 32);
+    s.kind = AVA1_JOB_UPLOAD;
+    s.policy = g_policy;
+    s.flags = g_flags;
+    s.entries = g_entries;
+    s.root = g_root;
+    s.emit = rec_emit;
+    g_job = ava1_recv_open(&s, &g_ack, msg, sizeof msg);
+    return g_job ? 0 : (int)g_ack.status;
+}
+
+static int recv_start(int crash_at) {
+    g_cfg.crash_at = crash_at;
+    ev_reset();
+    if (ava1_data_start(&g_cfg) != 0) return -100;
+    ava1_apply_hook = t_hook;
+    ava1_apply_fault = t_fault;
+    return recv_open_now();
+}
+
+/* 0, or the refusal's status (the job is then not open). */
+int ava1_test_recv_open(const char *jobs_dir, const char *root, uint32_t flags, uint8_t policy, uint32_t entries,
+                        int crash_at) {
+    ava1_test_set_same_device(1);
+    memset(&g_cfg, 0, sizeof g_cfg);
+    snprintf(g_cfg.jobs_dir, sizeof g_cfg.jobs_dir, "%s", jobs_dir);
+    g_cfg.may_write = t_allow;
+    g_cfg.may_read = t_allow_read;
+    g_cfg.same_device = t_same_device;
+    snprintf(g_root, sizeof g_root, "%s", root);
+    g_flags = flags;
+    g_policy = policy;
+    g_entries = entries;
+    g_trace = 0;
+    return recv_start(crash_at);
+}
+
+uint8_t ava1_test_recv_staged(void) { return g_ack.staged; }
+
+/* A payload restart: every job and thread gone, the disk kept. */
+int ava1_test_recv_restart(int crash_at) {
+    if (g_job) ava1_job_put(g_job);
+    g_job = NULL;
+    ava1_data_stop();
+    return recv_start(crash_at);
+}
+
+int ava1_test_recv_page(const uint8_t *page, size_t len) {
+    ava1_manifest_page_t p;
+    int rc = ava1_manifest_page_decode(page, len, &p);
+    return rc ? rc : ava1_recv_page(g_job, &p);
+}
+
+int ava1_test_recv_end(uint32_t files, uint64_t bytes, const uint8_t hash[32]) {
+    ava1_manifest_end_t e;
+    memset(&e, 0, sizeof e);
+    memcpy(e.job_id, TEST_JOB, 16);
+    e.files = files;
+    e.bytes = bytes;
+    memcpy(e.manifest_hash, hash, 32);
+    return ava1_recv_end(g_job, &e);
+}
+
+int ava1_test_recv_resume(const uint8_t hash[32]) { return ava1_recv_resume(g_job, hash); }
+
+int ava1_test_job_stopped(void) {
+    int s;
+    pthread_mutex_lock(&g_job->mu);
+    s = g_job->stopping;
+    pthread_mutex_unlock(&g_job->mu);
+    return s;
 }

@@ -309,6 +309,23 @@ pub mod ffi {
         pub fn ava1_test_apply_bundle_raw(d: *const u8, len: usize, count: u32) -> c_int;
         pub fn ava1_test_apply_trace(on: c_int);
         pub fn ava1_test_apply_dup_on_commit(id: u32, off: u64, d: *const u8, len: usize) -> c_int;
+        pub fn ava1_test_apply_fail_dir_sync(id: u32);
+        pub fn ava1_test_apply_hold(on: c_int);
+        pub fn ava1_test_apply_pending() -> u32;
+        pub fn ava1_test_recv_open(
+            jobs: *const c_char,
+            root: *const c_char,
+            flags: u32,
+            policy: u8,
+            entries: u32,
+            crash_at: c_int,
+        ) -> c_int;
+        pub fn ava1_test_recv_staged() -> u8;
+        pub fn ava1_test_recv_restart(crash_at: c_int) -> c_int;
+        pub fn ava1_test_recv_page(page: *const u8, len: usize) -> c_int;
+        pub fn ava1_test_recv_end(files: u32, bytes: u64, hash: *const u8) -> c_int;
+        pub fn ava1_test_recv_resume(hash: *const u8) -> c_int;
+        pub fn ava1_test_job_stopped() -> c_int;
     }
 }
 
@@ -933,8 +950,37 @@ impl CApplyJob {
         CApplyJob { _lock: lock }
     }
 
+    /// Adopts a held C server lock (the receiver opens its own job).
+    pub fn from_lock(lock: MutexGuard<'static, ()>) -> Self {
+        CApplyJob { _lock: lock }
+    }
+
     pub fn chunk(&self, id: u32, off: u64, d: &[u8]) {
         assert_eq!(self.try_chunk(id, off, d), 0);
+    }
+
+    /// While on, the job thread starts no sync batch (so a test decides what one batch holds).
+    pub fn hold_batches(&self, on: bool) {
+        unsafe { ffi::ava1_test_apply_hold(on as c_int) }
+    }
+
+    /// Waits until `n` small files are written and waiting for their batch.
+    pub fn wait_pending(&self, n: u32, ms: u64) {
+        let t = std::time::Instant::now();
+        while unsafe { ffi::ava1_test_apply_pending() } < n {
+            assert!(
+                t.elapsed().as_millis() < ms as u128,
+                "only {} pending of {n}",
+                unsafe { ffi::ava1_test_apply_pending() }
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The directory sync after the rename of file `id` (u32::MAX: the staged tree's) fails
+    /// with EIO.
+    pub fn fail_dir_sync(&self, id: u32) {
+        unsafe { ffi::ava1_test_apply_fail_dir_sync(id) }
     }
 
     /// ava1_apply_chunk's answer (0, or a negative AVA1_E_*).
@@ -1008,4 +1054,105 @@ impl Drop for CApplyJob {
     fn drop(&mut self) {
         unsafe { ffi::ava1_test_apply_end() }
     }
+}
+
+fn recv_open_raw(
+    jobs: &Path,
+    root: &Path,
+    flags: u32,
+    policy: u8,
+    entries: u32,
+    crash_at: i32,
+) -> i32 {
+    let (j, r) = (
+        CString::new(jobs.to_str().unwrap()).unwrap(),
+        CString::new(root.to_str().unwrap()).unwrap(),
+    );
+    unsafe { ffi::ava1_test_recv_open(j.as_ptr(), r.as_ptr(), flags, policy, entries, crash_at) }
+}
+
+/// The receiver driven directly (no network). It shares the data layer's lock and the apply
+/// calls of `CApplyJob` (chunk, record, root, wait, events), which act on its job.
+pub struct CRecv {
+    inner: CApplyJob,
+}
+
+impl CRecv {
+    pub fn open(jobs: &Path, root: &Path, flags: u32, policy: u8, crash_at: i32) -> Self {
+        let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = CApplyJob::from_lock(lock); // from here on, Drop stops the data layer
+        assert_eq!(
+            recv_open_raw(jobs, root, flags, policy, 0, crash_at),
+            0,
+            "recv_open"
+        );
+        CRecv { inner }
+    }
+
+    pub fn ack_staged(&self) -> u8 {
+        unsafe { ffi::ava1_test_recv_staged() }
+    }
+
+    pub fn manifest(&self, m: &ava1::manifest::Manifest) {
+        self.manifest_with_hash(m, m.hash())
+    }
+
+    pub fn manifest_with_hash(&self, m: &ava1::manifest::Manifest, hash: [u8; 32]) {
+        use ava1::wire::Message;
+        for p in m.pages([7; 16]) {
+            let b = p.to_bytes().unwrap();
+            assert_eq!(unsafe { ffi::ava1_test_recv_page(b.as_ptr(), b.len()) }, 0);
+        }
+        assert_eq!(
+            unsafe { ffi::ava1_test_recv_end(m.files(), m.bytes(), hash.as_ptr()) },
+            0
+        );
+    }
+
+    /// The fast path: `Resume{manifest_hash}`.
+    pub fn resume(&self, hash: [u8; 32]) {
+        assert_eq!(unsafe { ffi::ava1_test_recv_resume(hash.as_ptr()) }, 0);
+    }
+
+    /// Simulates a payload restart; the returned value replaces `self`.
+    pub fn restart(self, crash_at: i32) -> Self {
+        assert_eq!(
+            unsafe { ffi::ava1_test_recv_restart(crash_at) },
+            0,
+            "reopen"
+        );
+        self
+    }
+
+    pub fn wait_stopped(&self, ms: u64) {
+        let t = std::time::Instant::now();
+        while unsafe { ffi::ava1_test_job_stopped() } == 0 {
+            assert!(
+                t.elapsed().as_millis() < ms as u128,
+                "the injected crash never fired"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Waits for `needle` and returns the event log.
+    pub fn wait_event(&self, needle: &str, ms: u64) -> String {
+        self.inner.wait_event(needle, ms);
+        self.inner.events()
+    }
+}
+
+impl std::ops::Deref for CRecv {
+    type Target = CApplyJob;
+    fn deref(&self) -> &CApplyJob {
+        &self.inner
+    }
+}
+
+/// JobOpen's status for a job declaring `entries` entries (0 when accepted); the job, if
+/// opened, is stopped again.
+pub fn c_recv_open_status(jobs: &Path, root: &Path, entries: u32) -> i32 {
+    let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+    let _job = CApplyJob::from_lock(lock);
+    recv_open_raw(jobs, root, 0, ava1::gen::POLICY_REPLACE, entries, 0)
 }

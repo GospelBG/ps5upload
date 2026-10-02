@@ -38,6 +38,8 @@ int ava1_mstore_add_page(ava1_mstore_t *m, const ava1_manifest_page_t *p);
 void ava1_mstore_hash(const ava1_mstore_t *m, uint8_t out[32]);
 /* NULL when id >= n. */
 const char *ava1_mstore_path(const ava1_mstore_t *m, uint32_t id);
+/* The entry's root (verify policy), or NULL when it carries none or id >= n. */
+const uint8_t *ava1_mstore_root(const ava1_mstore_t *m, uint32_t id);
 int ava1_mstore_blob(const ava1_mstore_t *m, uint8_t **blob, size_t *len); /* malloc'd */
 int ava1_mstore_from_blob(ava1_mstore_t *m, const uint8_t *blob, size_t len);
 /* One ManifestPage; `*next` is the first entry not written. */

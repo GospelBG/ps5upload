@@ -158,6 +158,20 @@ void ava1_job_free_all(void) {
     for (i = 0; i < n; i++) ava1_job_put(gone[i]);
 }
 
+void ava1_job_free_one(const uint8_t id[16]) {
+    ava1_job_t *j = NULL;
+    int i;
+    pthread_mutex_lock(&T.mu);
+    for (i = 0; i < AVA1_MAX_JOBS; i++)
+        if (T.jobs[i] && memcmp(T.jobs[i]->id, id, 16) == 0) {
+            j = T.jobs[i];
+            T.jobs[i] = NULL;
+            break;
+        }
+    pthread_mutex_unlock(&T.mu);
+    if (j) ava1_job_put(j);
+}
+
 void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len) {
     if (j->emit) j->emit(j, type, flags, body, len);
 }

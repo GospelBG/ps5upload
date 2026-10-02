@@ -104,6 +104,10 @@ const char *ava1_mstore_path(const ava1_mstore_t *m, uint32_t id) {
     return id < m->n ? m->arena + m->e[id].path_off : NULL;
 }
 
+const uint8_t *ava1_mstore_root(const ava1_mstore_t *m, uint32_t id) {
+    return id < m->n && m->e[id].root_idx ? m->roots[m->e[id].root_idx - 1] : NULL;
+}
+
 static void to_wire(const ava1_mstore_t *m, uint32_t i, ava1_manifest_entry_t *w, int with_root) {
     const ava1_ment_t *e = &m->e[i];
     memset(w, 0, sizeof *w);
