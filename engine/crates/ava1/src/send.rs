@@ -168,7 +168,10 @@ pub struct Window {
     credit: u64,
     /// lane -> (unreceived bytes, seq -> frame length)
     lanes: LaneFrames,
-    /// seq -> len, frames of dead lanes, refunded until a late Received charges them.
+    /// seq -> len, frames of dead lanes whose bytes stay charged (I3): a lane's death
+    /// releases no window credit — the receiver may still charge these frames if it
+    /// admitted them — so the bytes are held here until the receiver accounts for them
+    /// (its `Credit` after the apply) or the job ends.
     refunded: HashMap<u32, u64>,
 }
 
@@ -203,22 +206,29 @@ impl Window {
                 return Some(len);
             }
         }
-        if let Some(len) = self.refunded.remove(&seq) {
-            self.credit = self.credit.saturating_sub(len); // the receiver did charge it
-        }
+        // I3: a late Received proves the receiver admitted the frame and charged its
+        // window for it. This side held the charge all along (a lane's death releases
+        // nothing), so there is nothing to re-charge: the receiver returns the bytes
+        // with a Credit when it applies the frame.
+        self.refunded.remove(&seq);
         None
     }
+    /// More window from the receiver (peer-controlled bytes): saturating (M4) — a plain
+    /// `+=` wraps on overflow, which would shrink the window (and panic in debug builds).
     pub fn credit(&mut self, n: u64) {
-        self.credit += n;
+        self.credit = self.credit.saturating_add(n);
     }
-    /// Unreceived frames of a dead lane: refunded now, charged again if a Received arrives.
+    /// Unreceived frames of a dead lane (I3): a lane's death does NOT release window
+    /// credit. The frames are requeued for a re-send and their bytes stay charged here —
+    /// the receiver may still charge them if it admitted them — so the sender can never
+    /// spend the same window twice. The charge is released only when the receiver
+    /// accounts for the frames (its `Credit` after the apply) or the job ends.
     pub fn lane_down(&mut self, lane: u16) -> Vec<u32> {
         let Some((_, frames)) = self.lanes.remove(&lane) else {
             return Vec::new();
         };
         let mut seqs = Vec::new();
         for (seq, len) in frames {
-            self.credit += len;
             self.refunded.insert(seq, len);
             seqs.push(seq);
         }
@@ -268,6 +278,17 @@ struct Sched {
     stalls: u32,
 }
 
+/// A stall every lane agrees on: frames are queued, none fits the window. When it
+/// persists — nothing sent, Received or credited anywhere — the receiver is applying
+/// nothing and will grant nothing, so the control loop fails the job loudly instead of
+/// parking it forever (I2).
+#[derive(Clone, Copy)]
+struct Stall {
+    since: Instant,
+    grant: u64,
+    smallest: u64,
+}
+
 struct Shared {
     sched: Mutex<Sched>,
     window: Mutex<Window>,
@@ -280,6 +301,8 @@ struct Shared {
     /// Read-ahead, in KiB permits: readers acquire before reading, frames carry the
     /// permit until they are finally dropped.
     bytes_budget: Arc<Semaphore>,
+    /// The lanes' credit stall (I2), cleared by any send, Received or Credit.
+    stall: Mutex<Option<Stall>>,
 }
 
 impl Shared {
@@ -311,7 +334,20 @@ enum Read {
 
 const READ_AHEAD_KIB: u32 = 96 * 1024;
 
-async fn next_ctl(link: &mut JobLink) -> Result<Frame, SendError> {
+/// The Chunk message overhead over its data (job 16 + file 4 + offset 8 + length 4 +
+/// extension count 2): the window counts lane-frame *body* bytes, so a piece's data must
+/// leave room for these (I2).
+const CHUNK_HDR: u64 = 34;
+
+/// I2: a credit stall with zero progress for this long — nothing sent, Received or
+/// credited — is a job the receiver can never advance (its window cannot hold the
+/// smallest queued frame and it applies nothing): the control loop fails it loudly
+/// instead of letting it park forever.
+const STALL_FATAL: Duration = Duration::from_secs(10);
+
+/// The next control frame, Status frames skipped (they are advisory). Shared with the
+/// receiver (`recv.rs`), which reads its manifest the same way.
+pub(crate) async fn next_ctl(link: &mut JobLink) -> Result<Frame, SendError> {
     loop {
         match link.rx.recv().await {
             Some(Inbound::Control(f)) if f.ty == Status::TYPE => continue,
@@ -365,6 +401,7 @@ pub async fn open_upload(
         })
         .await?;
     let mut need = Need::default();
+    let mut credit = ack.credit;
     loop {
         let f = next_ctl(link).await?;
         if f.ty == JobDone::TYPE {
@@ -374,6 +411,13 @@ pub async fn open_upload(
                 status: d.status,
                 message: d.message.unwrap_or_default(),
             });
+        }
+        if f.ty == Credit::TYPE {
+            // M5: a granting receiver may send Credit between the ack and the map —
+            // fold it into the window instead of discarding it (an under-granted sender).
+            let c: Credit = f.decode().map_err(|e| SendError::Protocol(e.to_string()))?;
+            credit = credit.saturating_add(c.bytes);
+            continue;
         }
         if f.ty != JobMap::TYPE {
             continue;
@@ -387,13 +431,16 @@ pub async fn open_upload(
         }
         need.add_page(&map);
         if map.last == 1 {
-            return Ok((ack.credit, need));
+            return Ok((credit, need));
         }
     }
 }
 
 /// The blocking readers. Small files: `readers` threads over a shared queue. Large files:
-/// one thread, file by file, piece by piece, hashing every group it reads.
+/// one thread, file by file, piece by piece, hashing every group it reads. Every thread
+/// checks the job's shutdown flag each iteration (I1) and returns its handle, so the
+/// control loop can close the budget and join them on teardown.
+#[allow(clippy::too_many_arguments)]
 fn spawn_readers(
     m: Arc<Manifest>,
     src: Arc<dyn Source>,
@@ -402,18 +449,26 @@ fn spawn_readers(
     sh: Arc<Shared>,
     o: &SendOptions,
     tx: mpsc::UnboundedSender<Read>,
-) {
+    stop: Arc<AtomicBool>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let rt = tokio::runtime::Handle::current();
+    let mut handles = Vec::new();
+    let cancel = o.cancel.clone();
     for _ in 0..o.readers.max(1) {
-        let (m, src, small, sh, tx, rt) = (
+        let (m, src, small, sh, tx, rt, stop, cancel) = (
             m.clone(),
             src.clone(),
             small.clone(),
             sh.clone(),
             tx.clone(),
             rt.clone(),
+            stop.clone(),
+            cancel.clone(),
         );
-        tokio::task::spawn_blocking(move || loop {
+        handles.push(tokio::task::spawn_blocking(move || loop {
+            if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let Some(id) = small.lock().unwrap().pop_front() else {
                 return;
             };
@@ -421,9 +476,11 @@ fn spawn_readers(
                 return;
             };
             let kib = (e.size / 1024 + 1).min(READ_AHEAD_KIB as u64) as u32;
-            let budget = rt
-                .block_on(sh.bytes_budget.clone().acquire_many_owned(kib))
-                .expect("the read-ahead semaphore is never closed");
+            // I1: a closed budget (the job ended) wakes a parked reader; it must leave,
+            // not panic on the acquire or park forever.
+            let Ok(budget) = rt.block_on(sh.bytes_budget.clone().acquire_many_owned(kib)) else {
+                return;
+            };
             let mut data = vec![0u8; e.size as usize];
             let r = src
                 .open(&e.path)
@@ -453,10 +510,13 @@ fn spawn_readers(
                     return;
                 }
             }
-        });
+        }));
     }
     let persist = o.persist.clone();
-    tokio::task::spawn_blocking(move || loop {
+    handles.push(tokio::task::spawn_blocking(move || loop {
+        if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let Some((id, durable)) = large.lock().unwrap().pop_front() else {
             return;
         };
@@ -483,22 +543,34 @@ fn spawn_readers(
             }
         };
         let chunk = sh.chunk.load(Ordering::Relaxed) as u64;
+        // I2: a piece is never larger than the credit the receiver has already granted.
+        // The window counts frame *body* bytes, so the piece data is capped at
+        // floor((grant − CHUNK_HDR) / GROUP) groups — one group minimum (`pieces` floors
+        // again, idempotently). A grant that cannot hold one group leaves the lane-side
+        // stall to fail the job loudly instead of parking forever.
+        let grant = sh.window.lock().unwrap().available();
+        let chunk = (chunk.min(grant.saturating_sub(CHUNK_HDR)) / GROUP * GROUP).max(GROUP);
         let plan = pieces(e.size, &durable, &|g| hasher.cv(g).is_some(), chunk);
         for p in plan {
+            if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+                return;
+            }
             // The permit is acquired before the read and rides with the frame: only the
             // frame's final drop releases it (correction 1). Hash-only pieces are read
             // into one transient buffer and never enter a queue, so they hold none.
-            let budget = p
-                .send
-                .then(|| {
-                    rt.block_on(
-                        sh.bytes_budget
-                            .clone()
-                            .acquire_many_owned((p.len / 1024 + 1) as u32),
-                    )
-                })
-                .transpose()
-                .expect("the read-ahead semaphore is never closed");
+            let budget = if p.send {
+                match rt.block_on(
+                    sh.bytes_budget
+                        .clone()
+                        .acquire_many_owned((p.len / 1024 + 1) as u32),
+                ) {
+                    // I1: the job ended while this reader was parked on the budget.
+                    Ok(b) => Some(b),
+                    Err(_) => return,
+                }
+            } else {
+                None
+            };
             let mut data = vec![0u8; p.len as usize];
             match read_full_at(f.as_mut(), p.offset, &mut data) {
                 Ok(n) if n as u64 == p.len => {}
@@ -537,7 +609,8 @@ fn spawn_readers(
         if let Some(root) = hasher.root() {
             let _ = tx.send(Read::Root { file_id: id, root });
         }
-    });
+    }));
+    handles
 }
 
 /// Packs records into bundles; flushes a partial bundle when no record is waiting.
@@ -586,16 +659,18 @@ fn chunk_frame(
     }
 }
 
-/// Which queue the next frame sits in (the order `pick` takes them).
-enum Slot {
-    Requeue,
-    Bundles,
-    Chunks,
-}
-
-fn slot(s: &Sched) -> Option<Slot> {
+/// Takes the first frame a lane can send, in the scheduler's order (the requeue first,
+/// then the governor's class preference). I2: `can_send` judges exactly the frame that
+/// leaves the queue — but a front frame that does not fit no longer blocks the frames
+/// behind it (the head-of-line credit stall): the scan skips it and takes a later one
+/// that fits. `None` with a non-empty queue means nothing fits at all (the caller
+/// records the stall).
+fn pick_any(s: &mut Sched, lane: u16, w: &Window, cap: u64) -> Option<OutFrame> {
+    let fits = |f: &OutFrame| w.can_send(lane, f.body.len() as u64, cap);
     if !s.requeue.is_empty() {
-        return Some(Slot::Requeue);
+        if let Some(i) = s.requeue.iter().position(fits) {
+            return s.requeue.remove(i);
+        }
     }
     let d = s.decision?;
     let bundle_first = match d.mode {
@@ -603,41 +678,17 @@ fn slot(s: &Sched) -> Option<Slot> {
         Mode::StreamOnly => false,
         Mode::Mixed => s.bundles_inflight < s.floor || d.prefer == Class::Bundle,
     };
-    if bundle_first {
-        if !s.bundles.is_empty() {
-            Some(Slot::Bundles)
-        } else if !s.chunks.is_empty() {
-            Some(Slot::Chunks)
-        } else {
-            None
-        }
-    } else if !s.chunks.is_empty() {
-        Some(Slot::Chunks)
-    } else if !s.bundles.is_empty() {
-        Some(Slot::Bundles)
+    let order: [&mut VecDeque<OutFrame>; 2] = if bundle_first {
+        [&mut s.bundles, &mut s.chunks]
     } else {
-        None
-    }
-}
-
-/// Takes the next frame out of its queue. Correction 2: `can_send` judges exactly this
-/// frame — when it must wait, `put_back` returns it to the front of the same queue.
-fn pick(s: &mut Sched) -> Option<(Slot, OutFrame)> {
-    let sl = slot(s)?;
-    let f = match sl {
-        Slot::Requeue => s.requeue.pop_front().unwrap(),
-        Slot::Bundles => s.bundles.pop_front().unwrap(),
-        Slot::Chunks => s.chunks.pop_front().unwrap(),
+        [&mut s.chunks, &mut s.bundles]
     };
-    Some((sl, f))
-}
-
-fn put_back(s: &mut Sched, sl: Slot, f: OutFrame) {
-    match sl {
-        Slot::Requeue => s.requeue.push_front(f),
-        Slot::Bundles => s.bundles.push_front(f),
-        Slot::Chunks => s.chunks.push_front(f),
+    for q in order {
+        if let Some(i) = q.iter().position(&fits) {
+            return q.remove(i);
+        }
     }
+    None
 }
 
 /// One tick's lane-rate update: EWMA-smoothed bytes/s per lane, from the raw bytes acked
@@ -671,30 +722,52 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
             let chunk = sh.chunk.load(Ordering::Relaxed);
             let rate = s.lane_rate.get(&lane.id).copied().unwrap_or(0.0);
             let cap = governor::inflight_cap(chunk, rate);
-            match pick(&mut s) {
-                Some((sl, f)) => {
+            match pick_any(&mut s, lane.id, &w, cap) {
+                Some(f) => {
                     let len = f.body.len() as u64;
-                    if !w.can_send(lane.id, len, cap) {
-                        if len > w.available() {
-                            s.credit_starved = true;
-                        }
-                        put_back(&mut s, sl, f);
-                        None
-                    } else {
-                        s.next_seq += 1;
-                        let seq = s.next_seq;
-                        let ty = f.ty;
-                        let body = (*f.body).clone();
-                        if f.class == Class::Bundle {
-                            s.bundles_inflight += 1;
-                        }
-                        assert!(w.sent(lane.id, seq, len), "can_send passed");
-                        s.inflight.insert(seq, (lane.id, f));
-                        Some((seq, ty, body))
+                    s.next_seq += 1;
+                    let seq = s.next_seq;
+                    let ty = f.ty;
+                    let body = (*f.body).clone();
+                    if f.class == Class::Bundle {
+                        s.bundles_inflight += 1;
                     }
+                    assert!(w.sent(lane.id, seq, len), "can_send passed");
+                    s.inflight.insert(seq, (lane.id, f));
+                    drop(w);
+                    drop(s);
+                    // Progress: a stall another lane observed is not a deadlock.
+                    *sh.stall.lock().unwrap() = None;
+                    Some((seq, ty, body))
                 }
                 None => {
-                    if s.requeue.is_empty() && s.bundles.is_empty() && s.chunks.is_empty() {
+                    let pending =
+                        !s.requeue.is_empty() || !s.bundles.is_empty() || !s.chunks.is_empty();
+                    if pending {
+                        s.credit_starved = true;
+                        // I2: nothing fits. When this persists with no send, Received or
+                        // Credit anywhere, the receiver is applying nothing and will grant
+                        // nothing — the control loop fails the job loudly instead of
+                        // parking it forever. Record the window and the smallest queued
+                        // frame once (progress clears it; the earliest mark wins).
+                        let grant = w.available();
+                        let smallest = s
+                            .requeue
+                            .iter()
+                            .chain(s.bundles.iter())
+                            .chain(s.chunks.iter())
+                            .map(|f| f.body.len() as u64)
+                            .min()
+                            .unwrap_or(0);
+                        let mut stall = sh.stall.lock().unwrap();
+                        if stall.is_none() {
+                            *stall = Some(Stall {
+                                since: Instant::now(),
+                                grant,
+                                smallest,
+                            });
+                        }
+                    } else {
                         s.source_starved = true;
                     }
                     None
@@ -776,6 +849,7 @@ pub async fn run_upload(
         chunk: AtomicU32::new(governor::START_CHUNK),
         bundle: AtomicU32::new(governor::START_BUNDLE),
         bytes_budget: Arc::new(Semaphore::new(READ_AHEAD_KIB as usize)),
+        stall: Mutex::new(None),
     });
     let mut gov = Governor::new();
     let first = gov.tick(&Sample::default());
@@ -783,7 +857,8 @@ pub async fn run_upload(
     let small_q = Arc::new(Mutex::new(small));
     let large_q = Arc::new(Mutex::new(large));
     let (rtx, mut rrx) = mpsc::unbounded_channel();
-    spawn_readers(
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut readers = spawn_readers(
         manifest.clone(),
         source.clone(),
         small_q.clone(),
@@ -791,10 +866,10 @@ pub async fn run_upload(
         sh.clone(),
         &opts,
         rtx.clone(),
+        stop.clone(),
     );
 
     // Lanes: open the governor's starting count (client side); adopt any already up.
-    let stop = Arc::new(AtomicBool::new(false));
     let mut lane_tasks: HashMap<u16, tokio::task::JoinHandle<()>> = HashMap::new();
     if let Some(op) = link.opener().cloned() {
         while link.lanes().len() < first.lanes as usize {
@@ -825,6 +900,7 @@ pub async fn run_upload(
     let mut last_tick = Instant::now();
     let (mut max_lanes, mut receiver_bn, mut sequential) = (0u8, gen::BN_NONE, false);
     let mut last_bn = gen::BN_NONE;
+    let mut root_next: VecDeque<(u32, [u8; 32])> = VecDeque::new();
     let result = loop {
         if opts.cancel.load(Ordering::Relaxed) {
             let _ = link
@@ -858,9 +934,12 @@ pub async fn run_upload(
                     sh.wake();
                 }
                 Some(Read::Root { file_id, root }) => {
-                    if let Err(e) = link.control.send(&FileRoot { job_id, file_id, root }).await {
-                        break Err(SendError::Disconnected(e.to_string()));
-                    }
+                    // Queued here, awaited on the select arm below: the loop must keep
+                    // draining the inbox while the control outbox is full, or the sender's
+                    // and the receiver's backpressure deadlock against each other — both
+                    // sides awaiting room on full control queues. The queue is bounded by
+                    // the file count (the roots already waiting in `rtx`).
+                    root_next.push_back((file_id, root));
                 }
                 Some(Read::Failed(e)) => {
                     let _ = link.control.send(&gen::JobCancel { job_id, reason: gen::ERR_IO }).await;
@@ -868,6 +947,18 @@ pub async fn run_upload(
                 }
                 // The retry path holds `rtx` alive, so the channel never closes mid-job.
                 None => {}
+            },
+            root_sent = async {
+                let (file_id, root) = root_next
+                    .front()
+                    .copied()
+                    .expect("guarded by `if !root_next.is_empty()`");
+                link.control.send(&FileRoot { job_id, file_id, root }).await
+            }, if !root_next.is_empty() => {
+                if let Err(e) = root_sent {
+                    break Err(SendError::Disconnected(e.to_string()));
+                }
+                root_next.pop_front();
             },
             ev = link.rx.recv() => match ev {
                 None => break Err(SendError::Disconnected("the session ended".into())),
@@ -910,6 +1001,7 @@ pub async fn run_upload(
                                 }
                             }
                             drop(s);
+                            *sh.stall.lock().unwrap() = None; // bytes moved: not a deadlock
                             sh.wake();
                         }
                         Err(e) => break Err(SendError::Protocol(e.to_string())),
@@ -917,6 +1009,7 @@ pub async fn run_upload(
                     Credit::TYPE => match f.decode::<Credit>() {
                         Ok(c) => {
                             sh.window.lock().unwrap().credit(c.bytes);
+                            *sh.stall.lock().unwrap() = None; // the window moved: not a deadlock
                             sh.wake();
                         }
                         Err(e) => break Err(SendError::Protocol(e.to_string())),
@@ -945,35 +1038,45 @@ pub async fn run_upload(
                     },
                     FileRetry::TYPE => match f.decode::<FileRetry>() {
                         Ok(r) => {
+                            // M7: an id outside the manifest would silently land in the
+                            // large queue, where the reader exits and the job stalls.
+                            let Some(entry) = manifest.entry(r.file_id) else {
+                                break Err(SendError::Protocol(format!(
+                                    "FileRetry for a file not in the manifest: id {}",
+                                    r.file_id
+                                )));
+                            };
                             let n = retries.entry(r.file_id).or_default();
                             *n += 1;
                             if *n > 3 {
                                 let _ = link.control.send(&gen::JobCancel { job_id, reason: gen::ERR_VERIFY }).await;
                                 break Err(SendError::Protocol(format!(
                                     "{} failed verification 3 times",
-                                    manifest.entry(r.file_id).map_or_else(|| "?".into(), |e| e.path.clone())
+                                    entry.path
                                 )));
                             }
                             if let Some(d) = &opts.persist {
                                 let _ = std::fs::remove_file(d.join(format!("{}.ob", r.file_id)));
                             }
-                            let small_file = manifest.entry(r.file_id).is_some_and(|e| e.size < opts.cutoff);
-                            if small_file {
+                            if entry.size < opts.cutoff {
                                 small_q.lock().unwrap().push_back(r.file_id);
                             } else {
                                 large_q.lock().unwrap().push_back((r.file_id, RangeSet::new()));
                             }
                             // The reader threads may have exited; start a fresh set for the retried file.
-                            spawn_readers(manifest.clone(), source.clone(), small_q.clone(), large_q.clone(), sh.clone(), &opts, rtx.clone());
+                            readers.extend(spawn_readers(manifest.clone(), source.clone(), small_q.clone(), large_q.clone(), sh.clone(), &opts, rtx.clone(), stop.clone()));
                         }
                         Err(e) => break Err(SendError::Protocol(e.to_string())),
                     },
-                    Status::TYPE => {
-                        if let Ok(st) = f.decode::<Status>() {
+                    Status::TYPE => match f.decode::<Status>() {
+                        Ok(st) => {
                             receiver_bn = st.bottleneck;
                             sh.sched.lock().unwrap().floor = st.workers.max(1) as usize;
                         }
-                    }
+                        // M6: like every other control frame, a malformed Status is a
+                        // protocol error, not something to shrug off.
+                        Err(e) => break Err(SendError::Protocol(e.to_string())),
+                    },
                     JobDone::TYPE => match f.decode::<JobDone>() {
                         Ok(d) => break Ok(SendReport {
                             status: d.status,
@@ -991,6 +1094,17 @@ pub async fn run_upload(
                 },
             },
             _ = tick.tick() => {
+                // I2: a stall that has persisted — nothing sent, Received or credited
+                // since it began — is a job the receiver can never advance: fail it
+                // loudly instead of parking forever.
+                if let Some(st) = *sh.stall.lock().unwrap() {
+                    if st.since.elapsed() >= STALL_FATAL {
+                        break Err(SendError::Protocol(format!(
+                            "no queued frame fits the receiver's window ({} bytes granted, the smallest queued frame is {} bytes) and nothing was sent, received or credited for {:?}",
+                            st.grant, st.smallest, STALL_FATAL
+                        )));
+                    }
+                }
                 let secs = last_tick.elapsed().as_secs_f64();
                 last_tick = Instant::now();
                 let lanes_now = link.lanes().len() as u8;
@@ -1036,11 +1150,26 @@ pub async fn run_upload(
         }
     };
     // Every exit: stop the lanes, wake the sleepers, cancel and join every lane task
-    // (correction 5) — nothing of this job keeps running after the return.
+    // (correction 5) — and then the readers (I1): close the read-ahead budget so a
+    // reader parked on it wakes, drain the queues so the frames' permits are released,
+    // and join every reader thread before the job's future returns. Nothing of this job
+    // keeps running after the return.
     stop.store(true, Ordering::Relaxed);
     sh.wake();
     for (_, h) in lane_tasks.drain() {
         h.abort();
+        let _ = h.await;
+    }
+    sh.bytes_budget.close();
+    {
+        let mut s = sh.sched.lock().unwrap();
+        s.bundles.clear();
+        s.chunks.clear();
+        s.requeue.clear();
+        s.inflight.clear();
+        s.bundles_inflight = 0;
+    }
+    for h in readers {
         let _ = h.await;
     }
     result
@@ -1054,6 +1183,78 @@ pub async fn send_job(
     opts: SendOptions,
 ) -> Result<SendReport, SendError> {
     let opened = open_upload(link, &manifest, &opts).await?;
+    run_upload(link, manifest, source, opts, opened).await
+}
+
+/// The responder's half of a download: ack, manifest, then the opener's map pages.
+async fn open_as_responder(
+    link: &mut JobLink,
+    open: &JobOpen,
+    m: &Manifest,
+) -> Result<(u64, Need), SendError> {
+    let job_id = link.job_id;
+    link.control
+        .send(&JobOpenAck {
+            job_id,
+            status: gen::STATUS_OK,
+            credit: 0,
+            staged: 0,
+            workers: 0,
+            message: None,
+        })
+        .await
+        .map_err(|e| SendError::Disconnected(e.to_string()))?;
+    for p in m.pages(job_id) {
+        link.control
+            .send(&p)
+            .await
+            .map_err(|e| SendError::Disconnected(e.to_string()))?;
+    }
+    link.control
+        .send(&ManifestEnd {
+            job_id,
+            files: m.files(),
+            bytes: m.bytes(),
+            manifest_hash: m.hash(),
+        })
+        .await
+        .map_err(|e| SendError::Disconnected(e.to_string()))?;
+    let mut need = Need::default();
+    loop {
+        let f = next_ctl(link).await?;
+        if f.ty != JobMap::TYPE {
+            continue;
+        }
+        let map: JobMap = f.decode().map_err(|e| SendError::Protocol(e.to_string()))?;
+        if map.status != gen::STATUS_OK {
+            return Err(SendError::Refused {
+                status: map.status,
+                message: map.message.unwrap_or_default(),
+            });
+        }
+        need.add_page(&map);
+        if map.last == 1 {
+            return Ok((open.credit.unwrap_or(16 << 20), need));
+        }
+    }
+}
+
+/// The responder's half of a download (a host for downloads): the JobOpen already arrived
+/// and no lane is opened — the opener joined the lanes. With `JF_ORDERED` one reader
+/// feeds one FIFO in file order: every file is large (`cutoff = 0`), so `run_upload` draws
+/// the queue in order once `small` is empty and the frames leave in (file, offset) order.
+pub async fn serve_download(
+    link: &mut JobLink,
+    open: JobOpen,
+    manifest: Arc<Manifest>,
+    source: Arc<dyn Source>,
+    mut opts: SendOptions,
+) -> Result<SendReport, SendError> {
+    if open.flags & gen::JF_ORDERED != 0 {
+        opts.readers = 1;
+        opts.cutoff = 0;
+    }
+    let opened = open_as_responder(link, &open, &manifest).await?;
     run_upload(link, manifest, source, opts, opened).await
 }
 
@@ -1127,20 +1328,76 @@ mod tests {
     }
 
     #[test]
-    fn the_window_refunds_lost_frames_and_charges_late_receipts() {
+    fn a_lane_death_keeps_the_window_charged_until_the_receiver_accounts() {
+        // I3: a lane's death does not release window credit. The un-Received frame keeps
+        // its charge, so the sender can never re-spend the same window (the receiver may
+        // still charge the frame if it admitted it). A late Received only confirms the
+        // receiver's books — its Credit returns the bytes when it applies the frame.
         let mut w = Window::new(100);
         assert!(w.can_send(1, 60, 1000));
         w.sent(1, 7, 60);
         assert!(!w.can_send(2, 60, 1000), "credit");
-        w.lane_down(1); // frame 7 never acknowledged: refunded
-        assert!(w.can_send(2, 60, 1000));
-        w.received(7); // ...but it had arrived after all
-        assert!(!w.can_send(2, 60, 1000));
-        w.credit(60);
+        w.lane_down(1); // frame 7 never acknowledged: the charge stays
+        assert_eq!(w.available(), 40, "a lane death released window credit");
+        assert!(
+            !w.can_send(2, 60, 1000),
+            "the dead lane's bytes could be spent twice"
+        );
+        w.received(7); // ...but it had arrived after all: the receiver did charge it
+        assert_eq!(
+            w.available(),
+            40,
+            "a late Received double-charged the sender"
+        );
+        w.credit(60); // the receiver applied it and returned the space
         assert!(w.can_send(2, 60, 1000));
         w.sent(2, 8, 60);
         assert!(!w.can_send(2, 30, 70), "the lane's in-flight cap");
         assert_eq!(w.received(8), Some(60));
+    }
+
+    #[test]
+    fn peer_credit_overflow_saturates_instead_of_wrapping() {
+        // M4: `Credit.bytes` is peer-controlled; a plain `+=` wraps on overflow — which
+        // shrinks the window — and panics in debug builds.
+        let mut w = Window::new(u64::MAX / 2);
+        w.credit(u64::MAX);
+        assert_eq!(w.available(), u64::MAX);
+        assert!(w.can_send(1, u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn a_lane_skips_a_front_frame_that_does_not_fit_and_takes_one_behind_it() {
+        // I2: the head-of-line credit stall — every lane re-picking the same oversized
+        // front frame while a smaller frame behind it fits. `pick_any` scans for a frame
+        // that fits and leaves the oversized front in place.
+        let mut s = Sched {
+            decision: Some(governor::Decision {
+                lanes: 1,
+                chunk: 4 << 20,
+                bundle: 1 << 20,
+                bottleneck: gen::BN_NETWORK,
+                mode: Mode::StreamOnly,
+                prefer: Class::Stream,
+                sequential: false,
+            }),
+            ..Default::default()
+        };
+        s.chunks.push_back(test_frame(Chunk::TYPE, 15 << 20));
+        s.chunks.push_back(test_frame(Chunk::TYPE, 4 << 20));
+        let w = Window::new(8 << 20);
+        let f = pick_any(&mut s, 1, &w, 64 << 20).unwrap();
+        assert_eq!(
+            f.payload,
+            4 << 20,
+            "the fitting frame behind the oversized front was taken"
+        );
+        assert_eq!(s.chunks.len(), 1, "the oversized front frame stayed queued");
+        assert_eq!(s.chunks.front().unwrap().payload, 15 << 20);
+        // Nothing fits at all: None, and the queues are untouched.
+        let tiny = Window::new(3 << 20);
+        assert!(pick_any(&mut s, 1, &tiny, 64 << 20).is_none());
+        assert_eq!(s.chunks.len(), 1);
     }
 
     #[test]
@@ -1227,6 +1484,7 @@ mod tests {
             chunk: AtomicU32::new(chunk),
             bundle: AtomicU32::new(governor::START_BUNDLE),
             bytes_budget: Arc::new(Semaphore::new(budget_kib)),
+            stall: Mutex::new(None),
         })
     }
 
@@ -1349,7 +1607,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let small = Arc::new(Mutex::new(VecDeque::new()));
         let large = Arc::new(Mutex::new(VecDeque::from([(0u32, RangeSet::new())])));
-        spawn_readers(
+        let _handles = spawn_readers(
             m,
             src,
             small,
@@ -1357,6 +1615,7 @@ mod tests {
             sh.clone(),
             &SendOptions::upload(""),
             tx,
+            Arc::new(AtomicBool::new(false)),
         );
         let budget = sh.bytes_budget.clone();
         let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
@@ -1560,6 +1819,492 @@ mod tests {
             lane_seen.load(Ordering::Relaxed),
             n,
             "a lane task kept sending after the error"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct FakeReceiver {
+        credit: u64,
+        credit_on_apply: bool,
+        done_when_complete: bool,
+        /// A `Credit` sent right after the ack, before the map (M5).
+        credit_after_ack: Option<u64>,
+        /// A malformed `Status` sent right after the first `Received` (M6).
+        malformed_status: bool,
+        /// A `FileRetry` for an id not in the manifest, right after the map (M7).
+        retry_unknown: bool,
+    }
+
+    /// A `JobLink` over in-memory pipes: one lane and a fake receiver that answers the
+    /// open (granting `rcv.credit`), the map, and every lane frame with `Received` (and
+    /// `Credit` when `credit_on_apply`). `done_when_complete` ends the job (`JobDone`)
+    /// once the payload bytes reach the manifest's total. Returns the link, how many
+    /// frames the lane carried, and the background tasks — the caller must keep the
+    /// tasks alive (dropping the link drives closes the session).
+    fn fake_link(
+        rcv: FakeReceiver,
+    ) -> (
+        JobLink,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Vec<crate::link::Link>,
+    ) {
+        let timing = Timing {
+            ping_every: Duration::from_secs(3600),
+            dead_after: Duration::from_secs(3600),
+            handshake: Duration::from_secs(5),
+            min_frame_rate: crate::link::MIN_FRAME_RATE,
+        };
+        let job = [0x7d; 16];
+        // The control connection.
+        let (ca, cb) = duplex(1 << 20);
+        let (car, caw) = split(ca);
+        let (cbr, cbw) = split(cb);
+        let (ctx, mut crx) = mpsc::channel(crate::link::DELIVER_DEPTH);
+        let (clink, coutbox) =
+            crate::link::drive(FrameReader::new(car), FrameWriter::new(caw), timing, ctx);
+        // One lane.
+        let (la, lb) = duplex(1 << 20);
+        let (lar, law) = split(la);
+        let (lbr, _lbw) = split(lb);
+        let (ltx, _lrx) = mpsc::channel(crate::link::DELIVER_DEPTH);
+        let (llink, loutbox) =
+            crate::link::drive(FrameReader::new(lar), FrameWriter::new(law), timing, ltx);
+        let keep: Vec<crate::link::Link> = vec![clink, llink];
+        let router = Arc::new(Router::default());
+        router.lane_up(1, loutbox);
+        let link = JobLink::new(job, router.clone(), ConnTx::new(coutbox), None);
+        // Route the control connection's frames into the job, like the session dispatcher.
+        let r2 = router.clone();
+        tokio::spawn(async move {
+            while let Some(f) = crx.recv().await {
+                if is_data_type(f.ty) {
+                    let _ = r2.route_control(f).await;
+                }
+            }
+            r2.close("the session ended");
+        });
+        let lane_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ls = lane_seen.clone();
+        tokio::spawn(async move {
+            let mut peer = FrameReader::new(cbr);
+            peer.set_max_body(crate::frame::MAX_BODY);
+            let mut lane_peer = FrameReader::new(lbr);
+            lane_peer.set_max_body(crate::frame::MAX_BODY);
+            let mut peer_w = FrameWriter::new(cbw);
+            let (mut total, mut manifest_bytes, mut manifest_files) = (0u64, 0u64, 0u32);
+            loop {
+                tokio::select! {
+                    f = peer.recv() => match f {
+                        Ok(f) if f.ty == JobOpen::TYPE => {
+                            let open: JobOpen = f.decode().unwrap();
+                            peer_w.send_msg(0, &JobOpenAck {
+                                job_id: open.job_id,
+                                status: 0,
+                                credit: rcv.credit,
+                                staged: 1,
+                                workers: 4,
+                                message: None,
+                            }).await.unwrap();
+                            if let Some(bytes) = rcv.credit_after_ack {
+                                let _ = peer_w.send_msg(0, &Credit { job_id: job, bytes }).await;
+                            }
+                        }
+                        Ok(f) if f.ty == ManifestEnd::TYPE => {
+                            let me: ManifestEnd = f.decode().unwrap();
+                            manifest_bytes = me.bytes;
+                            manifest_files = me.files;
+                            peer_w.send_msg(0, &JobMap {
+                                job_id: job,
+                                status: 0,
+                                last: 1,
+                                done: vec![],
+                                partial: vec![],
+                                message: None,
+                            }).await.unwrap();
+                            if rcv.retry_unknown {
+                                let _ = peer_w.send_msg(0, &FileRetry {
+                                    job_id: job,
+                                    file_id: 99,
+                                    reason: 1,
+                                }).await;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => return,
+                    },
+                    f = lane_peer.recv() => match f {
+                        Ok(f) if is_data_type(f.ty) => {
+                            let n = ls.fetch_add(1, Ordering::Relaxed);
+                            let payload = f.decode::<Chunk>().map(|c| c.data.len() as u64).unwrap_or(0);
+                            let _ = peer_w.send_msg(0, &Received { job_id: job, lane: 1, seq: f.channel }).await;
+                            if rcv.credit_on_apply {
+                                let _ = peer_w.send_msg(0, &Credit { job_id: job, bytes: f.body.len() as u64 }).await;
+                            }
+                            if rcv.malformed_status && n == 0 {
+                                // A Status whose body is just the job id (its decode fails).
+                                let _ = peer_w.send(Status::TYPE, 0, &job).await;
+                            }
+                            total += payload;
+                            if rcv.done_when_complete && total >= manifest_bytes {
+                                let _ = peer_w.send_msg(0, &JobDone {
+                                    job_id: job,
+                                    status: 0,
+                                    files: manifest_files,
+                                    bytes: manifest_bytes,
+                                    message: None,
+                                }).await;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => return,
+                    },
+                }
+            }
+        });
+        (link, lane_seen, keep)
+    }
+
+    /// A `Source` whose reads are counted and slow, and whose open sessions are counted —
+    /// a parked reader still holds its session, so a leaked thread shows as `active > 0`.
+    struct CountingRead {
+        data: Arc<Vec<u8>>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::source::ReadAt for CountingRead {
+        fn read_at(&mut self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(5)); // a slow source: reads are observable
+            let n = buf
+                .len()
+                .min(64 * 1024)
+                .min(self.data.len().saturating_sub(off as usize));
+            if n > 0 {
+                buf[..n].copy_from_slice(&self.data[off as usize..off as usize + n]);
+            }
+            self.reads.fetch_add(n, Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+    impl Drop for CountingRead {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    struct CountingSource {
+        data: Arc<Vec<u8>>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Source for CountingSource {
+        fn open(&self, _rel: &str) -> io::Result<Box<dyn crate::source::ReadAt>> {
+            self.active.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(CountingRead {
+                data: self.data.clone(),
+                reads: self.reads.clone(),
+                active: self.active.clone(),
+            }))
+        }
+        fn list(&self, _rel: &str) -> io::Result<Vec<(String, SourceMeta)>> {
+            Ok(Vec::new())
+        }
+        fn stat(&self, _rel: &str) -> io::Result<SourceMeta> {
+            Ok(SourceMeta {
+                size: self.data.len() as u64,
+                mtime: 0,
+                mode: 0o644,
+                is_dir: false,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_job_stops_the_readers_and_leaves_none_parked() {
+        // I1: teardown wakes every blocked reader (the budget closes), drains the queues
+        // so the frames' read-ahead permits are released, and joins the reader threads
+        // before the job's future returns; the readers also check the shutdown flag each
+        // iteration. Against the unfixed sender the reader keeps reading for seconds
+        // after the return and then leaks, parked on the budget.
+        let size = 160usize << 20;
+        let (mut link, _lane_seen, _keep) = fake_link(FakeReceiver {
+            credit: 4 << 20,
+            credit_on_apply: true,
+            done_when_complete: false,
+            credit_after_ack: None,
+            malformed_status: false,
+            retry_unknown: false,
+        });
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let src: Arc<dyn Source> = Arc::new(CountingSource {
+            data: Arc::new(vec![0x5a; size]),
+            reads: reads.clone(),
+            active: active.clone(),
+        });
+        let m = Arc::new(Manifest {
+            entries: vec![Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: size as u64,
+                mtime: 1,
+                path: "big".into(),
+                root: None,
+            }],
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut opts = SendOptions::upload("dest");
+        opts.cancel = cancel.clone();
+        let job_task = tokio::spawn(async move { send_job(&mut link, m, src, opts).await });
+        // Let the reader get going: two pieces' worth of reads.
+        tokio::time::timeout(Duration::from_secs(12), async {
+            while reads.load(Ordering::Relaxed) < 2 * (4 << 20) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the reader made progress within the bound");
+        cancel.store(true, Ordering::Relaxed);
+        let result = tokio::time::timeout(Duration::from_secs(15), job_task)
+            .await
+            .expect("the sender task completed within the bound")
+            .expect("the sender task did not panic");
+        assert!(matches!(result, Err(SendError::Cancelled)), "{result:?}");
+        // The reads stopped with the job...
+        let at = reads.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            at,
+            "a reader kept reading after the job returned"
+        );
+        // ...and no reader thread is still inside the source (parked on the read-ahead
+        // budget or otherwise).
+        assert_eq!(active.load(Ordering::Relaxed), 0, "a reader thread leaked");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_completes_when_the_grant_is_smaller_than_the_chunk() {
+        // I2: the receiver grants less than the sender's chunk. The unfixed sender reads
+        // chunk-sized pieces that can never fit the grant — the bounded wait here fails
+        // by hanging. With the read-time grant cap every piece fits and the job completes.
+        let size = 12usize << 20;
+        let (mut link, _lane_seen, _keep) = fake_link(FakeReceiver {
+            credit: 3 << 20,
+            credit_on_apply: true,
+            done_when_complete: true,
+            credit_after_ack: None,
+            malformed_status: false,
+            retry_unknown: false,
+        });
+        let dir = std::env::temp_dir().join(format!("ava1-send-grant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big"), vec![0x44u8; size]).unwrap();
+        let m = Arc::new(Manifest {
+            entries: vec![Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: size as u64,
+                mtime: 1,
+                path: "big".into(),
+                root: None,
+            }],
+        });
+        let report = tokio::time::timeout(
+            Duration::from_secs(20),
+            send_job(
+                &mut link,
+                m,
+                Arc::new(crate::source::LocalSource::new(dir.clone())),
+                SendOptions::upload("dest"),
+            ),
+        )
+        .await
+        .expect("the job completed within the bound (a grant below the chunk must not hang it)")
+        .expect("the upload completed");
+        assert_eq!(report.status, 0, "{:?}", report.message);
+        assert_eq!(report.bytes, size as u64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_grant_smaller_than_one_group_fails_loudly_instead_of_hanging() {
+        // I2: with a window below one verification group, even the smallest legal piece
+        // (one group) can never fit and no Credit can arrive — the job must fail with a
+        // Protocol error naming the grant, not park forever.
+        let size = 8usize << 20;
+        let (mut link, _lane_seen, _keep) = fake_link(FakeReceiver {
+            credit: 512 << 10,
+            credit_on_apply: true,
+            done_when_complete: true,
+            credit_after_ack: None,
+            malformed_status: false,
+            retry_unknown: false,
+        });
+        let dir = std::env::temp_dir().join(format!("ava1-send-tinygrant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big"), vec![0x45u8; size]).unwrap();
+        let m = Arc::new(Manifest {
+            entries: vec![Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: size as u64,
+                mtime: 1,
+                path: "big".into(),
+                root: None,
+            }],
+        });
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            send_job(
+                &mut link,
+                m,
+                Arc::new(crate::source::LocalSource::new(dir.clone())),
+                SendOptions::upload("dest"),
+            ),
+        )
+        .await
+        .expect("the job ended within the bound (it must not hang)")
+        .expect_err("a window below one group cannot send anything");
+        assert!(
+            matches!(&err, SendError::Protocol(msg) if msg.contains("524288") && msg.contains("window")),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_credit_between_the_ack_and_the_map_is_not_discarded() {
+        // M5: the ack grants nothing and the receiver returns Credit before the map. The
+        // unfixed open_upload discards it, leaving the window empty forever (the bounded
+        // wait here fails); folded in, the window is usable and the job completes.
+        let size = 8usize << 20;
+        let (mut link, _lane_seen, _keep) = fake_link(FakeReceiver {
+            credit: 0,
+            credit_on_apply: true,
+            done_when_complete: true,
+            credit_after_ack: Some(4 << 20),
+            malformed_status: false,
+            retry_unknown: false,
+        });
+        let dir =
+            std::env::temp_dir().join(format!("ava1-send-earlycredit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big"), vec![0x46u8; size]).unwrap();
+        let m = Arc::new(Manifest {
+            entries: vec![Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: size as u64,
+                mtime: 1,
+                path: "big".into(),
+                root: None,
+            }],
+        });
+        let report = tokio::time::timeout(
+            Duration::from_secs(20),
+            send_job(
+                &mut link,
+                m,
+                Arc::new(crate::source::LocalSource::new(dir.clone())),
+                SendOptions::upload("dest"),
+            ),
+        )
+        .await
+        .expect("the job completed within the bound")
+        .expect("the upload completed");
+        assert_eq!(report.status, 0, "{:?}", report.message);
+        assert_eq!(report.bytes, size as u64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_malformed_status_is_a_protocol_error() {
+        // M6: like every other control frame, a Status whose decode fails ends the job
+        // with a Protocol error — the unfixed sender shrugs it off and completes.
+        let size = 4usize << 20;
+        let (mut link, _lane_seen, _keep) = fake_link(FakeReceiver {
+            credit: 64 << 20,
+            credit_on_apply: true,
+            done_when_complete: true,
+            credit_after_ack: None,
+            malformed_status: true,
+            retry_unknown: false,
+        });
+        let dir = std::env::temp_dir().join(format!("ava1-send-badstatus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big"), vec![0x47u8; size]).unwrap();
+        let m = Arc::new(Manifest {
+            entries: vec![Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: size as u64,
+                mtime: 1,
+                path: "big".into(),
+                root: None,
+            }],
+        });
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            send_job(
+                &mut link,
+                m,
+                Arc::new(crate::source::LocalSource::new(dir.clone())),
+                SendOptions::upload("dest"),
+            ),
+        )
+        .await
+        .expect("the job ended within the bound")
+        .expect_err("a malformed Status ends the job");
+        assert!(matches!(err, SendError::Protocol(_)), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_retry_for_an_unknown_file_is_a_protocol_error() {
+        // M7: a FileRetry for an id not in the manifest must fail the job — the unfixed
+        // sender silently queues it for the large reader, which exits, and the job
+        // completes without the retried file.
+        let size = 4usize << 20;
+        let (mut link, _lane_seen, _keep) = fake_link(FakeReceiver {
+            credit: 64 << 20,
+            credit_on_apply: true,
+            done_when_complete: true,
+            credit_after_ack: None,
+            malformed_status: false,
+            retry_unknown: true,
+        });
+        let dir = std::env::temp_dir().join(format!("ava1-send-badretry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big"), vec![0x48u8; size]).unwrap();
+        let m = Arc::new(Manifest {
+            entries: vec![Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: size as u64,
+                mtime: 1,
+                path: "big".into(),
+                root: None,
+            }],
+        });
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            send_job(
+                &mut link,
+                m,
+                Arc::new(crate::source::LocalSource::new(dir.clone())),
+                SendOptions::upload("dest"),
+            ),
+        )
+        .await
+        .expect("the job ended within the bound")
+        .expect_err("a FileRetry for an unknown file ends the job");
+        assert!(
+            matches!(&err, SendError::Protocol(msg) if msg.contains("FileRetry")),
+            "{err:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

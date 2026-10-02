@@ -276,12 +276,20 @@ with `ERR_PROTOCOL` on a `Chunk` for a small file or a `BundleRecord` for a larg
 
 12.3 `Received{lane, seq}` is sent as soon as the receiver has a lane frame in memory,
 before any disk work. A sender requeues, on any lane, the frames of a lane that closed
-before they were `Received`. Applying a frame twice is harmless.
+before they were `Received`. Applying a frame twice is harmless. A lane's death does not
+release window credit: the requeued frames' bytes stay charged until the receiver
+accounts for them (its `Credit` after the apply) or the job ends.
 
 12.4 Credit: `JobOpenAck.credit` (uploads) or `JobOpen.ext credit` (downloads) is the
 number of lane-frame body bytes the sender may have outstanding; `Credit{bytes}` returns
-space as the receiver frees buffers. A receiver that sees its credit exceeded refuses the
-frame with `ERR_CREDIT` and closes the lane.
+space as the receiver frees buffers. A receiver that sees its credit exceeded sends a
+sealed `Error{ERR_CREDIT}` on the offending lane and ends the job: the C receiver closes
+that one lane itself, and a transport without a server-side lane close lets the session's
+own lifecycle end it — the sender observes the same either way: its lane dies. A sender
+never sends a piece larger than the credit already granted: pieces are sized at read time
+to fit the window (whole verification groups, one group minimum; a file's final piece
+keeps the whole-file rule), and a window that cannot hold one group ends the job
+(`ERR_PROTOCOL`) instead of stalling.
 
 12.5 Per lane, the sender keeps at most `max(chunk size, lane rate × 2 s)` bytes sent
 and not yet `Received`.
