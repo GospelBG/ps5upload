@@ -10,7 +10,46 @@
 static struct {
     pthread_mutex_t mu;
     ava1_job_t *jobs[AVA1_MAX_JOBS];
+    /* Ids that left the table but whose destroy may still be running (threads joined,
+     * journal closed): a create of the same id must not touch the job's directory until
+     * the destroy finished. Cleared when the job's last reference is dropped. */
+    uint8_t retiring[AVA1_MAX_JOBS][16];
+    unsigned retiring_n;
 } T = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+/* Caller holds T.mu. */
+static void retiring_add(const uint8_t id[16]) {
+    unsigned i;
+    for (i = 0; i < T.retiring_n; i++)
+        if (memcmp(T.retiring[i], id, 16) == 0) return;
+    /* Full: every listed id is retiring, so no create can succeed anyway. */
+    if (T.retiring_n < AVA1_MAX_JOBS) memcpy(T.retiring[T.retiring_n++], id, 16);
+}
+
+/* Caller holds T.mu. */
+static void retiring_clear(const uint8_t id[16]) {
+    unsigned i;
+    for (i = 0; i < T.retiring_n; i++)
+        if (memcmp(T.retiring[i], id, 16) == 0) {
+            memcpy(T.retiring[i], T.retiring[--T.retiring_n], 16);
+            return;
+        }
+}
+
+/* Control-frame bytes queued for jobs, all jobs together (Task 14 fix round 1). */
+static uint64_t g_ctl;
+
+int ava1_ctl_take(size_t len) {
+    uint64_t cap = ava1_data_cfg()->ctl_cap ? ava1_data_cfg()->ctl_cap : AVA1_CTL_CAP;
+    uint64_t cur = __atomic_load_n(&g_ctl, __ATOMIC_RELAXED);
+    for (;;) {
+        if (cur + len > cap) return -1;
+        if (__atomic_compare_exchange_n(&g_ctl, &cur, cur + len, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return 0;
+    }
+}
+
+void ava1_ctl_give(size_t len) { (void)__atomic_sub_fetch(&g_ctl, len, __ATOMIC_RELAXED); }
 
 ava1_job_t *ava1_job_find(const uint8_t id[16]) {
     ava1_job_t *j = NULL;
@@ -52,6 +91,12 @@ static ava1_job_t *create(const uint8_t id[16], const uint8_t owner[32], const u
         }
         if (!T.jobs[i] && slot == -1) slot = i;
     }
+    if (slot >= 0)
+        for (i = 0; i < (int)T.retiring_n; i++)
+            if (memcmp(T.retiring[i], id, 16) == 0) {
+                slot = -2; /* the previous job of this id is still being destroyed */
+                break;
+            }
     if (slot >= 0) T.jobs[slot] = j;
     pthread_mutex_unlock(&T.mu);
     if (slot < 0) {
@@ -172,6 +217,7 @@ static void job_destroy(ava1_job_t *j) {
     ava1_mstore_free(&j->m);
     if (j->credit) ava1_budget_give(j->credit);
     free_frames(j->held_head);
+    if (j->in_bytes) ava1_ctl_give(j->in_bytes); /* its inbox's frames were charged */
     free_frames(j->in_head);
     pthread_mutex_destroy(&j->mu);
     pthread_cond_destroy(&j->cv);
@@ -185,7 +231,14 @@ void ava1_job_put(ava1_job_t *j) {
     pthread_mutex_lock(&T.mu);
     last = --j->refs == 0;
     pthread_mutex_unlock(&T.mu);
-    if (last) job_destroy(j);
+    if (last) {
+        uint8_t id[16];
+        memcpy(id, j->id, 16);
+        job_destroy(j); /* threads joined, journal closed: only now may the id reopen */
+        pthread_mutex_lock(&T.mu);
+        retiring_clear(id);
+        pthread_mutex_unlock(&T.mu);
+    }
 }
 
 static void *put_main(void *arg) {
@@ -206,7 +259,21 @@ void ava1_job_put_nowait(ava1_job_t *j) {
 static void unlist(ava1_job_t *j) {
     int i;
     for (i = 0; i < AVA1_MAX_JOBS; i++)
-        if (T.jobs[i] == j) T.jobs[i] = NULL;
+        if (T.jobs[i] == j) {
+            T.jobs[i] = NULL;
+            retiring_add(j->id); /* the destroy may still be running: the id stays taken */
+            return;
+        }
+}
+
+void ava1_job_park(ava1_job_t *j) {
+    uint64_t now = ava1_mono_ms();
+    pthread_mutex_lock(&T.mu);
+    pthread_mutex_lock(&j->cmu);
+    j->attached = 0;
+    pthread_mutex_unlock(&j->cmu);
+    j->parked_at_ms = now;
+    pthread_mutex_unlock(&T.mu);
 }
 
 void ava1_job_park_session(const uint8_t sid[16]) {
@@ -259,6 +326,7 @@ void ava1_job_free_all(void) {
         if (T.jobs[i]) {
             gone[n++] = T.jobs[i];
             T.jobs[i] = NULL;
+            retiring_add(gone[n - 1]->id);
         }
     pthread_mutex_unlock(&T.mu);
     for (i = 0; i < n; i++) ava1_job_put(gone[i]);
@@ -272,6 +340,7 @@ void ava1_job_free_one(const uint8_t id[16]) {
         if (T.jobs[i] && memcmp(T.jobs[i]->id, id, 16) == 0) {
             j = T.jobs[i];
             T.jobs[i] = NULL;
+            retiring_add(j->id); /* like unlist: the destroy may still be running */
             break;
         }
     pthread_mutex_unlock(&T.mu);
@@ -279,14 +348,13 @@ void ava1_job_free_one(const uint8_t id[16]) {
 }
 
 int ava1_job_retire(ava1_job_t *j) {
-    int i, ok;
+    int ok;
     pthread_mutex_lock(&T.mu);
     /* Listed, and held only by the table and the caller: nobody else can be running it. An
      * unlisted job's two references are the caller's and someone else's. */
     ok = listed_locked(j) && j->refs == 2;
     if (ok) {
-        for (i = 0; i < AVA1_MAX_JOBS; i++)
-            if (T.jobs[i] == j) T.jobs[i] = NULL;
+        unlist(j);
         j->refs = 1;
     }
     pthread_mutex_unlock(&T.mu);

@@ -428,6 +428,20 @@ int ava1_server_post(const uint8_t sid[16], uint16_t lane, uint8_t type, uint8_t
     return rc;
 }
 
+/* Free entries of the session's control post queue: a hook decides whether a post can
+ * still be absorbed or must wait for the socket instead (a full queue closes the
+ * connection). -1: no such session. */
+int ava1_server_post_room(const uint8_t sid[16]) {
+    conn_t *k = conn_lookup(sid, 0);
+    int room;
+    if (!k) return -1;
+    pthread_mutex_lock(&k->io.qmu);
+    room = (int)AVA1_Q_ENTRIES - (int)k->io.q_n;
+    pthread_mutex_unlock(&k->io.qmu);
+    conn_put(k);
+    return room;
+}
+
 int ava1_server_lanes(const uint8_t sid[16], uint16_t out[AVA1_MAX_LANES]) {
     int idx, n = 0;
     uint16_t l;
@@ -868,8 +882,11 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     if (notify && S.cfg.on_pair_request) S.cfg.on_pair_request(peer_name, ava1_pairing_code(ns.h));
     conn_publish(idx, sid, 0, k);
     serve_loop(k, idx, sid, 0, 0, buf);
-    if (S.cfg.data && S.cfg.data->on_session_end) S.cfg.data->on_session_end(sid);
+    /* Withdraw first: from here on a send to this session fails (E_CLOSED), so a job
+     * racing the teardown cannot be left attached to a session that is gone. Then park
+     * whatever is attached. */
     conn_withdraw(idx, sid, 0, k);
+    if (S.cfg.data && S.cfg.data->on_session_end) S.cfg.data->on_session_end(sid);
     sess_remove(idx, sid);
 out:
     if (!filled) sess_release(idx);

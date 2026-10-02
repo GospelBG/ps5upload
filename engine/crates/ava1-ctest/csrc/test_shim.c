@@ -1502,3 +1502,48 @@ int ava1_test_job_counts(const uint8_t id[16], uint64_t out[2]) {
     ava1_job_put(j);
     return 0;
 }
+
+/* Fix round 1 knobs, by name. 0 = done, -1 = unknown name. */
+int ava1_test_data_knob(const char *name, uint32_t v) {
+    ava1_data_cfg_t *c = (ava1_data_cfg_t *)ava1_data_cfg(); /* a static, not const: tests only */
+    if (!strcmp(name, "ack_fail")) ava1_data_test_ack_fail = (int)v ? -(int)v : 0;
+    else if (!strcmp(name, "feeder_fail")) ava1_data_test_feeder_fail = (int)v;
+    else if (!strcmp(name, "feed_delay_ms")) ava1_data_test_feed_delay_ms = v;
+    else if (!strcmp(name, "reserve_fail")) ava1_data_test_reserve_fail = (int)v;
+    else if (!strcmp(name, "lane_alloc_fail")) ava1_data_test_lane_alloc_fail = (int)v;
+    else if (!strcmp(name, "fb_force")) ava1_data_test_fb_force = (int)v;
+    else if (!strcmp(name, "park_ms")) __atomic_store_n(&c->park_ms, v, __ATOMIC_SEQ_CST);
+    else if (!strcmp(name, "ctl_cap")) __atomic_store_n(&c->ctl_cap, v, __ATOMIC_SEQ_CST);
+    else return -1;
+    return 0;
+}
+
+/* Fix round 1, minor 5: a job unlisted (reaped) while someone still holds it keeps its id
+ * until it is destroyed: a create of the same id fails until then. 0 or the failed step. */
+int ava1_test_retiring_blocks_reopen(void) {
+    ava1_data_cfg_t dc;
+    ava1_job_t *j, *held, *again;
+    uint8_t id[16];
+    int rc = 0;
+    memset(&dc, 0, sizeof dc);
+    snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "/tmp/ava1-retiring-unused");
+    if (ava1_data_start(&dc) != 0) return -100;
+    memset(id, 0x42, 16);
+    j = ava1_job_create(id, TEST_OWNER); /* detached: parked from creation */
+    held = j ? ava1_job_find(id) : NULL; /* someone still running it (a hook, a destroy) */
+    if (!j || !held) rc = -1;
+    if (!rc) {
+        ava1_job_put(j);
+        ava1_job_reap(ava1_mono_ms() + 3600u * 1000u); /* unlisted; `held` keeps it alive */
+        again = ava1_job_create(id, TEST_OWNER);
+        if (again) {
+            rc = -2; /* a second job over the same directory while the first still runs */
+            ava1_job_put(again);
+        }
+        ava1_job_put(held); /* destroyed now: the id is free */
+        if (!rc && !(again = ava1_job_create(id, TEST_OWNER))) rc = -3;
+        else if (!rc) ava1_job_put(again);
+    }
+    ava1_data_stop();
+    return rc;
+}

@@ -125,20 +125,26 @@ struct ava1_job {
     char message[128];
     /* ---- the wire (Task 14, ava1_data.c) ----
      * `cmu` is a leaf lock: held for a few field updates only, never across I/O and never
-     * while taking another lock (j->mu, then cmu, is the only order). Reader threads take
-     * cmu and never mu, so a job busy with its disk (mu is held across opens, fallocate and
-     * journal compaction) cannot stall a session's reader. Under cmu: `attached` and `sid`
-     * (also written under the table lock, so either lock reads them), the sender's credit
-     * as this side counts it, the held lane frames and the control inbox. */
+     * while taking another lock. The two orders are T.mu -> cmu (attach, park, reap reads)
+     * and j->mu -> cmu (a job thread checking the wire state); never the reverse. Reader
+     * threads take cmu and never mu, so a job busy with its disk (mu is held across opens,
+     * fallocate and journal compaction) cannot stall a session's reader. Under cmu:
+     * `attached` and `sid` (also written under the table lock, so either lock reads them),
+     * the sender's credit as this side counts it, the held lane frames and the control
+     * inbox. */
     pthread_mutex_t cmu;
     pthread_cond_t ccv;               /* the feeder waits here */
     int ready;                        /* the attached session has its map: lane frames go on */
     uint64_t w_avail;                 /* lane-frame bytes the sender may still send */
     uint64_t w_grant;                 /* the largest credit granted (admission's pre-read bound) */
+    uint64_t att_gen;                 /* bumped per attach; a feeder batch records the one it was taken under */
+    int att_granted;                  /* the current attach carried a grant (JobOpen; not Resume) */
     ava1_inframe_t *held_head, *held_tail; /* lane frames, in arrival order */
     ava1_inframe_t *in_head, *in_tail;     /* control frames, in arrival order */
     size_t in_bytes;
-    int in_overflow;                  /* the inbox was full: the job ends with ERR_PROTOCOL */
+    int in_overflow;                  /* the inbox was full: the job ends with in_over_status */
+    uint16_t in_over_status;          /* the overflow's status; 0 = AVA1_ERR_PROTOCOL */
+    int in_oom;                       /* a lane frame could not be allocated: the job ends INTERNAL */
     int feed_stop;
     pthread_t feeder;                 /* applies held frames and control frames (receiver jobs) */
     int feeder_started;
@@ -158,7 +164,9 @@ ava1_job_t *ava1_job_create_attached(const uint8_t id[16], const uint8_t owner[3
  * NULL when it is not listed. Find and attach are one step, so the reaper cannot unlist a
  * job between them. */
 ava1_job_t *ava1_job_find_attach(const uint8_t id[16], const uint8_t sid[16]);
-/* The same for a job already in hand: 0, or -1 when it is no longer listed. */
+/* The same for a job already in hand: 0, or -1 when it is no longer listed. The in-hand
+ * equivalent of ava1_job_find_attach (the same listed check under the same lock), for a
+ * caller that already holds a reference (Resume in ava1_data.c). */
 int ava1_job_attach_sid(ava1_job_t *j, const uint8_t sid[16]);
 void ava1_job_put(ava1_job_t *j);
 /* For reader threads: drops a reference, never freeing the job on this thread (freeing
@@ -167,6 +175,9 @@ void ava1_job_put_nowait(ava1_job_t *j);
 /* fn(j, ctx) for every listed job, under the table lock: fn must not block or take it. */
 void ava1_job_foreach(void (*fn)(ava1_job_t *j, void *ctx), void *ctx);
 void ava1_job_park_session(const uint8_t sid[16]); /* every job attached to sid detaches */
+/* One job: detaches it and stamps it parked (a job refused at attach must not stay
+ * attached to the session that got the refusal). */
+void ava1_job_park(ava1_job_t *j);
 /* Frees parked jobs older than the park age (data cfg park_ms; finished ones after 10 s). */
 void ava1_job_reap(uint64_t now_ms);
 void ava1_job_free_all(void);
@@ -176,5 +187,14 @@ void ava1_job_free_one(const uint8_t id[16]);      /* unlists it and drops the t
  * the caller's reference and returns -1 (someone else may still be running it). */
 int ava1_job_retire(ava1_job_t *j);
 void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len);
+
+/* Control-frame bytes queued across all jobs (their inboxes and the frames behind a
+ * JobOpen still opening), one global counter (Task 14 fix round 1): a flood past it is
+ * refused with ERR_BUSY instead of exhausting memory. ava1_ctl_take charges `len` and
+ * returns 0, or returns -1 when it would pass ava1_data_cfg_t.ctl_cap (0 = AVA1_CTL_CAP)
+ * and charges nothing. ava1_ctl_give returns the bytes when a frame leaves a queue. */
+#define AVA1_CTL_CAP (64u << 20)
+int ava1_ctl_take(size_t len);
+void ava1_ctl_give(size_t len);
 
 #endif

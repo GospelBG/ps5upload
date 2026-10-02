@@ -350,6 +350,8 @@ pub mod ffi {
         pub fn ava1_test_reap_rules(jobs_dir: *const c_char) -> c_int;
         pub fn ava1_test_retire_unlisted() -> c_int;
         pub fn ava1_test_job_counts(id: *const u8, out: *mut u64) -> c_int;
+        pub fn ava1_test_data_knob(name: *const c_char, v: u32) -> c_int;
+        pub fn ava1_test_retiring_blocks_reopen() -> c_int;
     }
 }
 
@@ -722,6 +724,18 @@ impl CServer {
         (out[0], out[1])
     }
 
+    /// A data-layer test knob (test_shim.c `ava1_test_data_knob`): ack_fail (the ack's send
+    /// "fails" with -v), feeder_fail, feed_delay_ms, park_ms, ctl_cap, reserve_fail,
+    /// lane_alloc_fail, fb_force (every Received takes the waiting-send fallback).
+    pub fn knob(&self, name: &str, v: u32) {
+        let n = CString::new(name).unwrap();
+        assert_eq!(
+            unsafe { ffi::ava1_test_data_knob(n.as_ptr(), v) },
+            0,
+            "{name}"
+        );
+    }
+
     /// 1 attached to a session, 0 parked, -1 not in the job table.
     pub fn job_attached(&self, id: [u8; 16]) -> i32 {
         unsafe { ffi::ava1_test_job_attached(id.as_ptr()) }
@@ -772,6 +786,12 @@ impl Drop for CServer {
 pub fn c_retire_unlisted() -> i32 {
     let _lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { ffi::ava1_test_retire_unlisted() }
+}
+
+/// A reaped job still held keeps its id until destroyed (0 = holds).
+pub fn c_retiring_blocks_reopen() -> i32 {
+    let _lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { ffi::ava1_test_retiring_blocks_reopen() }
 }
 
 /// The reaper's rules, checked in C on a private data layer (0 = all hold, else the step

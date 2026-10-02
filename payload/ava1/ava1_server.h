@@ -90,6 +90,9 @@ int ava1_server_send_frame(const uint8_t sid[16], uint16_t lane, uint8_t type, u
  * connection and returns AVA1_E_BUSY. A hook never calls ava1_server_send. */
 int ava1_server_post(const uint8_t sid[16], uint16_t lane, uint8_t type, uint8_t flags, uint32_t channel,
                      const uint8_t *body, size_t len);
+/* Free entries left in the session's control post queue (0..AVA1_Q_ENTRIES), or -1 when
+ * the session is not live. */
+int ava1_server_post_room(const uint8_t sid[16]);
 /* The ids of the session's live lanes (1..AVA1_MAX_LANES); returns how many. */
 int ava1_server_lanes(const uint8_t sid[16], uint16_t out[AVA1_MAX_LANES]);
 

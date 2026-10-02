@@ -21,6 +21,9 @@ typedef struct {
     uint32_t fsync_delay_us;              /* tests: a slow disk */
     int crash_at;                         /* tests: AVA1_CRASH_* (Task 13) */
     uint32_t park_ms;                     /* a parked job is freed after this; 0 = AVA1_PARK_MS */
+    /* Control-frame bytes queued for jobs (their inboxes and the frames behind a JobOpen
+     * still opening), all jobs together; 0 = 64 MiB. Past it, the job ends with ERR_BUSY. */
+    uint32_t ctl_cap;
 } ava1_data_cfg_t;
 
 int ava1_data_start(const ava1_data_cfg_t *cfg);  /* starts housekeeping; 0 or -errno */
@@ -38,12 +41,20 @@ int ava1_data_spawn(void *(*fn)(void *), void *arg);
 const ava1_data_hooks_t *ava1_data_hooks(void);
 /* Attaches a job to session `sid`: its messages go there (waiting sends), its lanes are
  * counted, frames held for an earlier session are dropped and lane frames wait for the
- * new session's map. 0, or -1 when the job is no longer listed. */
-int ava1_job_attach(ava1_job_t *j, const uint8_t sid[16]);
+ * new session's map. `credit` nonzero is this attach's grant (JobOpenAck.credit): the
+ * sender's allowance restarts from it; 0 (Resume) keeps the allowance running. Returns 0,
+ * or -1 when the job is no longer listed or its feeder cannot start (the job is parked). */
+int ava1_job_attach(ava1_job_t *j, const uint8_t sid[16], uint64_t credit);
 
 /* Tests only (0 in the payload): JobOpen's work waits this long before it starts, and an
  * OK map this long before it is sent. */
 extern uint32_t ava1_data_test_open_delay_ms;
 extern uint32_t ava1_data_test_map_delay_ms;
+extern int ava1_data_test_ack_fail;        /* JobOpenAck's send "fails" with this code */
+extern int ava1_data_test_feeder_fail;     /* a job's feeder thread "cannot start" */
+extern uint32_t ava1_data_test_feed_delay_ms; /* the feeder waits this long after taking lane frames */
+extern int ava1_data_test_reserve_fail;    /* ava1_apply_reserve "fails" for every lane frame */
+extern int ava1_data_test_lane_alloc_fail; /* the lane frame's calloc "fails" */
+extern int ava1_data_test_fb_force;   /* every Received goes through the waiting-send fallback */
 
 #endif

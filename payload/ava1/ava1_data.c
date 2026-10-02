@@ -17,6 +17,12 @@
 
 uint32_t ava1_data_test_open_delay_ms;
 uint32_t ava1_data_test_map_delay_ms;
+int ava1_data_test_ack_fail;
+int ava1_data_test_feeder_fail;
+uint32_t ava1_data_test_feed_delay_ms;
+int ava1_data_test_reserve_fail;
+int ava1_data_test_lane_alloc_fail;
+int ava1_data_test_fb_force;
 
 static struct {
     ava1_data_cfg_t cfg;
@@ -25,6 +31,7 @@ static struct {
     uint64_t budget_free;
     uint64_t admitted; /* lane bytes between their header and on_lane */
     int bg;            /* ava1_data_spawn threads running */
+    int fb;            /* Received waiting-sends spawned (bounded, see RECV_FB_MAX) */
     volatile int running;
     pthread_t house;
 } D = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
@@ -106,7 +113,9 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     if (!D.cfg.cutoff) D.cfg.cutoff = 256u << 10;
     D.budget_free = D.cfg.budget;
     D.admitted = 0;
-    ava1_data_test_open_delay_ms = ava1_data_test_map_delay_ms = 0;
+    ava1_data_test_open_delay_ms = ava1_data_test_map_delay_ms = ava1_data_test_feed_delay_ms = 0;
+    ava1_data_test_ack_fail = ava1_data_test_feeder_fail = 0;
+    ava1_data_test_reserve_fail = ava1_data_test_lane_alloc_fail = ava1_data_test_fb_force = 0;
     D.running = 1;
     if (ava1_thread_start(house_main, NULL, &D.house) != 0) {
         D.running = 0;
@@ -156,6 +165,73 @@ static void post_unknown_map(const uint8_t sid[16], const uint8_t job[16]) {
     if (ava1_job_map_encode(&m, &w) == 0) (void)ava1_server_post(sid, 0, AVA1_TYPE_JOB_MAP, 0, 0, b, w.len);
 }
 
+/* Received goes out the moment a lane frame is in memory (SPEC.md §12.3), so it cannot
+ * wait for a job thread. A burst of tiny frames could otherwise fill the connection's
+ * bounded post queue (which closes the connection when full), so once the queue runs low
+ * the ack is handed to a short-lived thread that waits for the socket instead — the
+ * queue's writer and that thread serialise on the connection's writer lock. */
+#define RECV_POST_FLOOR 8 /* free post-queue entries below which a Received waits */
+#define RECV_FB_MAX 32    /* such waiting sends in flight, all sessions together */
+#define RECV_FB_POLL_MS 10   /* one sleep of a capped spawn's slot wait */
+#define RECV_FB_WAIT_MS 1000 /* a capped spawn waits this long for a slot before posting */
+
+typedef struct {
+    uint8_t sid[16];
+    size_t len;
+    uint8_t body[];
+} recv_send_t;
+
+static void *recv_send_main(void *arg) {
+    recv_send_t *r = arg;
+    (void)ava1_server_send(r->sid, 0, AVA1_TYPE_RECEIVED, 0, 0, r->body, r->len);
+    pthread_mutex_lock(&D.mu);
+    D.fb--;
+    pthread_mutex_unlock(&D.mu);
+    free(r);
+    return NULL;
+}
+
+/* The waiting send for one Received, on a spawned thread. 0, or -1 when the spawn failed
+ * (the caller posts instead). When every waiting-send slot is busy the caller waits a
+ * bounded moment for one to free up: the post queue must not take the overflow, or a few
+ * milliseconds of peer slowness fill it and break the connection. The wait is monotonic
+ * (a settimeofday jump must not stretch or cut it short) and never touches the wall
+ * clock. */
+static int recv_send_spawn(const uint8_t sid[16], const uint8_t *body, size_t len) {
+    recv_send_t *r;
+    r = malloc(sizeof *r + len);
+    if (!r) return -1;
+    memcpy(r->sid, sid, 16);
+    r->len = len;
+    memcpy(r->body, body, len);
+    pthread_mutex_lock(&D.mu);
+    {
+        uint64_t end = ava1_mono_ms() + RECV_FB_WAIT_MS;
+        while (D.fb >= RECV_FB_MAX && ava1_mono_ms() < end) {
+            pthread_mutex_unlock(&D.mu);
+            ava1_platform_sleep_ms(RECV_FB_POLL_MS);
+            pthread_mutex_lock(&D.mu);
+        }
+    }
+    if (D.fb >= RECV_FB_MAX) {
+        /* No slot after the bound: a peer this slow is as good as gone, and the
+         * caller's post closes the connection on a full queue. */
+        pthread_mutex_unlock(&D.mu);
+        free(r);
+        return -1;
+    }
+    D.fb++;
+    pthread_mutex_unlock(&D.mu);
+    if (ava1_data_spawn(recv_send_main, r) != 0) {
+        pthread_mutex_lock(&D.mu);
+        D.fb--;
+        pthread_mutex_unlock(&D.mu);
+        free(r);
+        return -1;
+    }
+    return 0;
+}
+
 static void post_received(const uint8_t sid[16], const uint8_t job[16], uint16_t lane, uint32_t seq) {
     ava1_received_t r;
     uint8_t b[64];
@@ -165,7 +241,12 @@ static void post_received(const uint8_t sid[16], const uint8_t job[16], uint16_t
     r.lane = lane;
     r.seq = seq;
     ava1_w_init(&w, b, sizeof b);
-    if (ava1_received_encode(&r, &w) == 0) (void)ava1_server_post(sid, 0, AVA1_TYPE_RECEIVED, 0, 0, b, w.len);
+    if (ava1_received_encode(&r, &w) == 0) {
+        if (ava1_data_test_fb_force || ava1_server_post_room(sid) < RECV_POST_FLOOR) {
+            if (recv_send_spawn(sid, b, w.len) == 0) return;
+        }
+        (void)ava1_server_post(sid, 0, AVA1_TYPE_RECEIVED, 0, 0, b, w.len);
+    }
 }
 
 /* JobOpenAck: a refusal carries why. `post` for hooks; otherwise the waiting send. */
@@ -322,7 +403,15 @@ static void feed_lane(ava1_job_t *j, ava1_inframe_t *f) {
         fail_soon(j, AVA1_ERR_PROTOCOL, bad);
         return;
     }
-    if (ava1_apply_reserve(j, f->len) != 0) { /* the job ended meanwhile (its credit is 0) */
+    if (ava1_data_test_reserve_fail || ava1_apply_reserve(j, f->len) != 0) {
+        /* Received already told the sender the frame is here. A live job that cannot take
+         * it has lost the frame for good (the sender got its ack), so it ends loudly; an
+         * ended job's reserve fails by design and the frame just goes. */
+        int fin;
+        pthread_mutex_lock(&j->mu);
+        fin = j->finished || j->stopping;
+        pthread_mutex_unlock(&j->mu);
+        if (!fin) fail_soon(j, AVA1_ERR_PROTOCOL, "a data frame beyond the granted credit");
         free_frame(f);
         return;
     }
@@ -347,13 +436,21 @@ static void *feed_main(void *arg) {
     pthread_mutex_lock(&j->cmu);
     for (;;) {
         ava1_inframe_t *f = NULL, *held = NULL;
-        int over;
-        while (!j->feed_stop && !j->in_overflow && !(j->held_head && j->ready) &&
+        int over, oom;
+        uint16_t over_status;
+        uint64_t gen;
+        while (!j->feed_stop && !j->in_overflow && !j->in_oom &&
+               !(j->held_head && j->ready) &&
                !(j->in_head && (j->ready || j->in_head->type != AVA1_TYPE_FILE_ROOT)))
             pthread_cond_wait(&j->ccv, &j->cmu);
         if (j->feed_stop) break;
         over = j->in_overflow;
+        over_status = j->in_over_status;
         j->in_overflow = 0;
+        j->in_over_status = 0;
+        oom = j->in_oom;
+        j->in_oom = 0;
+        gen = j->att_gen; /* the session the batch below belongs to */
         if (j->in_head && (j->ready || j->in_head->type != AVA1_TYPE_FILE_ROOT)) {
             f = j->in_head;
             j->in_head = f->next;
@@ -364,14 +461,27 @@ static void *feed_main(void *arg) {
             j->held_head = j->held_tail = NULL;
         }
         pthread_mutex_unlock(&j->cmu);
-        if (over) fail_soon(j, AVA1_ERR_PROTOCOL, "too many control messages are waiting");
+        if (f) ava1_ctl_give(f->len); /* no longer queued: the global control cap */
+        if (held && ava1_data_test_feed_delay_ms) ava1_platform_sleep_ms(ava1_data_test_feed_delay_ms);
+        if (over)
+            fail_soon(j, over_status ? over_status : AVA1_ERR_PROTOCOL, "too many control messages are waiting");
+        if (oom) fail_soon(j, AVA1_ERR_INTERNAL, "out of memory");
         if (f) {
             feed_control(j, f);
             free_frame(f);
         }
         while (held) {
             ava1_inframe_t *n = held->next;
-            feed_lane(j, held);
+            int stale;
+            pthread_mutex_lock(&j->cmu);
+            /* A re-attach may have run while this batch was taken: its frames name the old
+             * session's manifest, so they go (their bytes are the sender's again, unless
+             * the attach's grant restarted the allowance and already covers them). */
+            stale = j->att_gen != gen;
+            if (stale && !j->att_granted) j->w_avail += held->len;
+            pthread_mutex_unlock(&j->cmu);
+            if (stale) free_frame(held);
+            else feed_lane(j, held);
             held = n;
         }
         pthread_mutex_lock(&j->cmu);
@@ -395,7 +505,11 @@ static void inbox_add(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t l
     }
     pthread_mutex_lock(&j->cmu);
     if (!f || j->in_bytes + len > IN_MAX) {
+        j->in_overflow = 1; /* its own inbox full (or no memory): the job ends PROTOCOL */
+    } else if (ava1_ctl_take(len) != 0) {
+        /* The global control cap (all jobs together): refuse with ERR_BUSY. */
         j->in_overflow = 1;
+        j->in_over_status = AVA1_ERR_BUSY;
     } else {
         if (j->in_tail) j->in_tail->next = f;
         else j->in_head = f;
@@ -408,7 +522,7 @@ static void inbox_add(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t l
     if (f) free_frame(f);
 }
 
-int ava1_job_attach(ava1_job_t *j, const uint8_t sid[16]) {
+int ava1_job_attach(ava1_job_t *j, const uint8_t sid[16], uint64_t credit) {
     uint16_t lanes[AVA1_MAX_LANES];
     int nl = ava1_server_lanes(sid, lanes), start = 0;
     ava1_inframe_t *drop, *f;
@@ -416,11 +530,19 @@ int ava1_job_attach(ava1_job_t *j, const uint8_t sid[16]) {
     pthread_mutex_lock(&j->cmu);
     j->emit = net_emit;
     /* Frames held for an earlier session name what its map said: they go, and the new
-     * session's frames wait for its own map. Their bytes are the sender's again. */
+     * session's frames wait for its own map. Their bytes are the sender's again. A grant
+     * (JobOpen, not Resume) restarts the allowance: it is applied after the give-backs, so
+     * the sender's credit is exactly the grant (SPEC.md §11.5). */
     j->ready = 0;
+    j->att_gen++;
+    j->att_granted = credit != 0;
     drop = j->held_head;
     j->held_head = j->held_tail = NULL;
     for (f = drop; f; f = f->next) j->w_avail += f->len;
+    if (credit) {
+        j->w_avail = credit;
+        if (credit > j->w_grant) j->w_grant = credit;
+    }
     if (!j->on_frame && !j->feeder_started) start = j->feeder_started = 1;
     pthread_mutex_unlock(&j->cmu);
     __atomic_store_n(&j->lanes, (uint8_t)nl, __ATOMIC_RELAXED);
@@ -429,26 +551,38 @@ int ava1_job_attach(ava1_job_t *j, const uint8_t sid[16]) {
         free_frame(drop);
         drop = f;
     }
-    if (start && ava1_thread_start(feed_main, j, &j->feeder) != 0) {
+    if (start && (ava1_data_test_feeder_fail || ava1_thread_start(feed_main, j, &j->feeder) != 0)) {
         pthread_mutex_lock(&j->cmu);
         j->feeder_started = 0;
         pthread_mutex_unlock(&j->cmu);
+        /* The caller answers the session with BUSY: the job must not stay attached to a
+         * session its sender believes never opened it. */
+        ava1_job_park(j);
         return -1;
     }
     return 0;
 }
 
-/* The credit a JobOpenAck grants: the sender may have this many lane bytes outstanding. */
-static void grant(ava1_job_t *j, uint64_t credit) {
-    pthread_mutex_lock(&j->cmu);
-    j->w_avail = credit;
-    if (credit > j->w_grant) j->w_grant = credit;
-    pthread_mutex_unlock(&j->cmu);
-}
-
 /* ---- JobOpen ----------------------------------------------------------------------- */
 
 static pthread_mutex_t g_open_mu = PTHREAD_MUTEX_INITIALIZER; /* one ava1_recv_open at a time */
+
+/* A JobOpen in progress and the control frames for its job that arrived meanwhile: they
+ * are applied after it, in order, by its thread. */
+typedef struct opening_t {
+    int used;
+    int refused; /* a pipelined frame was not queued: open_now refuses the JobOpen */
+    uint16_t refuse_status;
+    char refuse_msg[64];
+    uint8_t id[16], sid[16], peer[32];
+    ava1_inframe_t *head, *tail;
+    size_t bytes;
+} opening_t;
+
+static struct {
+    pthread_mutex_t mu;
+    opening_t o[AVA1_MAX_JOBS];
+} O = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 typedef struct {
     const uint8_t *id;
@@ -487,40 +621,61 @@ static int root_in_use(const uint8_t id[16], const char *root) {
 
 /* Runs on the open thread: the work behind a JobOpen (stat, mkdir, journal replay, thread
  * starts) never runs on a reader. */
-static void open_now(const uint8_t sid[16], const uint8_t peer[32], const uint8_t *body, size_t len) {
-    ava1_job_open_t o;
+static void open_now(opening_t *o, const uint8_t sid[16], const uint8_t peer[32], const uint8_t *body,
+                     size_t len) {
+    ava1_job_open_t q;
     ava1_job_open_ack_t ack;
     char root[AVA1_MAX_PATH + 1], msg[160] = "";
     ava1_job_t *j = NULL;
     if (ava1_data_test_open_delay_ms) ava1_platform_sleep_ms(ava1_data_test_open_delay_ms);
-    if (ava1_job_open_decode(body, len, &o) != 0) return; /* checked by the reader */
+    if (ava1_job_open_decode(body, len, &q) != 0) return; /* checked by the reader */
+    /* A frame pipelined behind this open did not fit the global control cap (or could not
+     * be queued): the open is refused instead of letting a partial conversation through. */
+    if (o) {
+        int refused;
+        uint16_t refuse_status;
+        char refuse_msg[64];
+        pthread_mutex_lock(&O.mu);
+        refused = o->refused;
+        o->refused = 0;
+        refuse_status = o->refuse_status;
+        o->refuse_status = 0;
+        memcpy(refuse_msg, o->refuse_msg, sizeof refuse_msg);
+        o->refuse_msg[0] = 0;
+        pthread_mutex_unlock(&O.mu);
+        if (refused) {
+            refuse_open(sid, q.job_id, refuse_status ? refuse_status : AVA1_ERR_BUSY,
+                        refuse_msg[0] ? refuse_msg : "the job could not be opened");
+            return;
+        }
+    }
     memset(&ack, 0, sizeof ack);
-    memcpy(ack.job_id, o.job_id, 16);
+    memcpy(ack.job_id, q.job_id, 16);
     if (!D.running) {
         ack.status = AVA1_ERR_BUSY;
         snprintf(msg, sizeof msg, "the console is stopping");
-    } else if (o.root_len > AVA1_MAX_PATH || memchr(o.root, 0, o.root_len)) {
+    } else if (q.root_len > AVA1_MAX_PATH || memchr(q.root, 0, q.root_len)) {
         ack.status = AVA1_ERR_PATH;
         snprintf(msg, sizeof msg, "the destination is not a valid path");
-    } else if (o.kind != AVA1_JOB_UPLOAD) { /* Task 18 adds JOB_DOWNLOAD */
+    } else if (q.kind != AVA1_JOB_UPLOAD) { /* Task 18 adds JOB_DOWNLOAD */
         ack.status = AVA1_ERR_PROTOCOL;
         snprintf(msg, sizeof msg, "unknown job kind");
     } else {
         ava1_recv_spec_t s;
         int tries;
-        memcpy(root, o.root, o.root_len);
-        root[o.root_len] = 0;
+        memcpy(root, q.root, q.root_len);
+        root[q.root_len] = 0;
         memset(&s, 0, sizeof s);
-        memcpy(s.id, o.job_id, 16);
+        memcpy(s.id, q.job_id, 16);
         memcpy(s.owner, peer, 32);
-        s.kind = o.kind;
-        s.policy = o.policy;
-        s.flags = o.flags;
+        s.kind = q.kind;
+        s.policy = q.policy;
+        s.flags = q.flags;
         s.root = root;
         s.emit = net_emit;
         s.sid = sid;
         pthread_mutex_lock(&g_open_mu);
-        if (root_in_use(o.job_id, root)) {
+        if (root_in_use(q.job_id, root)) {
             ack.status = AVA1_ERR_BUSY;
             snprintf(msg, sizeof msg, "another transfer is writing to this destination");
         } else {
@@ -528,8 +683,8 @@ static void open_now(const uint8_t sid[16], const uint8_t peer[32], const uint8_
              * parked long enough) is opened again, from its journal. */
             for (tries = 0; tries < 2 && !j; tries++) {
                 j = ava1_recv_open(&s, &ack, msg, sizeof msg);
-                if (j && ava1_job_attach(j, sid) != 0) {
-                    ava1_job_put(j);
+                if (j && ava1_job_attach(j, sid, ack.credit) != 0) {
+                    ava1_job_put(j); /* attached nowhere (ava1_job_attach parked it) */
                     j = NULL;
                     ack.status = AVA1_ERR_BUSY;
                     snprintf(msg, sizeof msg, "the job could not be attached");
@@ -537,28 +692,24 @@ static void open_now(const uint8_t sid[16], const uint8_t peer[32], const uint8_
                     break;
                 }
             }
-            if (j) grant(j, ack.credit);
         }
         pthread_mutex_unlock(&g_open_mu);
     }
-    if (send_ack(sid, &ack, j ? "" : msg, 0) == AVA1_E_CLOSED && j)
+    /* Any send failure means the session is gone or breaking: a job left attached to it
+     * would never be reached (and never reaped), so park it. */
+    if ((ava1_data_test_ack_fail ? ava1_data_test_ack_fail : send_ack(sid, &ack, j ? "" : msg, 0)) != 0 && j)
         ava1_job_park_session(sid); /* the session ended while we opened: on_session_end missed it */
     if (j) ava1_job_put(j);
 }
 
-/* A JobOpen in progress and the control frames for its job that arrived meanwhile: they
- * are applied after it, in order, by its thread. */
-typedef struct {
-    int used;
-    uint8_t id[16], sid[16], peer[32];
-    ava1_inframe_t *head, *tail;
-    size_t bytes;
-} opening_t;
+/* ---- control frames ---------------------------------------------------------------- */
 
-static struct {
-    pthread_mutex_t mu;
-    opening_t o[AVA1_MAX_JOBS];
-} O = { .mu = PTHREAD_MUTEX_INITIALIZER };
+static void *cancel_main(void *arg) {
+    ava1_job_t *j = arg;
+    ava1_recv_cancel(j); /* stops it (the journal stays); may join its threads */
+    ava1_job_put(j);
+    return NULL;
+}
 
 static int route(const uint8_t sid[16], const uint8_t peer[32], uint8_t type, const uint8_t *body, size_t len);
 
@@ -580,18 +731,25 @@ static void *open_main(void *arg) {
         }
         pthread_mutex_unlock(&O.mu);
         if (!f) break;
-        if (f->type == AVA1_TYPE_JOB_OPEN) open_now(sid, peer, f->body, f->len);
+        if (f->type == AVA1_TYPE_JOB_OPEN) open_now(o, sid, peer, f->body, f->len);
         else (void)route(sid, peer, f->type, f->body, f->len);
+        ava1_ctl_give(f->len); /* no longer queued: the global control cap */
         free_frame(f);
     }
     return NULL;
 }
 
-/* Caller holds O.mu. */
+/* Caller holds O.mu. 0, -1 = no memory, -2 = past the global control cap (or the queue's
+ * own bound). On -2 nothing was charged. */
 static int open_append(opening_t *o, uint8_t type, const uint8_t *body, size_t len) {
     ava1_inframe_t *f;
-    if (o->bytes + len > OPEN_MAX || !(f = calloc(1, sizeof *f))) return -1;
+    if (o->bytes + len > OPEN_MAX || ava1_ctl_take(len) != 0) return -2;
+    if (!(f = calloc(1, sizeof *f))) {
+        ava1_ctl_give(len);
+        return -1;
+    }
     if (!(f->body = malloc(len ? len : 1))) {
+        ava1_ctl_give(len);
         free(f);
         return -1;
     }
@@ -607,13 +765,6 @@ static int open_append(opening_t *o, uint8_t type, const uint8_t *body, size_t l
 
 /* ---- control frames ---------------------------------------------------------------- */
 
-static void *cancel_main(void *arg) {
-    ava1_job_t *j = arg;
-    ava1_recv_cancel(j); /* stops it (the journal stays); may join its threads */
-    ava1_job_put(j);
-    return NULL;
-}
-
 /* A control frame for an existing job (any thread; it never waits on the job). */
 static int route(const uint8_t sid[16], const uint8_t peer[32], uint8_t type, const uint8_t *body, size_t len) {
     ava1_job_t *j = ava1_job_find(body);
@@ -628,14 +779,17 @@ static int route(const uint8_t sid[16], const uint8_t peer[32], uint8_t type, co
         return 0;
     }
     if (j->on_frame) { /* a sender job (Task 18): the receiving peer's acks and map */
-        if (type == AVA1_TYPE_RESUME) (void)ava1_job_attach(j, sid);
+        if (type == AVA1_TYPE_RESUME) (void)ava1_job_attach(j, sid, 0);
         rc = j->on_frame(j, type, body, len);
         ava1_job_put_nowait(j);
         return rc;
     }
     switch (type) {
     case AVA1_TYPE_RESUME:
-        if (ava1_job_attach(j, sid) != 0) post_unknown_map(sid, body);
+        /* ava1_job_attach uses ava1_job_attach_sid: the in-hand equivalent of
+         * ava1_job_find_attach (the same listed check under the same lock), since this
+         * frame already holds the job's reference. */
+        if (ava1_job_attach(j, sid, 0) != 0) post_unknown_map(sid, body);
         else inbox_add(j, type, body, len);
         break;
     case AVA1_TYPE_JOB_CANCEL:
@@ -643,9 +797,17 @@ static int route(const uint8_t sid[16], const uint8_t peer[32], uint8_t type, co
         break;
     case AVA1_TYPE_MANIFEST_PAGE:
     case AVA1_TYPE_MANIFEST_END:
-    case AVA1_TYPE_FILE_ROOT:
-        inbox_add(j, type, body, len);
+    case AVA1_TYPE_FILE_ROOT: {
+        /* Only the session the job is attached to may feed it: another session's
+         * pipelined pages (say, after a refused open for another destination) must not
+         * reach this job's manifest. */
+        int mine;
+        pthread_mutex_lock(&j->cmu);
+        mine = j->attached && memcmp(j->sid, sid, 16) == 0;
+        pthread_mutex_unlock(&j->cmu);
+        if (mine) inbox_add(j, type, body, len);
         break;
+    }
     default:
         break; /* nothing else is for a receiver */
     }
@@ -685,7 +847,16 @@ static int data_on_control(const uint8_t sid[16], const uint8_t peer[32], uint8_
     for (i = 0; i < AVA1_MAX_JOBS; i++) {
         opening_t *o = &O.o[i];
         if (o->used && memcmp(o->id, body, 16) == 0 && memcmp(o->sid, sid, 16) == 0) {
-            rc = open_append(o, type, body, len) != 0; /* a sender that floods an opening job */
+            rc = open_append(o, type, body, len);
+            if (rc == -2) { /* the global control cap: the open itself will be refused BUSY */
+                o->refused = 1;
+                o->refuse_status = AVA1_ERR_BUSY;
+                snprintf(o->refuse_msg, sizeof o->refuse_msg, "too many control messages are queued");
+            } else if (rc == -1) { /* no memory for a pipelined frame: refused INTERNAL */
+                o->refused = 1;
+                o->refuse_status = AVA1_ERR_INTERNAL;
+                snprintf(o->refuse_msg, sizeof o->refuse_msg, "out of memory");
+            }
             queued = 1;
             break;
         }
@@ -701,15 +872,20 @@ static int data_on_control(const uint8_t sid[16], const uint8_t peer[32], uint8_
         memcpy(O.o[slot].id, body, 16);
         memcpy(O.o[slot].sid, sid, 16);
         memcpy(O.o[slot].peer, peer, 32);
-        if (open_append(&O.o[slot], type, body, len) != 0) {
+        rc = open_append(&O.o[slot], type, body, len);
+        if (rc != 0) {
             pthread_mutex_unlock(&O.mu);
-            refuse_open(sid, body, AVA1_ERR_INTERNAL, "out of memory");
+            refuse_open(sid, body, rc == -2 ? AVA1_ERR_BUSY : AVA1_ERR_INTERNAL,
+                        rc == -2 ? "too many control messages are queued" : "out of memory");
             return 0;
         }
         O.o[slot].used = 1;
         pthread_mutex_unlock(&O.mu);
         if (ava1_data_spawn(open_main, &O.o[slot]) != 0) {
+            size_t give;
             pthread_mutex_lock(&O.mu);
+            give = O.o[slot].bytes;
+            O.o[slot].bytes = 0;
             while (O.o[slot].head) {
                 ava1_inframe_t *f = O.o[slot].head;
                 O.o[slot].head = f->next;
@@ -717,12 +893,13 @@ static int data_on_control(const uint8_t sid[16], const uint8_t peer[32], uint8_
             }
             O.o[slot].used = 0;
             pthread_mutex_unlock(&O.mu);
+            if (give) ava1_ctl_give(give);
             refuse_open(sid, body, AVA1_ERR_INTERNAL, "cannot start a thread");
         }
         return 0;
     }
     pthread_mutex_unlock(&O.mu);
-    if (queued) return rc;
+    if (queued) return 0; /* queued, or the refusal flag is set for the open thread */
     return route(sid, peer, type, body, len);
 }
 
@@ -784,8 +961,22 @@ static int data_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
         return 0; /* a frame for a job that is gone: its credit died with it */
     }
     f = calloc(1, sizeof *f);
+    if (ava1_data_test_lane_alloc_fail) {
+        free(f);
+        f = NULL;
+    }
     pthread_mutex_lock(&j->cmu);
-    take = f && j->attached && memcmp(j->sid, sid, 16) == 0 && !j->on_frame;
+    if (!f) {
+        /* No memory for the frame after Received went out: the job cannot recover the
+         * frame, so it ends (the feeder records the failure: readers never take j->mu). */
+        j->in_oom = 1;
+        pthread_cond_broadcast(&j->ccv);
+        pthread_mutex_unlock(&j->cmu);
+        free(body);
+        ava1_job_put_nowait(j);
+        return 0;
+    }
+    take = j->attached && memcmp(j->sid, sid, 16) == 0 && !j->on_frame;
     if (take && len > j->w_avail) {
         over = 1;
         take = 0;
