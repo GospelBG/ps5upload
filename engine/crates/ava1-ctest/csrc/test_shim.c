@@ -8,13 +8,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include "ava1_apply.h"
 #include "ava1_conn.h"
 #include "ava1_data.h"
 #include "ava1_platform.h"
 
 #include "ava1_gen.h"
+#include "ava1_job.h"
 #include "ava1_journal.h"
 #include "ava1_manifest.h"
 #include "ava1_ranges.h"
@@ -838,4 +841,248 @@ void ava1_test_data_clamp(uint8_t start, uint8_t min, uint8_t max, int out[5]) {
     out[2] = ava1_data_cfg()->workers_max;
     out[3] = ava1_data_start(&c);
     ava1_data_stop();
+}
+
+/* ---- the apply engine on a hand-built job (Task 12) ------------------------------ */
+/* One apply job at a time: the Rust side (CApplyJob) holds the shared C server lock. */
+
+static pthread_mutex_t g_ev_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_ev[1 << 16];
+static size_t g_ev_len;
+static int g_ev_done; /* the recorder has seen JOB_DONE */
+static int g_same_device = 1;
+static ava1_job_t *g_job;
+static const uint8_t TEST_JOB[16] = { 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 };
+static const uint8_t TEST_OWNER[32] = { 1 };
+
+/* Read by the data layer's same_device hook from the job's threads. */
+void ava1_test_set_same_device(int v) { __atomic_store_n(&g_same_device, v, __ATOMIC_SEQ_CST); }
+static int t_same_device(const char *a, const char *b) {
+    (void)a;
+    (void)b;
+    return __atomic_load_n(&g_same_device, __ATOMIC_SEQ_CST);
+}
+static int t_allow(const char *p) {
+    (void)p;
+    return 1;
+}
+static int t_allow_read(const char *p, int u) {
+    (void)p;
+    (void)u;
+    return 1;
+}
+
+static void ev_add(const char *s, int done) {
+    size_t n = strlen(s);
+    pthread_mutex_lock(&g_ev_mu);
+    if (g_ev_len + n < sizeof g_ev) {
+        memcpy(g_ev + g_ev_len, s, n);
+        g_ev_len += n;
+    }
+    if (done) g_ev_done = 1;
+    pthread_mutex_unlock(&g_ev_mu);
+}
+
+static void rec_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len) {
+    char line[256];
+    (void)j;
+    (void)flags;
+    if (type == AVA1_TYPE_DURABLE) {
+        ava1_durable_t d;
+        ava1_r_t it;
+        ava1_file_run_t r;
+        size_t at;
+        if (ava1_durable_decode(body, len, &d) != 0) return;
+        snprintf(line, sizeof line, "durable files=");
+        at = strlen(line);
+        ava1_r_init(&it, d.files, d.files_len);
+        while (ava1_file_run_next(&it, &r) == 1 && at < sizeof line - 24)
+            at += (size_t)snprintf(line + at, sizeof line - at, "%u+%u,", r.first, r.count);
+        snprintf(line + at, sizeof line - at, " ranges=%u\n", d.ranges_count);
+        ev_add(line, 0);
+    } else if (type == AVA1_TYPE_FILE_RETRY) {
+        ava1_file_retry_t r;
+        if (ava1_file_retry_decode(body, len, &r) != 0) return;
+        snprintf(line, sizeof line, "retry %u %u\n", r.file_id, r.reason);
+        ev_add(line, 0);
+    } else if (type == AVA1_TYPE_JOB_DONE) {
+        ava1_job_done_t d;
+        if (ava1_job_done_decode(body, len, &d) != 0) return;
+        snprintf(line, sizeof line, "done %u\n", d.status);
+        ev_add(line, 1);
+    }
+}
+
+static void mkdir_p(const char *p) {
+    char b[1200];
+    size_t i;
+    snprintf(b, sizeof b, "%s", p);
+    for (i = 1; b[i]; i++)
+        if (b[i] == '/') {
+            b[i] = 0;
+            (void)mkdir(b, 0755);
+            b[i] = '/';
+        }
+    (void)mkdir(b, 0755);
+}
+
+/* 0, or a negative step; on failure everything begin set up is torn down again. */
+int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags, const uint8_t *blob, size_t len,
+                          uint32_t fsync_delay_us, int crash_at) {
+    ava1_data_cfg_t cfg;
+    ava1_jnl_open_t o;
+    struct stat st;
+    uint32_t i;
+    int rc = 0;
+    ava1_test_set_same_device(1); /* a test that died mid-way must not leak its override */
+    memset(&cfg, 0, sizeof cfg);
+    snprintf(cfg.jobs_dir, sizeof cfg.jobs_dir, "%s", jobs_dir);
+    cfg.may_write = t_allow;
+    cfg.may_read = t_allow_read;
+    cfg.same_device = t_same_device;
+    cfg.fsync_delay_us = fsync_delay_us;
+    cfg.crash_at = crash_at;
+    if (ava1_data_start(&cfg) != 0) return -1;
+    pthread_mutex_lock(&g_ev_mu);
+    g_ev_len = 0;
+    g_ev_done = 0;
+    pthread_mutex_unlock(&g_ev_mu);
+    g_job = ava1_job_create(TEST_JOB, TEST_OWNER);
+    if (!g_job) {
+        ava1_data_stop();
+        return -2;
+    }
+    g_job->kind = AVA1_JOB_UPLOAD;
+    g_job->flags = flags;
+    snprintf(g_job->root, sizeof g_job->root, "%s", root);
+    /* Staging is decided here, once: a root that appears later must not be moved over. */
+    g_job->staged = !(flags & AVA1_JF_SINGLE_FILE) && stat(root, &st) != 0;
+    snprintf(g_job->base, sizeof g_job->base, "%s%s", root, g_job->staged ? ".ava-part" : "");
+    mkdir_p(jobs_dir);
+    ava1_job_dir(jobs_dir, TEST_JOB, g_job->dir, sizeof g_job->dir);
+    mkdir_p(g_job->dir);
+    if (ava1_mstore_from_blob(&g_job->m, blob, len) != 0) {
+        rc = -3;
+        goto fail;
+    }
+    ava1_mstore_hash(&g_job->m, g_job->manifest_hash);
+    if (ava1_bits_init(&g_job->done, g_job->m.n) != 0) {
+        rc = -4;
+        goto fail;
+    }
+    g_job->lf = calloc(g_job->m.n + 1, sizeof *g_job->lf);
+    if (!g_job->lf) {
+        rc = -4;
+        goto fail;
+    }
+    if (!(flags & AVA1_JF_SINGLE_FILE)) {
+        mkdir_p(g_job->base);
+        for (i = 0; i < g_job->m.n; i++)
+            if (g_job->m.e[i].kind == AVA1_ENTRY_DIR) {
+                char p[1200];
+                const char *rel = ava1_mstore_path(&g_job->m, i);
+                snprintf(p, sizeof p, "%s/%s", g_job->base, rel ? rel : "");
+                mkdir_p(p);
+            }
+    }
+    memset(&o, 0, sizeof o);
+    memcpy(o.job_id, TEST_JOB, 16);
+    memcpy(o.manifest_hash, g_job->manifest_hash, 32);
+    o.kind = AVA1_JOB_UPLOAD;
+    o.flags = flags;
+    o.staged = (uint8_t)g_job->staged;
+    o.root = (const uint8_t *)root;
+    o.root_len = (uint16_t)strlen(root);
+    if (ava1_jnl_create(&g_job->jnl, g_job->dir, &o) != 0) {
+        rc = -5;
+        goto fail;
+    }
+    g_job->credit = 1ull << 32;
+    g_job->emit = rec_emit;
+    g_job->prepared = 1;
+    if (ava1_apply_start(g_job) != 0) {
+        rc = -6;
+        goto fail;
+    }
+    return 0;
+fail:
+    ava1_job_put(g_job);
+    g_job = NULL;
+    ava1_data_stop();
+    return rc;
+}
+
+int ava1_test_apply_chunk(uint32_t id, uint64_t off, const uint8_t *d, size_t len) {
+    uint8_t *own = malloc(len ? len : 1);
+    if (!own) return -1;
+    memcpy(own, d, len);
+    if (ava1_apply_reserve(g_job, len) != 0) {
+        free(own);
+        return -2;
+    }
+    return ava1_apply_chunk(g_job, own, len, id, off, own, len);
+}
+
+int ava1_test_apply_record(uint32_t id, const uint8_t *d, size_t len, const uint8_t root[32]) {
+    ava1_bundle_record_t r;
+    ava1_bundle_t b;
+    size_t cap = len + 128;
+    uint8_t *own = malloc(cap);
+    ava1_w_t w;
+    if (!own) return -1;
+    memset(&r, 0, sizeof r);
+    r.file_id = id;
+    memcpy(r.root, root, 32);
+    r.data = d;
+    r.data_len = (uint32_t)len;
+    ava1_w_init(&w, own, cap);
+    if (ava1_bundle_record_append(&w, &r) != 0) {
+        free(own);
+        return -2;
+    }
+    memset(&b, 0, sizeof b);
+    b.records = own;
+    b.records_len = (uint32_t)w.len;
+    if (ava1_apply_reserve(g_job, cap) != 0) {
+        free(own);
+        return -3;
+    }
+    return ava1_apply_bundle(g_job, own, cap, &b);
+}
+
+int ava1_test_apply_root(uint32_t id, const uint8_t root[32]) { return ava1_apply_root(g_job, id, root); }
+
+/* The final status, once the job is finished AND its JobDone has been recorded
+ * (ava1_apply_fail sets `finished` before it journals Done and emits). -1 on timeout. */
+int ava1_test_apply_wait(uint32_t timeout_ms) {
+    uint64_t t0 = ava1_mono_ms();
+    while (ava1_mono_ms() - t0 < timeout_ms) {
+        int fin, st, seen;
+        pthread_mutex_lock(&g_job->mu);
+        fin = g_job->finished;
+        st = g_job->final_status;
+        pthread_mutex_unlock(&g_job->mu);
+        pthread_mutex_lock(&g_ev_mu);
+        seen = g_ev_done;
+        pthread_mutex_unlock(&g_ev_mu);
+        if (fin && seen) return st;
+        ava1_platform_sleep_ms(10);
+    }
+    return -1;
+}
+
+size_t ava1_test_apply_events(char *out, size_t cap) {
+    size_t n;
+    pthread_mutex_lock(&g_ev_mu);
+    n = g_ev_len < cap ? g_ev_len : cap;
+    memcpy(out, g_ev, n);
+    pthread_mutex_unlock(&g_ev_mu);
+    return n;
+}
+
+void ava1_test_apply_end(void) {
+    if (g_job) ava1_job_put(g_job);
+    g_job = NULL;
+    ava1_data_stop();
+    ava1_test_set_same_device(1);
 }

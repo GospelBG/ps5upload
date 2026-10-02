@@ -290,6 +290,22 @@ pub mod ffi {
         ) -> c_int;
         pub fn ava1_test_page_next(out: *mut i64);
         pub fn ava1_test_data_clamp(start: u8, min: u8, max: u8, out: *mut c_int);
+        pub fn ava1_test_set_same_device(v: c_int);
+        pub fn ava1_test_apply_begin(
+            jobs: *const c_char,
+            root: *const c_char,
+            flags: u32,
+            blob: *const u8,
+            len: usize,
+            fsync_delay_us: u32,
+            crash_at: c_int,
+        ) -> c_int;
+        pub fn ava1_test_apply_chunk(id: u32, off: u64, d: *const u8, len: usize) -> c_int;
+        pub fn ava1_test_apply_record(id: u32, d: *const u8, len: usize, root: *const u8) -> c_int;
+        pub fn ava1_test_apply_root(id: u32, root: *const u8) -> c_int;
+        pub fn ava1_test_apply_wait(timeout_ms: u32) -> c_int;
+        pub fn ava1_test_apply_events(out: *mut u8, cap: usize) -> usize;
+        pub fn ava1_test_apply_end();
     }
 }
 
@@ -847,4 +863,116 @@ pub fn c_data_clamp(start: u8, min: u8, max: u8) -> ([i32; 3], i32, i32) {
     let mut o = [0i32; 5];
     unsafe { ffi::ava1_test_data_clamp(start, min, max, o.as_mut_ptr()) };
     ([o[0], o[1], o[2]], o[3], o[4])
+}
+
+thread_local! {
+    /// The same_device answer the next `CApplyJob::begin` on this thread installs.
+    static SAME_DEVICE: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
+}
+
+/// What the data layer's same_device hook answers for the next apply job begun on this
+/// thread (1 same, 0 crosses, -1 unknown). It is installed under the C server lock by
+/// `CApplyJob::begin` and cleared when that job ends, so it cannot reach a job another
+/// test is running.
+pub fn c_set_same_device(v: i32) {
+    SAME_DEVICE.with(|c| c.set(v));
+}
+
+/// The payload's apply engine on a hand-built job (one at a time: it shares the C
+/// server lock, since both use the data layer's globals).
+pub struct CApplyJob {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl CApplyJob {
+    pub fn begin(
+        jobs: &Path,
+        root: &Path,
+        flags: u32,
+        m: &ava1::manifest::Manifest,
+        fsync_delay_us: u32,
+    ) -> Self {
+        Self::begin_crash(jobs, root, flags, m, fsync_delay_us, 0)
+    }
+
+    pub fn begin_crash(
+        jobs: &Path,
+        root: &Path,
+        flags: u32,
+        m: &ava1::manifest::Manifest,
+        fsync_delay_us: u32,
+        crash_at: i32,
+    ) -> Self {
+        let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ava1-blob-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        ava1::journal::write_manifest(&dir, m).unwrap();
+        let blob = std::fs::read(dir.join("manifest")).unwrap();
+        let (j, r) = (
+            CString::new(jobs.to_str().unwrap()).unwrap(),
+            CString::new(root.to_str().unwrap()).unwrap(),
+        );
+        let rc = unsafe {
+            ffi::ava1_test_apply_begin(
+                j.as_ptr(),
+                r.as_ptr(),
+                flags,
+                blob.as_ptr(),
+                blob.len(),
+                fsync_delay_us,
+                crash_at,
+            )
+        };
+        assert_eq!(rc, 0, "apply_begin");
+        // begin reset the hook to "same"; install this thread's answer before any data.
+        let v = SAME_DEVICE.with(|c| c.replace(1));
+        unsafe { ffi::ava1_test_set_same_device(v) };
+        CApplyJob { _lock: lock }
+    }
+
+    pub fn chunk(&self, id: u32, off: u64, d: &[u8]) {
+        assert_eq!(
+            unsafe { ffi::ava1_test_apply_chunk(id, off, d.as_ptr(), d.len()) },
+            0
+        );
+    }
+
+    pub fn record(&self, id: u32, d: &[u8], root: [u8; 32]) {
+        assert_eq!(
+            unsafe { ffi::ava1_test_apply_record(id, d.as_ptr(), d.len(), root.as_ptr()) },
+            0
+        );
+    }
+
+    pub fn root(&self, id: u32, root: [u8; 32]) {
+        assert_eq!(unsafe { ffi::ava1_test_apply_root(id, root.as_ptr()) }, 0);
+    }
+
+    pub fn wait(&self, ms: u32) -> i32 {
+        unsafe { ffi::ava1_test_apply_wait(ms) }
+    }
+
+    pub fn events(&self) -> String {
+        let mut b = vec![0u8; 1 << 16];
+        let n = unsafe { ffi::ava1_test_apply_events(b.as_mut_ptr(), b.len()) };
+        String::from_utf8_lossy(&b[..n]).into_owned()
+    }
+
+    pub fn wait_event(&self, needle: &str, ms: u64) {
+        let t = std::time::Instant::now();
+        while !self.events().contains(needle) {
+            assert!(
+                t.elapsed().as_millis() < ms as u128,
+                "no {needle:?} in {}",
+                self.events()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for CApplyJob {
+    fn drop(&mut self) {
+        unsafe { ffi::ava1_test_apply_end() }
+    }
 }
