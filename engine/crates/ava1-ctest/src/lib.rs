@@ -212,6 +212,19 @@ pub mod ffi {
             out_len: *mut usize,
             count: *mut u32,
         ) -> c_int;
+        pub fn ava1_test_rset_after(
+            ops: *const u64,
+            nops: usize,
+            out: *mut u64,
+            cap: usize,
+        ) -> usize;
+        pub fn ava1_test_bits_runs(
+            n: u32,
+            set: *const u32,
+            nset: usize,
+            out: *mut u32,
+            cap: usize,
+        ) -> usize;
     }
 }
 
@@ -556,4 +569,21 @@ pub fn c_peers_load(path: &Path, key: &[u8; 32]) -> (i32, bool) {
 /// with AVA1_E_BUSY and breaks the connection. 0 = ok, negative = which check failed.
 pub fn c_post_queue(key: [u8; 32]) -> i32 {
     unsafe { ffi::ava1_test_post_queue(key.as_ptr()) }
+}
+
+pub fn c_rset_after(ops: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let flat: Vec<u64> = ops.iter().flat_map(|(s, e)| [*s, *e]).collect();
+    let mut out = vec![0u64; 2 * ops.len() + 2];
+    let n = unsafe {
+        ffi::ava1_test_rset_after(flat.as_ptr(), ops.len(), out.as_mut_ptr(), ops.len() + 1)
+    };
+    out.chunks(2).take(n).map(|p| (p[0], p[1])).collect()
+}
+
+pub fn c_bits_runs(n: u32, set: &[u32]) -> Vec<(u32, u32)> {
+    let mut out = vec![0u32; 2 * (n as usize + 1)];
+    let k = unsafe {
+        ffi::ava1_test_bits_runs(n, set.as_ptr(), set.len(), out.as_mut_ptr(), n as usize + 1)
+    };
+    out.chunks(2).take(k).map(|p| (p[0], p[1])).collect()
 }

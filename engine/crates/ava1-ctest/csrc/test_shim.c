@@ -10,6 +10,7 @@
 #include "ava1_platform.h"
 
 #include "ava1_gen.h"
+#include "ava1_ranges.h"
 #include "ava1_server.h"
 
 static uint32_t g_pair_requests, g_last_code, g_logs;
@@ -385,4 +386,42 @@ bound_out:
     close(sv[0]);
     close(sv[1]);
     return rc;
+}
+
+/* Applies ops[2i]..ops[2i+1] and writes the resulting pairs to out; returns pair count. */
+size_t ava1_test_rset_after(const uint64_t *ops, size_t nops, uint64_t *out, size_t cap_pairs) {
+    ava1_rset_t r;
+    size_t i, n;
+    memset(&r, 0, sizeof r);
+    for (i = 0; i < nops; i++) (void)ava1_rset_add(&r, ops[2 * i], ops[2 * i + 1]);
+    n = r.n < cap_pairs ? r.n : cap_pairs;
+    memcpy(out, r.v, n * 2 * sizeof *out);
+    ava1_rset_clear(&r);
+    return n;
+}
+
+/* FileRun pairs (first, count) for the given set bits; returns pair count. */
+size_t ava1_test_bits_runs(uint32_t n, const uint32_t *set, size_t nset, uint32_t *out, size_t cap_pairs) {
+    ava1_bits_t b;
+    ava1_w_t w;
+    ava1_r_t it;
+    ava1_file_run_t r;
+    uint8_t *blob = malloc(16 + 16 * (size_t)n);
+    size_t i, k = 0;
+    if (!blob || ava1_bits_init(&b, n) != 0) {
+        free(blob);
+        return 0;
+    }
+    for (i = 0; i < nset; i++) ava1_bits_set(&b, set[i]);
+    ava1_w_init(&w, blob, 16 + 16 * (size_t)n);
+    (void)ava1_bits_append_runs(&b, &w);
+    ava1_r_init(&it, blob, w.len);
+    while (k < cap_pairs && ava1_file_run_next(&it, &r) == 1) {
+        out[2 * k] = r.first;
+        out[2 * k + 1] = r.count;
+        k++;
+    }
+    ava1_bits_free(&b);
+    free(blob);
+    return k;
 }

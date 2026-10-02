@@ -12,6 +12,7 @@ pub mod launch;
 mod link;
 pub mod manifest;
 pub mod peers;
+pub mod ranges;
 pub mod router;
 pub mod server;
 pub mod session;
