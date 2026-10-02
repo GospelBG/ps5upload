@@ -157,15 +157,20 @@ impl Router {
     pub fn register(&self, job: JobId) -> Inbox {
         let (data, rx) = mpsc::channel(DELIVER_DEPTH);
         let (events, erx) = mpsc::unbounded_channel();
-        if let Some(why) = self.closed.lock().unwrap().clone() {
-            let _ = events.send(Inbound::Closed(why));
-        }
-        // Lanes, then jobs — the same order every other method takes them, and both held
-        // across the snapshot and the insert so a lane that comes up now is either in the
-        // snapshot or in a broadcast that finds this inbox, never in neither.
+        // Lanes, then jobs — the same order every other method takes them — and the closed
+        // check happens inside `lanes`, because `close` sets its flag *before* it takes
+        // `lanes`: whatever it does with lanes happens after the flag, so an inbox that
+        // checks the flag while holding lanes either sees it, or its snapshot precedes the
+        // clear and the broadcast that follows finds this inbox. A check outside the lock
+        // could miss both and leave the job waiting on a session that is gone.
         let lanes = self.lanes.lock().unwrap();
-        for id in lanes.keys() {
-            let _ = events.send(Inbound::LaneUp(*id));
+        let closed = self.closed.lock().unwrap().clone();
+        if let Some(why) = closed {
+            let _ = events.send(Inbound::Closed(why));
+        } else {
+            for id in lanes.keys() {
+                let _ = events.send(Inbound::LaneUp(*id));
+            }
         }
         let id = Arc::new(());
         let inbox = JobInbox {
@@ -232,14 +237,14 @@ impl Router {
 
     pub(crate) fn lane_up(&self, id: u16, outbox: Outbox) -> u64 {
         let gen = self.next_gen.fetch_add(1, Ordering::Relaxed) + 1;
-        // A lane that comes up as the session ends is nobody's: the job has already been
-        // told the session closed, and that message is terminal.
-        if self.closed.lock().unwrap().is_some() {
+        // Lanes, then jobs (see `register`), and the closed check under `lanes` for the same
+        // reason: a lane that comes up as the session ends is nobody's — the job has already
+        // been told the session closed, and that message is terminal.
+        let mut lanes = self.lanes.lock().unwrap();
+        let closed = self.closed.lock().unwrap().is_some();
+        if closed {
             return gen;
         }
-        // Lanes, then jobs (see `register`): the broadcast must not miss an inbox that is
-        // registering at this instant.
-        let mut lanes = self.lanes.lock().unwrap();
         lanes.insert(
             id,
             LaneTx {
@@ -460,5 +465,40 @@ mod tests {
                 .is_err(),
             "a lane came up after the session ended"
         );
+    }
+
+    #[tokio::test]
+    async fn a_registration_that_races_close_still_hears_it() {
+        // `close` sets its flag before it takes `lanes`, and `register` checks the flag
+        // *under* `lanes`: an inbox that reaches the insert while the router closes in
+        // between must still be told, or its job waits on a session that is gone forever.
+        // The test holds `lanes` so the register thread reads the flag (still open), then
+        // sets it and lets go — the exact interleaving a check outside the lock misses.
+        let router = Arc::new(Router::default());
+        let held = router.lanes.lock().unwrap();
+        let r = router.clone();
+        let t = std::thread::spawn(move || r.register([11; 16]));
+        std::thread::sleep(Duration::from_millis(50));
+        *router.closed.lock().unwrap() = Some("done".into());
+        drop(held);
+        let mut inbox = t.join().unwrap();
+        let ev = timeout(Duration::from_secs(1), inbox.recv())
+            .await
+            .expect("a closed router told the new job");
+        assert!(matches!(ev, Some(Inbound::Closed(why)) if why == "done"));
+    }
+
+    #[tokio::test]
+    async fn a_lane_that_lands_while_the_session_is_closing_is_not_kept() {
+        let router = Arc::new(Router::default());
+        let ob = outbox();
+        let held = router.lanes.lock().unwrap();
+        let r = router.clone();
+        let t = std::thread::spawn(move || r.lane_up(3, ob));
+        std::thread::sleep(Duration::from_millis(50));
+        *router.closed.lock().unwrap() = Some("done".into());
+        drop(held);
+        t.join().unwrap();
+        assert!(router.lanes().is_empty(), "a closed router kept a lane");
     }
 }

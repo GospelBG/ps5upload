@@ -801,6 +801,9 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     memset(&si, 0, sizeof si);
     si.version = AVA1_PROTOCOL_VERSION;
     si.caps = S.cfg.caps;
+    /* A server without data hooks cannot serve the data plane, whatever the caller asked
+     * for: the caps are what a client is entitled to rely on. */
+    if (!S.cfg.data) si.caps &= ~AVA1_CAP_DATA_PLANE;
     memcpy(si.session_id, sid, 16);
     si.has_name = 1;
     si.name = (const uint8_t *)S.cfg.name;

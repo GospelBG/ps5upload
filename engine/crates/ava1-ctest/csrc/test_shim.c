@@ -85,6 +85,10 @@ int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, con
         memcpy(cfg.launch_key, o->launch_key, 32);
         memcpy(cfg.launch_token, o->launch_token, 16);
     }
+    /* Deliberately asks for the data-plane cap with no hooks — a mistaken embedder. The
+     * server must mask it off; `a_server_without_hooks_advertises_no_data_plane_cap`
+     * pins that. */
+    cfg.caps = AVA1_CAP_DATA_PLANE;
     cfg.on_pair_request = on_pair;
     cfg.log = on_log;
     cfg.rpc = rpc;
@@ -300,7 +304,7 @@ int ava1_test_post_queue(const uint8_t key[32]) {
     uint8_t type, flags;
     uint32_t ch;
     size_t n;
-    unsigned i;
+    unsigned i, tries;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -100;
     ava1_conn_init(&c, sv[0]);
     ava1_conn_init(&peer, sv[1]);
@@ -350,12 +354,19 @@ out:
         rc = -105;
         goto bound_out;
     }
-    for (;;) {
+    /* The queue's writer pops under qmu and only then waits for wmu, so wait (bounded, in
+     * case the thread is starved) until it has taken that first frame: parked on wmu, it
+     * cannot free more room. */
+    for (tries = 0; tries < 5000; tries++) {
         pthread_mutex_lock(&c.qmu);
         n = c.q_n;
         pthread_mutex_unlock(&c.qmu);
         if (!n) break;
         ava1_platform_sleep_ms(1);
+    }
+    if (n) {
+        rc = -109; /* the writer never took the frame */
+        goto bound_out;
     }
     for (i = 0; i < AVA1_Q_ENTRIES; i++) {
         memset(body, (int)i, sizeof body);

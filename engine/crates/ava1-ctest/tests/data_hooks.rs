@@ -27,6 +27,21 @@ async fn next_control(link: &mut JobLink) -> Frame {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_server_without_hooks_advertises_no_data_plane_cap() {
+    // SPEC.md §10: a capability is a promise. The plain test server deliberately asks for
+    // CAP_DATA_PLANE with no data hooks (a mistaken embedder); the server masks it off, so
+    // a client never opens lanes against a server that would close them.
+    let d = dir("hooks-none");
+    let peers = d.join("peers");
+    let (me, mine) = paired_client(&peers);
+    let srv = CServer::start(SECRET, &peers, 5, 100, 500, 500);
+    let s = connect(&srv.addr(), me, mine, "rust", fast())
+        .await
+        .unwrap();
+    assert_eq!(s.peer_caps() & gen::CAP_DATA_PLANE, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_chunk_reaches_the_c_data_hooks_and_is_acknowledged() {
     let d = dir("hooks-up");
     let peers = d.join("peers");
