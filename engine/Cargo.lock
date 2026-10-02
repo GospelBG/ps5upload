@@ -172,6 +172,7 @@ version = "5.41.0"
 dependencies = [
  "ava1-chaos",
  "blake2 0.10.6",
+ "blake3",
  "chacha20poly1305",
  "getrandom 0.4.3",
  "ring",

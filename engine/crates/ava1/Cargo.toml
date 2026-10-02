@@ -8,6 +8,8 @@ license.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "time", "sync", "io-util"] }
 blake2 = "0.10"
+# Manifest hashes (SPEC.md §11.3); pinned by the workspace.
+blake3.workspace = true
 getrandom = "0.4"
 # Frame AEAD: assembly ChaCha20-Poly1305 (NEON on aarch64/armv7, AVX2 on x86-64). Already
 # in the tree through snow and rustls, so it builds for every shipped target.

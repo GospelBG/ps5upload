@@ -10,10 +10,12 @@ pub mod hex;
 pub mod keys;
 pub mod launch;
 mod link;
+pub mod manifest;
 pub mod peers;
 pub mod router;
 pub mod server;
 pub mod session;
+pub mod source;
 pub mod trust;
 pub mod wire;
 
