@@ -44,11 +44,17 @@ static void *house_main(void *arg) {
 }
 
 int ava1_data_start(const ava1_data_cfg_t *cfg) {
+    if (D.running) return -EBUSY; /* one housekeeping thread; a second start changes nothing */
     D.cfg = *cfg;
     if (!D.cfg.budget) D.cfg.budget = 96u << 20;
     if (!D.cfg.workers_start) D.cfg.workers_start = 4;
     if (!D.cfg.workers_min) D.cfg.workers_min = 2;
     if (!D.cfg.workers_max) D.cfg.workers_max = 16;
+    /* job->workers[] holds 16; min <= start <= max */
+    if (D.cfg.workers_max > 16) D.cfg.workers_max = 16;
+    if (D.cfg.workers_min > D.cfg.workers_max) D.cfg.workers_min = D.cfg.workers_max;
+    if (D.cfg.workers_start > D.cfg.workers_max) D.cfg.workers_start = D.cfg.workers_max;
+    if (D.cfg.workers_start < D.cfg.workers_min) D.cfg.workers_start = D.cfg.workers_min;
     if (!D.cfg.cutoff) D.cfg.cutoff = 256u << 10;
     D.budget_free = D.cfg.budget;
     D.running = 1;

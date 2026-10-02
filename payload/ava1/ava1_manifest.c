@@ -38,12 +38,26 @@ static int grow(void **p, size_t elem, uint32_t *cap, uint32_t need) {
     return 0;
 }
 
+int ava1_mstore_reserve(ava1_mstore_t *m, uint32_t n) {
+    if (n > AVA1_MAX_ENTRIES) return AVA1_E_PROTO;
+    if (n > m->cap) {
+        ava1_ment_t *q = realloc(m->e, (size_t)n * sizeof *m->e);
+        if (!q) return AVA1_E_IO;
+        m->e = q;
+        m->cap = n;
+    }
+    return 0;
+}
+
 int ava1_mstore_add(ava1_mstore_t *m, const ava1_manifest_entry_t *w) {
     ava1_ment_t *e;
     if (w->file_id != m->n) return AVA1_E_PROTO;
+    if (m->n >= AVA1_MAX_ENTRIES) return AVA1_E_PROTO;
     if (!ava1_path_ok(w->path, w->path_len)) return AVA1_E_BADPATH;
     if (w->kind != AVA1_ENTRY_FILE && w->kind != AVA1_ENTRY_DIR) return AVA1_E_PROTO;
+    if (w->kind == AVA1_ENTRY_FILE && m->bytes + w->size < m->bytes) return AVA1_E_PROTO;
     if (grow((void **)&m->e, sizeof *m->e, &m->cap, m->n + 1) != 0) return AVA1_E_IO;
+    if (w->has_root && grow((void **)&m->roots, 32, &m->roots_cap, m->nroots + 1) != 0) return AVA1_E_IO;
     while (m->arena_len + w->path_len + 1 > m->arena_cap) {
         size_t c = m->arena_cap ? m->arena_cap * 2 : 65536;
         char *a = realloc(m->arena, c);
@@ -62,8 +76,10 @@ int ava1_mstore_add(ava1_mstore_t *m, const ava1_manifest_entry_t *w) {
     memcpy(m->arena + m->arena_len, w->path, w->path_len);
     m->arena[m->arena_len + w->path_len] = 0;
     m->arena_len += (size_t)w->path_len + 1;
-    e->has_root = (uint8_t)w->has_root;
-    if (w->has_root) memcpy(e->root, w->root, 32);
+    if (w->has_root) {
+        memcpy(m->roots[m->nroots], w->root, 32);
+        e->root_idx = ++m->nroots;
+    }
     if (w->kind == AVA1_ENTRY_FILE) {
         m->files++;
         m->bytes += w->size;
@@ -84,7 +100,9 @@ int ava1_mstore_add_page(ava1_mstore_t *m, const ava1_manifest_page_t *p) {
     return rc;
 }
 
-const char *ava1_mstore_path(const ava1_mstore_t *m, uint32_t id) { return m->arena + m->e[id].path_off; }
+const char *ava1_mstore_path(const ava1_mstore_t *m, uint32_t id) {
+    return id < m->n ? m->arena + m->e[id].path_off : NULL;
+}
 
 static void to_wire(const ava1_mstore_t *m, uint32_t i, ava1_manifest_entry_t *w, int with_root) {
     const ava1_ment_t *e = &m->e[i];
@@ -96,9 +114,9 @@ static void to_wire(const ava1_mstore_t *m, uint32_t i, ava1_manifest_entry_t *w
     w->mtime = e->mtime;
     w->path = (const uint8_t *)ava1_mstore_path(m, i);
     w->path_len = e->path_len;
-    if (with_root && e->has_root) {
+    if (with_root && e->root_idx) {
         w->has_root = 1;
-        memcpy(w->root, e->root, 32);
+        memcpy(w->root, m->roots[e->root_idx - 1], 32);
     }
 }
 
@@ -161,13 +179,14 @@ int ava1_mstore_page(const ava1_mstore_t *m, const uint8_t job[16], uint32_t *ne
     ava1_manifest_page_t p;
     ava1_w_t blob, w;
     uint8_t *b = malloc(AVA1_PAGE_BYTES);
+    uint32_t nx = *next;
     int rc;
     if (!b) return AVA1_E_IO;
     ava1_w_init(&blob, b, AVA1_PAGE_BYTES - 64);
-    while (*next < m->n) {
+    while (nx < m->n) {
         ava1_manifest_entry_t e;
         size_t before = blob.len;
-        to_wire(m, *next, &e, 1);
+        to_wire(m, nx, &e, 1);
         if (ava1_manifest_entry_append(&blob, &e) != 0) {
             if (before == 0) { /* one entry larger than a page cannot happen (paths <= 1 KiB) */
                 free(b);
@@ -177,7 +196,7 @@ int ava1_mstore_page(const ava1_mstore_t *m, const uint8_t job[16], uint32_t *ne
             blob.err = 0;
             break;
         }
-        (*next)++;
+        nx++;
     }
     memset(&p, 0, sizeof p);
     memcpy(p.job_id, job, 16);
@@ -187,6 +206,7 @@ int ava1_mstore_page(const ava1_mstore_t *m, const uint8_t job[16], uint32_t *ne
     rc = ava1_manifest_page_encode(&p, &w);
     *len = w.len;
     free(b);
+    if (rc == 0) *next = nx; /* a page that did not fit `out` consumed nothing */
     return rc;
 }
 
@@ -248,7 +268,7 @@ int ava1_mstore_walk(ava1_mstore_t *m, const char *root) {
         struct dirent *de;
         snprintf(abs, 2 * (AVA1_MAX_PATH + 2) + 512, "%s%s%s", root, *rel ? "/" : "", rel);
         d = opendir(abs);
-        if (!d) rc = -errno;
+        if (!d) rc = AVA1_E_IO;
         while (d && rc == 0 && (de = readdir(d)) != NULL) {
             char child[AVA1_MAX_PATH + 2];
             struct stat st, lst;
@@ -272,7 +292,7 @@ int ava1_mstore_walk(ava1_mstore_t *m, const char *root) {
         struct stat st;
         snprintf(abs, 2 * (AVA1_MAX_PATH + 2) + 512, "%s/%s", root, found.v[i]);
         if (stat(abs, &st) != 0) {
-            rc = -errno;
+            rc = AVA1_E_IO;
             break;
         }
         fill_entry(&w, m->n, found.v[i], &st);
@@ -288,7 +308,7 @@ int ava1_mstore_single(ava1_mstore_t *m, const char *file) {
     struct stat st;
     ava1_manifest_entry_t w;
     const char *name = strrchr(file, '/');
-    if (stat(file, &st) != 0) return -errno;
+    if (stat(file, &st) != 0) return AVA1_E_IO;
     if (!S_ISREG(st.st_mode)) return AVA1_E_BADPATH;
     fill_entry(&w, m->n, name ? name + 1 : file, &st);
     return ava1_mstore_add(m, &w);
@@ -296,6 +316,7 @@ int ava1_mstore_single(ava1_mstore_t *m, const char *file) {
 
 void ava1_mstore_free(ava1_mstore_t *m) {
     free(m->e);
+    free(m->roots);
     free(m->arena);
     memset(m, 0, sizeof *m);
 }

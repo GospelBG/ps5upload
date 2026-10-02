@@ -10,27 +10,33 @@
 #define AVA1_MAX_PATH 1024
 #define AVA1_E_BADPATH (-20)
 #define AVA1_PAGE_BYTES (60u * 1024u)
+#define AVA1_MAX_ENTRIES 4000000u /* refuse `add` past this: bounds a hostile manifest's memory */
 
 typedef struct {
     uint64_t size, mtime;
     uint32_t mode, path_off;
+    uint32_t root_idx; /* 0 = no root, else 1 + index into the store's roots[] */
     uint16_t path_len;
-    uint8_t kind, has_root;
-    uint8_t root[32];
-} ava1_ment_t;
+    uint8_t kind;
+} ava1_ment_t; /* 32 bytes: the 32-byte roots live in a side array, allocated only when set */
 
 typedef struct {
     ava1_ment_t *e;
     uint32_t n, cap, files;
     uint64_t bytes;
+    uint8_t (*roots)[32]; /* only entries that carry a root (verify policy) */
+    uint32_t nroots, roots_cap;
     char *arena; /* NUL-terminated paths */
     size_t arena_len, arena_cap;
 } ava1_mstore_t;
 
 int ava1_path_ok(const uint8_t *p, size_t n);
+/* Room for n entries up front, when the count is known. 0, AVA1_E_PROTO past the cap, AVA1_E_IO. */
+int ava1_mstore_reserve(ava1_mstore_t *m, uint32_t n);
 int ava1_mstore_add(ava1_mstore_t *m, const ava1_manifest_entry_t *e);
 int ava1_mstore_add_page(ava1_mstore_t *m, const ava1_manifest_page_t *p);
 void ava1_mstore_hash(const ava1_mstore_t *m, uint8_t out[32]);
+/* NULL when id >= n. */
 const char *ava1_mstore_path(const ava1_mstore_t *m, uint32_t id);
 int ava1_mstore_blob(const ava1_mstore_t *m, uint8_t **blob, size_t *len); /* malloc'd */
 int ava1_mstore_from_blob(ava1_mstore_t *m, const uint8_t *blob, size_t len);

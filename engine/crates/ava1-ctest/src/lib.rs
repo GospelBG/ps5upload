@@ -262,6 +262,34 @@ pub mod ffi {
         ) -> c_int;
         pub fn ava1_test_mstore_walk(root: *const c_char, hash: *mut u8, count: *mut u32) -> c_int;
         pub fn ava1_test_thread_smoke(stack_bytes: *mut usize) -> c_int;
+        pub fn ava1_test_ment_size() -> usize;
+        pub fn ava1_test_path_ok(p: *const u8, n: usize) -> c_int;
+        pub fn ava1_test_add_one(
+            file_id: u32,
+            kind: u8,
+            size: u64,
+            path: *const u8,
+            plen: u16,
+            existing: u64,
+            out: *mut u64,
+        );
+        pub fn ava1_test_mstore_cap(out: *mut i64);
+        pub fn ava1_test_mstore_roundtrip(
+            pages: *const *const u8,
+            lens: *const usize,
+            n: usize,
+            hash: *mut u8,
+            hash2: *mut u8,
+            blob: *mut u8,
+            blob_cap: usize,
+            blob_len: *mut usize,
+            nroots: *mut u32,
+            cpages: *mut u8,
+            cpages_cap: usize,
+            cpages_len: *mut usize,
+        ) -> c_int;
+        pub fn ava1_test_page_next(out: *mut i64);
+        pub fn ava1_test_data_clamp(start: u8, min: u8, max: u8, out: *mut c_int);
     }
 }
 
@@ -707,4 +735,116 @@ pub fn c_journal_compact(dir: &Path, open: &[u8], snap: &[u8], done: Option<&[u8
             dn,
         )
     }
+}
+
+/// sizeof(ava1_ment_t).
+pub fn c_ment_size() -> usize {
+    unsafe { ffi::ava1_test_ment_size() }
+}
+
+/// ava1_path_ok on raw bytes.
+pub fn c_path_ok(p: &[u8]) -> bool {
+    unsafe { ffi::ava1_test_path_ok(p.as_ptr(), p.len()) != 0 }
+}
+
+/// Result of one `ava1_mstore_add` onto a store that already holds one file "pre".
+pub struct CAdd {
+    pub rc: i32,
+    pub stored_size: u64,
+    pub bytes: u64,
+    pub path_bounds_ok: bool,
+}
+
+pub fn c_add_one(file_id: u32, kind: u8, size: u64, path: &[u8], existing: u64) -> CAdd {
+    let mut o = [0u64; 4];
+    unsafe {
+        ffi::ava1_test_add_one(
+            file_id,
+            kind,
+            size,
+            path.as_ptr(),
+            path.len() as u16,
+            existing,
+            o.as_mut_ptr(),
+        )
+    };
+    CAdd {
+        rc: o[0] as i64 as i32,
+        stored_size: o[1],
+        bytes: o[2],
+        path_bounds_ok: o[3] == 1,
+    }
+}
+
+/// (reserve past the cap, add past the cap, capacity after reserve(223000)).
+pub fn c_mstore_cap() -> (i64, i64, i64) {
+    let mut o = [0i64; 3];
+    unsafe { ffi::ava1_test_mstore_cap(o.as_mut_ptr()) };
+    (o[0], o[1], o[2])
+}
+
+pub struct CRoundtrip {
+    pub rc: i32,
+    pub hash: [u8; 32],
+    pub hash2: [u8; 32],
+    pub blob: Vec<u8>,
+    pub nroots: u32,
+    /// Pages the C store encoded (job id [5; 16]).
+    pub pages: Vec<Vec<u8>>,
+}
+
+/// pages -> C store -> blob -> second C store -> blob; plus C-encoded pages.
+pub fn c_mstore_roundtrip(pages: &[Vec<u8>]) -> CRoundtrip {
+    let ptrs: Vec<*const u8> = pages.iter().map(|p| p.as_ptr()).collect();
+    let lens: Vec<usize> = pages.iter().map(|p| p.len()).collect();
+    let (mut h, mut h2) = ([0u8; 32], [0u8; 32]);
+    let mut blob = vec![0u8; 8 << 20];
+    let mut cp = vec![0u8; 8 << 20];
+    let (mut bl, mut nr, mut cl) = (0usize, 0u32, 0usize);
+    let rc = unsafe {
+        ffi::ava1_test_mstore_roundtrip(
+            ptrs.as_ptr(),
+            lens.as_ptr(),
+            pages.len(),
+            h.as_mut_ptr(),
+            h2.as_mut_ptr(),
+            blob.as_mut_ptr(),
+            blob.len(),
+            &mut bl,
+            &mut nr,
+            cp.as_mut_ptr(),
+            cp.len(),
+            &mut cl,
+        )
+    };
+    blob.truncate(bl);
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < cl {
+        let n = u32::from_le_bytes(cp[at..at + 4].try_into().unwrap()) as usize;
+        out.push(cp[at + 4..at + 4 + n].to_vec());
+        at += 4 + n;
+    }
+    CRoundtrip {
+        rc,
+        hash: h,
+        hash2: h2,
+        blob,
+        nroots: nr,
+        pages: out,
+    }
+}
+
+/// (rc small, next after small, rc big, next after big) of ava1_mstore_page.
+pub fn c_page_next() -> (i64, i64, i64, i64) {
+    let mut o = [0i64; 4];
+    unsafe { ffi::ava1_test_page_next(o.as_mut_ptr()) };
+    (o[0], o[1], o[2], o[3])
+}
+
+/// Effective (start, min, max) after ava1_data_start, the second start's rc, the first's.
+pub fn c_data_clamp(start: u8, min: u8, max: u8) -> ([i32; 3], i32, i32) {
+    let mut o = [0i32; 5];
+    unsafe { ffi::ava1_test_data_clamp(start, min, max, o.as_mut_ptr()) };
+    ([o[0], o[1], o[2]], o[3], o[4])
 }

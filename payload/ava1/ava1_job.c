@@ -88,8 +88,8 @@ static void job_destroy(ava1_job_t *j) {
     }
     ava1_jnl_close(&j->jnl);
     ava1_bits_free(&j->done);
-    ava1_mstore_free(&j->m);
     if (j->role_free) j->role_free(j);
+    ava1_mstore_free(&j->m);
     if (j->credit) ava1_budget_give(j->credit);
     pthread_mutex_destroy(&j->mu);
     pthread_cond_destroy(&j->cv);

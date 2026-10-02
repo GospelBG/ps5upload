@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* pthread_getattr_np on glibc */
+#endif
 /* Starts the payload's AVA1 server on the host with a node.info handler (tests only). */
 #include <pthread.h>
 #include <stdint.h>
@@ -8,6 +11,7 @@
 #include <unistd.h>
 
 #include "ava1_conn.h"
+#include "ava1_data.h"
 #include "ava1_platform.h"
 
 #include "ava1_gen.h"
@@ -684,4 +688,154 @@ int ava1_test_thread_smoke(size_t *stack_bytes) {
     *stack_bytes = sz;
     if ((uintptr_t)ret != 0) return -1;
     return (sz >= 200u * 1024u && sz <= max) ? 0 : -3;
+}
+
+/* ---------------------------------------------------------------------------
+ * Task 11 fix round: manifest store limits, blob/page cross checks, data config.
+ */
+
+size_t ava1_test_ment_size(void) { return sizeof(ava1_ment_t); }
+
+int ava1_test_path_ok(const uint8_t *p, size_t n) { return ava1_path_ok(p, n); }
+
+/* A store holding one file "pre" of `existing` bytes, then one add with the given fields.
+ * out[0] = add rc, out[1] = stored size of the new entry (0 if refused), out[2] = store bytes,
+ * out[3] = 1 when ava1_mstore_path(id n) is NULL and (id 0) is not. */
+void ava1_test_add_one(uint32_t file_id, uint8_t kind, uint64_t size, const uint8_t *path, uint16_t plen,
+                       uint64_t existing, uint64_t out[4]) {
+    ava1_mstore_t m;
+    ava1_manifest_entry_t w;
+    memset(&m, 0, sizeof m);
+    memset(&w, 0, sizeof w);
+    w.path = (const uint8_t *)"pre";
+    w.path_len = 3;
+    w.kind = AVA1_ENTRY_FILE;
+    w.size = existing;
+    (void)ava1_mstore_add(&m, &w);
+    memset(&w, 0, sizeof w);
+    w.file_id = file_id;
+    w.kind = kind;
+    w.size = size;
+    w.path = path;
+    w.path_len = plen;
+    out[0] = (uint64_t)(int64_t)ava1_mstore_add(&m, &w);
+    out[1] = m.n == 2 ? m.e[1].size : 0;
+    out[2] = m.bytes;
+    out[3] = (ava1_mstore_path(&m, m.n) == NULL && ava1_mstore_path(&m, 0) != NULL) ? 1 : 0;
+    ava1_mstore_free(&m);
+}
+
+/* out[0] = reserve(MAX+1) rc, out[1] = add rc on a store already holding MAX entries,
+ * out[2] = capacity after reserve(223000). */
+void ava1_test_mstore_cap(int64_t out[3]) {
+    ava1_mstore_t m;
+    ava1_manifest_entry_t w;
+    memset(&m, 0, sizeof m);
+    out[0] = ava1_mstore_reserve(&m, AVA1_MAX_ENTRIES + 1);
+    m.n = AVA1_MAX_ENTRIES; /* refused before the table is touched */
+    memset(&w, 0, sizeof w);
+    w.file_id = AVA1_MAX_ENTRIES;
+    w.path = (const uint8_t *)"x";
+    w.path_len = 1;
+    out[1] = ava1_mstore_add(&m, &w);
+    m.n = 0;
+    out[2] = ava1_mstore_reserve(&m, 223000) == 0 ? (int64_t)m.cap : -1;
+    ava1_mstore_free(&m);
+}
+
+/* Pages (Rust-encoded, roots included) -> store -> blob -> second store -> blob again.
+ * Returns 0 when the blobs match; hash is the store hash, `blob` the first blob, and the
+ * C-encoded pages go to cpages (each u32le length then bytes). */
+int ava1_test_mstore_roundtrip(const uint8_t *const *pages, const size_t *lens, size_t n, uint8_t hash[32],
+                               uint8_t hash2[32], uint8_t *blob, size_t blob_cap, size_t *blob_len,
+                               uint32_t *nroots, uint8_t *cpages, size_t cpages_cap, size_t *cpages_len) {
+    ava1_mstore_t m, m2;
+    size_t i, off = 0;
+    uint8_t *b = NULL, *b2 = NULL;
+    size_t bl = 0, bl2 = 0;
+    uint32_t next = 0;
+    uint8_t job[16] = { 5 };
+    int rc = 0;
+    memset(&m, 0, sizeof m);
+    memset(&m2, 0, sizeof m2);
+    for (i = 0; i < n && rc == 0; i++) {
+        ava1_manifest_page_t p;
+        rc = ava1_manifest_page_decode(pages[i], lens[i], &p);
+        if (rc == 0) rc = ava1_mstore_add_page(&m, &p);
+    }
+    if (rc == 0) rc = ava1_mstore_blob(&m, &b, &bl);
+    if (rc == 0) rc = ava1_mstore_from_blob(&m2, b, bl);
+    if (rc == 0) rc = ava1_mstore_blob(&m2, &b2, &bl2);
+    if (rc == 0 && (bl != bl2 || memcmp(b, b2, bl) != 0)) rc = -100;
+    if (rc == 0 && bl > blob_cap) rc = -101;
+    if (rc == 0) {
+        memcpy(blob, b, bl);
+        *blob_len = bl;
+        *nroots = m.nroots;
+        ava1_mstore_hash(&m, hash);
+        ava1_mstore_hash(&m2, hash2);
+    }
+    while (rc == 0 && next < m.n) {
+        size_t len = 0;
+        uint8_t *pg = malloc(AVA1_PAGE_BYTES + 64);
+        if (!pg) { rc = -102; break; }
+        rc = ava1_mstore_page(&m, job, &next, pg, AVA1_PAGE_BYTES + 64, &len);
+        if (rc == 0 && off + 4 + len > cpages_cap) rc = -103;
+        if (rc == 0) {
+            cpages[off] = (uint8_t)len;
+            cpages[off + 1] = (uint8_t)(len >> 8);
+            cpages[off + 2] = (uint8_t)(len >> 16);
+            cpages[off + 3] = (uint8_t)(len >> 24);
+            memcpy(cpages + off + 4, pg, len);
+            off += 4 + len;
+        }
+        free(pg);
+    }
+    *cpages_len = off;
+    free(b);
+    free(b2);
+    ava1_mstore_free(&m);
+    ava1_mstore_free(&m2);
+    return rc;
+}
+
+/* A too-small `out` must leave *next alone; a fitting one advances it.
+ * out[0] = rc small, out[1] = next after small, out[2] = rc big, out[3] = next after big. */
+void ava1_test_page_next(int64_t out[4]) {
+    ava1_mstore_t m;
+    uint32_t i, next = 0;
+    uint8_t job[16] = { 1 }, small[8], big[4096];
+    size_t len = 0;
+    memset(&m, 0, sizeof m);
+    for (i = 0; i < 3; i++) {
+        ava1_manifest_entry_t w;
+        char p[8];
+        memset(&w, 0, sizeof w);
+        snprintf(p, sizeof p, "f%u", i);
+        w.file_id = i;
+        w.path = (const uint8_t *)p;
+        w.path_len = (uint16_t)strlen(p);
+        (void)ava1_mstore_add(&m, &w);
+    }
+    out[0] = ava1_mstore_page(&m, job, &next, small, sizeof small, &len);
+    out[1] = next;
+    out[2] = ava1_mstore_page(&m, job, &next, big, sizeof big, &len);
+    out[3] = next;
+    ava1_mstore_free(&m);
+}
+
+/* Start with the given workers, report the effective cfg, then start a second time.
+ * out[0..3] = start/min/max, out[3] = second start rc, out[4] = first start rc. */
+void ava1_test_data_clamp(uint8_t start, uint8_t min, uint8_t max, int out[5]) {
+    ava1_data_cfg_t c;
+    memset(&c, 0, sizeof c);
+    c.workers_start = start;
+    c.workers_min = min;
+    c.workers_max = max;
+    out[4] = ava1_data_start(&c);
+    out[0] = ava1_data_cfg()->workers_start;
+    out[1] = ava1_data_cfg()->workers_min;
+    out[2] = ava1_data_cfg()->workers_max;
+    out[3] = ava1_data_start(&c);
+    ava1_data_stop();
 }
