@@ -55,7 +55,10 @@ fn rust_samples_round_trip_in_c() {
 
 #[test]
 fn c_and_rust_agree_on_garbage() {
-    // Random bytes: both sides must accept exactly the same inputs, and re-encode them identically.
+    // Random bytes: both sides must accept exactly the same inputs. Re-encodings are
+    // compared on canonical bytes (SPEC.md §3): a re-encoder may drop what it accepted but
+    // would not have written (an unknown extension inside a records item), so C's
+    // verbatim item bytes and Rust's re-encoded ones are both correct.
     let mut rng = SplitMix(9);
     for _ in 0..20_000 {
         let name = gen::ALL[rng.below(gen::ALL.len() as u64) as usize];
@@ -65,10 +68,59 @@ fn c_and_rust_agree_on_garbage() {
         let rust = gen::roundtrip(name, &b).unwrap();
         let c = c_roundtrip(name, &b);
         assert_eq!(rust.is_ok(), c.is_ok(), "{name} {}", ava1::hex::encode(&b));
-        if let (Ok(r), Ok(c)) = (rust, c) {
-            assert_eq!(r, c);
+        if let Ok(r) = rust {
+            assert_eq!(
+                c_roundtrip(name, &r),
+                Ok(r.clone()),
+                "C must reproduce Rust's canonical bytes: {name} {}",
+                ava1::hex::encode(&r)
+            );
+        }
+        if let Ok(c) = c {
+            assert_eq!(
+                c_roundtrip(name, &c),
+                Ok(c.clone()),
+                "re-encoding twice changes nothing: {name}"
+            );
         }
     }
+}
+
+#[test]
+fn c_counts_and_rebuilds_a_records_blob_with_the_generated_helpers() {
+    // The per-struct helpers the payload uses to build and walk records blobs: nothing
+    // else on the host calls them, so a defect in the emitted C would otherwise ship
+    // unnoticed. The items are Rust's canonical encodings; C must count them and
+    // re-append them to exactly those bytes.
+    use ava1::wire::Message;
+    let items = vec![
+        gen::NodeInfo {
+            version: "1.0".into(),
+            platform: "ps5".into(),
+            name: "console".into(),
+            firmware: Some("13.60".into()),
+        },
+        gen::NodeInfo {
+            version: String::new(),
+            platform: "host".into(),
+            name: String::new(),
+            firmware: None,
+        },
+    ];
+    let mut blob = Vec::new();
+    for it in &items {
+        let b = it.to_bytes().unwrap();
+        blob.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&b);
+    }
+    let (out, count) = c_records_helpers(&blob).unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(out, blob, "C re-appends the items it read");
+    // An empty list, and a truncated item: the second must be refused, not counted.
+    assert_eq!(c_records_helpers(&[]).unwrap(), (Vec::new(), 0));
+    let mut bad = blob.clone();
+    bad.truncate(bad.len() - 1);
+    assert!(c_records_helpers(&bad).is_err());
 }
 
 #[test]
@@ -224,9 +276,25 @@ fn c_and_rust_agree_on_mutated_messages() {
             let rust = gen::roundtrip(name, &m).unwrap();
             let c = c_roundtrip(name, &m);
             assert_eq!(rust.is_ok(), c.is_ok(), "{name} {}", ava1::hex::encode(&m));
-            if let (Ok(r), Ok(c)) = (rust, c) {
-                assert_eq!(r, c, "{name} {}", ava1::hex::encode(&m));
+            if let Ok(r) = rust {
+                // Canonical bytes only (SPEC.md §3): a mutation can leave an accepted
+                // message the encoder would not have written — an extension inside a
+                // records item that Rust drops and C reproduces — and that difference is
+                // not a divergence. Canonical output must still match exactly.
+                assert_eq!(
+                    c_roundtrip(name, &r),
+                    Ok(r.clone()),
+                    "{name} {}",
+                    ava1::hex::encode(&m)
+                );
                 accepted += 1;
+            }
+            if let Ok(c) = c {
+                assert_eq!(
+                    c_roundtrip(name, &c),
+                    Ok(c.clone()),
+                    "re-encoding twice changes nothing: {name}"
+                );
             }
             total += 1;
         }

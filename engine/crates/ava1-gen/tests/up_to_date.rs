@@ -55,6 +55,8 @@ fn records_must_name_a_struct() {
         "[[struct]]\nname = \"S\"\nfields = [{ name = \"r\", ty = \"records\", of = \"S\" }]\n",
         // records in ext
         "[[struct]]\nname = \"S\"\n[[message]]\nname = \"A\"\ntype = 1\next = [{ tag = 1, name = \"r\", ty = \"records\" }]\n",
+        // a field whose name is a C member the records field generates
+        "[[struct]]\nname = \"S\"\nfields = [{ name = \"v\", ty = \"u8\" }]\n[[message]]\nname = \"A\"\ntype = 1\nfields = [{ name = \"r\", ty = \"records\", of = \"S\" }, { name = \"r_count\", ty = \"u32\" }]\n",
     ];
     for b in bad {
         assert!(ava1_gen::parse(b).is_err(), "accepted: {b}");

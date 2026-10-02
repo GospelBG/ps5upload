@@ -117,3 +117,26 @@ int ava1_test_conn_open_frame(const uint8_t key[32], const uint8_t *frame, size_
     close(sv[0]);
     return rc;
 }
+
+/* The generated per-struct records helpers (SPEC.md §3), which nothing else on the host
+ * executes: count the items in `blob`, read each with _next, re-append them with _append
+ * (which is also what drives ava1_w_len_begin/_len_end). 0 = ok, -1 = bad blob,
+ * -2 = append failed, -3 = writer error. `count` and `out` are the results. */
+int ava1_test_records_helpers(const uint8_t *blob, uint32_t len, uint8_t *out, size_t cap,
+                              size_t *out_len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_node_info_t item;
+    ava1_w_t w;
+    int rc;
+    *count = 0;
+    *out_len = 0;
+    if (ava1_node_info_count(blob, len, count) != 0) return -1;
+    ava1_w_init(&w, out, cap);
+    ava1_r_init(&it, blob, len);
+    while ((rc = ava1_node_info_next(&it, &item)) == 1) {
+        if (ava1_node_info_append(&w, &item) != 0) return -2;
+    }
+    if (rc != 0) return rc;
+    *out_len = w.len;
+    return w.err != 0 ? -3 : 0;
+}

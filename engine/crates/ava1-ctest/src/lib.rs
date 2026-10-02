@@ -186,7 +186,38 @@ pub mod ffi {
         pub fn ava1_identity_load_or_create(path: *const c_char, id: *mut CIdentity) -> c_int;
         pub fn ava1_peers_load(ps: *mut CPeers, path: *const c_char) -> c_int;
         pub fn ava1_peers_contains(ps: *const CPeers, key: *const u8) -> c_int;
+        pub fn ava1_test_records_helpers(
+            blob: *const u8,
+            len: u32,
+            out: *mut u8,
+            cap: usize,
+            out_len: *mut usize,
+            count: *mut u32,
+        ) -> c_int;
     }
+}
+
+/// The generated C per-struct records helpers (SPEC.md §3) over one blob of items: how
+/// many items the blob holds, and the blob C rebuilds by re-appending each of them.
+pub fn c_records_helpers(blob: &[u8]) -> Result<(Vec<u8>, u32), i32> {
+    let mut out = vec![0u8; blob.len() + 64];
+    let mut out_len = 0usize;
+    let mut count = 0u32;
+    let rc = unsafe {
+        ffi::ava1_test_records_helpers(
+            blob.as_ptr(),
+            blob.len() as u32,
+            out.as_mut_ptr(),
+            out.len(),
+            &mut out_len,
+            &mut count,
+        )
+    };
+    if rc != 0 {
+        return Err(rc);
+    }
+    out.truncate(out_len);
+    Ok((out, count))
 }
 
 pub fn c_roundtrip(name: &str, input: &[u8]) -> Result<Vec<u8>, i32> {

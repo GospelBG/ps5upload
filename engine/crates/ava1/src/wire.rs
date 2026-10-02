@@ -347,5 +347,70 @@ mod tests {
         // An item with a trailing byte inside its own length.
         let b = hex("0b0000000700000001010078000000");
         assert!(Reader::new(&b).records::<Two>().is_err());
+        // The blob claims more than the buffer holds.
+        assert_eq!(
+            Reader::new(&hex("0900000001000000")).records::<Two>(),
+            Err(DecodeError::Short)
+        );
+        // A zero-length item: no struct encodes to nothing (each carries its ext count).
+        assert!(Reader::new(&hex("0400000000000000"))
+            .records::<Two>()
+            .is_err());
+        // A byte after the last item that does not start one.
+        let b = hex("0b00000006000000010100780000ff");
+        assert!(Reader::new(&b).records::<Two>().is_err());
+    }
+
+    /// A struct that lists `Two`s, so a records field can hold records inside its items.
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    struct Wrap {
+        items: Vec<Two>,
+    }
+    impl Message for Wrap {
+        const NAME: &'static str = "Wrap";
+        fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+            w.records(&self.items)?;
+            w.u16(0);
+            Ok(())
+        }
+        fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+            let mut r = Reader::new(b);
+            let m = Wrap {
+                items: r.records::<Two>()?,
+            };
+            let _ = r.u16()?;
+            r.finish()?;
+            Ok(m)
+        }
+    }
+
+    #[test]
+    fn records_nest_and_the_outer_length_follows_the_inner_ones() {
+        let outer = vec![
+            Wrap {
+                items: vec![
+                    Two {
+                        a: 1,
+                        s: "x".into(),
+                    },
+                    Two {
+                        a: 2,
+                        s: String::new(),
+                    },
+                ],
+            },
+            Wrap::default(),
+        ];
+        let mut w = Writer::new();
+        w.records(&outer).unwrap();
+        // Each Wrap is its records field (the inner blob: the 19 bytes the flat test pins)
+        // plus its own u16 ext count, and every item carries its own u32 length.
+        assert_eq!(
+            w.buf,
+            hex("27000000190000001300000006000000010100780000050000000200000000000006000000000000000000")
+        );
+        let mut r = Reader::new(&w.buf);
+        assert_eq!(r.records::<Wrap>().unwrap(), outer);
+        r.finish().unwrap();
     }
 }
