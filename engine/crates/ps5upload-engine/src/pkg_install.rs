@@ -713,10 +713,9 @@ async fn payload_restore_handler(Json(req): Json<PayloadRestoreRequest>) -> Resp
     }
     let res = tokio::task::spawn_blocking(move || {
         use ps5upload_core::payload_lifecycle as pl;
-        let bytes = crate::bundled_payload::image_bytes(crate::bundled_payload::Image::Payload)?;
-        // Stamped like the desktop app's sends, so the console trusts this engine's AVA1
-        // identity without pairing.
-        let bytes = crate::ava1_api::stamped_helper(&bytes);
+        let bytes = payload_restore_bytes(|| {
+            crate::bundled_payload::image_bytes(crate::bundled_payload::Image::Payload)
+        })?;
         pl::send_elf_to_loader(
             &ps5_ip,
             pl::PS5_LOADER_PORT,
@@ -745,6 +744,16 @@ async fn payload_restore_handler(Json(req): Json<PayloadRestoreRequest>) -> Resp
             serde_json::json!({"ok": false, "error": format!("payload-restore task failed: {e}")}),
         ),
     }
+}
+
+/// The bytes `payload-restore` sends: the helper image from `load`, stamped like the
+/// desktop app's sends so the console trusts this engine's AVA1 identity without
+/// pairing (SPEC.md §5.1).
+fn payload_restore_bytes(
+    load: impl FnOnce() -> Result<std::borrow::Cow<'static, [u8]>, String>,
+) -> Result<Vec<u8>, String> {
+    let image = load()?;
+    Ok(crate::ava1_api::stamped_helper(&image))
 }
 
 pub fn router(state: PkgInstallStateHandle) -> Router {
@@ -5068,5 +5077,37 @@ mod container_ip_tests {
         ] {
             assert!(!is_container_bridge_ip(ip.parse().unwrap()), "{ip}");
         }
+    }
+}
+
+#[cfg(test)]
+mod payload_restore_tests {
+    use std::borrow::Cow;
+
+    /// A helper image with an empty AVA1 trust slot, as the payload build leaves it.
+    fn slotted_elf() -> Vec<u8> {
+        let mut elf = vec![0x11u8; 4096];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[2000..2064].fill(0);
+        elf[2000..2009].copy_from_slice(ava1::trust::MAGIC);
+        elf
+    }
+
+    #[test]
+    fn the_restored_helper_carries_this_engines_ava1_key() {
+        let bytes = super::payload_restore_bytes(|| Ok(Cow::Owned(slotted_elf()))).unwrap();
+        let key = crate::ava1_api::identity().map(|i| i.public());
+        assert!(key.is_some(), "the test machine has a data dir");
+        assert_eq!(
+            ava1::trust::read(&bytes),
+            key,
+            "payload-restore sends the helper without this engine's key in its trust slot"
+        );
+    }
+
+    #[test]
+    fn a_helper_that_cannot_be_loaded_is_not_sent() {
+        let r = super::payload_restore_bytes(|| Err("no image".into()));
+        assert_eq!(r.unwrap_err(), "no image");
     }
 }
