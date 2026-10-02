@@ -10,6 +10,7 @@
 
 #include "ava1_frame.h"
 #include "ava1_noise.h"
+#include "ava1_platform.h"
 #include "ava1_wire.h"
 #include "monocypher.h"
 
@@ -308,6 +309,7 @@ static void *q_writer(void *arg) {
             if (!c->q_head) c->q_tail = NULL;
             c->q_n--;
             c->q_bytes -= it->len;
+            c->q_busy = 1;
         }
         pthread_mutex_unlock(&c->qmu);
         if (!it) break;
@@ -317,6 +319,9 @@ static void *q_writer(void *arg) {
             (void)ava1_conn_send_flags(c, it->type, it->flags, it->channel, (const uint8_t *)(it + 1), it->len);
             free(it);
         }
+        pthread_mutex_lock(&c->qmu);
+        c->q_busy = 0;
+        pthread_mutex_unlock(&c->qmu);
     }
     return NULL;
 }
@@ -370,4 +375,16 @@ int ava1_conn_post(ava1_conn_t *c, uint8_t type, uint8_t flags, uint32_t channel
     pthread_mutex_unlock(&c->qmu);
     if (rc != 0) free(it);
     return rc;
+}
+
+void ava1_conn_drain(ava1_conn_t *c, uint32_t ms) {
+    uint64_t end = ava1_now_ms() + ms;
+    for (;;) {
+        int idle;
+        pthread_mutex_lock(&c->qmu);
+        idle = !c->q_started || (!c->q_head && !c->q_busy);
+        pthread_mutex_unlock(&c->qmu);
+        if (idle || c->broken || ava1_now_ms() >= end) return;
+        ava1_platform_sleep_ms(2);
+    }
 }

@@ -978,6 +978,8 @@ static void *conn_main(void *arg) {
         free(buf);
     }
     member_drop(k);
+    /* What was posted last (an Error saying why a lane closes) goes out first, briefly. */
+    ava1_conn_drain(&k->io, 250);
     /* Wake any worker blocked writing to a peer that is gone, then drop our reference. */
     shutdown(k->io.fd, SHUT_RDWR);
     conn_put(k);

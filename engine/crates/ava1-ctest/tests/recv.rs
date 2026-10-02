@@ -843,3 +843,43 @@ fn m9_a_policy_match_drops_the_part_in_progress() {
     assert!(!t.join("dest/big.ava-part").exists());
     assert!(!job_dir(&t.join("jobs"), &[7; 16]).join("0.ob").exists());
 }
+
+#[test]
+fn n1_a_root_one_byte_past_the_path_cap_is_refused() {
+    // 1,025 bytes: `ava1_path_ok` sees 1,024 after the '/', but `j->root` holds 1,024 + NUL,
+    // so it would be cut short into another path.
+    let t = tmp("n1");
+    let mut root = t.display().to_string();
+    while root.len() < 1025 {
+        let room = 1025 - root.len() - 1;
+        root.push('/');
+        root.push_str(&"r".repeat(room.min(100)));
+    }
+    assert_eq!(root.len(), 1025);
+    assert_eq!(
+        c_recv_open_status(&t.join("jobs"), std::path::Path::new(&root), OPEN_OK),
+        gen::ERR_PATH as i32
+    );
+}
+
+#[test]
+fn n2_a_folders_only_manifest_creates_its_folders() {
+    // No files: "every file is done" holds before anything was made. The staged tree must
+    // still be prepared, so the declared folders exist when the job ends.
+    let t = tmp("n2");
+    let d = |p: &str| Entry {
+        kind: ENTRY_DIR,
+        mode: 0o755,
+        size: 0,
+        mtime: 1,
+        path: p.into(),
+        root: None,
+    };
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&Manifest {
+        entries: vec![d("a"), d("a/b")],
+    });
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+    assert!(t.join("dest/a/b").is_dir(), "{}", r.events());
+    assert!(!t.join("dest.ava-part").exists());
+}

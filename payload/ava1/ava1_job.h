@@ -21,8 +21,23 @@
 #define AVA1_STAGED_HELD 2
 
 typedef struct ava1_job ava1_job_t;
-/* Where a job's outgoing messages go: a session (network jobs) or a recorder (local, tests). */
+/* Where a job's outgoing messages go: a session (network jobs) or a recorder (local, tests).
+ * Called on job threads, workers and the data layer's own threads, never on a connection's
+ * reader thread: it may wait for the socket (ava1_server_send, which serialises writers on
+ * the connection's lock, so concurrent emitters are safe). Reader-thread hooks never emit;
+ * what they send (Received, a refusal, Error) they post (ava1_server_post). */
 typedef void (*ava1_emit_fn)(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len);
+
+/* A frame waiting for a job (Task 14): a lane frame held until the job's map is out, or a
+ * control frame for the job's feeder thread. `body` is malloc'd and owned. */
+typedef struct ava1_inframe {
+    struct ava1_inframe *next;
+    uint8_t type;
+    uint16_t lane;
+    uint32_t seq;
+    size_t len;
+    uint8_t *body;
+} ava1_inframe_t;
 
 typedef struct {        /* one large file being assembled */
     int fd, ob_fd;
@@ -108,13 +123,52 @@ struct ava1_job {
     void *emit_ctx;
     uint16_t final_status;
     char message[128];
+    /* ---- the wire (Task 14, ava1_data.c) ----
+     * `cmu` is a leaf lock: held for a few field updates only, never across I/O and never
+     * while taking another lock (j->mu, then cmu, is the only order). Reader threads take
+     * cmu and never mu, so a job busy with its disk (mu is held across opens, fallocate and
+     * journal compaction) cannot stall a session's reader. Under cmu: `attached` and `sid`
+     * (also written under the table lock, so either lock reads them), the sender's credit
+     * as this side counts it, the held lane frames and the control inbox. */
+    pthread_mutex_t cmu;
+    pthread_cond_t ccv;               /* the feeder waits here */
+    int ready;                        /* the attached session has its map: lane frames go on */
+    uint64_t w_avail;                 /* lane-frame bytes the sender may still send */
+    uint64_t w_grant;                 /* the largest credit granted (admission's pre-read bound) */
+    ava1_inframe_t *held_head, *held_tail; /* lane frames, in arrival order */
+    ava1_inframe_t *in_head, *in_tail;     /* control frames, in arrival order */
+    size_t in_bytes;
+    int in_overflow;                  /* the inbox was full: the job ends with ERR_PROTOCOL */
+    int feed_stop;
+    pthread_t feeder;                 /* applies held frames and control frames (receiver jobs) */
+    int feeder_started;
+    /* Sender roles (Task 18): control frames from the receiving peer, and lane changes.
+     * Both run on a reader thread (or under the table lock): they must not block. */
+    int (*on_frame)(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len);
+    void (*on_lane_change)(ava1_job_t *j, uint16_t lane, int up);
 };
 
 ava1_job_t *ava1_job_find(const uint8_t id[16]); /* referenced, or NULL */
-ava1_job_t *ava1_job_create(const uint8_t id[16], const uint8_t owner[32]); /* referenced; NULL when full */
+/* Referenced; NULL when full. Created detached and stamped parked now, so a job nobody
+ * attaches is collected like any parked one. */
+ava1_job_t *ava1_job_create(const uint8_t id[16], const uint8_t owner[32]);
+/* Like ava1_job_create, but attached to session `sid` before it is listed (NULL: detached). */
+ava1_job_t *ava1_job_create_attached(const uint8_t id[16], const uint8_t owner[32], const uint8_t *sid);
+/* Under the table lock: the listed job `id`, referenced and attached to `sid` (not parked);
+ * NULL when it is not listed. Find and attach are one step, so the reaper cannot unlist a
+ * job between them. */
+ava1_job_t *ava1_job_find_attach(const uint8_t id[16], const uint8_t sid[16]);
+/* The same for a job already in hand: 0, or -1 when it is no longer listed. */
+int ava1_job_attach_sid(ava1_job_t *j, const uint8_t sid[16]);
 void ava1_job_put(ava1_job_t *j);
+/* For reader threads: drops a reference, never freeing the job on this thread (freeing
+ * joins its threads); the last reference is dropped on a short-lived thread. */
+void ava1_job_put_nowait(ava1_job_t *j);
+/* fn(j, ctx) for every listed job, under the table lock: fn must not block or take it. */
+void ava1_job_foreach(void (*fn)(ava1_job_t *j, void *ctx), void *ctx);
 void ava1_job_park_session(const uint8_t sid[16]); /* every job attached to sid detaches */
-void ava1_job_reap(uint64_t now_ms);               /* frees parked jobs older than AVA1_PARK_MS */
+/* Frees parked jobs older than the park age (data cfg park_ms; finished ones after 10 s). */
+void ava1_job_reap(uint64_t now_ms);
 void ava1_job_free_all(void);
 void ava1_job_free_one(const uint8_t id[16]);      /* unlists it and drops the table's reference */
 /* Takes the caller's reference. When only the table and the caller hold the job, unlists

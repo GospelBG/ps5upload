@@ -1205,7 +1205,7 @@ void ava1_test_apply_end(void) {
  * holds the C server lock). */
 
 static ava1_data_cfg_t g_cfg;
-static char g_root[1024];
+static char g_root[2048]; /* room past AVA1_MAX_PATH: refusals of long roots are tested */
 static uint32_t g_flags, g_entries;
 static uint8_t g_policy;
 static ava1_job_open_ack_t g_ack;
@@ -1334,4 +1334,171 @@ int ava1_test_apply_reserve(size_t n, int take) {
         return 0;
     }
     return ava1_apply_reserve(g_job, n);
+}
+
+/* ---- the data layer on the wire (Task 14) ----------------------------------------- */
+
+/* The server with the real data hooks: uploads land under any absolute path. `port` 0 =
+ * any (a restart passes the old one); `workers` nonzero fixes the apply pool's size. */
+int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path, const char *jobs_dir,
+                                uint32_t ping_ms, uint32_t dead_ms, uint32_t handshake_ms, uint32_t fsync_delay_us,
+                                uint16_t port, uint8_t workers) {
+    ava1_server_cfg_t cfg;
+    ava1_data_cfg_t dc;
+    int rc;
+    memset(&dc, 0, sizeof dc);
+    snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "%s", jobs_dir);
+    dc.may_write = t_allow;
+    dc.may_read = t_allow_read;
+    dc.same_device = t_same_device;
+    dc.fsync_delay_us = fsync_delay_us;
+    dc.workers_start = dc.workers_min = dc.workers_max = workers;
+    ava1_test_set_same_device(1);
+    if (ava1_data_start(&dc) != 0) return -100;
+    memset(&cfg, 0, sizeof cfg);
+    ava1_identity_from_secret(&cfg.identity, secret);
+    strncpy(cfg.name, "C data server", sizeof cfg.name - 1);
+    strncpy(cfg.peers_path, peers_path, sizeof cfg.peers_path - 1);
+    cfg.port = port;
+    cfg.bind_loopback = 1;
+    cfg.ping_every_ms = ping_ms;
+    cfg.dead_after_ms = dead_ms;
+    cfg.handshake_ms = handshake_ms;
+    cfg.rpc = rpc; /* node.info (Task 19 adds the data RPCs) */
+    cfg.data = ava1_data_hooks();
+    cfg.caps = AVA1_CAP_DATA_PLANE;
+    rc = ava1_server_start(&cfg);
+    if (rc != 0) {
+        ava1_data_stop();
+        return rc;
+    }
+    return (int)ava1_server_port();
+}
+
+void ava1_test_server_stop_data(void) {
+    ava1_server_stop();
+    ava1_data_stop();
+}
+
+/* UINT32_MAX keeps a value. */
+void ava1_test_data_delays(uint32_t open_ms, uint32_t map_ms) {
+    if (open_ms != UINT32_MAX) ava1_data_test_open_delay_ms = open_ms;
+    if (map_ms != UINT32_MAX) ava1_data_test_map_delay_ms = map_ms;
+}
+
+/* 1 attached, 0 parked, -1 not listed. */
+int ava1_test_job_attached(const uint8_t id[16]) {
+    ava1_job_t *j = ava1_job_find(id);
+    int a;
+    if (!j) return -1;
+    pthread_mutex_lock(&j->cmu);
+    a = j->attached;
+    pthread_mutex_unlock(&j->cmu);
+    ava1_job_put(j);
+    return a;
+}
+
+static int listed(uint8_t tag) {
+    uint8_t id[16];
+    ava1_job_t *j;
+    memset(id, tag, 16);
+    j = ava1_job_find(id);
+    if (j) ava1_job_put(j);
+    return j != NULL;
+}
+
+static ava1_job_t *mk(uint8_t tag, const uint8_t *sid) {
+    uint8_t id[16];
+    memset(id, tag, 16);
+    return ava1_job_create_attached(id, TEST_OWNER, sid);
+}
+
+/* Rulings 3 and 4. 0, or the step that failed. */
+int ava1_test_reap_rules(const char *jobs_dir) {
+    static const uint8_t SA[16] = { 0xa1 }, SB[16] = { 0xb1 }, SC[16] = { 0xc1 }, SD[16] = { 0xd1 };
+    ava1_data_cfg_t dc;
+    ava1_job_t *j;
+    uint8_t id[16];
+    int rc = 0;
+    memset(&dc, 0, sizeof dc);
+    snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "%s", jobs_dir);
+    dc.park_ms = 300;
+    if (ava1_data_start(&dc) != 0) return -100;
+    /* Created detached: stamped parked at creation, so it ages out. */
+    if (!(j = mk(0x31, NULL))) rc = -1;
+    else ava1_job_put(j);
+    /* Attached at creation (a driver, or on_job_open): never parked, survives the age. */
+    if (!rc && !(j = mk(0x32, SA))) rc = -2;
+    else if (!rc) ava1_job_put(j);
+    /* Attached, then its session ended: parked, reaped. */
+    if (!rc && !(j = mk(0x33, SB))) rc = -3;
+    else if (!rc) {
+        ava1_job_put(j);
+        ava1_job_park_session(SB);
+    }
+    if (!rc) {
+        ava1_platform_sleep_ms(2300); /* > park age + two housekeeping ticks */
+        if (listed(0x31)) rc = -4;
+        else if (!listed(0x32)) rc = -5;
+        else if (listed(0x33)) rc = -6;
+    }
+    /* find_attach under the table lock: a parked job taken over is never collected. */
+    if (!rc && !(j = mk(0x34, SC))) rc = -7;
+    else if (!rc) {
+        ava1_job_put(j);
+        ava1_job_park_session(SC);
+        memset(id, 0x34, 16);
+        j = ava1_job_find_attach(id, SD);
+        ava1_job_reap(ava1_mono_ms() + 3600u * 1000u);
+        if (!j) rc = -8;
+        else if (!listed(0x34)) rc = -9;
+        if (j) ava1_job_put(j);
+        ava1_job_park_session(SD);
+        ava1_job_reap(ava1_mono_ms() + 3600u * 1000u);
+        if (!rc && listed(0x34)) rc = -10;
+    }
+    ava1_data_stop();
+    return rc;
+}
+
+/* N3: a job a cancel unlisted, still referenced by the caller and one other holder. */
+int ava1_test_retire_unlisted(void) {
+    ava1_data_cfg_t dc;
+    ava1_job_t *j, *other;
+    uint8_t id[16];
+    int rc = 0;
+    memset(&dc, 0, sizeof dc);
+    snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "/tmp/ava1-retire-unused");
+    if (ava1_data_start(&dc) != 0) return -100;
+    memset(id, 0x41, 16);
+    j = ava1_job_create_attached(id, TEST_OWNER, TEST_OWNER);
+    other = j ? ava1_job_find(id) : NULL;
+    if (!j || !other) rc = -1;
+    if (!rc) {
+        ava1_job_free_one(id); /* unlisted; refs: ours and `other` */
+        if (ava1_job_retire(j) == 0) {
+            rc = -2; /* it freed the job under `other` (which must not be touched now) */
+        } else {
+            if (memcmp(other->id, id, 16) != 0) rc = -3;
+            ava1_job_put(other);
+        }
+    }
+    ava1_data_stop();
+    return rc;
+}
+
+/* out[0] = bytes the apply engine received, out[1] = lane frames held. -1: not listed. */
+int ava1_test_job_counts(const uint8_t id[16], uint64_t out[2]) {
+    ava1_job_t *j = ava1_job_find(id);
+    ava1_inframe_t *f;
+    if (!j) return -1;
+    pthread_mutex_lock(&j->mu);
+    out[0] = j->bytes_received;
+    pthread_mutex_unlock(&j->mu);
+    out[1] = 0;
+    pthread_mutex_lock(&j->cmu);
+    for (f = j->held_head; f; f = f->next) out[1]++;
+    pthread_mutex_unlock(&j->cmu);
+    ava1_job_put(j);
+    return 0;
 }

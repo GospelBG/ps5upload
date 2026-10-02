@@ -26,7 +26,7 @@ ava1_job_t *ava1_job_find(const uint8_t id[16]) {
     return j;
 }
 
-ava1_job_t *ava1_job_create(const uint8_t id[16], const uint8_t owner[32]) {
+static ava1_job_t *create(const uint8_t id[16], const uint8_t owner[32], const uint8_t *sid) {
     ava1_job_t *j = calloc(1, sizeof *j);
     int i, slot = -1;
     if (!j) return NULL;
@@ -34,8 +34,16 @@ ava1_job_t *ava1_job_create(const uint8_t id[16], const uint8_t owner[32]) {
     memcpy(j->owner, owner, 32);
     j->refs = 2; /* the table's and the caller's */
     j->jnl.fd = -1;
+    if (sid) {
+        memcpy(j->sid, sid, 16);
+        j->attached = 1;
+    } else {
+        j->parked_at_ms = ava1_mono_ms(); /* nobody holds it yet: it ages like a parked job */
+    }
     pthread_mutex_init(&j->mu, NULL);
     pthread_cond_init(&j->cv, NULL);
+    pthread_mutex_init(&j->cmu, NULL);
+    pthread_cond_init(&j->ccv, NULL);
     pthread_mutex_lock(&T.mu);
     for (i = 0; i < AVA1_MAX_JOBS; i++) {
         if (T.jobs[i] && memcmp(T.jobs[i]->id, id, 16) == 0) {
@@ -49,10 +57,75 @@ ava1_job_t *ava1_job_create(const uint8_t id[16], const uint8_t owner[32]) {
     if (slot < 0) {
         pthread_mutex_destroy(&j->mu);
         pthread_cond_destroy(&j->cv);
+        pthread_mutex_destroy(&j->cmu);
+        pthread_cond_destroy(&j->ccv);
         free(j);
         return NULL;
     }
     return j;
+}
+
+ava1_job_t *ava1_job_create(const uint8_t id[16], const uint8_t owner[32]) { return create(id, owner, NULL); }
+
+ava1_job_t *ava1_job_create_attached(const uint8_t id[16], const uint8_t owner[32], const uint8_t *sid) {
+    return create(id, owner, sid);
+}
+
+static int listed_locked(const ava1_job_t *j) {
+    int i;
+    for (i = 0; i < AVA1_MAX_JOBS; i++)
+        if (T.jobs[i] == j) return 1;
+    return 0;
+}
+
+/* Caller holds T.mu. */
+static void attach_locked(ava1_job_t *j, const uint8_t sid[16]) {
+    pthread_mutex_lock(&j->cmu);
+    memcpy(j->sid, sid, 16);
+    j->attached = 1;
+    pthread_mutex_unlock(&j->cmu);
+    j->parked_at_ms = 0;
+}
+
+ava1_job_t *ava1_job_find_attach(const uint8_t id[16], const uint8_t sid[16]) {
+    ava1_job_t *j = NULL;
+    int i;
+    pthread_mutex_lock(&T.mu);
+    for (i = 0; i < AVA1_MAX_JOBS; i++)
+        if (T.jobs[i] && memcmp(T.jobs[i]->id, id, 16) == 0) {
+            j = T.jobs[i];
+            j->refs++;
+            attach_locked(j, sid);
+            break;
+        }
+    pthread_mutex_unlock(&T.mu);
+    return j;
+}
+
+int ava1_job_attach_sid(ava1_job_t *j, const uint8_t sid[16]) {
+    int ok;
+    pthread_mutex_lock(&T.mu);
+    ok = listed_locked(j);
+    if (ok) attach_locked(j, sid);
+    pthread_mutex_unlock(&T.mu);
+    return ok ? 0 : -1;
+}
+
+void ava1_job_foreach(void (*fn)(ava1_job_t *j, void *ctx), void *ctx) {
+    int i;
+    pthread_mutex_lock(&T.mu);
+    for (i = 0; i < AVA1_MAX_JOBS; i++)
+        if (T.jobs[i]) fn(T.jobs[i], ctx);
+    pthread_mutex_unlock(&T.mu);
+}
+
+static void free_frames(ava1_inframe_t *f) {
+    while (f) {
+        ava1_inframe_t *n = f->next;
+        free(f->body);
+        free(f);
+        f = n;
+    }
 }
 
 /* Stops threads, closes files, returns credit. Journal and job directory stay. */
@@ -63,6 +136,13 @@ static void job_destroy(ava1_job_t *j) {
     j->stopping = 1;
     pthread_cond_broadcast(&j->cv);
     pthread_mutex_unlock(&j->mu);
+    if (j->feeder_started) { /* first: it may be handing work to the threads below */
+        pthread_mutex_lock(&j->cmu);
+        j->feed_stop = 1;
+        pthread_cond_broadcast(&j->ccv);
+        pthread_mutex_unlock(&j->cmu);
+        pthread_join(j->feeder, NULL);
+    }
     if (j->thread_started) pthread_join(j->thread, NULL);
     for (i = 0; i < j->nworkers; i++) pthread_join(j->workers[i], NULL);
     while ((w = j->q_head) != NULL) {
@@ -91,8 +171,12 @@ static void job_destroy(ava1_job_t *j) {
     if (j->role_free) j->role_free(j);
     ava1_mstore_free(&j->m);
     if (j->credit) ava1_budget_give(j->credit);
+    free_frames(j->held_head);
+    free_frames(j->in_head);
     pthread_mutex_destroy(&j->mu);
     pthread_cond_destroy(&j->cv);
+    pthread_mutex_destroy(&j->cmu);
+    pthread_cond_destroy(&j->ccv);
     free(j);
 }
 
@@ -102,6 +186,21 @@ void ava1_job_put(ava1_job_t *j) {
     last = --j->refs == 0;
     pthread_mutex_unlock(&T.mu);
     if (last) job_destroy(j);
+}
+
+static void *put_main(void *arg) {
+    ava1_job_put(arg);
+    return NULL;
+}
+
+void ava1_job_put_nowait(ava1_job_t *j) {
+    int done;
+    pthread_mutex_lock(&T.mu);
+    done = j->refs > 1;
+    if (done) j->refs--;
+    pthread_mutex_unlock(&T.mu);
+    if (done) return;
+    if (ava1_data_spawn(put_main, j) != 0) ava1_job_put(j); /* no thread: free it here */
 }
 
 static void unlist(ava1_job_t *j) {
@@ -117,7 +216,9 @@ void ava1_job_park_session(const uint8_t sid[16]) {
     for (i = 0; i < AVA1_MAX_JOBS; i++) {
         ava1_job_t *j = T.jobs[i];
         if (j && j->attached && memcmp(j->sid, sid, 16) == 0) {
+            pthread_mutex_lock(&j->cmu);
             j->attached = 0;
+            pthread_mutex_unlock(&j->cmu);
             j->parked_at_ms = now;
         }
     }
@@ -127,16 +228,21 @@ void ava1_job_park_session(const uint8_t sid[16]) {
 void ava1_job_reap(uint64_t now_ms) {
     ava1_job_t *gone[AVA1_MAX_JOBS];
     int i, n = 0;
+    uint64_t age = ava1_data_cfg()->park_ms ? ava1_data_cfg()->park_ms : AVA1_PARK_MS;
+    uint64_t done_age = age < 10000u ? age : 10000u;
     pthread_mutex_lock(&T.mu);
     for (i = 0; i < AVA1_MAX_JOBS; i++) {
         ava1_job_t *j = T.jobs[i];
-        /* Only a job that was actually parked can be collected: `parked_at_ms == 0` means
-         * the job is still being set up (between create and attach) or is driven by a test
-         * with no session, and monotonic uptime must not age it. A local job (JOB_COPY) is
-         * unlisted by Task 19, never here. */
-        if (j && !j->attached && j->parked_at_ms != 0 &&
-            (now_ms - j->parked_at_ms > AVA1_PARK_MS ||
-             (j->finished && now_ms - j->parked_at_ms > 10000u))) {
+        int fin;
+        /* Only a parked job can be collected: detached with a park stamp. A job created
+         * detached is stamped at creation, so one nobody ever attaches ages too; a job
+         * attached (find_attach, under this lock) has no stamp. A local job (JOB_COPY) is
+         * unlisted by Task 19, never here. `finished` is read without j->mu: that lock can
+         * be held across disk I/O, and waiting for it under T.mu would stall every reader
+         * thread's job lookup. It only ever goes 0 -> 1, so a stale read reaps later. */
+        if (!j || j->attached || j->parked_at_ms == 0) continue;
+        fin = __atomic_load_n(&j->finished, __ATOMIC_ACQUIRE);
+        if (now_ms - j->parked_at_ms > age || (fin && now_ms - j->parked_at_ms > done_age)) {
             gone[n++] = j;
             unlist(j);
         }
@@ -175,7 +281,9 @@ void ava1_job_free_one(const uint8_t id[16]) {
 int ava1_job_retire(ava1_job_t *j) {
     int i, ok;
     pthread_mutex_lock(&T.mu);
-    ok = j->refs == 2; /* the table's and the caller's: nobody else can be running it */
+    /* Listed, and held only by the table and the caller: nobody else can be running it. An
+     * unlisted job's two references are the caller's and someone else's. */
+    ok = listed_locked(j) && j->refs == 2;
     if (ok) {
         for (i = 0; i < AVA1_MAX_JOBS; i++)
             if (T.jobs[i] == j) T.jobs[i] = NULL;
@@ -191,5 +299,9 @@ int ava1_job_retire(ava1_job_t *j) {
 }
 
 void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len) {
-    if (j->emit) j->emit(j, type, flags, body, len);
+    ava1_emit_fn fn;
+    pthread_mutex_lock(&j->cmu);
+    fn = j->emit;
+    pthread_mutex_unlock(&j->cmu);
+    if (fn) fn(j, type, flags, body, len);
 }

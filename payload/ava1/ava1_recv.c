@@ -325,7 +325,8 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
     if (!known_open(s)) return refuse(ack, AVA1_ERR_PROTOCOL, msg, cap, "unknown job kind, policy or flags");
     /* An absolute path whose rest follows the manifest path rules (SPEC.md §11.2): no
      * trailing '/', no empty, "." or ".." component. */
-    if (!s->root || s->root[0] != '/' || !ava1_path_ok((const uint8_t *)s->root + 1, strlen(s->root) - 1))
+    if (!s->root || s->root[0] != '/' || strlen(s->root) > AVA1_MAX_PATH || /* j->root holds no more */
+        !ava1_path_ok((const uint8_t *)s->root + 1, strlen(s->root) - 1))
         return refuse(ack, AVA1_ERR_PATH, msg, cap, "the destination is not a valid path");
     if (!cfg->may_write || !cfg->may_write(s->root))
         return refuse(ack, AVA1_ERR_PATH, msg, cap, "writing there is not allowed");
@@ -383,7 +384,7 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
             return refuse(ack, AVA1_ERR_PROTOCOL, msg, cap, "this job was opened for another destination");
         peek_staged = peeked ? o.staged : 0;
     }
-    j = ava1_job_create(s->id, s->owner);
+    j = ava1_job_create_attached(s->id, s->owner, s->sid);
     if (!j) return refuse(ack, AVA1_ERR_BUSY, msg, cap, "too many jobs");
     j->kind = s->kind;
     j->policy = s->policy;
@@ -928,7 +929,8 @@ static int staged_tree_landed(ava1_job_t *j) {
     if (lstat(j->root, &st) != 0 || !S_ISDIR(st.st_mode)) return 0;
     pthread_mutex_lock(&j->mu);
     recount(j);
-    all = j->files_done >= j->m.files;
+    /* With no files, "all done" says nothing about the tree: prepare must make its folders. */
+    all = j->m.files > 0 && j->files_done >= j->m.files;
     if (all) j->prepared = 1;
     pthread_mutex_unlock(&j->mu);
     return all;

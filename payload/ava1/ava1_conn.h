@@ -64,6 +64,7 @@ typedef struct {
     pthread_t q_thread;
     int q_started; /* the writer thread is draining */
     int q_closed;  /* no more posts: the writer drops pending items and exits */
+    int q_busy;    /* the writer is sending a frame it popped */
     unsigned q_n;
     size_t q_bytes;
     ava1_qitem_t *q_head, *q_tail;
@@ -103,5 +104,8 @@ int ava1_conn_recv(ava1_conn_t *c, uint8_t *type, uint8_t *flags, uint32_t *chan
  * queue returns AVA1_E_BUSY and breaks the connection. */
 int ava1_conn_post(ava1_conn_t *c, uint8_t type, uint8_t flags, uint32_t channel, const uint8_t *body,
                    size_t len);
+/* Waits up to `ms` for the post queue to be written out (a closing connection's last
+ * words, such as an Error, go out before it is shut down). */
+void ava1_conn_drain(ava1_conn_t *c, uint32_t ms);
 
 #endif

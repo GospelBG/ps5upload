@@ -332,6 +332,24 @@ pub mod ffi {
         pub fn ava1_test_recv_set(root: *const c_char, owner: u8, deny_write: c_int);
         pub fn ava1_test_recv_args(kind: u8);
         pub fn ava1_test_apply_reserve(n: usize, take: c_int) -> c_int;
+        #[allow(clippy::too_many_arguments)]
+        pub fn ava1_test_server_start_data(
+            secret: *const u8,
+            peers_path: *const c_char,
+            jobs_dir: *const c_char,
+            ping_ms: u32,
+            dead_ms: u32,
+            handshake_ms: u32,
+            fsync_delay_us: u32,
+            port: u16,
+            workers: u8,
+        ) -> c_int;
+        pub fn ava1_test_server_stop_data();
+        pub fn ava1_test_data_delays(open_ms: u32, map_ms: u32);
+        pub fn ava1_test_job_attached(id: *const u8) -> c_int;
+        pub fn ava1_test_reap_rules(jobs_dir: *const c_char) -> c_int;
+        pub fn ava1_test_retire_unlisted() -> c_int;
+        pub fn ava1_test_job_counts(id: *const u8, out: *mut u64) -> c_int;
     }
 }
 
@@ -539,7 +557,35 @@ static C_SERVER: Mutex<()> = Mutex::new(());
 /// The payload's server, running on 127.0.0.1. One at a time per process.
 pub struct CServer {
     pub port: u16,
+    data: Option<DataArgs>,
     _lock: MutexGuard<'static, ()>,
+}
+
+/// What `restart_data` needs to start the same data server again.
+struct DataArgs {
+    secret: [u8; 32],
+    peers: CString,
+    jobs: CString,
+    times: [u32; 4],
+    workers: u8,
+}
+
+fn start_data_raw(a: &DataArgs, port: u16) -> u16 {
+    let rc = unsafe {
+        ffi::ava1_test_server_start_data(
+            a.secret.as_ptr(),
+            a.peers.as_ptr(),
+            a.jobs.as_ptr(),
+            a.times[0],
+            a.times[1],
+            a.times[2],
+            a.times[3],
+            port,
+            a.workers,
+        )
+    };
+    assert!(rc > 0, "C data server failed to start: {rc}");
+    rc as u16
 }
 
 impl CServer {
@@ -571,6 +617,7 @@ impl CServer {
         assert!(rc > 0, "C server failed to start: {rc}");
         CServer {
             port: rc as u16,
+            data: None,
             _lock: lock,
         }
     }
@@ -591,8 +638,93 @@ impl CServer {
         assert!(rc > 0, "C server failed to start: {rc}");
         CServer {
             port: rc as u16,
+            data: None,
             _lock: lock,
         }
+    }
+
+    /// The C server with the real data layer (Task 14): uploads land under any absolute
+    /// path. `fsync_delay_us` slows every data fsync (a slow disk).
+    pub fn start_data(
+        secret: [u8; 32],
+        peers: &Path,
+        jobs: &Path,
+        ping_ms: u32,
+        dead_ms: u32,
+        hs_ms: u32,
+        fsync_delay_us: u32,
+    ) -> Self {
+        Self::start_data_with(
+            secret,
+            peers,
+            jobs,
+            ping_ms,
+            dead_ms,
+            hs_ms,
+            fsync_delay_us,
+            0,
+        )
+    }
+
+    /// `start_data` with a fixed number of apply workers (0 = the defaults).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_data_with(
+        secret: [u8; 32],
+        peers: &Path,
+        jobs: &Path,
+        ping_ms: u32,
+        dead_ms: u32,
+        hs_ms: u32,
+        fsync_delay_us: u32,
+        workers: u8,
+    ) -> Self {
+        let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        let a = DataArgs {
+            secret,
+            peers: CString::new(peers.to_str().unwrap()).unwrap(),
+            jobs: CString::new(jobs.to_str().unwrap()).unwrap(),
+            times: [ping_ms, dead_ms, hs_ms, fsync_delay_us],
+            workers,
+        };
+        let port = start_data_raw(&a, 0);
+        CServer {
+            port,
+            data: Some(a),
+            _lock: lock,
+        }
+    }
+
+    /// A payload restart: server and data layer stopped (every job freed, the disk kept)
+    /// and started again on the same port.
+    pub fn restart_data(&mut self) {
+        let a = self.data.as_ref().expect("restart_data needs start_data");
+        unsafe { ffi::ava1_test_server_stop_data() };
+        self.port = start_data_raw(a, self.port);
+    }
+
+    /// Test hooks: JobOpen's work waits `open_ms` before it starts; an OK map waits
+    /// `map_ms` before it is sent. 0 = off. Reset by every start.
+    pub fn set_open_delay_ms(&self, ms: u32) {
+        unsafe { ffi::ava1_test_data_delays(ms, u32::MAX) }
+    }
+
+    pub fn set_map_delay_ms(&self, ms: u32) {
+        unsafe { ffi::ava1_test_data_delays(u32::MAX, ms) }
+    }
+
+    /// (bytes the apply engine has received, lane frames held) for job `id`.
+    pub fn job_counts(&self, id: [u8; 16]) -> (u64, u64) {
+        let mut out = [0u64; 2];
+        assert_eq!(
+            unsafe { ffi::ava1_test_job_counts(id.as_ptr(), out.as_mut_ptr()) },
+            0
+        );
+        (out[0], out[1])
+    }
+
+    /// 1 attached to a session, 0 parked, -1 not in the job table.
+    pub fn job_attached(&self, id: [u8; 16]) -> i32 {
+        unsafe { ffi::ava1_test_job_attached(id.as_ptr()) }
     }
 
     pub fn addr(&self) -> String {
@@ -628,8 +760,26 @@ impl CServer {
 
 impl Drop for CServer {
     fn drop(&mut self) {
-        unsafe { ffi::ava1_server_stop() };
+        if self.data.is_some() {
+            unsafe { ffi::ava1_test_server_stop_data() };
+        } else {
+            unsafe { ffi::ava1_server_stop() };
+        }
     }
+}
+
+/// `ava1_job_retire` on a job that is no longer listed (0 = refused, as it must be).
+pub fn c_retire_unlisted() -> i32 {
+    let _lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { ffi::ava1_test_retire_unlisted() }
+}
+
+/// The reaper's rules, checked in C on a private data layer (0 = all hold, else the step
+/// that failed). Holds the C server lock.
+pub fn c_reap_rules(jobs: &Path) -> i32 {
+    let _lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+    let j = CString::new(jobs.to_str().unwrap()).unwrap();
+    unsafe { ffi::ava1_test_reap_rules(j.as_ptr()) }
 }
 
 extern "C" {
