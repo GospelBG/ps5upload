@@ -215,6 +215,11 @@ int ava1_crypto_bench_decode(const uint8_t *buf, size_t len, ava1_crypto_bench_t
 typedef struct {
     uint64_t bytes;
     uint64_t micros;
+    int has_open_micros;
+    uint64_t open_micros;
+    int has_backend;
+    const uint8_t *backend;
+    uint16_t backend_len;
 } ava1_crypto_bench_result_t;
 
 int ava1_crypto_bench_result_encode(const ava1_crypto_bench_result_t *m, ava1_w_t *w);

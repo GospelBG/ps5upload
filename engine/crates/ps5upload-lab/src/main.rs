@@ -593,7 +593,8 @@ mod ava1_cmds {
         Ok(())
     }
 
-    /// ChaCha20-Poly1305 cost on the console (sealed in its memory) and on this computer.
+    /// Frame AEAD (ChaCha20-Poly1305) cost on the console (1 MiB frames sealed and opened
+    /// in its memory with the code its transfers use) and on this computer.
     pub async fn cryptobench(addr: &str, mib: u16) -> Result<()> {
         use ava1::wire::Message;
         let s = session(addr).await?;
@@ -603,26 +604,65 @@ mod ava1_cmds {
             bail!("crypto.bench failed with status {}", r.status);
         }
         let res = ava1::gen::CryptoBenchResult::decode(&r.body)?;
-        let console = res.bytes as f64 / res.micros.max(1) as f64; // bytes per µs = MB/s
-        let mut buf = vec![0x5au8; 1 << 20];
-        let t = std::time::Instant::now();
-        for i in 0..u64::from(mib.max(1)) {
-            ava1::keys::seal(&[0x11; 32], i, &[], &mut buf);
-            buf.truncate(1 << 20);
-        }
-        let here =
-            f64::from(u32::from(mib.max(1))) * 1_048_576.0 / t.elapsed().as_micros().max(1) as f64;
+        let rate = |micros: u64| res.bytes as f64 / micros.max(1) as f64; // bytes per µs = MB/s
+        let seal = rate(res.micros);
         println!(
-            "console: {console:.0} MB/s on one core ({} MiB)",
-            res.bytes >> 20
+            "console: seal {seal:.0} MB/s, open {} on one core ({} MiB, ChaCha20 path: {})",
+            res.open_micros
+                .map_or("n/a (older helper)".into(), |m| format!(
+                    "{:.0} MB/s",
+                    rate(m)
+                )),
+            res.bytes >> 20,
+            res.backend
+                .as_deref()
+                .unwrap_or("unreported (older helper)")
         );
-        println!("this computer: {here:.0} MB/s on one core");
+        let (here_seal, here_open) = local_aead_rate(mib.max(1));
+        println!("this computer: seal {here_seal:.0} MB/s, open {here_open:.0} MB/s on one core");
+        let worst = res.open_micros.map_or(seal, |m| seal.min(rate(m)));
         println!(
             "110 MB/s of transfer costs {:.1}% of one console core (target: at most 15%)",
-            110.0 / console * 100.0
+            110.0 / worst * 100.0
         );
         s.close().await;
         Ok(())
+    }
+
+    /// MB/s of `ava1::keys::seal` and `open` here, on `mib` 1 MiB frames.
+    fn local_aead_rate(mib: u16) -> (f64, f64) {
+        const MIB: usize = 1 << 20;
+        let key = [0x11u8; 32];
+        let mut buf = vec![0x5au8; MIB];
+        let t = std::time::Instant::now();
+        for i in 0..u64::from(mib) {
+            ava1::keys::seal(&key, i, &[], &mut buf);
+            buf.truncate(MIB);
+        }
+        let seal = t.elapsed();
+        let mut sealed = vec![0x5au8; MIB];
+        ava1::keys::seal(&key, 0, &[], &mut sealed);
+        // Opening needs the same frame every round: copy it in, and take the copies' time out.
+        let t = std::time::Instant::now();
+        for _ in 0..mib {
+            buf.clear();
+            buf.extend_from_slice(std::hint::black_box(&sealed));
+        }
+        let copy = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..mib {
+            buf.clear();
+            buf.extend_from_slice(&sealed);
+            assert!(
+                ava1::keys::open(&key, 0, &[], &mut buf),
+                "local open failed"
+            );
+        }
+        let open = t.elapsed().saturating_sub(copy);
+        let rate = |d: std::time::Duration| {
+            f64::from(u32::from(mib)) * MIB as f64 / d.as_micros().max(1) as f64
+        };
+        (rate(seal), rate(open))
     }
 
     pub fn stamp(input: &str, output: &str) -> Result<()> {
@@ -684,7 +724,7 @@ fn usage() -> ! {
         "  ava1-ping [SECONDS]            AVA1 handshake (pairs if needed), node.info, heartbeats"
     );
     eprintln!("  ava1-lanes N [SECONDS]         open N data lanes and keep them up");
-    eprintln!("  ava1-cryptobench [MIB]         ChaCha20 cost on the console vs this computer");
+    eprintln!("  ava1-cryptobench [MIB]         frame AEAD cost on the console vs this computer");
     eprintln!("  ava1-pairing-open [SECONDS]    let another device pair with the console");
     eprintln!("  ava1-stamp IN.elf OUT.elf      stamp this machine's AVA1 key into a payload");
     eprintln!("  chaos-proxy PORT HOST:PORT [--delay-ms N] [--kbps N] [--kill-every-s N]");

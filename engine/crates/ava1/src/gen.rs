@@ -758,6 +758,8 @@ impl Message for CryptoBench {
 pub struct CryptoBenchResult {
     pub bytes: u64,
     pub micros: u64,
+    pub open_micros: Option<u64>,
+    pub backend: Option<String>,
 }
 
 impl Message for CryptoBenchResult {
@@ -766,7 +768,12 @@ impl Message for CryptoBenchResult {
     fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.u64(self.bytes);
         w.u64(self.micros);
-        w.u16(0);
+        let mut ext_n: u16 = 0;
+        if self.open_micros.is_some() { ext_n += 1; }
+        if self.backend.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.open_micros { w.ext(1, |w| { w.u64(*v); Ok(()) })?; }
+        if let Some(v) = &self.backend { w.ext(2, |w| { w.str(v) })?; }
         Ok(())
     }
 
@@ -780,7 +787,21 @@ impl Message for CryptoBenchResult {
             let tag = r.u16()?;
             let len = r.u32()? as usize;
             let v = r.take(len)?;
-            let _ = (tag, v);
+            match tag {
+                1 => {
+                    if m.open_micros.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.open_micros = Some(vr.u64()?);
+                    vr.finish()?;
+                }
+                2 => {
+                    if m.backend.is_some() { return Err(DecodeError::DupExt(2)); }
+                    let mut vr = Reader::new(v);
+                    m.backend = Some(vr.str()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
         }
         r.finish()?;
         Ok(m)
@@ -813,7 +834,7 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "ClientInfo" => ClientInfo { name: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
         "PairingOpen" => PairingOpen { seconds: rng.next_u64() as u16, }.to_bytes().ok(),
         "CryptoBench" => CryptoBench { mib: rng.next_u64() as u16, }.to_bytes().ok(),
-        "CryptoBenchResult" => CryptoBenchResult { bytes: rng.next_u64(), micros: rng.next_u64(), }.to_bytes().ok(),
+        "CryptoBenchResult" => CryptoBenchResult { bytes: rng.next_u64(), micros: rng.next_u64(), open_micros: if rng.below(2) == 1 { Some(rng.next_u64()) } else { None }, backend: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
         _ => None,
     }
 }

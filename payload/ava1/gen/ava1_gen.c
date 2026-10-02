@@ -537,9 +537,22 @@ int ava1_crypto_bench_decode(const uint8_t *buf, size_t len, ava1_crypto_bench_t
 }
 
 int ava1_crypto_bench_result_encode(const ava1_crypto_bench_result_t *m, ava1_w_t *w) {
+    uint16_t ext_n = 0;
     ava1_w_u64(w, m->bytes);
     ava1_w_u64(w, m->micros);
-    ava1_w_u16(w, 0);
+    if (m->has_open_micros) ext_n++;
+    if (m->has_backend) ext_n++;
+    ava1_w_u16(w, ext_n);
+    if (m->has_open_micros) {
+        size_t at = ava1_w_ext_begin(w, 1);
+        ava1_w_u64(w, m->open_micros);
+        ava1_w_ext_end(w, at);
+    }
+    if (m->has_backend) {
+        size_t at = ava1_w_ext_begin(w, 2);
+        ava1_w_str(w, m->backend, m->backend_len);
+        ava1_w_ext_end(w, at);
+    }
     return w->err;
 }
 
@@ -552,10 +565,29 @@ int ava1_crypto_bench_result_decode(const uint8_t *buf, size_t len, ava1_crypto_
     m->micros = ava1_r_u64(&r);
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {
-        uint32_t vlen;
-        (void)ava1_r_u16(&r);
-        vlen = ava1_r_u32(&r);
-        (void)ava1_r_take(&r, vlen);
+        uint16_t tag = ava1_r_u16(&r);
+        uint32_t vlen = ava1_r_u32(&r);
+        const uint8_t *v = ava1_r_take(&r, vlen);
+        ava1_r_t vr;
+        int rc;
+        if (r.err) break;
+        ava1_r_init(&vr, v, vlen);
+        switch (tag) {
+        case 1:
+            if (m->has_open_micros) return AVA1_E_DUP_EXT;
+            m->has_open_micros = 1;
+            m->open_micros = ava1_r_u64(&vr);
+            break;
+        case 2:
+            if (m->has_backend) return AVA1_E_DUP_EXT;
+            m->has_backend = 1;
+            m->backend = ava1_r_str(&vr, &m->backend_len);
+            break;
+        default:
+            continue;
+        }
+        rc = ava1_r_finish(&vr);
+        if (rc != 0) return rc;
     }
     return ava1_r_finish(&r);
 }

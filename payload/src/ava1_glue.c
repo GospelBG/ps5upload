@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <time.h>
 
+#include "ava1_aead.h"
 #include "ava1_gen.h"
 #include "ava1_noise.h"
 #include "ava1_server.h"
@@ -38,27 +39,56 @@ static uint64_t mono_us(void) {
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
 
-/* crypto.bench: seals `mib` MiB in memory and reports how long it took, so the
- * ChaCha20 cost is measured on this console (spec risk table). */
+/* crypto.bench: the frame AEAD in use (ava1_seal / ava1_open) on `mib` 1 MiB frames in
+ * memory, timed on this console (spec risk table), and which ChaCha20 path it chose. */
 static int crypto_bench(const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap, size_t *out_len) {
+    const size_t MIB = 1u << 20;
     ava1_crypto_bench_t q;
     ava1_crypto_bench_result_t r;
     ava1_w_t w;
-    uint8_t key[32], mac[16], *buf;
-    uint64_t t0;
+    uint8_t key[32], mac[16], *buf, *ct;
+    const char *backend = ava1_aead_backend();
+    uint64_t t0, copy;
     unsigned i, mib;
+    int bad = 0;
     if (ava1_crypto_bench_decode(body, body_len, &q) != 0) return AVA1_ERR_PROTOCOL;
     mib = q.mib == 0 ? 1u : (q.mib > 256 ? 256u : q.mib);
-    buf = malloc(1u << 20);
-    if (!buf) return AVA1_ERR_INTERNAL;
-    memset(buf, 0x5a, 1u << 20);
+    buf = malloc(MIB);
+    ct = malloc(MIB);
+    if (!buf || !ct) {
+        free(buf);
+        free(ct);
+        return AVA1_ERR_INTERNAL;
+    }
+    memset(buf, 0x5a, MIB);
     memset(key, 0x11, sizeof key);
-    t0 = mono_us();
-    for (i = 0; i < mib; i++) ava1_seal(key, i, NULL, 0, buf, 1u << 20, mac);
     memset(&r, 0, sizeof r);
-    r.bytes = (uint64_t)mib << 20;
+    t0 = mono_us();
+    for (i = 0; i < mib; i++) ava1_seal(key, i, NULL, 0, buf, MIB, mac);
     r.micros = mono_us() - t0;
+    /* Opening needs the same frame every round: copy it in, and take the copies' time out. */
+    memcpy(ct, buf, MIB);
+    t0 = mono_us();
+    for (i = 0; i < mib; i++) {
+        memcpy(buf, ct, MIB);
+        __asm__ __volatile__("" : : "r"(buf) : "memory"); /* keep every copy */
+    }
+    copy = mono_us() - t0;
+    t0 = mono_us();
+    for (i = 0; i < mib; i++) {
+        memcpy(buf, ct, MIB);
+        bad |= ava1_open(key, mib - 1, NULL, 0, buf, MIB, mac);
+    }
+    r.open_micros = mono_us() - t0;
+    r.open_micros = r.open_micros > copy ? r.open_micros - copy : 1;
     free(buf);
+    free(ct);
+    if (bad) return AVA1_ERR_INTERNAL;
+    r.bytes = (uint64_t)mib << 20;
+    r.has_open_micros = 1;
+    r.has_backend = 1;
+    r.backend = (const uint8_t *)backend;
+    r.backend_len = (uint16_t)strlen(backend);
     ava1_w_init(&w, out, cap);
     if (ava1_crypto_bench_result_encode(&r, &w) != 0) return AVA1_ERR_INTERNAL;
     *out_len = w.len;

@@ -206,3 +206,9 @@ fields = [
   { name = "bytes", ty = "u64" },
   { name = "micros", ty = "u64" },
 ]
+# micros = sealing `bytes` as 1 MiB frames (ava1_seal); open_micros = opening them;
+# backend = the ChaCha20 path in use ("avx2" or "portable").
+ext = [
+  { tag = 1, name = "open_micros", ty = "u64" },
+  { tag = 2, name = "backend", ty = "str" },
+]
