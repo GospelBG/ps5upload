@@ -122,11 +122,18 @@ impl FileHasher {
 /// complete image or the new complete one. A crash that loses the rename costs only the
 /// last batch's CVs, which §13.4 re-hashes at resume. `put` itself is one 32-byte write
 /// (plus one full-image copy per batch), so feeding a group's CV is O(1).
+///
+/// One instance per path at a time: each rebuilds the whole image from the slots it read
+/// at open, so a second instance's `sync` would drop the first's updates.
 pub struct Outboard {
     path: PathBuf,
     f: File,
     shadow: Option<File>,
     slots: Vec<Option<[u8; 32]>>,
+    /// A `put` failed part-way through a slot: the shadow no longer holds a complete
+    /// image, so every later `put` and `sync` refuses rather than rename a torn file over
+    /// the outboard. Reopening recovers — the outboard itself was never written.
+    poisoned: bool,
 }
 
 impl Outboard {
@@ -138,7 +145,10 @@ impl Outboard {
             .truncate(false)
             .open(path)?;
         let need = groups * 32;
-        let len = f.metadata()?.len().min(need);
+        // A tail that is not a whole slot (a crash mid-write, a manual truncation) is not
+        // an error: the slots it covers are simply unknown, and the next `sync` rewrites
+        // the file whole.
+        let len = f.metadata()?.len().min(need) & !31;
         let mut raw = vec![0u8; need as usize];
         if len > 0 {
             read_exact_at(&f, &mut raw[..len as usize], 0)?;
@@ -155,6 +165,7 @@ impl Outboard {
             f,
             shadow: None,
             slots,
+            poisoned: false,
         })
     }
 
@@ -163,9 +174,20 @@ impl Outboard {
     }
 
     pub fn put(&mut self, i: u64, cv: &[u8; 32]) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "the outboard's shadow was torn by a failed put",
+            ));
+        }
         self.slots[i as usize] = Some(*cv);
         match self.shadow.as_mut() {
-            Some(shadow) => write_all_at(shadow, cv, i * 32),
+            Some(shadow) => match write_all_at(shadow, cv, i * 32) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    self.poisoned = true;
+                    Err(e)
+                }
+            },
             None => {
                 let mut img = vec![0u8; self.slots.len() * 32];
                 for (s, slot) in img.as_chunks_mut::<32>().0.iter_mut().zip(&self.slots) {
@@ -186,6 +208,11 @@ impl Outboard {
     }
 
     pub fn sync(&mut self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "the outboard's shadow was torn by a failed put",
+            ));
+        }
         if let Some(shadow) = self.shadow.take() {
             shadow.sync_data()?;
             std::fs::rename(tmp_path(&self.path), &self.path)?;
@@ -268,9 +295,12 @@ mod tests {
             2 * g + 1023,
             3 * g + 5000,
             5 * g,
+            6 * g,
+            7 * g + 7,
             7 * g + 1,
             8 * g + 1024,
             9 * g - 1,
+            12 * g + 1,
         ] {
             let d = data(n);
             assert_eq!(
@@ -284,7 +314,7 @@ mod tests {
     #[test]
     fn the_file_hasher_handles_every_size_class() {
         let g = GROUP as usize;
-        for n in [0, 1, 1024, g - 1, g, g + 1, 3 * g + 17] {
+        for n in [0, 1, 1024, 1025, g - 1, g, g + 1, 3 * g + 17] {
             let d = data(n);
             let mut h = FileHasher::new(n as u64);
             // feed groups out of order
@@ -326,6 +356,24 @@ mod tests {
         h.add_group(3, &d[3 * g..4 * g]);
         h.add_group(4, &d[4 * g..]);
         assert_eq!(h.root(), Some(*blake3::hash(&d).as_bytes()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_outboard_tolerates_a_torn_tail() {
+        // A crash mid-write can leave a length that is not a whole number of slots; the
+        // whole slots are still true and the rest is simply unknown. This used to panic.
+        let dir = std::env::temp_dir().join(format!("ava1-ob-torn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.ob");
+        let _ = std::fs::remove_file(&p);
+        let mut raw = vec![0u8; 32 + 8];
+        raw[..32].copy_from_slice(&[7u8; 32]);
+        std::fs::write(&p, &raw).unwrap();
+        let ob = Outboard::open(&p, 3).expect("a torn tail is not an error");
+        assert_eq!(ob.get(0), Some([7u8; 32]));
+        assert_eq!(ob.get(1), None);
+        assert_eq!(ob.get(2), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

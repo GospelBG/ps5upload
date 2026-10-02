@@ -288,8 +288,9 @@ rename) is reported in `JobDone` and never causes a resend.
 (`GROUP_SHIFT` = 20): group i covers bytes [i·2^20, (i+1)·2^20). For a file of two or more
 groups, each group's chaining value (BLAKE3 `finalize_non_root` of that subtree) is
 computed where its bytes are, and the root is merged from the group CVs along BLAKE3's
-tree (left subtree = the largest power of two of groups strictly less than the count).
-A file of zero or one group: root = BLAKE3(bytes).
+tree (left subtree = the largest power of two of groups strictly less than the count);
+every merge is a non-root parent compression except the last, whose compression carries
+BLAKE3's ROOT flag. A file of zero or one group: root = BLAKE3(bytes).
 
 13.2 Senders compute the root while reading. Small files carry it in their
 `BundleRecord`; large files send `FileRoot` once their last group is read (or, on a
