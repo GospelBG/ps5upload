@@ -23,6 +23,42 @@
 #define AVA1_ERR_UNKNOWN_METHOD 6ULL
 #define AVA1_ERR_INTERNAL 7ULL
 #define AVA1_ERR_BUSY 8ULL
+#define AVA1_CAP_DATA_PLANE 1ULL
+#define AVA1_METHOD_JOB_COPY 16ULL
+#define AVA1_METHOD_JOB_STATUS 17ULL
+#define AVA1_METHOD_JOB_CANCEL 18ULL
+#define AVA1_METHOD_DISK_CALIBRATE 19ULL
+#define AVA1_ERR_PATH 9ULL
+#define AVA1_ERR_NO_SPACE 10ULL
+#define AVA1_ERR_UNKNOWN_JOB 11ULL
+#define AVA1_ERR_IO 12ULL
+#define AVA1_ERR_VERIFY 13ULL
+#define AVA1_ERR_EXISTS 14ULL
+#define AVA1_ERR_CANCELLED 15ULL
+#define AVA1_ERR_CROSS_DEVICE 16ULL
+#define AVA1_ERR_CREDIT 17ULL
+#define AVA1_JOB_UPLOAD 1ULL
+#define AVA1_JOB_DOWNLOAD 2ULL
+#define AVA1_JOB_COPY 3ULL
+#define AVA1_POLICY_REPLACE 0ULL
+#define AVA1_POLICY_SKIP_EXISTING 1ULL
+#define AVA1_POLICY_VERIFY 2ULL
+#define AVA1_JF_SINGLE_FILE 1ULL
+#define AVA1_JF_ORDERED 2ULL
+#define AVA1_JF_UNSAFE_READ 4ULL
+#define AVA1_JF_MOVE 8ULL
+#define AVA1_ENTRY_FILE 0ULL
+#define AVA1_ENTRY_DIR 1ULL
+#define AVA1_GROUP_SHIFT 20ULL
+#define AVA1_BN_NONE 0ULL
+#define AVA1_BN_NETWORK 1ULL
+#define AVA1_BN_SOURCE 2ULL
+#define AVA1_BN_DISK 3ULL
+#define AVA1_BN_WORKERS 4ULL
+#define AVA1_BN_CREDIT 5ULL
+#define AVA1_RETRY_VERIFY 1ULL
+#define AVA1_RETRY_IO 2ULL
+#define AVA1_RETRY_CHANGED 3ULL
 
 #define AVA1_TYPE_HS1 0x01u
 #define AVA1_TYPE_HS2 0x02u
@@ -38,6 +74,22 @@
 #define AVA1_TYPE_BYE 0x0cu
 #define AVA1_TYPE_RPC_REQUEST 0x60u
 #define AVA1_TYPE_RPC_RESPONSE 0x61u
+#define AVA1_TYPE_JOB_OPEN 0x20u
+#define AVA1_TYPE_JOB_OPEN_ACK 0x21u
+#define AVA1_TYPE_MANIFEST_PAGE 0x22u
+#define AVA1_TYPE_MANIFEST_END 0x23u
+#define AVA1_TYPE_JOB_MAP 0x24u
+#define AVA1_TYPE_RESUME 0x25u
+#define AVA1_TYPE_CHUNK 0x26u
+#define AVA1_TYPE_BUNDLE 0x27u
+#define AVA1_TYPE_RECEIVED 0x28u
+#define AVA1_TYPE_CREDIT 0x29u
+#define AVA1_TYPE_DURABLE 0x2au
+#define AVA1_TYPE_FILE_ROOT 0x2bu
+#define AVA1_TYPE_FILE_RETRY 0x2cu
+#define AVA1_TYPE_STATUS 0x2du
+#define AVA1_TYPE_JOB_DONE 0x2eu
+#define AVA1_TYPE_JOB_CANCEL 0x2fu
 
 typedef struct {
     const uint8_t *version;
@@ -138,6 +190,221 @@ int ava1_crypto_bench_result_decode(const uint8_t *buf, size_t len, ava1_crypto_
 int ava1_crypto_bench_result_append(ava1_w_t *blob, const ava1_crypto_bench_result_t *m);
 int ava1_crypto_bench_result_next(ava1_r_t *it, ava1_crypto_bench_result_t *out);
 int ava1_crypto_bench_result_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint32_t file_id;
+    uint8_t kind;
+    uint32_t mode;
+    uint64_t size;
+    uint64_t mtime;
+    const uint8_t *path;
+    uint16_t path_len;
+    int has_root;
+    uint8_t root[32];
+} ava1_manifest_entry_t;
+
+int ava1_manifest_entry_encode(const ava1_manifest_entry_t *m, ava1_w_t *w);
+int ava1_manifest_entry_decode(const uint8_t *buf, size_t len, ava1_manifest_entry_t *m);
+
+int ava1_manifest_entry_append(ava1_w_t *blob, const ava1_manifest_entry_t *m);
+int ava1_manifest_entry_next(ava1_r_t *it, ava1_manifest_entry_t *out);
+int ava1_manifest_entry_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint32_t first;
+    uint32_t count;
+} ava1_file_run_t;
+
+int ava1_file_run_encode(const ava1_file_run_t *m, ava1_w_t *w);
+int ava1_file_run_decode(const uint8_t *buf, size_t len, ava1_file_run_t *m);
+
+int ava1_file_run_append(ava1_w_t *blob, const ava1_file_run_t *m);
+int ava1_file_run_next(ava1_r_t *it, ava1_file_run_t *out);
+int ava1_file_run_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint32_t file_id;
+    uint64_t offset;
+    uint64_t len;
+} ava1_file_range_t;
+
+int ava1_file_range_encode(const ava1_file_range_t *m, ava1_w_t *w);
+int ava1_file_range_decode(const uint8_t *buf, size_t len, ava1_file_range_t *m);
+
+int ava1_file_range_append(ava1_w_t *blob, const ava1_file_range_t *m);
+int ava1_file_range_next(ava1_r_t *it, ava1_file_range_t *out);
+int ava1_file_range_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint32_t file_id;
+    uint8_t root[32];
+    const uint8_t *data;
+    uint32_t data_len;
+} ava1_bundle_record_t;
+
+int ava1_bundle_record_encode(const ava1_bundle_record_t *m, ava1_w_t *w);
+int ava1_bundle_record_decode(const uint8_t *buf, size_t len, ava1_bundle_record_t *m);
+
+int ava1_bundle_record_append(ava1_w_t *blob, const ava1_bundle_record_t *m);
+int ava1_bundle_record_next(ava1_r_t *it, ava1_bundle_record_t *out);
+int ava1_bundle_record_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint32_t file_id;
+    uint8_t root[32];
+} ava1_root_item_t;
+
+int ava1_root_item_encode(const ava1_root_item_t *m, ava1_w_t *w);
+int ava1_root_item_decode(const uint8_t *buf, size_t len, ava1_root_item_t *m);
+
+int ava1_root_item_append(ava1_w_t *blob, const ava1_root_item_t *m);
+int ava1_root_item_next(ava1_r_t *it, ava1_root_item_t *out);
+int ava1_root_item_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint8_t job_id[16];
+    const uint8_t *src;
+    uint16_t src_len;
+    const uint8_t *dest;
+    uint16_t dest_len;
+    uint32_t flags;
+} ava1_job_copy_t;
+
+int ava1_job_copy_encode(const ava1_job_copy_t *m, ava1_w_t *w);
+int ava1_job_copy_decode(const uint8_t *buf, size_t len, ava1_job_copy_t *m);
+
+int ava1_job_copy_append(ava1_w_t *blob, const ava1_job_copy_t *m);
+int ava1_job_copy_next(ava1_r_t *it, ava1_job_copy_t *out);
+int ava1_job_copy_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint8_t job_id[16];
+} ava1_job_ref_t;
+
+int ava1_job_ref_encode(const ava1_job_ref_t *m, ava1_w_t *w);
+int ava1_job_ref_decode(const uint8_t *buf, size_t len, ava1_job_ref_t *m);
+
+int ava1_job_ref_append(ava1_w_t *blob, const ava1_job_ref_t *m);
+int ava1_job_ref_next(ava1_r_t *it, ava1_job_ref_t *out);
+int ava1_job_ref_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *dir;
+    uint16_t dir_len;
+    uint32_t files;
+    uint32_t size;
+} ava1_disk_calibrate_t;
+
+int ava1_disk_calibrate_encode(const ava1_disk_calibrate_t *m, ava1_w_t *w);
+int ava1_disk_calibrate_decode(const uint8_t *buf, size_t len, ava1_disk_calibrate_t *m);
+
+int ava1_disk_calibrate_append(ava1_w_t *blob, const ava1_disk_calibrate_t *m);
+int ava1_disk_calibrate_next(ava1_r_t *it, ava1_disk_calibrate_t *out);
+int ava1_disk_calibrate_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint8_t workers;
+    uint32_t files_per_s;
+    uint32_t create_us;
+    uint32_t fsync_us;
+} ava1_cal_point_t;
+
+int ava1_cal_point_encode(const ava1_cal_point_t *m, ava1_w_t *w);
+int ava1_cal_point_decode(const uint8_t *buf, size_t len, ava1_cal_point_t *m);
+
+int ava1_cal_point_append(ava1_w_t *blob, const ava1_cal_point_t *m);
+int ava1_cal_point_next(ava1_r_t *it, ava1_cal_point_t *out);
+int ava1_cal_point_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *points;
+    uint32_t points_len;
+    uint32_t points_count;
+} ava1_disk_calibrate_result_t;
+
+int ava1_disk_calibrate_result_encode(const ava1_disk_calibrate_result_t *m, ava1_w_t *w);
+int ava1_disk_calibrate_result_decode(const uint8_t *buf, size_t len, ava1_disk_calibrate_result_t *m);
+
+int ava1_disk_calibrate_result_append(ava1_w_t *blob, const ava1_disk_calibrate_result_t *m);
+int ava1_disk_calibrate_result_next(ava1_r_t *it, ava1_disk_calibrate_result_t *out);
+int ava1_disk_calibrate_result_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint8_t manifest_hash[32];
+    uint8_t kind;
+    uint32_t flags;
+    uint8_t staged;
+    const uint8_t *root;
+    uint16_t root_len;
+} ava1_jnl_open_t;
+
+int ava1_jnl_open_encode(const ava1_jnl_open_t *m, ava1_w_t *w);
+int ava1_jnl_open_decode(const uint8_t *buf, size_t len, ava1_jnl_open_t *m);
+
+int ava1_jnl_open_append(ava1_w_t *blob, const ava1_jnl_open_t *m);
+int ava1_jnl_open_next(ava1_r_t *it, ava1_jnl_open_t *out);
+int ava1_jnl_open_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *files;
+    uint32_t files_len;
+    uint32_t files_count;
+    const uint8_t *ranges;
+    uint32_t ranges_len;
+    uint32_t ranges_count;
+    const uint8_t *roots;
+    uint32_t roots_len;
+    uint32_t roots_count;
+} ava1_jnl_batch_t;
+
+int ava1_jnl_batch_encode(const ava1_jnl_batch_t *m, ava1_w_t *w);
+int ava1_jnl_batch_decode(const uint8_t *buf, size_t len, ava1_jnl_batch_t *m);
+
+int ava1_jnl_batch_append(ava1_w_t *blob, const ava1_jnl_batch_t *m);
+int ava1_jnl_batch_next(ava1_r_t *it, ava1_jnl_batch_t *out);
+int ava1_jnl_batch_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint32_t file_id;
+} ava1_jnl_reset_t;
+
+int ava1_jnl_reset_encode(const ava1_jnl_reset_t *m, ava1_w_t *w);
+int ava1_jnl_reset_decode(const uint8_t *buf, size_t len, ava1_jnl_reset_t *m);
+
+int ava1_jnl_reset_append(ava1_w_t *blob, const ava1_jnl_reset_t *m);
+int ava1_jnl_reset_next(ava1_r_t *it, ava1_jnl_reset_t *out);
+int ava1_jnl_reset_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *done;
+    uint32_t done_len;
+    uint32_t done_count;
+    const uint8_t *ranges;
+    uint32_t ranges_len;
+    uint32_t ranges_count;
+    const uint8_t *roots;
+    uint32_t roots_len;
+    uint32_t roots_count;
+} ava1_jnl_snapshot_t;
+
+int ava1_jnl_snapshot_encode(const ava1_jnl_snapshot_t *m, ava1_w_t *w);
+int ava1_jnl_snapshot_decode(const uint8_t *buf, size_t len, ava1_jnl_snapshot_t *m);
+
+int ava1_jnl_snapshot_append(ava1_w_t *blob, const ava1_jnl_snapshot_t *m);
+int ava1_jnl_snapshot_next(ava1_r_t *it, ava1_jnl_snapshot_t *out);
+int ava1_jnl_snapshot_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint16_t status;
+} ava1_jnl_done_t;
+
+int ava1_jnl_done_encode(const ava1_jnl_done_t *m, ava1_w_t *w);
+int ava1_jnl_done_decode(const uint8_t *buf, size_t len, ava1_jnl_done_t *m);
+
+int ava1_jnl_done_append(ava1_w_t *blob, const ava1_jnl_done_t *m);
+int ava1_jnl_done_next(ava1_r_t *it, ava1_jnl_done_t *out);
+int ava1_jnl_done_count(const uint8_t *p, uint32_t len, uint32_t *count);
 
 typedef struct {
     const uint8_t *noise;
@@ -254,6 +521,194 @@ typedef struct {
 
 int ava1_rpc_response_encode(const ava1_rpc_response_t *m, ava1_w_t *w);
 int ava1_rpc_response_decode(const uint8_t *buf, size_t len, ava1_rpc_response_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint8_t kind;
+    uint8_t policy;
+    uint32_t flags;
+    const uint8_t *root;
+    uint16_t root_len;
+    int has_src;
+    const uint8_t *src;
+    uint16_t src_len;
+    int has_credit;
+    uint64_t credit;
+} ava1_job_open_t;
+
+int ava1_job_open_encode(const ava1_job_open_t *m, ava1_w_t *w);
+int ava1_job_open_decode(const uint8_t *buf, size_t len, ava1_job_open_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint16_t status;
+    uint64_t credit;
+    uint8_t staged;
+    uint8_t workers;
+    int has_message;
+    const uint8_t *message;
+    uint16_t message_len;
+} ava1_job_open_ack_t;
+
+int ava1_job_open_ack_encode(const ava1_job_open_ack_t *m, ava1_w_t *w);
+int ava1_job_open_ack_decode(const uint8_t *buf, size_t len, ava1_job_open_ack_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    const uint8_t *entries;
+    uint32_t entries_len;
+    uint32_t entries_count;
+} ava1_manifest_page_t;
+
+int ava1_manifest_page_encode(const ava1_manifest_page_t *m, ava1_w_t *w);
+int ava1_manifest_page_decode(const uint8_t *buf, size_t len, ava1_manifest_page_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint32_t files;
+    uint64_t bytes;
+    uint8_t manifest_hash[32];
+} ava1_manifest_end_t;
+
+int ava1_manifest_end_encode(const ava1_manifest_end_t *m, ava1_w_t *w);
+int ava1_manifest_end_decode(const uint8_t *buf, size_t len, ava1_manifest_end_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint16_t status;
+    uint8_t last;
+    const uint8_t *done;
+    uint32_t done_len;
+    uint32_t done_count;
+    const uint8_t *partial;
+    uint32_t partial_len;
+    uint32_t partial_count;
+    int has_message;
+    const uint8_t *message;
+    uint16_t message_len;
+} ava1_job_map_t;
+
+int ava1_job_map_encode(const ava1_job_map_t *m, ava1_w_t *w);
+int ava1_job_map_decode(const uint8_t *buf, size_t len, ava1_job_map_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint8_t manifest_hash[32];
+} ava1_resume_t;
+
+int ava1_resume_encode(const ava1_resume_t *m, ava1_w_t *w);
+int ava1_resume_decode(const uint8_t *buf, size_t len, ava1_resume_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint32_t file_id;
+    uint64_t offset;
+    const uint8_t *data;
+    uint32_t data_len;
+} ava1_chunk_t;
+
+int ava1_chunk_encode(const ava1_chunk_t *m, ava1_w_t *w);
+int ava1_chunk_decode(const uint8_t *buf, size_t len, ava1_chunk_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    const uint8_t *records;
+    uint32_t records_len;
+    uint32_t records_count;
+} ava1_bundle_t;
+
+int ava1_bundle_encode(const ava1_bundle_t *m, ava1_w_t *w);
+int ava1_bundle_decode(const uint8_t *buf, size_t len, ava1_bundle_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint16_t lane;
+    uint32_t seq;
+} ava1_received_t;
+
+int ava1_received_encode(const ava1_received_t *m, ava1_w_t *w);
+int ava1_received_decode(const uint8_t *buf, size_t len, ava1_received_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint64_t bytes;
+} ava1_credit_t;
+
+int ava1_credit_encode(const ava1_credit_t *m, ava1_w_t *w);
+int ava1_credit_decode(const uint8_t *buf, size_t len, ava1_credit_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    const uint8_t *files;
+    uint32_t files_len;
+    uint32_t files_count;
+    const uint8_t *ranges;
+    uint32_t ranges_len;
+    uint32_t ranges_count;
+} ava1_durable_t;
+
+int ava1_durable_encode(const ava1_durable_t *m, ava1_w_t *w);
+int ava1_durable_decode(const uint8_t *buf, size_t len, ava1_durable_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint32_t file_id;
+    uint8_t root[32];
+} ava1_file_root_t;
+
+int ava1_file_root_encode(const ava1_file_root_t *m, ava1_w_t *w);
+int ava1_file_root_decode(const uint8_t *buf, size_t len, ava1_file_root_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint32_t file_id;
+    uint16_t reason;
+} ava1_file_retry_t;
+
+int ava1_file_retry_encode(const ava1_file_retry_t *m, ava1_w_t *w);
+int ava1_file_retry_decode(const uint8_t *buf, size_t len, ava1_file_retry_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint32_t files_done;
+    uint32_t files_total;
+    uint64_t bytes_received;
+    uint64_t bytes_durable;
+    uint64_t bytes_total;
+    uint8_t bottleneck;
+    uint8_t workers;
+    uint8_t lanes;
+    uint8_t sequential;
+    int has_current;
+    const uint8_t *current;
+    uint16_t current_len;
+    int has_state;
+    uint8_t state;
+} ava1_status_t;
+
+int ava1_status_encode(const ava1_status_t *m, ava1_w_t *w);
+int ava1_status_decode(const uint8_t *buf, size_t len, ava1_status_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint16_t status;
+    uint32_t files;
+    uint64_t bytes;
+    int has_message;
+    const uint8_t *message;
+    uint16_t message_len;
+} ava1_job_done_t;
+
+int ava1_job_done_encode(const ava1_job_done_t *m, ava1_w_t *w);
+int ava1_job_done_decode(const uint8_t *buf, size_t len, ava1_job_done_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint16_t reason;
+} ava1_job_cancel_t;
+
+int ava1_job_cancel_encode(const ava1_job_cancel_t *m, ava1_w_t *w);
+int ava1_job_cancel_decode(const uint8_t *buf, size_t len, ava1_job_cancel_t *m);
 
 extern const char *const ava1_message_names[];
 extern const size_t ava1_message_count;

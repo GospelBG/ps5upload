@@ -216,3 +216,68 @@ signing keys and tickets, cross-network encryption, session parking (project 2);
 management RPCs replacing FTX2 (project 3). Unknown frame types on a control
 connection are a protocol error; new frame types require a version bump or a
 negotiated `caps` bit.
+
+## 11. Jobs and manifest
+
+11.1 Every transfer is a job with a 16-byte `job_id`, chosen by the node that opens it
+(the engine uses the HTTP API's `tx_id`). A job is bound to the static key of the peer
+that opened it; only that key may resume or cancel it. Every data-plane message
+(types 0x20–0x3F) has `job_id` as its first field.
+
+11.2 Paths in a manifest are relative to the job root: UTF-8, '/'-separated, at most
+1024 bytes, no empty, "." or ".." component, no NUL, no leading '/'. A receiver refuses
+a manifest with any other path (`ERR_PATH`) before touching the filesystem.
+
+11.3 Opening (`kind` as seen by the node that receives `JobOpen`):
+- `JOB_UPLOAD`: opener → `JobOpen`; receiver → `JobOpenAck{credit, staged}`; opener →
+  `ManifestPage`* → `ManifestEnd`; receiver → `JobMap`; then data.
+- `JOB_DOWNLOAD`: opener → `JobOpen{root = source, ext credit}`; the other node becomes
+  the sender: `JobOpenAck`, `ManifestPage`* → `ManifestEnd`; opener → `JobMap`; then data.
+- `JOB_COPY` runs on one node (`job.copy` RPC, §16).
+Entries are numbered 0.. in manifest order (`file_id`); directories are entries with
+`kind = ENTRY_DIR`. `manifest_hash` = BLAKE3 over, for every entry in order,
+`u32le(len) ‖ encoding of the entry without its ext`.
+
+11.4 Policies: `replace` (send everything not in the map), `skip-existing` (the receiver
+marks a file done when a file of the same size and mtime seconds exists), `verify` (the
+sender puts each file's root in `ext root`; the receiver marks a file done when an
+existing file of the same size hashes to it).
+
+11.5 A `JobOpen` for a job the receiver already knows is a resume: the receiver matches
+the new manifest against its stored one by path, keeps the progress of entries whose
+size and mtime are unchanged, and restarts the others (never splicing old and new bytes).
+`Resume{job_id, manifest_hash}` is the fast path when the sender still holds the same
+manifest: the receiver answers `JobMap`, or `JobMap{status = ERR_UNKNOWN_JOB}` and the
+sender falls back to `JobOpen`. A map larger than one control frame is sent as several
+`JobMap` pages; `last = 1` marks the final one. `Durable` is never paged: each is complete.
+
+11.6 Staging: when the job root does not exist, the receiver writes the whole tree under
+`<root>.ava-part/` and, after the last file, renames it to `<root>` (same parent, `st_dev`
+checked). When the root exists, files are written in place; large files through
+`<name>.ava-part` and a same-directory rename. `JF_SINGLE_FILE` writes `<root>.ava-part`.
+
+## 12. Data frames and credit
+
+12.1 `Chunk` and `Bundle` travel on lanes; everything else on the control connection.
+The header `channel` of a lane data frame is the sender's per-job sequence number.
+
+12.2 `Chunk.offset` is a multiple of 1 MiB (one verification group, §13); its length is
+a multiple of 1 MiB unless the chunk ends the file. A file is a *large* file when its
+size is at least the job's cutoff; smaller files travel whole, as `BundleRecord`s.
+
+12.3 `Received{lane, seq}` is sent as soon as the receiver has a lane frame in memory,
+before any disk work. A sender requeues, on any lane, the frames of a lane that closed
+before they were `Received`. Applying a frame twice is harmless.
+
+12.4 Credit: `JobOpenAck.credit` (uploads) or `JobOpen.ext credit` (downloads) is the
+number of lane-frame body bytes the sender may have outstanding; `Credit{bytes}` returns
+space as the receiver frees buffers. A receiver that sees its credit exceeded refuses the
+frame with `ERR_CREDIT` and closes the lane.
+
+12.5 Per lane, the sender keeps at most `max(chunk size, lane rate × 2 s)` bytes sent
+and not yet `Received`.
+
+12.6 `Durable{files, ranges}` follows the order: data synced → journal appended and
+synced → `Durable`. `JobDone` follows the last durable commit (and the staging rename).
+A failure after every byte is durable (`ERR_EXISTS`, `ERR_CROSS_DEVICE` on the final
+rename) is reported in `JobDone` and never causes a resend.

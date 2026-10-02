@@ -19,6 +19,42 @@ pub const ERR_BAD_JOIN: u16 = 5;
 pub const ERR_UNKNOWN_METHOD: u16 = 6;
 pub const ERR_INTERNAL: u16 = 7;
 pub const ERR_BUSY: u16 = 8;
+pub const CAP_DATA_PLANE: u64 = 1;
+pub const METHOD_JOB_COPY: u16 = 16;
+pub const METHOD_JOB_STATUS: u16 = 17;
+pub const METHOD_JOB_CANCEL: u16 = 18;
+pub const METHOD_DISK_CALIBRATE: u16 = 19;
+pub const ERR_PATH: u16 = 9;
+pub const ERR_NO_SPACE: u16 = 10;
+pub const ERR_UNKNOWN_JOB: u16 = 11;
+pub const ERR_IO: u16 = 12;
+pub const ERR_VERIFY: u16 = 13;
+pub const ERR_EXISTS: u16 = 14;
+pub const ERR_CANCELLED: u16 = 15;
+pub const ERR_CROSS_DEVICE: u16 = 16;
+pub const ERR_CREDIT: u16 = 17;
+pub const JOB_UPLOAD: u8 = 1;
+pub const JOB_DOWNLOAD: u8 = 2;
+pub const JOB_COPY: u8 = 3;
+pub const POLICY_REPLACE: u8 = 0;
+pub const POLICY_SKIP_EXISTING: u8 = 1;
+pub const POLICY_VERIFY: u8 = 2;
+pub const JF_SINGLE_FILE: u32 = 1;
+pub const JF_ORDERED: u32 = 2;
+pub const JF_UNSAFE_READ: u32 = 4;
+pub const JF_MOVE: u32 = 8;
+pub const ENTRY_FILE: u8 = 0;
+pub const ENTRY_DIR: u8 = 1;
+pub const GROUP_SHIFT: u8 = 20;
+pub const BN_NONE: u8 = 0;
+pub const BN_NETWORK: u8 = 1;
+pub const BN_SOURCE: u8 = 2;
+pub const BN_DISK: u8 = 3;
+pub const BN_WORKERS: u8 = 4;
+pub const BN_CREDIT: u8 = 5;
+pub const RETRY_VERIFY: u16 = 1;
+pub const RETRY_IO: u16 = 2;
+pub const RETRY_CHANGED: u16 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Hs1 {
@@ -536,6 +572,757 @@ impl FrameMessage for RpcResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobOpen {
+    pub job_id: [u8; 16],
+    pub kind: u8,
+    pub policy: u8,
+    pub flags: u32,
+    pub root: String,
+    pub src: Option<String>,
+    pub credit: Option<u64>,
+}
+
+impl Message for JobOpen {
+    const NAME: &'static str = "JobOpen";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u8(self.kind);
+        w.u8(self.policy);
+        w.u32(self.flags);
+        w.str(&self.root)?;
+        let mut ext_n: u16 = 0;
+        if self.src.is_some() { ext_n += 1; }
+        if self.credit.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.src { w.ext(1, |w| { w.str(v) })?; }
+        if let Some(v) = &self.credit { w.ext(2, |w| { w.u64(*v); Ok(()) })?; }
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.kind = r.u8()?;
+        m.policy = r.u8()?;
+        m.flags = r.u32()?;
+        m.root = r.str()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            match tag {
+                1 => {
+                    if m.src.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.src = Some(vr.str()?);
+                    vr.finish()?;
+                }
+                2 => {
+                    if m.credit.is_some() { return Err(DecodeError::DupExt(2)); }
+                    let mut vr = Reader::new(v);
+                    m.credit = Some(vr.u64()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for JobOpen {
+    const TYPE: u8 = 0x20;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobOpenAck {
+    pub job_id: [u8; 16],
+    pub status: u16,
+    pub credit: u64,
+    pub staged: u8,
+    pub workers: u8,
+    pub message: Option<String>,
+}
+
+impl Message for JobOpenAck {
+    const NAME: &'static str = "JobOpenAck";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u16(self.status);
+        w.u64(self.credit);
+        w.u8(self.staged);
+        w.u8(self.workers);
+        let mut ext_n: u16 = 0;
+        if self.message.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.message { w.ext(1, |w| { w.str(v) })?; }
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.status = r.u16()?;
+        m.credit = r.u64()?;
+        m.staged = r.u8()?;
+        m.workers = r.u8()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            match tag {
+                1 => {
+                    if m.message.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.message = Some(vr.str()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for JobOpenAck {
+    const TYPE: u8 = 0x21;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManifestPage {
+    pub job_id: [u8; 16],
+    pub entries: Vec<ManifestEntry>,
+}
+
+impl Message for ManifestPage {
+    const NAME: &'static str = "ManifestPage";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.records(&self.entries)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.entries = r.records::<ManifestEntry>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for ManifestPage {
+    const TYPE: u8 = 0x22;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManifestEnd {
+    pub job_id: [u8; 16],
+    pub files: u32,
+    pub bytes: u64,
+    pub manifest_hash: [u8; 32],
+}
+
+impl Message for ManifestEnd {
+    const NAME: &'static str = "ManifestEnd";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u32(self.files);
+        w.u64(self.bytes);
+        w.fixed(&self.manifest_hash);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.files = r.u32()?;
+        m.bytes = r.u64()?;
+        m.manifest_hash = r.fixed::<32>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for ManifestEnd {
+    const TYPE: u8 = 0x23;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobMap {
+    pub job_id: [u8; 16],
+    pub status: u16,
+    pub last: u8,
+    pub done: Vec<FileRun>,
+    pub partial: Vec<FileRange>,
+    pub message: Option<String>,
+}
+
+impl Message for JobMap {
+    const NAME: &'static str = "JobMap";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u16(self.status);
+        w.u8(self.last);
+        w.records(&self.done)?;
+        w.records(&self.partial)?;
+        let mut ext_n: u16 = 0;
+        if self.message.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.message { w.ext(1, |w| { w.str(v) })?; }
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.status = r.u16()?;
+        m.last = r.u8()?;
+        m.done = r.records::<FileRun>()?;
+        m.partial = r.records::<FileRange>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            match tag {
+                1 => {
+                    if m.message.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.message = Some(vr.str()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for JobMap {
+    const TYPE: u8 = 0x24;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Resume {
+    pub job_id: [u8; 16],
+    pub manifest_hash: [u8; 32],
+}
+
+impl Message for Resume {
+    const NAME: &'static str = "Resume";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.fixed(&self.manifest_hash);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.manifest_hash = r.fixed::<32>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for Resume {
+    const TYPE: u8 = 0x25;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Chunk {
+    pub job_id: [u8; 16],
+    pub file_id: u32,
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+impl Message for Chunk {
+    const NAME: &'static str = "Chunk";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u32(self.file_id);
+        w.u64(self.offset);
+        w.bytes(&self.data)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.file_id = r.u32()?;
+        m.offset = r.u64()?;
+        m.data = r.bytes()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for Chunk {
+    const TYPE: u8 = 0x26;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Bundle {
+    pub job_id: [u8; 16],
+    pub records: Vec<BundleRecord>,
+}
+
+impl Message for Bundle {
+    const NAME: &'static str = "Bundle";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.records(&self.records)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.records = r.records::<BundleRecord>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for Bundle {
+    const TYPE: u8 = 0x27;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Received {
+    pub job_id: [u8; 16],
+    pub lane: u16,
+    pub seq: u32,
+}
+
+impl Message for Received {
+    const NAME: &'static str = "Received";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u16(self.lane);
+        w.u32(self.seq);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.lane = r.u16()?;
+        m.seq = r.u32()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for Received {
+    const TYPE: u8 = 0x28;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Credit {
+    pub job_id: [u8; 16],
+    pub bytes: u64,
+}
+
+impl Message for Credit {
+    const NAME: &'static str = "Credit";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u64(self.bytes);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.bytes = r.u64()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for Credit {
+    const TYPE: u8 = 0x29;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Durable {
+    pub job_id: [u8; 16],
+    pub files: Vec<FileRun>,
+    pub ranges: Vec<FileRange>,
+}
+
+impl Message for Durable {
+    const NAME: &'static str = "Durable";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.records(&self.files)?;
+        w.records(&self.ranges)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.files = r.records::<FileRun>()?;
+        m.ranges = r.records::<FileRange>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for Durable {
+    const TYPE: u8 = 0x2a;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileRoot {
+    pub job_id: [u8; 16],
+    pub file_id: u32,
+    pub root: [u8; 32],
+}
+
+impl Message for FileRoot {
+    const NAME: &'static str = "FileRoot";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u32(self.file_id);
+        w.fixed(&self.root);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.file_id = r.u32()?;
+        m.root = r.fixed::<32>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for FileRoot {
+    const TYPE: u8 = 0x2b;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileRetry {
+    pub job_id: [u8; 16],
+    pub file_id: u32,
+    pub reason: u16,
+}
+
+impl Message for FileRetry {
+    const NAME: &'static str = "FileRetry";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u32(self.file_id);
+        w.u16(self.reason);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.file_id = r.u32()?;
+        m.reason = r.u16()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for FileRetry {
+    const TYPE: u8 = 0x2c;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Status {
+    pub job_id: [u8; 16],
+    pub files_done: u32,
+    pub files_total: u32,
+    pub bytes_received: u64,
+    pub bytes_durable: u64,
+    pub bytes_total: u64,
+    pub bottleneck: u8,
+    pub workers: u8,
+    pub lanes: u8,
+    pub sequential: u8,
+    pub current: Option<String>,
+    pub state: Option<u8>,
+}
+
+impl Message for Status {
+    const NAME: &'static str = "Status";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u32(self.files_done);
+        w.u32(self.files_total);
+        w.u64(self.bytes_received);
+        w.u64(self.bytes_durable);
+        w.u64(self.bytes_total);
+        w.u8(self.bottleneck);
+        w.u8(self.workers);
+        w.u8(self.lanes);
+        w.u8(self.sequential);
+        let mut ext_n: u16 = 0;
+        if self.current.is_some() { ext_n += 1; }
+        if self.state.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.current { w.ext(1, |w| { w.str(v) })?; }
+        if let Some(v) = &self.state { w.ext(2, |w| { w.u8(*v); Ok(()) })?; }
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.files_done = r.u32()?;
+        m.files_total = r.u32()?;
+        m.bytes_received = r.u64()?;
+        m.bytes_durable = r.u64()?;
+        m.bytes_total = r.u64()?;
+        m.bottleneck = r.u8()?;
+        m.workers = r.u8()?;
+        m.lanes = r.u8()?;
+        m.sequential = r.u8()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            match tag {
+                1 => {
+                    if m.current.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.current = Some(vr.str()?);
+                    vr.finish()?;
+                }
+                2 => {
+                    if m.state.is_some() { return Err(DecodeError::DupExt(2)); }
+                    let mut vr = Reader::new(v);
+                    m.state = Some(vr.u8()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for Status {
+    const TYPE: u8 = 0x2d;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobDone {
+    pub job_id: [u8; 16],
+    pub status: u16,
+    pub files: u32,
+    pub bytes: u64,
+    pub message: Option<String>,
+}
+
+impl Message for JobDone {
+    const NAME: &'static str = "JobDone";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u16(self.status);
+        w.u32(self.files);
+        w.u64(self.bytes);
+        let mut ext_n: u16 = 0;
+        if self.message.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.message { w.ext(1, |w| { w.str(v) })?; }
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.status = r.u16()?;
+        m.files = r.u32()?;
+        m.bytes = r.u64()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            match tag {
+                1 => {
+                    if m.message.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.message = Some(vr.str()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for JobDone {
+    const TYPE: u8 = 0x2e;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobCancel {
+    pub job_id: [u8; 16],
+    pub reason: u16,
+}
+
+impl Message for JobCancel {
+    const NAME: &'static str = "JobCancel";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u16(self.reason);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.reason = r.u16()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for JobCancel {
+    const TYPE: u8 = 0x2f;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NodeInfo {
     pub version: String,
     pub platform: String,
@@ -820,8 +1607,554 @@ impl Message for CryptoBenchResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManifestEntry {
+    pub file_id: u32,
+    pub kind: u8,
+    pub mode: u32,
+    pub size: u64,
+    pub mtime: u64,
+    pub path: String,
+    pub root: Option<[u8; 32]>,
+}
+
+impl Message for ManifestEntry {
+    const NAME: &'static str = "ManifestEntry";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.file_id);
+        w.u8(self.kind);
+        w.u32(self.mode);
+        w.u64(self.size);
+        w.u64(self.mtime);
+        w.str(&self.path)?;
+        let mut ext_n: u16 = 0;
+        if self.root.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.root { w.ext(1, |w| { w.fixed(v); Ok(()) })?; }
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.file_id = r.u32()?;
+        m.kind = r.u8()?;
+        m.mode = r.u32()?;
+        m.size = r.u64()?;
+        m.mtime = r.u64()?;
+        m.path = r.str()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            match tag {
+                1 => {
+                    if m.root.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.root = Some(vr.fixed::<32>()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileRun {
+    pub first: u32,
+    pub count: u32,
+}
+
+impl Message for FileRun {
+    const NAME: &'static str = "FileRun";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.first);
+        w.u32(self.count);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.first = r.u32()?;
+        m.count = r.u32()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileRange {
+    pub file_id: u32,
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl Message for FileRange {
+    const NAME: &'static str = "FileRange";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.file_id);
+        w.u64(self.offset);
+        w.u64(self.len);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.file_id = r.u32()?;
+        m.offset = r.u64()?;
+        m.len = r.u64()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BundleRecord {
+    pub file_id: u32,
+    pub root: [u8; 32],
+    pub data: Vec<u8>,
+}
+
+impl Message for BundleRecord {
+    const NAME: &'static str = "BundleRecord";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.file_id);
+        w.fixed(&self.root);
+        w.bytes(&self.data)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.file_id = r.u32()?;
+        m.root = r.fixed::<32>()?;
+        m.data = r.bytes()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RootItem {
+    pub file_id: u32,
+    pub root: [u8; 32],
+}
+
+impl Message for RootItem {
+    const NAME: &'static str = "RootItem";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.file_id);
+        w.fixed(&self.root);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.file_id = r.u32()?;
+        m.root = r.fixed::<32>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobCopy {
+    pub job_id: [u8; 16],
+    pub src: String,
+    pub dest: String,
+    pub flags: u32,
+}
+
+impl Message for JobCopy {
+    const NAME: &'static str = "JobCopy";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.str(&self.src)?;
+        w.str(&self.dest)?;
+        w.u32(self.flags);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.src = r.str()?;
+        m.dest = r.str()?;
+        m.flags = r.u32()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobRef {
+    pub job_id: [u8; 16],
+}
+
+impl Message for JobRef {
+    const NAME: &'static str = "JobRef";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiskCalibrate {
+    pub dir: String,
+    pub files: u32,
+    pub size: u32,
+}
+
+impl Message for DiskCalibrate {
+    const NAME: &'static str = "DiskCalibrate";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.str(&self.dir)?;
+        w.u32(self.files);
+        w.u32(self.size);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.dir = r.str()?;
+        m.files = r.u32()?;
+        m.size = r.u32()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CalPoint {
+    pub workers: u8,
+    pub files_per_s: u32,
+    pub create_us: u32,
+    pub fsync_us: u32,
+}
+
+impl Message for CalPoint {
+    const NAME: &'static str = "CalPoint";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u8(self.workers);
+        w.u32(self.files_per_s);
+        w.u32(self.create_us);
+        w.u32(self.fsync_us);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.workers = r.u8()?;
+        m.files_per_s = r.u32()?;
+        m.create_us = r.u32()?;
+        m.fsync_us = r.u32()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiskCalibrateResult {
+    pub points: Vec<CalPoint>,
+}
+
+impl Message for DiskCalibrateResult {
+    const NAME: &'static str = "DiskCalibrateResult";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.records(&self.points)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.points = r.records::<CalPoint>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JnlOpen {
+    pub job_id: [u8; 16],
+    pub manifest_hash: [u8; 32],
+    pub kind: u8,
+    pub flags: u32,
+    pub staged: u8,
+    pub root: String,
+}
+
+impl Message for JnlOpen {
+    const NAME: &'static str = "JnlOpen";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.fixed(&self.manifest_hash);
+        w.u8(self.kind);
+        w.u32(self.flags);
+        w.u8(self.staged);
+        w.str(&self.root)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.manifest_hash = r.fixed::<32>()?;
+        m.kind = r.u8()?;
+        m.flags = r.u32()?;
+        m.staged = r.u8()?;
+        m.root = r.str()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JnlBatch {
+    pub files: Vec<FileRun>,
+    pub ranges: Vec<FileRange>,
+    pub roots: Vec<RootItem>,
+}
+
+impl Message for JnlBatch {
+    const NAME: &'static str = "JnlBatch";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.records(&self.files)?;
+        w.records(&self.ranges)?;
+        w.records(&self.roots)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.files = r.records::<FileRun>()?;
+        m.ranges = r.records::<FileRange>()?;
+        m.roots = r.records::<RootItem>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JnlReset {
+    pub file_id: u32,
+}
+
+impl Message for JnlReset {
+    const NAME: &'static str = "JnlReset";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.file_id);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.file_id = r.u32()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JnlSnapshot {
+    pub done: Vec<FileRun>,
+    pub ranges: Vec<FileRange>,
+    pub roots: Vec<RootItem>,
+}
+
+impl Message for JnlSnapshot {
+    const NAME: &'static str = "JnlSnapshot";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.records(&self.done)?;
+        w.records(&self.ranges)?;
+        w.records(&self.roots)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.done = r.records::<FileRun>()?;
+        m.ranges = r.records::<FileRange>()?;
+        m.roots = r.records::<RootItem>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JnlDone {
+    pub status: u16,
+}
+
+impl Message for JnlDone {
+    const NAME: &'static str = "JnlDone";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u16(self.status);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.status = r.u16()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
 /// Every message and struct, by name (conformance tests).
-pub const ALL: &[&str] = &["Hs1", "Hs2", "Hs3", "Welcome", "PairConfirm", "PairResult", "Join", "JoinAck", "Ping", "Pong", "Error", "Bye", "RpcRequest", "RpcResponse", "NodeInfo", "HelloInfo", "ServerInfo", "ClientInfo", "PairingOpen", "CryptoBench", "CryptoBenchResult", ];
+pub const ALL: &[&str] = &["Hs1", "Hs2", "Hs3", "Welcome", "PairConfirm", "PairResult", "Join", "JoinAck", "Ping", "Pong", "Error", "Bye", "RpcRequest", "RpcResponse", "JobOpen", "JobOpenAck", "ManifestPage", "ManifestEnd", "JobMap", "Resume", "Chunk", "Bundle", "Received", "Credit", "Durable", "FileRoot", "FileRetry", "Status", "JobDone", "JobCancel", "NodeInfo", "HelloInfo", "ServerInfo", "ClientInfo", "PairingOpen", "CryptoBench", "CryptoBenchResult", "ManifestEntry", "FileRun", "FileRange", "BundleRecord", "RootItem", "JobCopy", "JobRef", "DiskCalibrate", "CalPoint", "DiskCalibrateResult", "JnlOpen", "JnlBatch", "JnlReset", "JnlSnapshot", "JnlDone", ];
 
 #[doc(hidden)]
 pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
@@ -840,6 +2173,22 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "Bye" => Bye { reason: rng.next_u64() as u8, }.to_bytes().ok(),
         "RpcRequest" => RpcRequest { method: rng.next_u64() as u16, body: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
         "RpcResponse" => RpcResponse { status: rng.next_u64() as u16, body: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
+        "JobOpen" => JobOpen { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, kind: rng.next_u64() as u8, policy: rng.next_u64() as u8, flags: rng.next_u64() as u32, root: rng.ascii(20), src: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, credit: if rng.below(2) == 1 { Some(rng.next_u64()) } else { None }, }.to_bytes().ok(),
+        "JobOpenAck" => JobOpenAck { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, status: rng.next_u64() as u16, credit: rng.next_u64(), staged: rng.next_u64() as u8, workers: rng.next_u64() as u8, message: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
+        "ManifestPage" => ManifestPage { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, entries: vec![ManifestEntry::default(); rng.below(3) as usize], }.to_bytes().ok(),
+        "ManifestEnd" => ManifestEnd { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, files: rng.next_u64() as u32, bytes: rng.next_u64(), manifest_hash: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, }.to_bytes().ok(),
+        "JobMap" => JobMap { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, status: rng.next_u64() as u16, last: rng.next_u64() as u8, done: vec![FileRun::default(); rng.below(3) as usize], partial: vec![FileRange::default(); rng.below(3) as usize], message: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
+        "Resume" => Resume { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, manifest_hash: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, }.to_bytes().ok(),
+        "Chunk" => Chunk { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, file_id: rng.next_u64() as u32, offset: rng.next_u64(), data: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
+        "Bundle" => Bundle { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, records: vec![BundleRecord::default(); rng.below(3) as usize], }.to_bytes().ok(),
+        "Received" => Received { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, lane: rng.next_u64() as u16, seq: rng.next_u64() as u32, }.to_bytes().ok(),
+        "Credit" => Credit { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, bytes: rng.next_u64(), }.to_bytes().ok(),
+        "Durable" => Durable { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, files: vec![FileRun::default(); rng.below(3) as usize], ranges: vec![FileRange::default(); rng.below(3) as usize], }.to_bytes().ok(),
+        "FileRoot" => FileRoot { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, file_id: rng.next_u64() as u32, root: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, }.to_bytes().ok(),
+        "FileRetry" => FileRetry { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, file_id: rng.next_u64() as u32, reason: rng.next_u64() as u16, }.to_bytes().ok(),
+        "Status" => Status { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, files_done: rng.next_u64() as u32, files_total: rng.next_u64() as u32, bytes_received: rng.next_u64(), bytes_durable: rng.next_u64(), bytes_total: rng.next_u64(), bottleneck: rng.next_u64() as u8, workers: rng.next_u64() as u8, lanes: rng.next_u64() as u8, sequential: rng.next_u64() as u8, current: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, state: if rng.below(2) == 1 { Some(rng.next_u64() as u8) } else { None }, }.to_bytes().ok(),
+        "JobDone" => JobDone { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, status: rng.next_u64() as u16, files: rng.next_u64() as u32, bytes: rng.next_u64(), message: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
+        "JobCancel" => JobCancel { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, reason: rng.next_u64() as u16, }.to_bytes().ok(),
         "NodeInfo" => NodeInfo { version: rng.ascii(20), platform: rng.ascii(20), name: rng.ascii(20), firmware: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
         "HelloInfo" => HelloInfo { version_min: rng.next_u64() as u16, version_max: rng.next_u64() as u16, caps: rng.next_u64(), }.to_bytes().ok(),
         "ServerInfo" => ServerInfo { version: rng.next_u64() as u16, caps: rng.next_u64(), session_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, name: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
@@ -847,6 +2196,21 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "PairingOpen" => PairingOpen { seconds: rng.next_u64() as u16, }.to_bytes().ok(),
         "CryptoBench" => CryptoBench { mib: rng.next_u64() as u16, }.to_bytes().ok(),
         "CryptoBenchResult" => CryptoBenchResult { bytes: rng.next_u64(), micros: rng.next_u64(), open_micros: if rng.below(2) == 1 { Some(rng.next_u64()) } else { None }, backend: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
+        "ManifestEntry" => ManifestEntry { file_id: rng.next_u64() as u32, kind: rng.next_u64() as u8, mode: rng.next_u64() as u32, size: rng.next_u64(), mtime: rng.next_u64(), path: rng.ascii(20), root: if rng.below(2) == 1 { Some({ let mut a = [0u8; 32]; rng.fill(&mut a); a }) } else { None }, }.to_bytes().ok(),
+        "FileRun" => FileRun { first: rng.next_u64() as u32, count: rng.next_u64() as u32, }.to_bytes().ok(),
+        "FileRange" => FileRange { file_id: rng.next_u64() as u32, offset: rng.next_u64(), len: rng.next_u64(), }.to_bytes().ok(),
+        "BundleRecord" => BundleRecord { file_id: rng.next_u64() as u32, root: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, data: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
+        "RootItem" => RootItem { file_id: rng.next_u64() as u32, root: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, }.to_bytes().ok(),
+        "JobCopy" => JobCopy { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, src: rng.ascii(20), dest: rng.ascii(20), flags: rng.next_u64() as u32, }.to_bytes().ok(),
+        "JobRef" => JobRef { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, }.to_bytes().ok(),
+        "DiskCalibrate" => DiskCalibrate { dir: rng.ascii(20), files: rng.next_u64() as u32, size: rng.next_u64() as u32, }.to_bytes().ok(),
+        "CalPoint" => CalPoint { workers: rng.next_u64() as u8, files_per_s: rng.next_u64() as u32, create_us: rng.next_u64() as u32, fsync_us: rng.next_u64() as u32, }.to_bytes().ok(),
+        "DiskCalibrateResult" => DiskCalibrateResult { points: vec![CalPoint::default(); rng.below(3) as usize], }.to_bytes().ok(),
+        "JnlOpen" => JnlOpen { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, manifest_hash: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, kind: rng.next_u64() as u8, flags: rng.next_u64() as u32, staged: rng.next_u64() as u8, root: rng.ascii(20), }.to_bytes().ok(),
+        "JnlBatch" => JnlBatch { files: vec![FileRun::default(); rng.below(3) as usize], ranges: vec![FileRange::default(); rng.below(3) as usize], roots: vec![RootItem::default(); rng.below(3) as usize], }.to_bytes().ok(),
+        "JnlReset" => JnlReset { file_id: rng.next_u64() as u32, }.to_bytes().ok(),
+        "JnlSnapshot" => JnlSnapshot { done: vec![FileRun::default(); rng.below(3) as usize], ranges: vec![FileRange::default(); rng.below(3) as usize], roots: vec![RootItem::default(); rng.below(3) as usize], }.to_bytes().ok(),
+        "JnlDone" => JnlDone { status: rng.next_u64() as u16, }.to_bytes().ok(),
         _ => None,
     }
 }
@@ -871,6 +2235,22 @@ pub fn roundtrip(name: &str, bytes: &[u8]) -> Option<Result<Vec<u8>, String>> {
         "Bye" => rt::<Bye>(bytes),
         "RpcRequest" => rt::<RpcRequest>(bytes),
         "RpcResponse" => rt::<RpcResponse>(bytes),
+        "JobOpen" => rt::<JobOpen>(bytes),
+        "JobOpenAck" => rt::<JobOpenAck>(bytes),
+        "ManifestPage" => rt::<ManifestPage>(bytes),
+        "ManifestEnd" => rt::<ManifestEnd>(bytes),
+        "JobMap" => rt::<JobMap>(bytes),
+        "Resume" => rt::<Resume>(bytes),
+        "Chunk" => rt::<Chunk>(bytes),
+        "Bundle" => rt::<Bundle>(bytes),
+        "Received" => rt::<Received>(bytes),
+        "Credit" => rt::<Credit>(bytes),
+        "Durable" => rt::<Durable>(bytes),
+        "FileRoot" => rt::<FileRoot>(bytes),
+        "FileRetry" => rt::<FileRetry>(bytes),
+        "Status" => rt::<Status>(bytes),
+        "JobDone" => rt::<JobDone>(bytes),
+        "JobCancel" => rt::<JobCancel>(bytes),
         "NodeInfo" => rt::<NodeInfo>(bytes),
         "HelloInfo" => rt::<HelloInfo>(bytes),
         "ServerInfo" => rt::<ServerInfo>(bytes),
@@ -878,6 +2258,21 @@ pub fn roundtrip(name: &str, bytes: &[u8]) -> Option<Result<Vec<u8>, String>> {
         "PairingOpen" => rt::<PairingOpen>(bytes),
         "CryptoBench" => rt::<CryptoBench>(bytes),
         "CryptoBenchResult" => rt::<CryptoBenchResult>(bytes),
+        "ManifestEntry" => rt::<ManifestEntry>(bytes),
+        "FileRun" => rt::<FileRun>(bytes),
+        "FileRange" => rt::<FileRange>(bytes),
+        "BundleRecord" => rt::<BundleRecord>(bytes),
+        "RootItem" => rt::<RootItem>(bytes),
+        "JobCopy" => rt::<JobCopy>(bytes),
+        "JobRef" => rt::<JobRef>(bytes),
+        "DiskCalibrate" => rt::<DiskCalibrate>(bytes),
+        "CalPoint" => rt::<CalPoint>(bytes),
+        "DiskCalibrateResult" => rt::<DiskCalibrateResult>(bytes),
+        "JnlOpen" => rt::<JnlOpen>(bytes),
+        "JnlBatch" => rt::<JnlBatch>(bytes),
+        "JnlReset" => rt::<JnlReset>(bytes),
+        "JnlSnapshot" => rt::<JnlSnapshot>(bytes),
+        "JnlDone" => rt::<JnlDone>(bytes),
         _ => return None,
     })
 }
