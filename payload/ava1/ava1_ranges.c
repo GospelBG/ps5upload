@@ -71,6 +71,9 @@ void ava1_bits_clear(ava1_bits_t *b, uint32_t i) {
 int ava1_bits_get(const ava1_bits_t *b, uint32_t i) { return i < b->n && (b->w[i / 64] >> (i % 64)) & 1; }
 
 uint32_t ava1_bits_count(const ava1_bits_t *b) {
+    /* A zeroed bits_t is a valid empty set everywhere else in this file; keep that
+     * symmetry instead of dereferencing a NULL word. */
+    if (!b->w) return 0;
     uint32_t i, c = 0;
     for (i = 0; i < b->n / 64 + 1; i++) c += (uint32_t)__builtin_popcountll(b->w[i]);
     return c;

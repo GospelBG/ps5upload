@@ -91,8 +91,10 @@ pub struct Need {
     pub partial: BTreeMap<u32, RangeSet>,
 }
 
-/// Items per map page: 2,000 × (4 + 14) bytes for runs, or × (4 + 26) for ranges,
-/// stays under the 60 KiB page limit.
+/// Items per map page. An item is `u32le(len) ‖ fields` (SPEC §3): 12 bytes for a run,
+/// 24 for a range, so a full page is at most 48 KiB — inside `manifest::PAGE_BYTES`
+/// (60 KiB), the same page budget the manifest uses. Pinned by
+/// `a_full_page_of_the_widest_items_fits`.
 pub const MAP_PAGE_ITEMS: usize = 2000;
 
 impl Need {
@@ -140,7 +142,9 @@ impl Need {
             self.partial
                 .entry(r.file_id)
                 .or_default()
-                .insert(r.offset, r.offset + r.len);
+                // `len` is peer-supplied: saturate exactly as `from_runs` does, so a
+                // bogus range can never panic or wrap.
+                .insert(r.offset, r.offset.saturating_add(r.len));
         }
     }
 }
@@ -148,6 +152,31 @@ impl Need {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_page_of_the_widest_items_fits() {
+        // The existing large-map test fills pages with runs (12 bytes an item); a page
+        // filled with FileRanges is the widest case (24 bytes an item) and is never
+        // reached there, since `partial` stays empty. Encode one for real against the
+        // same 60 KiB page budget the manifest test pins.
+        let mut need = Need::default();
+        for i in 0..MAP_PAGE_ITEMS as u32 {
+            need.done.insert(i);
+            need.partial.entry(i).or_default().insert(0, 1 << 20);
+        }
+        let pages = need.to_pages([0; 16], 0);
+        assert_eq!(
+            pages.len(),
+            2,
+            "2000 runs + 2000 ranges = exactly two pages"
+        );
+        for (i, p) in pages.iter().enumerate() {
+            let n = crate::wire::Message::to_bytes(p).unwrap().len();
+            assert!(n <= crate::manifest::PAGE_BYTES, "page {i} is {n} bytes");
+        }
+        assert_eq!(pages[0].last, 0);
+        assert_eq!(pages[1].last, 1);
+    }
 
     #[test]
     fn inserts_merge_and_report_coverage() {
