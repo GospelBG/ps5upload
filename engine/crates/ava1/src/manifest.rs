@@ -21,6 +21,8 @@ pub enum PathError {
     BadComponent,
     #[error("path contains NUL")]
     Nul,
+    /// Not a path: a malformed manifest. Every other variant maps to `ERR_PATH` on the
+    /// wire; this one maps to `ERR_PROTOCOL`.
     #[error("file ids are not consecutive at {0}")]
     Gap(u32),
 }
@@ -75,12 +77,14 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn entry(&self, id: u32) -> &Entry {
-        &self.entries[id as usize]
+    /// The entry with this `file_id` (SPEC.md §11.3 numbers them 0..), or `None` for an id
+    /// no manifest carries: a frame naming one must not be able to panic its reader.
+    pub fn entry(&self, id: u32) -> Option<&Entry> {
+        self.entries.get(id as usize)
     }
 
     pub fn is_file(&self, id: u32) -> bool {
-        self.entries[id as usize].kind == ENTRY_FILE
+        self.entry(id).is_some_and(|e| e.kind == ENTRY_FILE)
     }
 
     pub fn files(&self) -> u32 {
@@ -374,6 +378,114 @@ mod tests {
         assert_eq!((x.kind, x.path.as_str(), x.size), (ENTRY_FILE, "f.txt", 5));
         assert!(single(&src, "sub").is_err());
         assert!(single(&src, "missing").is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_manifest_hash_matches_hand_written_bytes() {
+        // SPEC.md §11.3: BLAKE3 over, for every entry in order, `u32le(len) ‖ entry`, the
+        // entry without its ext. The bytes below are written out from the spec — not
+        // through the generated encoder — so a wrong field order, endianness, length
+        // prefix or ext handling cannot pass by agreeing with itself.
+        let m = Manifest {
+            entries: vec![
+                Entry {
+                    kind: ENTRY_DIR,
+                    mode: 0o755,
+                    size: 0,
+                    mtime: 1_700_000_000,
+                    path: "d".into(),
+                    root: None,
+                },
+                Entry {
+                    kind: ENTRY_FILE,
+                    mode: 0o644,
+                    size: 3,
+                    mtime: 1_700_000_001,
+                    path: "d/a".into(),
+                    root: None,
+                },
+                Entry {
+                    kind: ENTRY_FILE,
+                    mode: 0o644,
+                    size: 0,
+                    mtime: 1_700_000_002,
+                    path: "b".into(),
+                    // Set, and must not reach the hash.
+                    root: Some([0xAA; 32]),
+                },
+            ],
+        };
+        let mut e0 = Vec::new();
+        e0.extend(0u32.to_le_bytes());
+        e0.push(ENTRY_DIR);
+        e0.extend(0o755u32.to_le_bytes());
+        e0.extend(0u64.to_le_bytes());
+        e0.extend(1_700_000_000u64.to_le_bytes());
+        e0.extend(1u16.to_le_bytes());
+        e0.extend(b"d");
+        e0.extend(0u16.to_le_bytes());
+        let mut e1 = Vec::new();
+        e1.extend(1u32.to_le_bytes());
+        e1.push(ENTRY_FILE);
+        e1.extend(0o644u32.to_le_bytes());
+        e1.extend(3u64.to_le_bytes());
+        e1.extend(1_700_000_001u64.to_le_bytes());
+        e1.extend(3u16.to_le_bytes());
+        e1.extend(b"d/a");
+        e1.extend(0u16.to_le_bytes());
+        let mut e2 = Vec::new();
+        e2.extend(2u32.to_le_bytes());
+        e2.push(ENTRY_FILE);
+        e2.extend(0o644u32.to_le_bytes());
+        e2.extend(0u64.to_le_bytes());
+        e2.extend(1_700_000_002u64.to_le_bytes());
+        e2.extend(1u16.to_le_bytes());
+        e2.extend(b"b");
+        e2.extend(0u16.to_le_bytes());
+        assert_eq!((e0.len(), e1.len(), e2.len()), (30, 32, 30));
+
+        let mut framed = Vec::new();
+        for e in [&e0, &e1, &e2] {
+            framed.extend((e.len() as u32).to_le_bytes());
+            framed.extend(e.iter());
+        }
+        assert_eq!(m.hash(), *blake3::hash(&framed).as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_follows_a_symlink_and_refuses_a_dangling_one() {
+        // §11 says nothing about links; the walk follows them as FTX2 did. Pinned so the
+        // consequence is deliberate: a link is uploaded under its in-tree name with its
+        // target's size, and a link whose target is gone fails the walk rather than
+        // silently producing a manifest that does not match the source tree.
+        use std::os::unix::fs::symlink;
+        let d = std::env::temp_dir().join(format!("ava1-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a"), b"abc").unwrap();
+        symlink(d.join("a"), d.join("link")).unwrap();
+        let src = LocalSource::new(d.clone());
+        let m = walk(&src, &|_| false).unwrap();
+        let l = m.entries.iter().find(|x| x.path == "link").unwrap();
+        assert_eq!((l.kind, l.size), (ENTRY_FILE, 3));
+        symlink(d.join("gone"), d.join("dead")).unwrap();
+        assert!(walk(&src, &|_| false).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cycle_ends_in_an_error_not_a_spin() {
+        use std::os::unix::fs::symlink;
+        let d = std::env::temp_dir().join(format!("ava1-cycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        symlink(&d, d.join("sub/loop")).unwrap();
+        let src = LocalSource::new(d.clone());
+        // The OS's symlink limit or MAX_PATH, whichever comes first: an error either way.
+        assert!(walk(&src, &|_| false).is_err());
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
