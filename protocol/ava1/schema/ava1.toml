@@ -328,6 +328,12 @@ value = 1
 name = "GROUP_SHIFT"
 ty = "u8"
 value = 20
+# SPEC.md §12.2: a file of at least this many bytes is a large file (Chunks); smaller
+# files travel whole as BundleRecords. A protocol constant: both sides use it.
+[[const]]
+name = "LARGE_CUTOFF"
+ty = "u32"
+value = 262144
 [[const]]
 name = "BN_NONE"
 ty = "u8"

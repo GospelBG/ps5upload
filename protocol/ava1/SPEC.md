@@ -250,6 +250,10 @@ size and mtime are unchanged, and restarts the others (never splicing old and ne
 manifest: the receiver answers `JobMap`, or `JobMap{status = ERR_UNKNOWN_JOB}` and the
 sender falls back to `JobOpen`. A map larger than one control frame is sent as several
 `JobMap` pages; `last = 1` marks the final one. `Durable` is never paged: each is complete.
+Engines reopen with `JobOpen` after any interruption; `Resume` is optional for senders that
+keep their manifest and credit state. Either way the sender's credit starts again from the
+grant in that session's answer (`JobOpenAck.credit`); nothing outstanding carries across a
+reconnect.
 
 11.6 Staging: when the job root does not exist, the receiver writes the whole tree under
 `<root>.ava-part/` and, after the last file, renames it to `<root>` (same parent, `st_dev`
@@ -266,7 +270,9 @@ The header `channel` of a lane data frame is the sender's per-job sequence numbe
 
 12.2 `Chunk.offset` is a multiple of 1 MiB (one verification group, §13); its length is
 a multiple of 1 MiB unless the chunk ends the file. A file is a *large* file when its
-size is at least the job's cutoff; smaller files travel whole, as `BundleRecord`s.
+size is at least `LARGE_CUTOFF` (256 KiB), a protocol constant both sides use (`JobOpen`
+carries no cutoff); smaller files travel whole, as `BundleRecord`s. A receiver ends the job
+with `ERR_PROTOCOL` on a `Chunk` for a small file or a `BundleRecord` for a large one.
 
 12.3 `Received{lane, seq}` is sent as soon as the receiver has a lane frame in memory,
 before any disk work. A sender requeues, on any lane, the frames of a lane that closed
@@ -356,8 +362,8 @@ numbers they are fed, so both are tested against models rather than sockets.
   estimated finish time is < 90 % of mixed. Sequential runs bundles first. The choice and reason
   go into `Status.sequential`. The probe never runs twice.
 - Priority: beyond the bundle floor, the class with the longer estimated remaining time is
-  preferred. The small/large cutoff is a per-job option (`SendOptions.cutoff`, 256 KiB default);
-  it is not governed in project 2 — the design spec's 64 KiB–4 MiB auto-tuning is deferred.
+  preferred. The small/large cutoff is the protocol constant `LARGE_CUTOFF` (§12.2); it is not
+  governed in project 2 — the design spec's 64 KiB–4 MiB auto-tuning is deferred.
 - Receiver workers: every 2 s; add one while work is queued and the last addition raised
   files/s by ≥ 10 %; revert and hold 30 s otherwise; release one after 3 idle steps; range
   2–16, start 4.

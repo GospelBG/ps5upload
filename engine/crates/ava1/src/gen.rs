@@ -46,6 +46,7 @@ pub const JF_MOVE: u32 = 8;
 pub const ENTRY_FILE: u8 = 0;
 pub const ENTRY_DIR: u8 = 1;
 pub const GROUP_SHIFT: u8 = 20;
+pub const LARGE_CUTOFF: u32 = 262144;
 pub const BN_NONE: u8 = 0;
 pub const BN_NETWORK: u8 = 1;
 pub const BN_SOURCE: u8 = 2;

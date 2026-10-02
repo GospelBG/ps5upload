@@ -16,6 +16,7 @@ pub mod manifest;
 pub mod peers;
 pub mod ranges;
 pub mod router;
+pub mod send;
 pub mod server;
 pub mod session;
 pub mod source;
