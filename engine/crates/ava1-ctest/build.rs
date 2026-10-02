@@ -44,6 +44,7 @@ fn main() {
             ava1.join("ava1_trust.c"),
             ava1.join("ava1_ranges.c"),
             ava1.join("ava1_journal.c"),
+            ava1.join("ava1_tune.c"),
             ava1.join("ava1_b3.c"),
             ava1.join("platform_posix.c"),
             ava1.join("gen/ava1_gen.c"),

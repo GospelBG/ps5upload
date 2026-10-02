@@ -233,7 +233,7 @@ a manifest with any other path (`ERR_PATH`) before touching the filesystem.
   `ManifestPage`* → `ManifestEnd`; receiver → `JobMap`; then data.
 - `JOB_DOWNLOAD`: opener → `JobOpen{root = source, ext credit}`; the other node becomes
   the sender: `JobOpenAck`, `ManifestPage`* → `ManifestEnd`; opener → `JobMap`; then data.
-- `JOB_COPY` runs on one node (`job.copy` RPC, §16).
+- `JOB_COPY` runs on one node (`job.copy` RPC, §7).
 Entries are numbered 0.. in manifest order (`file_id`); directories are entries with
 `kind = ENTRY_DIR`. `manifest_hash` = BLAKE3 over, for every entry in order,
 `u32le(len) ‖ encoding of the entry without its ext`.
@@ -327,3 +327,36 @@ durable ranges of the others), after the check in §13.4.
 under `<data dir>/ava/jobs/`. Each holds `journal`, `manifest` and one `<file_id>.ob` outboard
 per large file. A directory is removed 7 days after its last write (directory or journal mtime),
 on start.
+
+## 16. Governor
+
+The sender and the receiver each keep one small control loop; both are pure functions of the
+numbers they are fed, so both are tested against models rather than sockets.
+
+- Lanes: add one while the bottleneck is the network and the last addition raised throughput by
+  ≥ 10 %; otherwise revert it and hold for 30 s. A tick with a lane death or requeue drops one
+  lane (min 1) and halves the chunk.
+- Chunk: 1–15 MiB in whole groups; halved on a stall, doubled after 10 stable ticks; never more
+  than half a second of one lane's throughput (min 1 MiB). 15 MiB, not 16: the frame cap (§2)
+  counts the header and the MAC, which a 16 MiB body would not fit under.
+- Bundle target: a quarter second of one lane's throughput, clamped to 256 KiB–15 MiB. Grow
+  while the network is the limit, shrink while receiver workers wait.
+- In-flight cap per lane: `max(chunk, lane rate × 2 s)` — the same bound §12.5 states.
+- Mixing check: once per job — after 3 warm-up ticks, if both classes still have work queued,
+  the sender probes 5 s mixed, 5 s stream-only, 5 s bundle-only, then picks sequential if its
+  estimated finish time is < 90 % of mixed. Sequential runs bundles first. The choice and reason
+  go into `Status.sequential`. The probe never runs twice.
+- Priority: beyond the bundle floor, the class with the longer estimated remaining time is
+  preferred. The small/large cutoff is a per-job option (`SendOptions.cutoff`, 256 KiB default);
+  it is not governed in project 2 — the design spec's 64 KiB–4 MiB auto-tuning is deferred.
+- Receiver workers: every 2 s; add one while work is queued and the last addition raised
+  files/s by ≥ 10 %; revert and hold 30 s otherwise; release one after 3 idle steps; range
+  2–16, start 4.
+- Bottleneck: source starved → `BN_SOURCE`; credit starved → the receiver's reported bottleneck
+  (`BN_DISK`/`BN_WORKERS`), else `BN_CREDIT`; otherwise `BN_NETWORK`.
+
+16.9 Status: the receiver sends `Status` (IGNORABLE) every 250 ms while a job is open: files
+and bytes done, durable bytes, its own bottleneck (`BN_DISK` when workers are at their maximum
+or adding one did not help, `BN_WORKERS` while it is still adding, `BN_NETWORK` when its queue
+ran dry), workers, lanes, and whether it runs sequential. The engine shows the sender's
+bottleneck, which already folds in the receiver's.

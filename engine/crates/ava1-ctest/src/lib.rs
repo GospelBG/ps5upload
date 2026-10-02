@@ -154,6 +154,20 @@ pub mod ffi {
         pub n: c_int,
     }
 
+    /// Mirrors ava1_wtune_t (ava1_tune.c).
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct CTuneRaw {
+        pub workers: u8,
+        pub start: u8,
+        pub min: u8,
+        pub max: u8,
+        pub before: f64,
+        pub trying: c_int,
+        pub hold: u32,
+        pub idle: u32,
+    }
+
     /// Mirrors ava1_test_opts_t in csrc/test_shim.c.
     #[repr(C)]
     #[derive(Debug, Clone, Copy, Default)]
@@ -227,6 +241,8 @@ pub mod ffi {
             out: *mut u32,
             cap: usize,
         ) -> usize;
+        pub fn ava1_wtune_init(t: *mut CTuneRaw, start: u8, min: u8, max: u8);
+        pub fn ava1_wtune_step(t: *mut CTuneRaw, files_per_s: f64, backlog: c_int) -> u8;
     }
 }
 
@@ -588,6 +604,21 @@ pub fn c_bits_runs(n: u32, set: &[u32]) -> Vec<(u32, u32)> {
         ffi::ava1_test_bits_runs(n, set.as_ptr(), set.len(), out.as_mut_ptr(), n as usize + 1)
     };
     out.chunks(2).take(k).map(|p| (p[0], p[1])).collect()
+}
+
+/// The receiver's worker tuner (ava1_tune.c). Pure; step it once per 2 s tick.
+pub struct CTune(ffi::CTuneRaw);
+
+impl CTune {
+    pub fn new(start: u8, min: u8, max: u8) -> Self {
+        let mut t = ffi::CTuneRaw::default();
+        unsafe { ffi::ava1_wtune_init(&mut t, start, min, max) };
+        CTune(t)
+    }
+
+    pub fn step(&mut self, rate: f64, backlog: bool) -> u8 {
+        unsafe { ffi::ava1_wtune_step(&mut self.0, rate, backlog as c_int) }
+    }
 }
 
 /// The C replay of the journal at `dir`, as the text `c_style_dump` builds for the

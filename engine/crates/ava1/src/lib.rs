@@ -5,6 +5,7 @@ mod error;
 pub mod frame;
 #[rustfmt::skip]
 pub mod gen;
+pub mod governor;
 pub mod handshake;
 pub mod hex;
 pub mod journal;
