@@ -39,6 +39,15 @@ pub fn stamp(elf: &mut [u8], key: &[u8; 32]) -> Result<(), TrustError> {
     }
 }
 
+/// What every sender of the ps5upload helper does before it sends: stamp `key` (the
+/// sending engine's AVA1 public key) so the console trusts that engine without pairing.
+/// `Err` is a reason to log, never a reason not to send: an unstamped helper still
+/// runs, and the console falls back to its pairing window.
+pub fn stamp_helper(elf: &mut [u8], key: Option<&[u8; 32]>) -> Result<(), String> {
+    let key = key.ok_or("AVA1 trust not stamped: this engine has no AVA1 identity")?;
+    stamp(elf, key).map_err(|e| format!("AVA1 trust not stamped: {e}"))
+}
+
 /// The stamped key, if the ELF has exactly one stamped slot.
 pub fn read(elf: &[u8]) -> Option<[u8; 32]> {
     match slots(elf).as_slice() {
@@ -71,6 +80,21 @@ mod tests {
         assert_eq!(elf[1009], 1);
         stamp(&mut elf, &[8; 32]).unwrap();
         assert_eq!(read(&elf), Some([8; 32]));
+    }
+
+    #[test]
+    fn stamp_helper_reports_why_it_did_not_stamp() {
+        let mut elf = elf_with(1);
+        assert!(stamp_helper(&mut elf, None)
+            .unwrap_err()
+            .contains("no AVA1 identity"));
+        assert_eq!(read(&elf), None);
+        stamp_helper(&mut elf, Some(&[3; 32])).unwrap();
+        assert_eq!(read(&elf), Some([3; 32]));
+        let mut old_build = elf_with(0);
+        let before = old_build.clone();
+        assert!(stamp_helper(&mut old_build, Some(&[3; 32])).is_err());
+        assert_eq!(old_build, before, "an ELF without a slot is sent unchanged");
     }
 
     #[test]

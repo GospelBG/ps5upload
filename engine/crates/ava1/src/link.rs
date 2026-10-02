@@ -265,12 +265,21 @@ pub(crate) fn drive(
             let mut iv = tokio::time::interval(timing.ping_every);
             iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut seq = 0u32;
+            let mut prev_tick = now_us();
             loop {
                 iv.tick().await;
+                // A tick that comes late means this process was not running (a stalled
+                // runtime, a suspended machine): bytes may be waiting unread, and silence
+                // we were not awake to hear is not the peer's. Judge on the next tick,
+                // after the reader has had its turn.
+                let now = now_us();
+                let overslept =
+                    Duration::from_micros(now.saturating_sub(prev_tick)) > timing.ping_every * 3;
+                prev_tick = now;
                 // Any byte counts: a large frame still arriving is proof of life.
                 let quiet =
-                    Duration::from_micros(now_us().saturating_sub(last_rx.load(Ordering::Relaxed)));
-                if quiet > timing.dead_after {
+                    Duration::from_micros(now.saturating_sub(last_rx.load(Ordering::Relaxed)));
+                if quiet > timing.dead_after && !overslept {
                     return close(format!(
                         "the other device stopped answering ({} ms without a byte)",
                         quiet.as_millis()

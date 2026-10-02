@@ -52,6 +52,7 @@ pub mod ffi {
         pub re: [u8; 32],
         pub initiator: c_int,
         pub step: c_int,
+        pub failed: c_int,
     }
 
     extern "C" {
@@ -107,7 +108,7 @@ pub mod ffi {
             cap: usize,
             plen: *mut usize,
         ) -> c_int;
-        pub fn ava1_noise_split(ns: *const CNoise, k_i2r: *mut u8, k_r2i: *mut u8);
+        pub fn ava1_noise_split(ns: *const CNoise, k_i2r: *mut u8, k_r2i: *mut u8) -> c_int;
         pub fn ava1_seal(
             key: *const u8,
             n: u64,
@@ -309,10 +310,25 @@ impl CHandshake {
     pub fn remote_static(&self) -> [u8; 32] {
         self.0.rs
     }
+    /// Panics unless the handshake completed.
     pub fn split(&self) -> ([u8; 32], [u8; 32]) {
-        let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
-        unsafe { ffi::ava1_noise_split(&*self.0, a.as_mut_ptr(), b.as_mut_ptr()) };
-        (a, b)
+        self.try_split().expect("handshake complete")
+    }
+
+    pub fn try_split(&self) -> Result<([u8; 32], [u8; 32]), i32> {
+        let (mut a, mut b) = ([0xffu8; 32], [0xffu8; 32]);
+        match unsafe { ffi::ava1_noise_split(&*self.0, a.as_mut_ptr(), b.as_mut_ptr()) } {
+            0 => Ok((a, b)),
+            e => {
+                assert_eq!((a, b), ([0u8; 32], [0u8; 32]), "no key material on failure");
+                Err(e)
+            }
+        }
+    }
+
+    /// Replaces the static public key this side will send (to play a hostile peer).
+    pub fn set_static_public(&mut self, p: [u8; 32]) {
+        self.0.s.public = p;
     }
 }
 

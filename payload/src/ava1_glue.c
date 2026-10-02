@@ -16,6 +16,7 @@
 #include "ava1_store.h"
 #include "ava1_trust.h"
 #include "config.h"
+#include "monocypher.h"
 #include "runtime.h"
 
 #define AVA1_DIR "/data/ps5upload/ava"
@@ -112,5 +113,10 @@ int ava1_payload_start(void) {
         }
         free(peers);
     }
-    return ava1_server_start(&cfg);
+    {
+        /* The server keeps its own copy: do not leave the private key on this stack. */
+        int rc = ava1_server_start(&cfg);
+        crypto_wipe(&cfg.identity, sizeof cfg.identity);
+        return rc;
+    }
 }

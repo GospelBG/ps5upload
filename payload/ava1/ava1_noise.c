@@ -54,6 +54,7 @@ static void mix_hash(ava1_noise_t *ns, const uint8_t *d, size_t n) {
     uint8_t h[HASHLEN];
     hash2(ns->h, HASHLEN, d, n, h);
     memcpy(ns->h, h, HASHLEN);
+    crypto_wipe(h, sizeof h);
 }
 
 static void mix_key(ava1_noise_t *ns, const uint8_t ikm[32]) {
@@ -63,6 +64,7 @@ static void mix_key(ava1_noise_t *ns, const uint8_t ikm[32]) {
     memcpy(ns->k, tk, 32);
     ns->has_k = 1;
     ns->n = 0;
+    crypto_wipe(ck, sizeof ck);
     crypto_wipe(tk, sizeof tk);
 }
 
@@ -80,6 +82,7 @@ void ava1_seal(const uint8_t key[32], uint64_t n, const uint8_t *ad, size_t ad_l
     crypto_aead_init_ietf(&c, key, nn); /* a fresh context per message = RFC 8439 */
     crypto_aead_write(&c, buf, mac, ad, ad_len, buf, len);
     crypto_wipe(&c, sizeof c);
+    crypto_wipe(nn, sizeof nn);
 }
 
 int ava1_open(const uint8_t key[32], uint64_t n, const uint8_t *ad, size_t ad_len, uint8_t *buf,
@@ -113,8 +116,10 @@ static int dec_hash(ava1_noise_t *ns, const uint8_t *msg, size_t len, size_t *at
     memcpy(h_before, ns->h, HASHLEN);
     mix_hash(ns, msg + *at, need);
     if (n) memmove(out, msg + *at, n);
-    if (ns->has_k && ava1_open(ns->k, ns->n++, h_before, HASHLEN, out, n, msg + *at + n) != 0)
+    if (ns->has_k && ava1_open(ns->k, ns->n++, h_before, HASHLEN, out, n, msg + *at + n) != 0) {
+        if (n) crypto_wipe(out, n); /* unauthenticated plaintext is never handed back */
         return AVA1_E_TAG;
+    }
     *at += need;
     return 0;
 }
@@ -140,13 +145,19 @@ void ava1_noise_init(ava1_noise_t *ns, int initiator, const ava1_identity_t *s,
 }
 
 /* Messages: 0 "-> e", 1 "<- e, ee, s, es", 2 "-> s, se". */
+static int fail(ava1_noise_t *ns, int rc) {
+    ns->failed = 1;
+    return rc;
+}
+
 int ava1_noise_write(ava1_noise_t *ns, const uint8_t *payload, size_t payload_len, uint8_t *out,
                      size_t cap, size_t *out_len) {
     size_t at = 0;
     int rc = 0;
-    if (ns->step > 2 || (ns->step % 2 == 0) != (ns->initiator != 0)) return AVA1_E_PROTO;
+    if (ns->failed) return AVA1_E_PROTO;
+    if (ns->step > 2 || (ns->step % 2 == 0) != (ns->initiator != 0)) return fail(ns, AVA1_E_PROTO);
     if (ns->step == 0 || ns->step == 1) {
-        if (cap < 32) return AVA1_E_SPACE;
+        if (cap < 32) return fail(ns, AVA1_E_SPACE);
         memcpy(out, ns->e.pub, 32);
         mix_hash(ns, ns->e.pub, 32);
         at = 32;
@@ -160,7 +171,7 @@ int ava1_noise_write(ava1_noise_t *ns, const uint8_t *payload, size_t payload_le
         if (rc == 0) rc = dh_mix(ns, &ns->s, ns->re);                 /* se */
     }
     if (rc == 0) rc = enc_hash(ns, payload, payload_len, out, cap, &at);
-    if (rc != 0) return rc;
+    if (rc != 0) return fail(ns, rc);
     ns->step++;
     *out_len = at;
     return 0;
@@ -170,9 +181,10 @@ int ava1_noise_read(ava1_noise_t *ns, const uint8_t *msg, size_t len, uint8_t *p
                     size_t *payload_len) {
     size_t at = 0, mac, n;
     int rc = 0;
-    if (ns->step > 2 || (ns->step % 2 == 0) == (ns->initiator != 0)) return AVA1_E_PROTO;
+    if (ns->failed) return AVA1_E_PROTO;
+    if (ns->step > 2 || (ns->step % 2 == 0) == (ns->initiator != 0)) return fail(ns, AVA1_E_PROTO);
     if (ns->step == 0 || ns->step == 1) {
-        if (len < 32) return AVA1_E_SHORT;
+        if (len < 32) return fail(ns, AVA1_E_SHORT);
         memcpy(ns->re, msg, 32);
         mix_hash(ns, ns->re, 32);
         at = 32;
@@ -185,23 +197,32 @@ int ava1_noise_read(ava1_noise_t *ns, const uint8_t *msg, size_t len, uint8_t *p
         rc = dec_hash(ns, msg, len, &at, 32, ns->rs);                 /* s */
         if (rc == 0) rc = dh_mix(ns, &ns->e, ns->rs);                 /* se */
     }
-    if (rc != 0) return rc;
+    if (rc != 0) return fail(ns, rc);
     mac = ns->has_k ? 16 : 0;
-    if (len - at < mac) return AVA1_E_SHORT;
+    if (len - at < mac) return fail(ns, AVA1_E_SHORT);
     n = len - at - mac;
-    if (n > cap) return AVA1_E_SPACE;
+    if (n > cap) return fail(ns, AVA1_E_SPACE);
     rc = dec_hash(ns, msg, len, &at, n, payload);
-    if (rc != 0) return rc;
+    if (rc != 0) return fail(ns, rc);
     ns->step++;
     *payload_len = n;
     return 0;
 }
 
-void ava1_noise_split(const ava1_noise_t *ns, uint8_t k_i2r[32], uint8_t k_r2i[32]) {
+int ava1_noise_split(const ava1_noise_t *ns, uint8_t k_i2r[32], uint8_t k_r2i[32]) {
     uint8_t a[HASHLEN], b[HASHLEN];
+    if (ns->failed || ns->step != 3) {
+        /* Keys from an unfinished handshake authenticate nobody. */
+        memset(k_i2r, 0, 32);
+        memset(k_r2i, 0, 32);
+        return AVA1_E_PROTO;
+    }
     hkdf2(ns->ck, NULL, 0, a, b);
     memcpy(k_i2r, a, 32);
     memcpy(k_r2i, b, 32);
     crypto_wipe(a, sizeof a);
     crypto_wipe(b, sizeof b);
+    return 0;
 }
+
+void ava1_noise_wipe(ava1_noise_t *ns) { crypto_wipe(ns, sizeof *ns); }

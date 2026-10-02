@@ -4,6 +4,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 use crate::frame::{
     Header, HeaderError, CONTROL_MAX_BODY, FLAG_IGNORABLE, FLAG_SEALED, HEADER_LEN, MAX_BODY,
@@ -56,7 +57,7 @@ impl Pace {
 
 pub struct FrameWriter<W> {
     w: W,
-    key: Option<[u8; 32]>,
+    key: Option<Zeroizing<[u8; 32]>>,
     ctr: u64,
     pace: Option<Pace>,
     /// A write failed or stalled part-way: the stream is torn and nothing more is sent.
@@ -82,7 +83,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
 
     /// Seal every following frame with `key`; the counter restarts at 0.
     pub fn set_key(&mut self, key: [u8; 32]) {
-        self.key = Some(key);
+        self.key = Some(Zeroizing::new(key));
         self.ctr = 0;
     }
 
@@ -189,7 +190,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
 
 pub struct FrameReader<R> {
     r: R,
-    key: Option<[u8; 32]>,
+    key: Option<Zeroizing<[u8; 32]>>,
     ctr: u64,
     max_body: u32,
     /// Stamped (`now_us`) whenever bytes arrive, so liveness sees a large frame in progress.
@@ -234,7 +235,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     }
 
     pub fn set_key(&mut self, key: [u8; 32]) {
-        self.key = Some(key);
+        self.key = Some(Zeroizing::new(key));
         self.ctr = 0;
     }
 

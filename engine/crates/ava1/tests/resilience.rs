@@ -25,15 +25,17 @@ async fn blackholed_session_is_declared_dead() {
         .expect("client noticed");
     let took = t.elapsed();
     assert!(why.contains("stopped answering"), "{why}");
-    assert!(took < Duration::from_millis(1200), "{took:?}"); // dead_after 500 ms + one tick
-                                                             // `s` is still alive here, so the server cannot have learned of death from a FIN.
+    // dead_after is 500 ms and the check runs every 100 ms; the rest is headroom for a
+    // loaded machine (the bound is here to catch "never", not to time the scheduler).
+    assert!(took < Duration::from_millis(2500), "{took:?}");
+    // `s` is still alive here, so the server cannot have learned of death from a FIN.
     while ctx.sessions() > 0 && t.elapsed() < Duration::from_secs(3) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let server_took = t.elapsed();
     assert_eq!(ctx.sessions(), 0, "server noticed too");
     assert!(
-        server_took < Duration::from_millis(1200),
+        server_took < Duration::from_millis(2500),
         "server took {server_took:?}"
     );
     drop(s);

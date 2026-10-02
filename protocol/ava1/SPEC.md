@@ -33,7 +33,12 @@ reject a repeated known tag, reject invalid UTF-8, and reject trailing bytes
 4.2 Handshake: `Noise_XX_25519_ChaChaPoly_BLAKE2b` (Noise revision 34), prologue
 "AVA1 v1"; the client is the initiator. Implementations must reproduce
 `vectors/noise_xx.json` (from the cacophony set). After message 3, Split() gives
-c2s (initiator → responder) and s2c; `h` is the handshake hash.
+c2s (initiator → responder) and s2c; `h` is the handshake hash. Low-order keys:
+an implementation must abort the handshake when a DH result is all zero —
+equivalently, when the peer's ephemeral or static key is a low-order point (the C
+side checks each DH output; the Rust side checks each received key, since its Noise
+library does not). A handshake step that fails poisons the state: no later message
+is read or written and no keys are derived from it. Key material is wiped after use.
 
 4.3 Lane keys: lane_key(dir, n, cn, sn) = BLAKE2b-256(key = dir, "AVA1 lane" ‖
 u16le(n) ‖ cn ‖ sn), where cn and sn are the 16-byte client and server nonces of
@@ -61,7 +66,10 @@ six digits. A man in the middle yields different h, so different codes.
    Else → `Hs2{noise}`: message 2, payload `ServerInfo` (version, caps, random
    session_id, name).
 3. Client → `Hs3{noise}`: message 3, payload `ClientInfo` (name). Both sides
-   now key lane 0 (§4.3) and every further frame is sealed.
+   now key lane 0 (§4.3) and every further frame is sealed. A client that expects
+   a particular device (it knows the key it paired with at this address) compares
+   the server's static key from message 2 and, if it differs, closes without
+   sending `Hs3` — the wrong device never learns the client's key or name.
 4. The server learned the client's key in message 3. Unknown key and pairing
    closed → sealed `Error(ERR_PAIRING_CLOSED)`, close. Else → sealed
    `Welcome{knows_you}`.
@@ -116,7 +124,8 @@ ends a session; `Error` reports why and ends the connection.
 ## 7. RPC
 `RpcRequest{method, body}` on the control connection, channel = request id
 (chosen by the client, unique among its outstanding requests). The server
-answers `RpcResponse{status, body}` on the same channel. status 0 = OK; error
+answers `RpcResponse{status, body}` on the same channel; a request that does not
+decode is answered `Error(ERR_PROTOCOL)` and closes the connection. status 0 = OK; error
 statuses are the `ERR_*` constants. Methods: 1 = node.info → body `NodeInfo`.
 
 ## 8. Limits
@@ -135,7 +144,8 @@ paired. Otherwise it draws a fresh random server_nonce and sends, unsealed,
 tag. Both sides then seal everything after with lane_key(c2s|s2c, n, client_nonce,
 server_nonce) (§4.3), counters from 0. A join of a lane id that is
 still live supersedes the older connection. Lanes end with their session.
-In version 1 project 1, lanes carry only heartbeats.
+In version 1 project 1, lanes carry only heartbeats; any other frame without the
+IGNORABLE flag is answered `Error(ERR_PROTOCOL)` and closes the lane.
 
 ## 10. Version 1 scope
 Project 1 (this spec): framing, codecs, keys, handshake, pairing, trust slot,

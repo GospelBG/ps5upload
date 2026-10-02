@@ -302,3 +302,64 @@ fn the_c_reader_refuses_a_frame_whose_header_was_altered() {
         assert_ne!(open(&t), 0, "header byte {at} altered");
     }
 }
+
+#[test]
+fn a_failed_c_handshake_stays_failed_and_yields_no_keys() {
+    let mut init = CHandshake::new(true, [3; 32], [4; 32], keys::PROLOGUE);
+    assert!(init.try_split().is_err(), "no keys before the handshake");
+    let m1 = init.write(b"").unwrap();
+    let mut resp = CHandshake::new(false, [1; 32], [2; 32], keys::PROLOGUE);
+    resp.read(&m1).unwrap();
+    let good = resp.write(b"").unwrap();
+    assert!(
+        resp.try_split().is_err(),
+        "no keys after two of three messages"
+    );
+    let mut bad = good.clone();
+    bad[50] ^= 1;
+    assert!(init.read(&bad).is_err());
+    // Sticky: the untampered message is refused too — the failed read already mixed the
+    // forged bytes into the hash — and nothing can be written or split afterwards.
+    assert!(init.read(&good).is_err());
+    assert!(init.write(b"").is_err());
+    assert!(init.try_split().is_err());
+}
+
+#[test]
+fn low_order_keys_are_refused_by_c_and_rust() {
+    let low: [u8; 32] = {
+        let mut p = [0u8; 32];
+        p[0] = 1; // u = 1, order 1 on the Montgomery curve
+        p
+    };
+    // C responder, hostile initiator: message 1 carries a low-order ephemeral key. The
+    // ee DH (done when the responder writes message 2) would be all zero.
+    let mut resp = CHandshake::new(false, [1; 32], [2; 32], keys::PROLOGUE);
+    let mut m1 = low.to_vec();
+    m1.extend_from_slice(b"hi");
+    let _ = resp.read(&m1);
+    assert!(resp.write(b"").is_err());
+    assert!(resp.try_split().is_err());
+    // The same message to the Rust responder.
+    let id = Identity::from_secret([7; 32]);
+    let mut r = Handshake::responder(&id).unwrap();
+    assert!(matches!(r.read(&m1), Err(ava1::Ava1Error::WeakKey)));
+    // A hostile responder whose static key is low-order: the Rust initiator refuses
+    // message 2, and so does the C initiator.
+    for rust_initiator in [true, false] {
+        let mut hostile = CHandshake::new(false, [1; 32], [2; 32], keys::PROLOGUE);
+        hostile.set_static_public(low);
+        if rust_initiator {
+            let mut i = Handshake::initiator(&id).unwrap();
+            hostile.read(&i.write(b"").unwrap()).unwrap();
+            let m2 = hostile.write(b"").unwrap();
+            assert!(i.read(&m2).is_err());
+        } else {
+            let mut i = CHandshake::new(true, [3; 32], [4; 32], keys::PROLOGUE);
+            hostile.read(&i.write(b"").unwrap()).unwrap();
+            let m2 = hostile.write(b"").unwrap();
+            assert!(i.read(&m2).is_err());
+            assert!(i.try_split().is_err());
+        }
+    }
+}

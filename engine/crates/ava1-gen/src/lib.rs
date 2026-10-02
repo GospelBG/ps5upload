@@ -63,6 +63,67 @@ pub enum Ty {
     Str,
 }
 
+/// Rust keywords (strict, reserved, and 2018+): a field with one of these names is
+/// emitted as a raw identifier.
+const RUST_KEYWORDS: &[&str] = &[
+    "abstract", "as", "async", "await", "become", "box", "break", "const", "continue", "do", "dyn",
+    "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if", "impl", "in", "let",
+    "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub", "ref", "return",
+    "static", "struct", "trait", "true", "try", "type", "typeof", "unsafe", "unsized", "use",
+    "virtual", "where", "while", "yield",
+];
+/// Keywords that cannot be raw identifiers: refused as field names.
+const RUST_UNRAWABLE: &[&str] = &["self", "super", "crate"];
+/// C keywords (C11) and the names the C runtime's types use: suffixed with `_`.
+const C_KEYWORDS: &[&str] = &[
+    "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else",
+    "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long", "register",
+    "restrict", "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef",
+    "union", "unsigned", "void", "volatile", "while", "bool", "true", "false", "asm", "errno",
+];
+/// Type and item names the generated Rust refers to unqualified: a message with one of
+/// these names would shadow it.
+const RUST_RESERVED_TYPES: &[&str] = &[
+    "Self",
+    "Option",
+    "Some",
+    "None",
+    "Result",
+    "Ok",
+    "Err",
+    "Vec",
+    "String",
+    "Box",
+    "Default",
+    "Message",
+    "FrameMessage",
+    "Reader",
+    "Writer",
+    "DecodeError",
+    "EncodeError",
+    "SplitMix",
+];
+/// Items the generated Rust defines itself.
+const RUST_RESERVED_CONSTS: &[&str] = &["ALL"];
+
+/// A field name as the generated Rust spells it.
+fn rid(n: &str) -> String {
+    if RUST_KEYWORDS.contains(&n) {
+        format!("r#{n}")
+    } else {
+        n.to_string()
+    }
+}
+
+/// A field name as the generated C spells it.
+fn cid(n: &str) -> String {
+    if C_KEYWORDS.contains(&n) {
+        format!("{n}_")
+    } else {
+        n.to_string()
+    }
+}
+
 fn is_snake(n: &str) -> bool {
     !n.is_empty()
         && n.chars()
@@ -71,9 +132,38 @@ fn is_snake(n: &str) -> bool {
 
 pub fn parse(src: &str) -> Result<Schema, String> {
     let mut s: Schema = toml::from_str(src).map_err(|e| e.to_string())?;
+    let mut const_names = HashSet::new();
     for c in &s.consts {
-        if !matches!(c.ty.as_str(), "u8" | "u16" | "u32" | "u64") {
-            return Err(format!("const {}: bad ty {}", c.name, c.ty));
+        let max = match c.ty.as_str() {
+            "u8" => u64::from(u8::MAX),
+            "u16" => u64::from(u16::MAX),
+            "u32" => u64::from(u32::MAX),
+            "u64" => u64::MAX,
+            _ => return Err(format!("const {}: bad ty {}", c.name, c.ty)),
+        };
+        if c.value > max {
+            return Err(format!(
+                "const {}: {} does not fit {}",
+                c.name, c.value, c.ty
+            ));
+        }
+        let screaming = c
+            .name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
+            && c.name
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_');
+        if !screaming {
+            return Err(format!("const {}: const names are SCREAMING_SNAKE", c.name));
+        }
+        // AVA1_TYPE_* is the C namespace of frame types; ALL is generated.
+        if c.name.starts_with("TYPE_") || RUST_RESERVED_CONSTS.contains(&c.name.as_str()) {
+            return Err(format!("const {}: the name is reserved", c.name));
+        }
+        if !const_names.insert(c.name.clone()) {
+            return Err(format!("const {}: name used twice", c.name));
         }
     }
     let mut names = HashSet::new();
@@ -87,8 +177,23 @@ pub fn parse(src: &str) -> Result<Schema, String> {
         if !camel {
             return Err(format!("{}: message names are CamelCase", m.name));
         }
+        if RUST_RESERVED_TYPES.contains(&m.name.as_str()) {
+            return Err(format!(
+                "{}: the name would shadow a type the generated code uses",
+                m.name
+            ));
+        }
         if !names.insert(m.name.clone()) {
             return Err(format!("{}: name used twice", m.name));
+        }
+        // Two messages may differ in Rust yet collide in C (`FooBar` / `Foo_bar` cannot
+        // happen with CamelCase, but `AB` and `A_b`-style splits can): compare C names.
+        if !names.insert(format!("c:{}", snake(&m.name))) {
+            return Err(format!(
+                "{}: its C name ava1_{} is used twice",
+                m.name,
+                snake(&m.name)
+            ));
         }
         let mut fields = HashSet::new();
         for n in m
@@ -100,9 +205,37 @@ pub fn parse(src: &str) -> Result<Schema, String> {
             if !is_snake(n) {
                 return Err(format!("{}.{n}: field names are snake_case", m.name));
             }
+            if RUST_UNRAWABLE.contains(&n.as_str()) {
+                return Err(format!("{}.{n}: not usable as a field name", m.name));
+            }
             if !fields.insert(n.clone()) {
                 return Err(format!("{}.{n}: field used twice", m.name));
             }
+        }
+        // Names the C struct adds next to the declared ones must not collide with them.
+        let mut c_names: HashSet<String> = HashSet::new();
+        let mut c_add = |n: String| -> Result<(), String> {
+            if n == "unused_" || !c_names.insert(n.clone()) {
+                return Err(format!(
+                    "{}: C member `{n}` would be declared twice",
+                    m.name
+                ));
+            }
+            Ok(())
+        };
+        for (n, ty) in m
+            .fields
+            .iter()
+            .map(|f| (&f.name, f.ty))
+            .chain(m.ext.iter().map(|e| (&e.name, e.ty)))
+        {
+            c_add(cid(n))?;
+            if matches!(ty, Ty::Bytes | Ty::Str) {
+                c_add(format!("{}_len", cid(n)))?;
+            }
+        }
+        for e in &m.ext {
+            c_add(format!("has_{}", e.name))?;
         }
         let mut tags = HashSet::new();
         for e in &m.ext {
@@ -207,10 +340,10 @@ fn emit_rust_msg(o: &mut String, m: &Msg) {
         m.name
     );
     for f in &m.fields {
-        let _ = writeln!(o, "    pub {}: {},", f.name, rust_ty(f.ty));
+        let _ = writeln!(o, "    pub {}: {},", rid(&f.name), rust_ty(f.ty));
     }
     for e in &m.ext {
-        let _ = writeln!(o, "    pub {}: Option<{}>,", e.name, rust_ty(e.ty));
+        let _ = writeln!(o, "    pub {}: Option<{}>,", rid(&e.name), rust_ty(e.ty));
     }
     o.push_str("}\n\n");
     let _ = writeln!(
@@ -220,21 +353,29 @@ fn emit_rust_msg(o: &mut String, m: &Msg) {
     );
     o.push_str("    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {\n");
     for f in &m.fields {
-        let _ = writeln!(o, "        {}", rust_put(f.ty, &format!("self.{}", f.name)));
+        let _ = writeln!(
+            o,
+            "        {}",
+            rust_put(f.ty, &format!("self.{}", rid(&f.name)))
+        );
     }
     if m.ext.is_empty() {
         o.push_str("        w.u16(0);\n");
     } else {
         o.push_str("        let mut ext_n: u16 = 0;\n");
         for e in &m.ext {
-            let _ = writeln!(o, "        if self.{}.is_some() {{ ext_n += 1; }}", e.name);
+            let _ = writeln!(
+                o,
+                "        if self.{}.is_some() {{ ext_n += 1; }}",
+                rid(&e.name)
+            );
         }
         o.push_str("        w.u16(ext_n);\n");
         for e in &m.ext {
             let _ = writeln!(
                 o,
                 "        if let Some(v) = &self.{} {{ w.ext({}, |w| {{ {} }})?; }}",
-                e.name,
+                rid(&e.name),
                 e.tag,
                 rust_put_ext(e.ty)
             );
@@ -249,7 +390,7 @@ fn emit_rust_msg(o: &mut String, m: &Msg) {
         if assigns { "mut " } else { "" }
     );
     for f in &m.fields {
-        let _ = writeln!(o, "        m.{} = {};", f.name, rust_get(f.ty, "r"));
+        let _ = writeln!(o, "        m.{} = {};", rid(&f.name), rust_get(f.ty, "r"));
     }
     o.push_str("        let ext_n = r.u16()?;\n        for _ in 0..ext_n {\n            let tag = r.u16()?;\n            let len = r.u32()? as usize;\n            let v = r.take(len)?;\n");
     if m.ext.is_empty() {
@@ -260,7 +401,7 @@ fn emit_rust_msg(o: &mut String, m: &Msg) {
             let _ = writeln!(
                 o,
                 "                {} => {{\n                    if m.{}.is_some() {{ return Err(DecodeError::DupExt({})); }}\n                    let mut vr = Reader::new(v);\n                    m.{} = Some({});\n                    vr.finish()?;\n                }}",
-                e.tag, e.name, e.tag, e.name, rust_get(e.ty, "vr")
+                e.tag, rid(&e.name), e.tag, rid(&e.name), rust_get(e.ty, "vr")
             );
         }
         o.push_str("                _ => {}\n            }\n");
@@ -298,13 +439,13 @@ pub fn emit_rust(s: &Schema) -> String {
     for m in &all {
         let _ = write!(o, "        \"{}\" => {} {{", m.name, m.name);
         for f in &m.fields {
-            let _ = write!(o, " {}: {},", f.name, rust_sample(f.ty));
+            let _ = write!(o, " {}: {},", rid(&f.name), rust_sample(f.ty));
         }
         for e in &m.ext {
             let _ = write!(
                 o,
                 " {}: if rng.below(2) == 1 {{ Some({}) }} else {{ None }},",
-                e.name,
+                rid(&e.name),
                 rust_sample(e.ty)
             );
         }
@@ -378,7 +519,9 @@ pub fn emit_c_header(s: &Schema) -> String {
     let mut o = String::from(C_BANNER);
     o.push_str("#ifndef AVA1_GEN_H\n#define AVA1_GEN_H\n\n#include <stddef.h>\n#include <stdint.h>\n\n#include \"ava1_wire.h\"\n\n");
     for c in &s.consts {
-        let _ = writeln!(o, "#define AVA1_{} {}u", c.name, c.value);
+        // ULL: every constant has one type wide enough for a u64 value, whatever the
+        // target's int and long are.
+        let _ = writeln!(o, "#define AVA1_{} {}ULL", c.name, c.value);
     }
     o.push('\n');
     for m in &s.messages {
@@ -394,11 +537,11 @@ pub fn emit_c_header(s: &Schema) -> String {
         let sn = snake(&m.name);
         o.push_str("typedef struct {\n");
         for f in &m.fields {
-            o.push_str(&c_decl(f.ty, &f.name));
+            o.push_str(&c_decl(f.ty, &cid(&f.name)));
         }
         for e in &m.ext {
             let _ = writeln!(o, "    int has_{};", e.name);
-            o.push_str(&c_decl(e.ty, &e.name));
+            o.push_str(&c_decl(e.ty, &cid(&e.name)));
         }
         if m.fields.is_empty() && m.ext.is_empty() {
             o.push_str("    uint8_t unused_;\n");
@@ -438,7 +581,7 @@ pub fn emit_c_source(s: &Schema) -> String {
             o.push_str("    uint16_t ext_n = 0;\n");
         }
         for f in &m.fields {
-            let _ = writeln!(o, "    {}", c_put(f.ty, &f.name));
+            let _ = writeln!(o, "    {}", c_put(f.ty, &cid(&f.name)));
         }
         if m.ext.is_empty() {
             o.push_str("    ava1_w_u16(w, 0);\n");
@@ -453,7 +596,7 @@ pub fn emit_c_source(s: &Schema) -> String {
                     "    if (m->has_{n}) {{\n        size_t at = ava1_w_ext_begin(w, {t});\n        {put}\n        ava1_w_ext_end(w, at);\n    }}",
                     n = e.name,
                     t = e.tag,
-                    put = c_put(e.ty, &e.name)
+                    put = c_put(e.ty, &cid(&e.name))
                 );
             }
         }
@@ -465,7 +608,7 @@ pub fn emit_c_source(s: &Schema) -> String {
         );
         o.push_str("    ava1_r_t r;\n    uint16_t ext_n, i;\n    memset(m, 0, sizeof(*m));\n    ava1_r_init(&r, buf, len);\n");
         for f in &m.fields {
-            let _ = writeln!(o, "    {}", c_get(f.ty, "&r", &f.name));
+            let _ = writeln!(o, "    {}", c_get(f.ty, "&r", &cid(&f.name)));
         }
         o.push_str("    ext_n = ava1_r_u16(&r);\n    for (i = 0; i < ext_n && !r.err; i++) {\n");
         if m.ext.is_empty() {
@@ -478,7 +621,7 @@ pub fn emit_c_source(s: &Schema) -> String {
                     "        case {t}:\n            if (m->has_{n}) return AVA1_E_DUP_EXT;\n            m->has_{n} = 1;\n            {get}\n            break;",
                     t = e.tag,
                     n = e.name,
-                    get = c_get(e.ty, "&vr", &e.name)
+                    get = c_get(e.ty, "&vr", &cid(&e.name))
                 );
             }
             o.push_str("        default:\n            continue;\n        }\n        rc = ava1_r_finish(&vr);\n        if (rc != 0) return rc;\n");

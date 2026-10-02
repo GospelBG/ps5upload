@@ -714,6 +714,9 @@ async fn payload_restore_handler(Json(req): Json<PayloadRestoreRequest>) -> Resp
     let res = tokio::task::spawn_blocking(move || {
         use ps5upload_core::payload_lifecycle as pl;
         let bytes = crate::bundled_payload::image_bytes(crate::bundled_payload::Image::Payload)?;
+        // Stamped like the desktop app's sends, so the console trusts this engine's AVA1
+        // identity without pairing.
+        let bytes = crate::ava1_api::stamped_helper(&bytes);
         pl::send_elf_to_loader(
             &ps5_ip,
             pl::PS5_LOADER_PORT,

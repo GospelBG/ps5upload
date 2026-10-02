@@ -9,6 +9,9 @@ use blake2::{Blake2b, Blake2bMac, Digest};
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
+
+use crate::Ava1Error;
 
 pub const NOISE: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2b";
 pub const PROLOGUE: &[u8] = b"AVA1 v1";
@@ -22,14 +25,16 @@ pub struct Identity {
 
 impl Drop for Identity {
     fn drop(&mut self) {
-        self.secret = [0; 32];
+        self.secret.zeroize();
     }
 }
 
 impl Identity {
-    pub fn from_secret(secret: [u8; 32]) -> Self {
+    pub fn from_secret(mut secret: [u8; 32]) -> Self {
         let public = PublicKey::from(&StaticSecret::from(secret)).to_bytes();
-        Self { secret, public }
+        let id = Self { secret, public };
+        secret.zeroize();
+        id
     }
 
     pub fn generate() -> io::Result<Self> {
@@ -45,6 +50,7 @@ impl Identity {
     pub fn load_or_create(path: &Path) -> io::Result<Self> {
         match std::fs::read(path) {
             Ok(b) => {
+                let b = zeroize::Zeroizing::new(b);
                 let a: [u8; 32] = b.as_slice().try_into().map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -56,14 +62,14 @@ impl Identity {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let bytes = random_bytes::<32>()?;
+        let bytes = zeroize::Zeroizing::new(random_bytes::<32>()?);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = path.with_extension("tmp");
-        write_private(&tmp, &bytes)?;
+        write_private(&tmp, &bytes[..])?;
         std::fs::rename(&tmp, path)?;
-        Ok(Self::from_secret(bytes))
+        Ok(Self::from_secret(*bytes))
     }
 }
 
@@ -97,9 +103,30 @@ pub struct SessionKeys {
     pub hash: [u8; 64],
 }
 
+impl Drop for SessionKeys {
+    fn drop(&mut self) {
+        self.c2s.zeroize();
+        self.s2c.zeroize();
+        self.hash.zeroize();
+    }
+}
+
+/// Whether `p` is a low-order X25519 point: one whose shared secret with every private
+/// key is all zero, so a peer sending it would fix the "secret" in advance. X25519
+/// clamps scalars to multiples of 8, which maps exactly these points (and no others) to
+/// zero, so one multiplication by any scalar decides it. Same policy as the C side,
+/// which refuses an all-zero DH output (SPEC.md §4.2).
+pub fn is_low_order(p: &[u8; 32]) -> bool {
+    const PROBE: [u8; 32] = [0x42; 32];
+    x25519_dalek::x25519(PROBE, *p) == [0u8; 32]
+}
+
 /// One side of a `Noise_XX_25519_ChaChaPoly_BLAKE2b` handshake.
 pub struct Handshake {
     hs: snow::HandshakeState,
+    /// Handshake messages read so far: the first one read starts with the peer's
+    /// ephemeral key in the clear.
+    reads: u8,
 }
 
 impl Handshake {
@@ -130,7 +157,7 @@ impl Handshake {
         } else {
             b.build_responder()?
         };
-        Ok(Self { hs })
+        Ok(Self { hs, reads: 0 })
     }
 
     pub fn write(&mut self, payload: &[u8]) -> Result<Vec<u8>, snow::Error> {
@@ -140,10 +167,25 @@ impl Handshake {
         Ok(out)
     }
 
-    pub fn read(&mut self, msg: &[u8]) -> Result<Vec<u8>, snow::Error> {
+    /// Reads the peer's next handshake message. Refuses (`WeakKey`) a low-order
+    /// ephemeral or static key: snow would carry on with an all-zero DH result.
+    pub fn read(&mut self, msg: &[u8]) -> Result<Vec<u8>, Ava1Error> {
+        if self.reads == 0 {
+            // Message 1 (to the responder) and message 2 (to the initiator) both open
+            // with the sender's ephemeral key.
+            let e: Option<&[u8; 32]> = msg.get(..32).and_then(|b| b.try_into().ok());
+            if e.is_some_and(is_low_order) {
+                return Err(Ava1Error::WeakKey);
+            }
+        }
+        self.reads += 1;
         let mut out = vec![0u8; msg.len()];
         let n = self.hs.read_message(msg, &mut out)?;
         out.truncate(n);
+        if self.remote_static().is_some_and(|s| is_low_order(&s)) {
+            out.zeroize();
+            return Err(Ava1Error::WeakKey);
+        }
         Ok(out)
     }
 
@@ -210,7 +252,7 @@ pub fn control_key(dir: &[u8; 32]) -> [u8; 32] {
 fn join_mac(dir: &[u8; 32], parts: &[&[u8]]) -> [u8; 16] {
     let mut jk = mac32(dir, &[b"AVA1 join"]);
     let t = mac16(&jk, parts);
-    jk.fill(0);
+    jk.zeroize();
     t
 }
 
@@ -383,6 +425,30 @@ mod tests {
         let mut m2 = r.write(&[]).unwrap();
         m2[40] ^= 1; // inside the encrypted static key
         assert!(i.read(&m2).is_err());
+    }
+
+    #[test]
+    fn low_order_keys_are_refused() {
+        // The canonical small-order points (RFC 7748 §6.1 / Curve25519 "contributory" list).
+        let low: [&str; 5] = [
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0100000000000000000000000000000000000000000000000000000000000000",
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        ];
+        for h in low {
+            let p: [u8; 32] = hex::decode(h).unwrap().try_into().unwrap();
+            assert!(is_low_order(&p), "{h}");
+            // As the peer's ephemeral key in message 1.
+            let s = Identity::generate().unwrap();
+            let mut r = Handshake::responder(&s).unwrap();
+            let mut m1 = p.to_vec();
+            m1.extend_from_slice(b"hello");
+            assert!(matches!(r.read(&m1), Err(Ava1Error::WeakKey)), "{h}");
+        }
+        assert!(!is_low_order(&Identity::generate().unwrap().public()));
+        assert!(!is_low_order(&[9u8; 32]));
     }
 
     #[test]

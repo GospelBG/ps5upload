@@ -368,6 +368,11 @@ static void *rpc_worker(void *arg) {
     int status = AVA1_ERR_INTERNAL;
     if (out && S.cfg.rpc) status = S.cfg.rpc(j->method, j->body, j->body_len, out, RPC_OUT_MAX, &out_len);
     else if (out) status = AVA1_ERR_UNKNOWN_METHOD;
+    /* A handler that claims more than the buffer holds must not make us read past it. */
+    if (out_len > RPC_OUT_MAX) {
+        out_len = 0;
+        status = AVA1_ERR_INTERNAL;
+    }
     (void)send_status(&j->k->io, j->ch, (uint16_t)status, out, status == AVA1_STATUS_OK ? out_len : 0);
     pthread_mutex_lock(&mu);
     if (sess_is_locked(j->idx, j->sid)) S.sessions[j->idx].rpc_inflight--;
@@ -619,7 +624,7 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
         ava1_client_info_decode(pl, pn, &ci) != 0)
         goto out;
     clean_name(ci.name, ci.has_name ? ci.name_len : 0, peer_name);
-    ava1_noise_split(&ns, c2s, s2c);
+    if (ava1_noise_split(&ns, c2s, s2c) != 0) goto out;
     ava1_control_key(c2s, k->io.recv_key);
     ava1_control_key(s2c, k->io.send_key);
     k->io.keyed = 1;
@@ -661,8 +666,11 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     sess_remove(idx, sid);
 out:
     if (!filled) sess_release(idx);
-    crypto_wipe(&ns, sizeof ns);
+    ava1_noise_wipe(&ns);
     crypto_wipe(&eph, sizeof eph);
+    crypto_wipe(secret, sizeof secret);
+    crypto_wipe(pl, sizeof pl);
+    crypto_wipe(msg, sizeof msg);
     crypto_wipe(c2s, sizeof c2s);
     crypto_wipe(s2c, sizeof s2c);
 }
@@ -670,7 +678,7 @@ out:
 static void run_lane(conn_t *k, uint8_t *buf, size_t len) {
     ava1_join_t j;
     ava1_join_ack_t ack;
-    uint8_t expect[16], c2s[32], s2c[32], out[64];
+    uint8_t expect[16] = { 0 }, c2s[32], s2c[32], out[64];
     ava1_w_t w;
     int idx, verified = 0, fresh = 0, paired = 0;
     uint32_t gen = 0;
@@ -701,7 +709,7 @@ static void run_lane(conn_t *k, uint8_t *buf, size_t len) {
     if (!(fresh && paired)) {
         if (fresh) (void)send_error(&k->io, AVA1_ERR_NOT_PAIRED, "pair first");
         else (void)send_error(&k->io, AVA1_ERR_BAD_JOIN, "join refused");
-        return;
+        goto wipe;
     }
     memset(&ack, 0, sizeof ack);
     ack.lane_id = j.lane_id;
@@ -720,6 +728,7 @@ static void run_lane(conn_t *k, uint8_t *buf, size_t len) {
         serve_loop(k, idx, j.session_id, j.lane_id, gen, buf);
     }
 wipe:
+    crypto_wipe(expect, sizeof expect);
     crypto_wipe(c2s, sizeof c2s);
     crypto_wipe(s2c, sizeof s2c);
 }
@@ -917,3 +926,4 @@ void ava1_server_stop(void) {
     S.accept_started = 0;
     pthread_mutex_unlock(&mu);
 }
+

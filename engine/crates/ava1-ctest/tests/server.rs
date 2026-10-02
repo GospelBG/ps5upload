@@ -283,7 +283,7 @@ async fn c_server_drops_a_silent_half_handshake() {
         .unwrap_or(0);
     assert_eq!(n, 0);
     assert!(
-        t.elapsed() < Duration::from_millis(1200),
+        t.elapsed() < Duration::from_millis(2500),
         "{:?}",
         t.elapsed()
     );
@@ -338,7 +338,7 @@ async fn c_server_drops_a_blackholed_session() {
     let t = Instant::now();
     wait_conns(&srv, 0).await;
     assert!(
-        t.elapsed() < Duration::from_millis(1500),
+        t.elapsed() < Duration::from_millis(2500),
         "{:?}",
         t.elapsed()
     );
@@ -401,7 +401,7 @@ async fn c_server_drops_a_trickling_handshake() {
         .unwrap_or(0);
     assert_eq!(n, 0, "the server closed the trickling connection");
     assert!(
-        t.elapsed() < Duration::from_millis(1500),
+        t.elapsed() < Duration::from_millis(2500),
         "{:?}",
         t.elapsed()
     );

@@ -54,6 +54,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

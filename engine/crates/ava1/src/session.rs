@@ -105,21 +105,37 @@ pub async fn connect(
     my_name: &str,
     timing: Timing,
 ) -> Result<Session, Ava1Error> {
-    let stream = within(timing.handshake, async {
-        Ok(TcpStream::connect(addr).await?)
-    })
-    .await?;
+    connect_expecting(addr, None, me, peers, my_name, timing).await
+}
+
+/// `connect`, but only to the device whose key is `expected_key` (when `Some`). Another
+/// device at the same address — a second console that took over the IP — is refused
+/// with `WrongPeer` before it learns who we are.
+pub async fn connect_expecting(
+    addr: &str,
+    expected_key: Option<[u8; 32]>,
+    me: Arc<Identity>,
+    peers: Arc<Mutex<PeerStore>>,
+    my_name: &str,
+    timing: Timing,
+) -> Result<Session, Ava1Error> {
+    // One deadline for the TCP connect and the whole handshake.
+    let deadline = tokio::time::Instant::now() + timing.handshake;
+    let stream = tokio::time::timeout_at(deadline, TcpStream::connect(addr))
+        .await
+        .map_err(|_| Ava1Error::Timeout)??;
     stream.set_nodelay(true)?;
     let peer_addr = stream.peer_addr()?;
     let (rh, wh) = stream.into_split();
     let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
-    let est = within(
-        timing.handshake,
-        handshake::client(&mut r, &mut w, &me, my_name, |k| {
+    let est = tokio::time::timeout_at(
+        deadline,
+        handshake::client_expecting(&mut r, &mut w, &me, my_name, expected_key, |k| {
             peers.lock().unwrap().contains(k)
         }),
     )
-    .await?;
+    .await
+    .map_err(|_| Ava1Error::Timeout)??;
     let (tx, mut rx) = mpsc::channel(DELIVER_DEPTH);
     let (link, outbox) = drive(r, w, timing, tx);
     let pending: Pending = Arc::default();

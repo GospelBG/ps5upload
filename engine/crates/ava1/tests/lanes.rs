@@ -248,3 +248,49 @@ async fn two_joins_of_one_lane_id_never_share_a_key() {
     assert_ne!(a.0, b.0);
     assert_ne!(a.1, b.1);
 }
+
+#[tokio::test]
+async fn an_unknown_frame_on_a_lane_is_a_protocol_error_unless_ignorable() {
+    let (addr, _ctx, me, peers) = paired().await;
+    let s = connect(&addr.to_string(), me, peers, "c", fast())
+        .await
+        .unwrap();
+    for (ignorable, lane) in [(true, 5u16), (false, 6)] {
+        let j = s.join_frame_for_test(lane, [lane as u8; 16]);
+        let (rh, wh) = TcpStream::connect(addr).await.unwrap().into_split();
+        let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+        w.send_msg(0, &j).await.unwrap();
+        let ack: gen::JoinAck = r.recv().await.unwrap().decode().unwrap();
+        let (c2s, s2c) = s.lane_keys_for_test(lane, &j.client_nonce, &ack.server_nonce);
+        w.set_key(c2s);
+        r.set_key(s2c);
+        if ignorable {
+            w.send_ignorable(0x7e, 0, b"from the future").await.unwrap();
+        } else {
+            w.send(0x7e, 0, b"from the future").await.unwrap();
+        }
+        // The next non-heartbeat frame, if any, within a few heartbeats.
+        let verdict = tokio::time::timeout(Duration::from_millis(700), async {
+            loop {
+                let f = r.recv().await?;
+                if f.ty == gen::Error::TYPE {
+                    return f.decode::<gen::Error>();
+                }
+                // Stay alive: answer the server's heartbeats.
+                if let Ok(p) = f.decode::<gen::Ping>() {
+                    let pong = gen::Pong {
+                        seq: p.seq,
+                        t_us: p.t_us,
+                    };
+                    w.send_msg(0, &pong).await?;
+                }
+            }
+        })
+        .await;
+        match (ignorable, verdict) {
+            (true, Err(_)) => {} // still open, only heartbeats
+            (false, Ok(Ok(e))) => assert_eq!(e.code, gen::ERR_PROTOCOL),
+            (i, v) => panic!("ignorable={i}: {v:?}"),
+        }
+    }
+}

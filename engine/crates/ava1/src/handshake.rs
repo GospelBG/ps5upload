@@ -69,6 +69,24 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    client_expecting(r, w, me, my_name, None, knows).await
+}
+
+/// `client`, refusing any server whose static key is not `expected` (when given): the
+/// right address can be the wrong console. The check happens on message 2, before this
+/// side has revealed its own key or name.
+pub async fn client_expecting<R, W>(
+    r: &mut FrameReader<R>,
+    w: &mut FrameWriter<W>,
+    me: &Identity,
+    my_name: &str,
+    expected: Option<[u8; 32]>,
+    knows: impl Fn(&[u8; 32]) -> bool,
+) -> Result<Established, Ava1Error>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let v = gen::PROTOCOL_VERSION;
     let mut hs = Handshake::initiator(me)?;
     let hello = HelloInfo {
@@ -98,6 +116,9 @@ where
         });
     }
     let peer_key = hs.remote_static().ok_or(Ava1Error::WeakKey)?;
+    if expected.is_some_and(|k| k != peer_key) {
+        return Err(Ava1Error::WrongPeer);
+    }
     let ci = ClientInfo {
         name: Some(my_name.to_string()),
     }

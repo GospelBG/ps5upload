@@ -7,7 +7,7 @@ use ava1::gen;
 use ava1::keys::Identity;
 use ava1::peers::PeerStore;
 use ava1::server::ServerCtx;
-use ava1::session::connect;
+use ava1::session::{connect, connect_expecting};
 use ava1::Ava1Error;
 use common::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -168,13 +168,15 @@ async fn a_silent_half_handshake_is_dropped() {
         .unwrap()
         .unwrap_or(0);
     assert_eq!(n, 0, "server closed the half-open handshake");
-    assert!(t.elapsed() < Duration::from_millis(1500));
-    // Everyone else was served meanwhile.
-    connect(&addr.to_string(), me, peers, "c", fast())
+    assert!(t.elapsed() < Duration::from_millis(2500)); // handshake 500 ms + headroom
+                                                        // Everyone else was served meanwhile.
+    let s = connect(&addr.to_string(), me, peers, "c", fast())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(ctx.connections() <= 1);
+    wait_for(Duration::from_secs(5), || ctx.connections() <= 1)
+        .await
+        .expect("the half-open connection was released");
+    drop(s);
 }
 
 #[tokio::test]
@@ -555,4 +557,118 @@ where
         out.push(h.await.unwrap());
     }
     out
+}
+
+/// Reads frames until one that is not a heartbeat.
+async fn next_non_heartbeat(r: &mut RawReader) -> ava1::conn::Frame {
+    use ava1::wire::FrameMessage;
+    loop {
+        let f = tokio::time::timeout(Duration::from_secs(5), r.recv())
+            .await
+            .expect("a reply")
+            .unwrap();
+        if f.ty != gen::Ping::TYPE && f.ty != gen::Pong::TYPE {
+            return f;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_rpc_request_is_answered_with_an_error_before_closing() {
+    let (addr, ctx, me, _peers) = paired().await;
+    let (mut r, mut w) = raw_session(addr, &me).await;
+    w.send(0x60, 7, &[0xff]).await.unwrap(); // RpcRequest needs at least 8 bytes
+    let e: gen::Error = next_non_heartbeat(&mut r).await.decode().unwrap();
+    assert_eq!(e.code, gen::ERR_PROTOCOL);
+    wait_for(Duration::from_secs(5), || ctx.sessions() == 0)
+        .await
+        .expect("then the session is closed");
+}
+
+#[tokio::test]
+async fn the_handshake_has_one_deadline_from_accept_to_welcome() {
+    // 1.4 s of silence, then a valid first message, then silence again: the server must
+    // hang up 2 s after the accept, not 2 s after each step (which would be 3.4 s).
+    let timing = ava1::session::Timing {
+        handshake: Duration::from_secs(2),
+        ..fast()
+    };
+    let (addr, _ctx, me, _peers) = paired_with(timing).await;
+    let t = Instant::now();
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (rh, wh) = stream.into_split();
+    let (mut r, mut w) = (
+        ava1::conn::FrameReader::new(rh),
+        ava1::conn::FrameWriter::new(wh),
+    );
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    let mut hs = ava1::keys::Handshake::initiator(&me).unwrap();
+    let hello = {
+        use ava1::wire::Message;
+        gen::HelloInfo {
+            version_min: gen::PROTOCOL_VERSION,
+            version_max: gen::PROTOCOL_VERSION,
+            caps: 0,
+        }
+        .to_bytes()
+        .unwrap()
+    };
+    w.send_msg(
+        0,
+        &gen::Hs1 {
+            noise: hs.write(&hello).unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let _hs2: gen::Hs2 = r.recv().await.unwrap().decode().unwrap();
+    // Never send Hs3.
+    let end = tokio::time::timeout(Duration::from_secs(5), r.recv()).await;
+    assert!(matches!(end, Ok(Err(_))), "the server hung up: {end:?}");
+    let took = t.elapsed();
+    assert!(took >= Duration::from_millis(1900), "{took:?}");
+    assert!(
+        took < Duration::from_millis(2900),
+        "one deadline, not two: {took:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_client_expecting_another_device_refuses_before_introducing_itself() {
+    let seen = Arc::new(Mutex::new(0usize));
+    let seen2 = seen.clone();
+    let s_id = Identity::generate().unwrap();
+    let s_pub = s_id.public();
+    let ctx = ServerCtx::new(s_id, "console", PeerStore::in_memory(), node_info_rpc("s"))
+        .with_timing(fast())
+        .with_notify(Box::new(move |_| *seen2.lock().unwrap() += 1));
+    ctx.open_pairing(Duration::from_secs(60));
+    let (addr, ctx) = start(ctx).await;
+    let me = Arc::new(Identity::generate().unwrap());
+    let peers = Arc::new(Mutex::new(PeerStore::in_memory()));
+    // The right address, the wrong console.
+    let r = connect_expecting(
+        &addr.to_string(),
+        Some([0x33; 32]),
+        me.clone(),
+        peers.clone(),
+        "laptop",
+        fast(),
+    )
+    .await;
+    assert!(matches!(r, Err(Ava1Error::WrongPeer)), "{r:?}");
+    wait_for(Duration::from_secs(5), || ctx.connections() == 0)
+        .await
+        .expect("the refused connection is gone");
+    assert_eq!(ctx.sessions(), 0);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        0,
+        "the server never learned who asked"
+    );
+    // The expected console is accepted as before.
+    let s = connect_expecting(&addr.to_string(), Some(s_pub), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    assert_eq!(s.peer_key(), s_pub);
 }

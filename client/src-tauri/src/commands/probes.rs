@@ -412,13 +412,9 @@ async fn fetch_ava1_key(url: &str) -> Option<[u8; 32]> {
 async fn stamp_ava1_trust(bytes: &mut [u8]) {
     let url = format!("{}/api/ava1/identity", crate::engine::url());
     let key = fetch_ava1_key(&url).await;
-    match key {
-        Some(k) => {
-            if let Err(e) = ava1::trust::stamp(bytes, &k) {
-                eprintln!("[payload_send] AVA1 trust not stamped: {e}");
-            }
-        }
-        None => eprintln!("[payload_send] AVA1 trust not stamped: engine identity unavailable"),
+    // The same step the engine's own helper sends take (ava1_api::stamped_helper).
+    if let Err(why) = ava1::trust::stamp_helper(bytes, key.as_ref()) {
+        eprintln!("[payload_send] {why}");
     }
 }
 

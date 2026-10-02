@@ -23,6 +23,8 @@ pub enum Ava1Error {
     Version { min: u16, max: u16, ours: u16 },
     #[error("the devices are not paired yet")]
     NotPaired,
+    #[error("a different device answered at this address (its key is not the expected one)")]
+    WrongPeer,
     #[error("the other device sent no usable key")]
     WeakKey,
     #[error("timed out")]
