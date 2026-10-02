@@ -413,6 +413,22 @@ impl Drop for CServer {
     }
 }
 
+extern "C" {
+    fn ava1_test_firmware(kernel_version: *const c_char, out: *mut c_char, cap: usize);
+}
+
+/// The payload's node.info firmware string for kernel build string `kv`, written into a
+/// `cap`-byte buffer (payload/include/ps5_firmware.h).
+pub fn c_firmware_from_kernel(kv: &str, cap: usize) -> String {
+    let kv = CString::new(kv).unwrap();
+    let mut out = vec![0x55 as c_char; cap];
+    unsafe { ava1_test_firmware(kv.as_ptr(), out.as_mut_ptr(), cap) };
+    unsafe { std::ffi::CStr::from_ptr(out.as_ptr()) }
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
 pub fn c_identity_load_or_create(path: &Path) -> Result<[u8; 32], i32> {
     let p = CString::new(path.to_str().unwrap()).unwrap();
     let mut id = ffi::CIdentity {

@@ -28,10 +28,13 @@ fn main() {
             ava1.join("gen/ava1_gen.c"),
             here.join("csrc/sizes.c"),
             here.join("csrc/test_shim.c"),
+            here.join("csrc/firmware_shim.c"),
         ])
         .include(&ava1)
         .include(ava1.join("gen"))
         .include(&mono)
+        // Only for ps5_firmware.h, which the payload's AVA1 glue uses (node.info).
+        .include(p.join("include"))
         .warnings(true)
         .extra_warnings(true)
         .warnings_into_errors(true)
@@ -41,5 +44,9 @@ fn main() {
     }
     println!("cargo:rerun-if-changed={}", ava1.display());
     println!("cargo:rerun-if-changed={}", mono.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("include/ps5_firmware.h").display()
+    );
     println!("cargo:rerun-if-changed=csrc");
 }

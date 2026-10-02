@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
 #include <time.h>
 
 #include "ava1_gen.h"
@@ -17,6 +19,7 @@
 #include "ava1_trust.h"
 #include "config.h"
 #include "monocypher.h"
+#include "ps5_firmware.h"
 #include "runtime.h"
 
 #define AVA1_DIR "/data/ps5upload/ava"
@@ -62,13 +65,26 @@ static int crypto_bench(const uint8_t *body, uint32_t body_len, uint8_t *out, si
     return AVA1_STATUS_OK;
 }
 
+/* The firmware version, from kern.version: the same source as the STATUS frame's
+ * ps5_kernel, which the app parses the same way. */
+static void read_firmware(char *out, size_t cap) {
+    char kv[256];
+    size_t len = sizeof kv - 1;
+    memset(kv, 0, sizeof kv);
+    if (sysctlbyname("kern.version", kv, &len, NULL, 0) != 0) kv[0] = '\0';
+    kv[sizeof kv - 1] = '\0';
+    ps5_firmware_from_kernel(kv, out, cap);
+}
+
 static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap,
                size_t *out_len) {
     static const char version[] = PS5UPLOAD2_VERSION;
     ava1_node_info_t ni;
     ava1_w_t w;
+    char firmware[64];
     if (method == AVA1_METHOD_CRYPTO_BENCH) return crypto_bench(body, body_len, out, cap, out_len);
     if (method != AVA1_METHOD_NODE_INFO) return AVA1_ERR_UNKNOWN_METHOD;
+    read_firmware(firmware, sizeof firmware);
     memset(&ni, 0, sizeof ni);
     ni.version = (const uint8_t *)version;
     ni.version_len = (uint16_t)(sizeof version - 1);
@@ -76,6 +92,9 @@ static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t 
     ni.platform_len = 3;
     ni.name = (const uint8_t *)"PS5";
     ni.name_len = 3;
+    ni.has_firmware = 1;
+    ni.firmware = (const uint8_t *)firmware;
+    ni.firmware_len = (uint16_t)strlen(firmware);
     ava1_w_init(&w, out, cap);
     if (ava1_node_info_encode(&ni, &w) != 0) return AVA1_ERR_INTERNAL;
     *out_len = w.len;
