@@ -117,7 +117,10 @@ fn the_wire_numbers_are_pinned() {
     assert_eq!(METHOD_NODE_INFO, 1); // §7
     assert_eq!(METHOD_PAIRING_OPEN, 2); // §5: pairing.open
     assert_eq!((JOB_UPLOAD, JOB_DOWNLOAD, JOB_COPY), (1, 2, 3)); // §11.3
-    assert_eq!((POLICY_REPLACE, POLICY_SKIP_EXISTING, POLICY_VERIFY), (0, 1, 2)); // §11.4
+    assert_eq!(
+        (POLICY_REPLACE, POLICY_SKIP_EXISTING, POLICY_VERIFY),
+        (0, 1, 2)
+    ); // §11.4
     assert_eq!((ENTRY_FILE, ENTRY_DIR), (0, 1)); // §11.3
     assert_eq!(JF_SINGLE_FILE, 1); // §11.6
     assert_eq!((STATUS_OK, CAP_DATA_PLANE), (0, 1)); // §7, §10
