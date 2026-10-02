@@ -63,6 +63,29 @@ pub fn stamped_helper(elf: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// The identity response. The token is a secret — it is what proves to this engine that a
+/// console is the helper this engine launched — so it goes only to a loopback caller, and
+/// only then is one minted at all. The API is loopback-guarded anyway, but an operator can
+/// allow extra peers, and a browser on the LAN — or the Docker engine's page — has no
+/// business holding it; that engine stamps server-side and keeps its tokens to itself.
+///
+/// Residual: a forwarder on this host (a reverse proxy, an `ssh -L` tunnel) makes a remote
+/// caller look local. Every route behind the guard has the same property, and a token
+/// alone pairs nothing — it also needs the handshake hash of a live session with us.
+fn identity_body(
+    public_key: &str,
+    peer: std::net::IpAddr,
+    mint: impl FnOnce() -> Option<[u8; 16]>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({ "public_key": public_key });
+    if peer.is_loopback() {
+        if let Some(t) = mint() {
+            body["launch_token"] = ava1::hex::encode(&t).into();
+        }
+    }
+    body
+}
+
 fn stamp_helper_with(
     elf: &[u8],
     key: Option<&[u8; 32]>,
@@ -75,22 +98,11 @@ fn stamp_helper_with(
 
 /// `GET /api/ava1/identity` — the public key an app stamps into the helper ELF, and a
 /// fresh launch token to go with it (SPEC.md §5.2).
-///
-/// The token is a secret: it is what proves to this engine that a console is the helper
-/// this engine launched. Only a loopback caller gets one. The API is loopback-guarded
-/// anyway, but an operator can allow extra peers, and a browser on the LAN — or the
-/// Docker engine's page — has no business holding it; that engine stamps server-side and
-/// keeps its tokens to itself.
 pub async fn identity_handler(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
     match identity() {
         Some(i) => {
-            let mut body = serde_json::json!({ "public_key": ava1::hex::encode(&i.public()) });
-            if peer.ip().is_loopback() {
-                if let Some(t) = fresh_token() {
-                    body["launch_token"] = ava1::hex::encode(&t).into();
-                }
-            }
-            Json(body).into_response()
+            let key = ava1::hex::encode(&i.public());
+            Json(identity_body(&key, peer.ip(), fresh_token)).into_response()
         }
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -143,6 +155,33 @@ mod tests {
         // the fallback, never a broken slot.
         let (key_only, _) = super::stamp_helper_with(&elf, Some(&[9; 32]), || None);
         assert_eq!(ava1::trust::read_token(&key_only), None);
+    }
+
+    #[test]
+    fn a_launch_token_is_issued_to_a_local_caller_and_to_nobody_else() {
+        let minted = std::cell::Cell::new(0u32);
+        let mint = || {
+            minted.set(minted.get() + 1);
+            Some([7u8; 16])
+        };
+        let local = super::identity_body(
+            "aabb",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            mint,
+        );
+        assert_eq!(local["public_key"], "aabb");
+        assert_eq!(
+            local["launch_token"].as_str(),
+            Some(ava1::hex::encode(&[7u8; 16]).as_str())
+        );
+        assert_eq!(minted.get(), 1);
+        let remote = super::identity_body("aabb", "192.168.1.5".parse().unwrap(), mint);
+        assert_eq!(remote["public_key"], "aabb");
+        assert!(
+            remote.get("launch_token").is_none(),
+            "a caller the engine does not count as local never sees the token: {remote}"
+        );
+        assert_eq!(minted.get(), 1, "and none is minted for it either");
     }
 
     #[test]

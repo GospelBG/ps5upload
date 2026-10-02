@@ -94,6 +94,20 @@ where
     client_launched(r, w, me, my_name, expected, knows, |_, _| false).await
 }
 
+/// Whether a `Welcome` proves we launched that server (SPEC.md §5.2). Three things have
+/// to hold, and each rules out a different impostor: the server is one we do not already
+/// know (a known one needs no proof), it says it knows us (a server that does not know the
+/// client was never given a proof, so one that sends a proof anyway is not to be trusted),
+/// and its proof matches a token we issued and have not expired.
+fn proves_our_launch(
+    known: bool,
+    welcome: &Welcome,
+    hash: &[u8; 64],
+    recognises: impl Fn(&[u8; 64], &[u8; 16]) -> bool,
+) -> bool {
+    !known && welcome.knows_you != 0 && welcome.launch_proof.is_some_and(|p| recognises(hash, &p))
+}
+
 /// `client_expecting`, also trusting a server it does not know whose Welcome carries a
 /// launch proof that `launched(h, proof)` recognises (SPEC.md §5.2) — the helper this
 /// side launched. Such a session is paired at once (`Established::launched`).
@@ -162,13 +176,7 @@ where
     }
     let welcome: Welcome = f.decode()?;
     let known = knows(&peer_key);
-    // A proof only counts from a server that already trusts us (it is sent only to the
-    // key in its trust slot), and only for a server we do not know yet.
-    let launched = !known
-        && welcome.knows_you != 0
-        && welcome
-            .launch_proof
-            .is_some_and(|p| launched(&keys.hash, &p));
+    let launched = proves_our_launch(known, &welcome, &keys.hash, launched);
     let pairing = (!(known || launched) || welcome.knows_you == 0).then(|| PairingState {
         code: keys::pairing_code(&keys.hash),
         server_must_confirm: welcome.knows_you == 0,
@@ -430,6 +438,50 @@ mod tests {
         // Replaying the first Welcome's proof into the second handshake fails.
         assert_ne!(crate::launch::proof(&tok, &b[0].0), a[0].1);
         assert_eq!(crate::launch::proof(&tok, &b[0].0), b[0].1);
+    }
+
+    #[test]
+    fn a_proof_only_counts_from_a_server_that_says_it_knows_us() {
+        let h = [9u8; 64];
+        let accepts_anything = |_: &[u8; 64], _: &[u8; 16]| true;
+        let welcome = |knows_you: u8, launch_proof: Option<[u8; 16]>| Welcome {
+            knows_you,
+            launch_proof,
+        };
+        assert!(proves_our_launch(
+            false,
+            &welcome(1, Some([1; 16])),
+            &h,
+            accepts_anything
+        ));
+        // knows_you = 0 while carrying a proof: the server never had one to send, so a
+        // valid-looking proof must not skip the pairing. The live path cannot produce
+        // this pair — known drives both — so this is the one that guards a refactor.
+        assert!(!proves_our_launch(
+            false,
+            &welcome(0, Some([1; 16])),
+            &h,
+            accepts_anything
+        ));
+        assert!(!proves_our_launch(
+            true,
+            &welcome(1, Some([1; 16])),
+            &h,
+            accepts_anything
+        ));
+        assert!(!proves_our_launch(
+            false,
+            &welcome(1, None),
+            &h,
+            accepts_anything
+        ));
+        // Only the tokens we issued count.
+        assert!(!proves_our_launch(
+            false,
+            &welcome(1, Some([1; 16])),
+            &h,
+            |_, _| false
+        ));
     }
 
     #[tokio::test]

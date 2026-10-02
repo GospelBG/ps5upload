@@ -310,6 +310,27 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_token_file_recognises_nothing_and_is_never_written_over() {
+        let d = std::env::temp_dir().join(format!("ava1-launch-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let path = d.join("ava").join("launch_tokens");
+        // A directory where the file should be: present, unreadable as a file, and not
+        // ours to replace.
+        std::fs::create_dir_all(&path).unwrap();
+        let t = LaunchTokens::at(&path);
+        let h = [3u8; 64];
+        assert!(
+            !t.recognises(&h, &proof(&[1; 16], &h)),
+            "nothing is recognised"
+        );
+        assert_eq!(t.live(), 0);
+        // A token that cannot be recorded is not handed out, so nothing is stamped with it.
+        assert!(t.issue().is_err());
+        assert!(path.is_dir(), "the unreadable file was left alone");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn debug_output_never_shows_a_token() {
         let s = LaunchSecret {
             key: [1; 32],

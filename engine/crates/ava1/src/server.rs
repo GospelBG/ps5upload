@@ -177,6 +177,11 @@ impl ServerCtx {
         self
     }
 
+    /// The launcher (the key from the trust slot) is known without the peers file: this
+    /// server was handed that key by the code that launched it. The C payload keeps the
+    /// same trust in its peers file instead (SPEC.md §5.1), so a peers write that fails
+    /// leaves its launcher refused while this one still admits it — they differ only in
+    /// that case, and only this harness's favour.
     fn is_known(&self, key: &[u8; 32]) -> bool {
         self.launcher.as_ref() == Some(key) || self.peers.lock().unwrap().contains(key)
     }

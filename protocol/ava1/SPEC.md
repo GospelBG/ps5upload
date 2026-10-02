@@ -116,16 +116,21 @@ token into it (state 2) and keep it for itself — the reference side stores the
 `<data dir>/ava/launch_tokens`, one `<32 hex token> <unix seconds>` per line, mode
 0600, written atomically, at most 32 kept (oldest dropped) and each good for 24 h.
 The payload keeps the token in memory only. When the handshake's client static key
-equals the slot's key, the server adds an ignorable extension field `launch_proof`
-to `Welcome`: the first 16 bytes of BLAKE2b-256(key = the token followed by 16 zero
-bytes, "AVA1 launch" ‖ h), h being the handshake hash. No other client gets a
+equals the slot's key, and the client is one the server knows — a helper whose
+peers file could not be written knows nobody and sends no proof — the server adds an
+ignorable extension field `launch_proof` to `Welcome`: the first 16 bytes of
+BLAKE2b-256(key = the token followed by 16 zero bytes, "AVA1 launch" ‖ h), h
+being the handshake hash. No other client gets a
 proof, a proof differs every handshake, and the token itself never travels.
 `vectors/launch.txt` pins the derivation.
 
 A client that recognises the proof — one of its unexpired tokens, on this
 handshake — stores the server's key and treats the session as paired with no
-pairing code. A client that does not recognise it (another token, expired, or an
-old proof replayed under a new h) pairs with the code as usual. The token proves
+pairing code. A proof counts only from a server it does not already know and
+whose `Welcome` says it knows the client (`knows_you` ≠ 0); a server that does not
+know the client was never given a proof, so one presenting a proof anyway is not
+trusted. A client that does not recognise it (another token, expired, an old proof
+replayed under a new h, or a `knows_you` of 0) pairs with the code as usual. The token proves
 "this console is the helper I launched" to the side that sent it; an attacker who
 read the ELF in transit can forge a proof, but that attacker could have replaced
 the ELF outright — it is sent unauthenticated — so the token grants nothing a
