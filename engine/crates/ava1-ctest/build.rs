@@ -20,6 +20,7 @@ fn main() {
             ava1.join("ava1_frame.c"),
             ava1.join("ava1_keys.c"),
             ava1.join("ava1_noise.c"),
+            ava1.join("ava1_aead.c"),
             ava1.join("ava1_conn.c"),
             ava1.join("ava1_store.c"),
             ava1.join("ava1_server.c"),
@@ -39,6 +40,18 @@ fn main() {
         .extra_warnings(true)
         .warnings_into_errors(true)
         .compile("ava1c");
+    // The AVX2 ChaCha20 is its own unit, built with -mavx2 only on x86-64 (where the
+    // run-time CPUID check picks it); elsewhere it compiles to nothing.
+    let mut avx2 = cc::Build::new();
+    avx2.file(ava1.join("ava1_chacha_avx2.c"))
+        .include(&ava1)
+        .warnings(true)
+        .extra_warnings(true)
+        .warnings_into_errors(true);
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
+        avx2.flag("-mavx2");
+    }
+    avx2.compile("ava1avx2");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         println!("cargo:rustc-link-lib=pthread");
     }

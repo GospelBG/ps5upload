@@ -48,7 +48,13 @@ MONO_DIR := third_party/monocypher
 MONO_OBJ := monocypher.o
 AVA1_SRCS := ava1/ava1_wire.c ava1/ava1_frame.c ava1/ava1_keys.c ava1/ava1_noise.c ava1/ava1_conn.c \
              ava1/ava1_store.c ava1/ava1_server.c ava1/ava1_trust.c ava1/platform_ps5.c \
-             ava1/gen/ava1_gen.c src/ava1_glue.c
+             ava1/ava1_aead.c ava1/ava1_chacha_avx2.c ava1/gen/ava1_gen.c src/ava1_glue.c
+# AVA1 is built as objects at -O2: it seals every byte of a transfer, and the rest of the
+# payload is compiled without -O (i.e. -O0). The AVX2 ChaCha20 alone gets -mavx2;
+# ava1_aead.c calls it only once CPUID has confirmed AVX2, so the ELF stays safe on any
+# x86-64. payload/build/ is git-ignored.
+AVA1_OBJS := $(patsubst %.c,build/ava1/%.o,$(AVA1_SRCS))
+AVA1_CFLAGS = $(CFLAGS) -O2
 
 # Only the compile-time options that are safe with the *prebuilt*
 # amalgamation. SQLite's grammar-affecting SQLITE_OMIT_* flags (OMIT_VACUUM,
@@ -148,7 +154,7 @@ SRCS := src/main.c src/runtime.c src/shell_builtin.c src/takeover.c src/register
         src/wake_watchdog.c src/cheats.c src/xml_encoding.c src/activity.c src/sdk_changer.c src/fakelib_overlay.c \
         src/tmdb.c src/fw_spoof.c src/ftp_server.c src/focus_probe.c \
         src/content_db.c \
-        third_party/tiny_aes/aes.c $(AVA1_SRCS) \
+        third_party/tiny_aes/aes.c \
         $(BLAKE3_SRCS)
 
 # Headers as Make prerequisites so editing a .h triggers a rebuild. This
@@ -178,8 +184,16 @@ $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h:
 # without this a change to either printed "Built" while leaving the previous
 # link in place. Adding -lSceIpmi did exactly that — the stale ELF had no
 # libSceIpmi in DT_NEEDED until the sources were touched.
-$(ELF): $(SRCS) $(HEADERS) $(SQLITE_OBJ) $(MONO_OBJ) Makefile
-	$(CC) $(CFLAGS) -o $@ $(SRCS) $(SQLITE_OBJ) $(MONO_OBJ) $(LIBS)
+$(ELF): $(SRCS) $(HEADERS) $(SQLITE_OBJ) $(MONO_OBJ) $(AVA1_OBJS) Makefile
+	$(CC) $(CFLAGS) -o $@ $(SRCS) $(AVA1_OBJS) $(SQLITE_OBJ) $(MONO_OBJ) $(LIBS)
+
+build/ava1/%.o: %.c $(HEADERS) Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(AVA1_CFLAGS) -c -o $@ $<
+
+build/ava1/ava1/ava1_chacha_avx2.o: ava1/ava1_chacha_avx2.c $(HEADERS) Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(AVA1_CFLAGS) -mavx2 -c -o $@ $<
 
 # Gzipped copy for the Tauri bundle resource. linuxdeploy (Linux
 # AppImage bundler) walks every ELF in the AppDir and tries to
@@ -194,6 +208,7 @@ $(ELF).gz: $(ELF)
 
 clean:
 	rm -f $(ELF) $(ELF).gz $(SQLITE_OBJ) $(MONO_OBJ)
+	rm -rf build/ava1
 
 send: $(ELF)
 	@echo "Sending $(ELF) to $(PS5_HOST):$(PS5_PORT) ..."

@@ -44,7 +44,7 @@ void ava1_noise_wipe(ava1_noise_t *ns);
 /* ChaCha20-Poly1305 (RFC 8439), nonce = 4 zero bytes ‖ u64le(n), in place. */
 void ava1_seal(const uint8_t key[32], uint64_t n, const uint8_t *ad, size_t ad_len, uint8_t *buf,
                size_t len, uint8_t mac[16]);
-/* 0, or AVA1_E_TAG (buf is then garbage). */
+/* 0, or AVA1_E_TAG (buf is then left as it came in). Both run ava1_aead.c. */
 int ava1_open(const uint8_t key[32], uint64_t n, const uint8_t *ad, size_t ad_len, uint8_t *buf,
               size_t len, const uint8_t mac[16]);
 

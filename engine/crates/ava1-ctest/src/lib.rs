@@ -127,6 +127,10 @@ pub mod ffi {
             len: usize,
             mac: *const u8,
         ) -> c_int;
+        /// "avx2" or "portable" (NUL-terminated).
+        pub fn ava1_aead_backend() -> *const c_char;
+        /// 0 forces the portable ChaCha20, 1 restores CPUID selection.
+        pub fn ava1_aead_allow_simd(allow: c_int);
     }
 
     #[repr(C)]

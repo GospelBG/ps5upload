@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "ava1_aead.h"
 #include "ava1_wire.h"
 #include "monocypher.h"
 
@@ -76,24 +77,19 @@ static void nonce12(uint64_t n, uint8_t out[12]) {
 
 void ava1_seal(const uint8_t key[32], uint64_t n, const uint8_t *ad, size_t ad_len, uint8_t *buf,
                size_t len, uint8_t mac[16]) {
-    crypto_aead_ctx c;
     uint8_t nn[12];
     nonce12(n, nn);
-    crypto_aead_init_ietf(&c, key, nn); /* a fresh context per message = RFC 8439 */
-    crypto_aead_write(&c, buf, mac, ad, ad_len, buf, len);
-    crypto_wipe(&c, sizeof c);
+    ava1_aead_seal(key, nn, ad, ad_len, buf, len, mac);
     crypto_wipe(nn, sizeof nn);
 }
 
 int ava1_open(const uint8_t key[32], uint64_t n, const uint8_t *ad, size_t ad_len, uint8_t *buf,
               size_t len, const uint8_t mac[16]) {
-    crypto_aead_ctx c;
     uint8_t nn[12];
     int rc;
     nonce12(n, nn);
-    crypto_aead_init_ietf(&c, key, nn);
-    rc = crypto_aead_read(&c, buf, mac, ad, ad_len, buf, len);
-    crypto_wipe(&c, sizeof c);
+    rc = ava1_aead_open(key, nn, ad, ad_len, buf, len, mac);
+    crypto_wipe(nn, sizeof nn);
     return rc == 0 ? 0 : AVA1_E_TAG;
 }
 
