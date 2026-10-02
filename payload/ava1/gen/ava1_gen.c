@@ -4,6 +4,484 @@
 
 #include <string.h>
 
+int ava1_node_info_encode(const ava1_node_info_t *m, ava1_w_t *w) {
+    uint16_t ext_n = 0;
+    ava1_w_str(w, m->version, m->version_len);
+    ava1_w_str(w, m->platform, m->platform_len);
+    ava1_w_str(w, m->name, m->name_len);
+    if (m->has_firmware) ext_n++;
+    ava1_w_u16(w, ext_n);
+    if (m->has_firmware) {
+        size_t at = ava1_w_ext_begin(w, 1);
+        ava1_w_str(w, m->firmware, m->firmware_len);
+        ava1_w_ext_end(w, at);
+    }
+    return w->err;
+}
+
+int ava1_node_info_decode(const uint8_t *buf, size_t len, ava1_node_info_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->version = ava1_r_str(&r, &m->version_len);
+    m->platform = ava1_r_str(&r, &m->platform_len);
+    m->name = ava1_r_str(&r, &m->name_len);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint16_t tag = ava1_r_u16(&r);
+        uint32_t vlen = ava1_r_u32(&r);
+        const uint8_t *v = ava1_r_take(&r, vlen);
+        ava1_r_t vr;
+        int rc;
+        if (r.err) break;
+        ava1_r_init(&vr, v, vlen);
+        switch (tag) {
+        case 1:
+            if (m->has_firmware) return AVA1_E_DUP_EXT;
+            m->has_firmware = 1;
+            m->firmware = ava1_r_str(&vr, &m->firmware_len);
+            break;
+        default:
+            continue;
+        }
+        rc = ava1_r_finish(&vr);
+        if (rc != 0) return rc;
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_node_info_append(ava1_w_t *blob, const ava1_node_info_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_node_info_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_node_info_next(ava1_r_t *it, ava1_node_info_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_node_info_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_node_info_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_node_info_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_node_info_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_hello_info_encode(const ava1_hello_info_t *m, ava1_w_t *w) {
+    ava1_w_u16(w, m->version_min);
+    ava1_w_u16(w, m->version_max);
+    ava1_w_u64(w, m->caps);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_hello_info_decode(const uint8_t *buf, size_t len, ava1_hello_info_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->version_min = ava1_r_u16(&r);
+    m->version_max = ava1_r_u16(&r);
+    m->caps = ava1_r_u64(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_hello_info_append(ava1_w_t *blob, const ava1_hello_info_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_hello_info_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_hello_info_next(ava1_r_t *it, ava1_hello_info_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_hello_info_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_hello_info_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_hello_info_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_hello_info_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_server_info_encode(const ava1_server_info_t *m, ava1_w_t *w) {
+    uint16_t ext_n = 0;
+    ava1_w_u16(w, m->version);
+    ava1_w_u64(w, m->caps);
+    ava1_w_fixed(w, m->session_id, 16);
+    if (m->has_name) ext_n++;
+    ava1_w_u16(w, ext_n);
+    if (m->has_name) {
+        size_t at = ava1_w_ext_begin(w, 1);
+        ava1_w_str(w, m->name, m->name_len);
+        ava1_w_ext_end(w, at);
+    }
+    return w->err;
+}
+
+int ava1_server_info_decode(const uint8_t *buf, size_t len, ava1_server_info_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->version = ava1_r_u16(&r);
+    m->caps = ava1_r_u64(&r);
+    ava1_r_fixed(&r, m->session_id, 16);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint16_t tag = ava1_r_u16(&r);
+        uint32_t vlen = ava1_r_u32(&r);
+        const uint8_t *v = ava1_r_take(&r, vlen);
+        ava1_r_t vr;
+        int rc;
+        if (r.err) break;
+        ava1_r_init(&vr, v, vlen);
+        switch (tag) {
+        case 1:
+            if (m->has_name) return AVA1_E_DUP_EXT;
+            m->has_name = 1;
+            m->name = ava1_r_str(&vr, &m->name_len);
+            break;
+        default:
+            continue;
+        }
+        rc = ava1_r_finish(&vr);
+        if (rc != 0) return rc;
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_server_info_append(ava1_w_t *blob, const ava1_server_info_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_server_info_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_server_info_next(ava1_r_t *it, ava1_server_info_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_server_info_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_server_info_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_server_info_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_server_info_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_client_info_encode(const ava1_client_info_t *m, ava1_w_t *w) {
+    uint16_t ext_n = 0;
+    if (m->has_name) ext_n++;
+    ava1_w_u16(w, ext_n);
+    if (m->has_name) {
+        size_t at = ava1_w_ext_begin(w, 1);
+        ava1_w_str(w, m->name, m->name_len);
+        ava1_w_ext_end(w, at);
+    }
+    return w->err;
+}
+
+int ava1_client_info_decode(const uint8_t *buf, size_t len, ava1_client_info_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint16_t tag = ava1_r_u16(&r);
+        uint32_t vlen = ava1_r_u32(&r);
+        const uint8_t *v = ava1_r_take(&r, vlen);
+        ava1_r_t vr;
+        int rc;
+        if (r.err) break;
+        ava1_r_init(&vr, v, vlen);
+        switch (tag) {
+        case 1:
+            if (m->has_name) return AVA1_E_DUP_EXT;
+            m->has_name = 1;
+            m->name = ava1_r_str(&vr, &m->name_len);
+            break;
+        default:
+            continue;
+        }
+        rc = ava1_r_finish(&vr);
+        if (rc != 0) return rc;
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_client_info_append(ava1_w_t *blob, const ava1_client_info_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_client_info_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_client_info_next(ava1_r_t *it, ava1_client_info_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_client_info_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_client_info_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_client_info_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_client_info_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_pairing_open_encode(const ava1_pairing_open_t *m, ava1_w_t *w) {
+    ava1_w_u16(w, m->seconds);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_pairing_open_decode(const uint8_t *buf, size_t len, ava1_pairing_open_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->seconds = ava1_r_u16(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_pairing_open_append(ava1_w_t *blob, const ava1_pairing_open_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_pairing_open_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_pairing_open_next(ava1_r_t *it, ava1_pairing_open_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_pairing_open_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_pairing_open_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_pairing_open_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_pairing_open_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_crypto_bench_encode(const ava1_crypto_bench_t *m, ava1_w_t *w) {
+    ava1_w_u16(w, m->mib);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_crypto_bench_decode(const uint8_t *buf, size_t len, ava1_crypto_bench_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->mib = ava1_r_u16(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_crypto_bench_append(ava1_w_t *blob, const ava1_crypto_bench_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_crypto_bench_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_crypto_bench_next(ava1_r_t *it, ava1_crypto_bench_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_crypto_bench_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_crypto_bench_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_crypto_bench_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_crypto_bench_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_crypto_bench_result_encode(const ava1_crypto_bench_result_t *m, ava1_w_t *w) {
+    uint16_t ext_n = 0;
+    ava1_w_u64(w, m->bytes);
+    ava1_w_u64(w, m->micros);
+    if (m->has_open_micros) ext_n++;
+    if (m->has_backend) ext_n++;
+    ava1_w_u16(w, ext_n);
+    if (m->has_open_micros) {
+        size_t at = ava1_w_ext_begin(w, 1);
+        ava1_w_u64(w, m->open_micros);
+        ava1_w_ext_end(w, at);
+    }
+    if (m->has_backend) {
+        size_t at = ava1_w_ext_begin(w, 2);
+        ava1_w_str(w, m->backend, m->backend_len);
+        ava1_w_ext_end(w, at);
+    }
+    return w->err;
+}
+
+int ava1_crypto_bench_result_decode(const uint8_t *buf, size_t len, ava1_crypto_bench_result_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->bytes = ava1_r_u64(&r);
+    m->micros = ava1_r_u64(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint16_t tag = ava1_r_u16(&r);
+        uint32_t vlen = ava1_r_u32(&r);
+        const uint8_t *v = ava1_r_take(&r, vlen);
+        ava1_r_t vr;
+        int rc;
+        if (r.err) break;
+        ava1_r_init(&vr, v, vlen);
+        switch (tag) {
+        case 1:
+            if (m->has_open_micros) return AVA1_E_DUP_EXT;
+            m->has_open_micros = 1;
+            m->open_micros = ava1_r_u64(&vr);
+            break;
+        case 2:
+            if (m->has_backend) return AVA1_E_DUP_EXT;
+            m->has_backend = 1;
+            m->backend = ava1_r_str(&vr, &m->backend_len);
+            break;
+        default:
+            continue;
+        }
+        rc = ava1_r_finish(&vr);
+        if (rc != 0) return rc;
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_crypto_bench_result_append(ava1_w_t *blob, const ava1_crypto_bench_result_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_crypto_bench_result_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_crypto_bench_result_next(ava1_r_t *it, ava1_crypto_bench_result_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_crypto_bench_result_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_crypto_bench_result_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_crypto_bench_result_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_crypto_bench_result_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
 int ava1_hs1_encode(const ava1_hs1_t *m, ava1_w_t *w) {
     ava1_w_bytes(w, m->noise, m->noise_len);
     ava1_w_u16(w, 0);
@@ -352,268 +830,14 @@ int ava1_rpc_response_decode(const uint8_t *buf, size_t len, ava1_rpc_response_t
     return ava1_r_finish(&r);
 }
 
-int ava1_node_info_encode(const ava1_node_info_t *m, ava1_w_t *w) {
-    uint16_t ext_n = 0;
-    ava1_w_str(w, m->version, m->version_len);
-    ava1_w_str(w, m->platform, m->platform_len);
-    ava1_w_str(w, m->name, m->name_len);
-    if (m->has_firmware) ext_n++;
-    ava1_w_u16(w, ext_n);
-    if (m->has_firmware) {
-        size_t at = ava1_w_ext_begin(w, 1);
-        ava1_w_str(w, m->firmware, m->firmware_len);
-        ava1_w_ext_end(w, at);
-    }
-    return w->err;
-}
-
-int ava1_node_info_decode(const uint8_t *buf, size_t len, ava1_node_info_t *m) {
-    ava1_r_t r;
-    uint16_t ext_n, i;
-    memset(m, 0, sizeof(*m));
-    ava1_r_init(&r, buf, len);
-    m->version = ava1_r_str(&r, &m->version_len);
-    m->platform = ava1_r_str(&r, &m->platform_len);
-    m->name = ava1_r_str(&r, &m->name_len);
-    ext_n = ava1_r_u16(&r);
-    for (i = 0; i < ext_n && !r.err; i++) {
-        uint16_t tag = ava1_r_u16(&r);
-        uint32_t vlen = ava1_r_u32(&r);
-        const uint8_t *v = ava1_r_take(&r, vlen);
-        ava1_r_t vr;
-        int rc;
-        if (r.err) break;
-        ava1_r_init(&vr, v, vlen);
-        switch (tag) {
-        case 1:
-            if (m->has_firmware) return AVA1_E_DUP_EXT;
-            m->has_firmware = 1;
-            m->firmware = ava1_r_str(&vr, &m->firmware_len);
-            break;
-        default:
-            continue;
-        }
-        rc = ava1_r_finish(&vr);
-        if (rc != 0) return rc;
-    }
-    return ava1_r_finish(&r);
-}
-
-int ava1_hello_info_encode(const ava1_hello_info_t *m, ava1_w_t *w) {
-    ava1_w_u16(w, m->version_min);
-    ava1_w_u16(w, m->version_max);
-    ava1_w_u64(w, m->caps);
-    ava1_w_u16(w, 0);
-    return w->err;
-}
-
-int ava1_hello_info_decode(const uint8_t *buf, size_t len, ava1_hello_info_t *m) {
-    ava1_r_t r;
-    uint16_t ext_n, i;
-    memset(m, 0, sizeof(*m));
-    ava1_r_init(&r, buf, len);
-    m->version_min = ava1_r_u16(&r);
-    m->version_max = ava1_r_u16(&r);
-    m->caps = ava1_r_u64(&r);
-    ext_n = ava1_r_u16(&r);
-    for (i = 0; i < ext_n && !r.err; i++) {
-        uint32_t vlen;
-        (void)ava1_r_u16(&r);
-        vlen = ava1_r_u32(&r);
-        (void)ava1_r_take(&r, vlen);
-    }
-    return ava1_r_finish(&r);
-}
-
-int ava1_server_info_encode(const ava1_server_info_t *m, ava1_w_t *w) {
-    uint16_t ext_n = 0;
-    ava1_w_u16(w, m->version);
-    ava1_w_u64(w, m->caps);
-    ava1_w_fixed(w, m->session_id, 16);
-    if (m->has_name) ext_n++;
-    ava1_w_u16(w, ext_n);
-    if (m->has_name) {
-        size_t at = ava1_w_ext_begin(w, 1);
-        ava1_w_str(w, m->name, m->name_len);
-        ava1_w_ext_end(w, at);
-    }
-    return w->err;
-}
-
-int ava1_server_info_decode(const uint8_t *buf, size_t len, ava1_server_info_t *m) {
-    ava1_r_t r;
-    uint16_t ext_n, i;
-    memset(m, 0, sizeof(*m));
-    ava1_r_init(&r, buf, len);
-    m->version = ava1_r_u16(&r);
-    m->caps = ava1_r_u64(&r);
-    ava1_r_fixed(&r, m->session_id, 16);
-    ext_n = ava1_r_u16(&r);
-    for (i = 0; i < ext_n && !r.err; i++) {
-        uint16_t tag = ava1_r_u16(&r);
-        uint32_t vlen = ava1_r_u32(&r);
-        const uint8_t *v = ava1_r_take(&r, vlen);
-        ava1_r_t vr;
-        int rc;
-        if (r.err) break;
-        ava1_r_init(&vr, v, vlen);
-        switch (tag) {
-        case 1:
-            if (m->has_name) return AVA1_E_DUP_EXT;
-            m->has_name = 1;
-            m->name = ava1_r_str(&vr, &m->name_len);
-            break;
-        default:
-            continue;
-        }
-        rc = ava1_r_finish(&vr);
-        if (rc != 0) return rc;
-    }
-    return ava1_r_finish(&r);
-}
-
-int ava1_client_info_encode(const ava1_client_info_t *m, ava1_w_t *w) {
-    uint16_t ext_n = 0;
-    if (m->has_name) ext_n++;
-    ava1_w_u16(w, ext_n);
-    if (m->has_name) {
-        size_t at = ava1_w_ext_begin(w, 1);
-        ava1_w_str(w, m->name, m->name_len);
-        ava1_w_ext_end(w, at);
-    }
-    return w->err;
-}
-
-int ava1_client_info_decode(const uint8_t *buf, size_t len, ava1_client_info_t *m) {
-    ava1_r_t r;
-    uint16_t ext_n, i;
-    memset(m, 0, sizeof(*m));
-    ava1_r_init(&r, buf, len);
-    ext_n = ava1_r_u16(&r);
-    for (i = 0; i < ext_n && !r.err; i++) {
-        uint16_t tag = ava1_r_u16(&r);
-        uint32_t vlen = ava1_r_u32(&r);
-        const uint8_t *v = ava1_r_take(&r, vlen);
-        ava1_r_t vr;
-        int rc;
-        if (r.err) break;
-        ava1_r_init(&vr, v, vlen);
-        switch (tag) {
-        case 1:
-            if (m->has_name) return AVA1_E_DUP_EXT;
-            m->has_name = 1;
-            m->name = ava1_r_str(&vr, &m->name_len);
-            break;
-        default:
-            continue;
-        }
-        rc = ava1_r_finish(&vr);
-        if (rc != 0) return rc;
-    }
-    return ava1_r_finish(&r);
-}
-
-int ava1_pairing_open_encode(const ava1_pairing_open_t *m, ava1_w_t *w) {
-    ava1_w_u16(w, m->seconds);
-    ava1_w_u16(w, 0);
-    return w->err;
-}
-
-int ava1_pairing_open_decode(const uint8_t *buf, size_t len, ava1_pairing_open_t *m) {
-    ava1_r_t r;
-    uint16_t ext_n, i;
-    memset(m, 0, sizeof(*m));
-    ava1_r_init(&r, buf, len);
-    m->seconds = ava1_r_u16(&r);
-    ext_n = ava1_r_u16(&r);
-    for (i = 0; i < ext_n && !r.err; i++) {
-        uint32_t vlen;
-        (void)ava1_r_u16(&r);
-        vlen = ava1_r_u32(&r);
-        (void)ava1_r_take(&r, vlen);
-    }
-    return ava1_r_finish(&r);
-}
-
-int ava1_crypto_bench_encode(const ava1_crypto_bench_t *m, ava1_w_t *w) {
-    ava1_w_u16(w, m->mib);
-    ava1_w_u16(w, 0);
-    return w->err;
-}
-
-int ava1_crypto_bench_decode(const uint8_t *buf, size_t len, ava1_crypto_bench_t *m) {
-    ava1_r_t r;
-    uint16_t ext_n, i;
-    memset(m, 0, sizeof(*m));
-    ava1_r_init(&r, buf, len);
-    m->mib = ava1_r_u16(&r);
-    ext_n = ava1_r_u16(&r);
-    for (i = 0; i < ext_n && !r.err; i++) {
-        uint32_t vlen;
-        (void)ava1_r_u16(&r);
-        vlen = ava1_r_u32(&r);
-        (void)ava1_r_take(&r, vlen);
-    }
-    return ava1_r_finish(&r);
-}
-
-int ava1_crypto_bench_result_encode(const ava1_crypto_bench_result_t *m, ava1_w_t *w) {
-    uint16_t ext_n = 0;
-    ava1_w_u64(w, m->bytes);
-    ava1_w_u64(w, m->micros);
-    if (m->has_open_micros) ext_n++;
-    if (m->has_backend) ext_n++;
-    ava1_w_u16(w, ext_n);
-    if (m->has_open_micros) {
-        size_t at = ava1_w_ext_begin(w, 1);
-        ava1_w_u64(w, m->open_micros);
-        ava1_w_ext_end(w, at);
-    }
-    if (m->has_backend) {
-        size_t at = ava1_w_ext_begin(w, 2);
-        ava1_w_str(w, m->backend, m->backend_len);
-        ava1_w_ext_end(w, at);
-    }
-    return w->err;
-}
-
-int ava1_crypto_bench_result_decode(const uint8_t *buf, size_t len, ava1_crypto_bench_result_t *m) {
-    ava1_r_t r;
-    uint16_t ext_n, i;
-    memset(m, 0, sizeof(*m));
-    ava1_r_init(&r, buf, len);
-    m->bytes = ava1_r_u64(&r);
-    m->micros = ava1_r_u64(&r);
-    ext_n = ava1_r_u16(&r);
-    for (i = 0; i < ext_n && !r.err; i++) {
-        uint16_t tag = ava1_r_u16(&r);
-        uint32_t vlen = ava1_r_u32(&r);
-        const uint8_t *v = ava1_r_take(&r, vlen);
-        ava1_r_t vr;
-        int rc;
-        if (r.err) break;
-        ava1_r_init(&vr, v, vlen);
-        switch (tag) {
-        case 1:
-            if (m->has_open_micros) return AVA1_E_DUP_EXT;
-            m->has_open_micros = 1;
-            m->open_micros = ava1_r_u64(&vr);
-            break;
-        case 2:
-            if (m->has_backend) return AVA1_E_DUP_EXT;
-            m->has_backend = 1;
-            m->backend = ava1_r_str(&vr, &m->backend_len);
-            break;
-        default:
-            continue;
-        }
-        rc = ava1_r_finish(&vr);
-        if (rc != 0) return rc;
-    }
-    return ava1_r_finish(&r);
-}
-
 const char *const ava1_message_names[] = {
+    "NodeInfo",
+    "HelloInfo",
+    "ServerInfo",
+    "ClientInfo",
+    "PairingOpen",
+    "CryptoBench",
+    "CryptoBenchResult",
     "Hs1",
     "Hs2",
     "Hs3",
@@ -628,13 +852,6 @@ const char *const ava1_message_names[] = {
     "Bye",
     "RpcRequest",
     "RpcResponse",
-    "NodeInfo",
-    "HelloInfo",
-    "ServerInfo",
-    "ClientInfo",
-    "PairingOpen",
-    "CryptoBench",
-    "CryptoBenchResult",
 };
 const size_t ava1_message_count = 21;
 
@@ -644,7 +861,42 @@ int ava1_roundtrip(const char *name, const uint8_t *in, size_t in_len, uint8_t *
     int rc;
     ava1_w_init(&w, out, cap);
     *out_len = 0;
-    if (strcmp(name, "Hs1") == 0) {
+    if (strcmp(name, "NodeInfo") == 0) {
+        ava1_node_info_t m;
+        rc = ava1_node_info_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_node_info_encode(&m, &w);
+    }
+    else if (strcmp(name, "HelloInfo") == 0) {
+        ava1_hello_info_t m;
+        rc = ava1_hello_info_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_hello_info_encode(&m, &w);
+    }
+    else if (strcmp(name, "ServerInfo") == 0) {
+        ava1_server_info_t m;
+        rc = ava1_server_info_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_server_info_encode(&m, &w);
+    }
+    else if (strcmp(name, "ClientInfo") == 0) {
+        ava1_client_info_t m;
+        rc = ava1_client_info_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_client_info_encode(&m, &w);
+    }
+    else if (strcmp(name, "PairingOpen") == 0) {
+        ava1_pairing_open_t m;
+        rc = ava1_pairing_open_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_pairing_open_encode(&m, &w);
+    }
+    else if (strcmp(name, "CryptoBench") == 0) {
+        ava1_crypto_bench_t m;
+        rc = ava1_crypto_bench_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_crypto_bench_encode(&m, &w);
+    }
+    else if (strcmp(name, "CryptoBenchResult") == 0) {
+        ava1_crypto_bench_result_t m;
+        rc = ava1_crypto_bench_result_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_crypto_bench_result_encode(&m, &w);
+    }
+    else if (strcmp(name, "Hs1") == 0) {
         ava1_hs1_t m;
         rc = ava1_hs1_decode(in, in_len, &m);
         if (rc == 0) rc = ava1_hs1_encode(&m, &w);
@@ -713,41 +965,6 @@ int ava1_roundtrip(const char *name, const uint8_t *in, size_t in_len, uint8_t *
         ava1_rpc_response_t m;
         rc = ava1_rpc_response_decode(in, in_len, &m);
         if (rc == 0) rc = ava1_rpc_response_encode(&m, &w);
-    }
-    else if (strcmp(name, "NodeInfo") == 0) {
-        ava1_node_info_t m;
-        rc = ava1_node_info_decode(in, in_len, &m);
-        if (rc == 0) rc = ava1_node_info_encode(&m, &w);
-    }
-    else if (strcmp(name, "HelloInfo") == 0) {
-        ava1_hello_info_t m;
-        rc = ava1_hello_info_decode(in, in_len, &m);
-        if (rc == 0) rc = ava1_hello_info_encode(&m, &w);
-    }
-    else if (strcmp(name, "ServerInfo") == 0) {
-        ava1_server_info_t m;
-        rc = ava1_server_info_decode(in, in_len, &m);
-        if (rc == 0) rc = ava1_server_info_encode(&m, &w);
-    }
-    else if (strcmp(name, "ClientInfo") == 0) {
-        ava1_client_info_t m;
-        rc = ava1_client_info_decode(in, in_len, &m);
-        if (rc == 0) rc = ava1_client_info_encode(&m, &w);
-    }
-    else if (strcmp(name, "PairingOpen") == 0) {
-        ava1_pairing_open_t m;
-        rc = ava1_pairing_open_decode(in, in_len, &m);
-        if (rc == 0) rc = ava1_pairing_open_encode(&m, &w);
-    }
-    else if (strcmp(name, "CryptoBench") == 0) {
-        ava1_crypto_bench_t m;
-        rc = ava1_crypto_bench_decode(in, in_len, &m);
-        if (rc == 0) rc = ava1_crypto_bench_encode(&m, &w);
-    }
-    else if (strcmp(name, "CryptoBenchResult") == 0) {
-        ava1_crypto_bench_result_t m;
-        rc = ava1_crypto_bench_result_decode(in, in_len, &m);
-        if (rc == 0) rc = ava1_crypto_bench_result_encode(&m, &w);
     }
     else {
         return AVA1_E_PROTO;

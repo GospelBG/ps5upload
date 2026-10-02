@@ -27,6 +27,12 @@ reject a repeated known tag, reject invalid UTF-8, and reject trailing bytes
 (both in the body and inside an extension value). The canonical encodings in
 `vectors/messages.txt` must round-trip byte for byte.
 
+**Records.** A field of type `records` holds a list of one struct. It is encoded as a
+`bytes` field whose content is, for each item in order, `u32le(item length) ‖ item`.
+An empty list is `00000000`. A decoder validates every item (a bad item makes the whole
+message malformed). Records are not allowed as extensions. C decoders keep a pointer to
+the encoded list and its item count; items are read with the generated `ava1_<struct>_next`.
+
 ## 4. Keys and sealing
 4.1 Identity: a static X25519 key pair per node.
 

@@ -72,6 +72,14 @@ void ava1_w_ext_end(ava1_w_t *w, size_t at) {
     for (i = 0; i < 4; i++) w->buf[at + (size_t)i] = (uint8_t)(n >> (8 * i));
 }
 
+size_t ava1_w_len_begin(ava1_w_t *w) {
+    size_t at = w->len;
+    ava1_w_u32(w, 0);
+    return at;
+}
+
+void ava1_w_len_end(ava1_w_t *w, size_t at) { ava1_w_ext_end(w, at); }
+
 void ava1_r_init(ava1_r_t *r, const uint8_t *buf, size_t len) {
     r->buf = buf ? buf : EMPTY;
     r->len = buf ? len : 0;

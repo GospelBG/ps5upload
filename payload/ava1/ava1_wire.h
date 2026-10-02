@@ -45,6 +45,9 @@ void ava1_w_str(ava1_w_t *w, const uint8_t *p, uint16_t n);
 /* Writes the tag and a placeholder length; returns where the length sits. */
 size_t ava1_w_ext_begin(ava1_w_t *w, uint16_t tag);
 void ava1_w_ext_end(ava1_w_t *w, size_t len_at);
+/* A u32 length placeholder; ava1_w_len_end patches it with the bytes written since. */
+size_t ava1_w_len_begin(ava1_w_t *w);
+void ava1_w_len_end(ava1_w_t *w, size_t at);
 
 void ava1_r_init(ava1_r_t *r, const uint8_t *buf, size_t len);
 const uint8_t *ava1_r_take(ava1_r_t *r, size_t n);

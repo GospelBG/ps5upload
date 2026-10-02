@@ -40,6 +40,106 @@
 #define AVA1_TYPE_RPC_RESPONSE 0x61u
 
 typedef struct {
+    const uint8_t *version;
+    uint16_t version_len;
+    const uint8_t *platform;
+    uint16_t platform_len;
+    const uint8_t *name;
+    uint16_t name_len;
+    int has_firmware;
+    const uint8_t *firmware;
+    uint16_t firmware_len;
+} ava1_node_info_t;
+
+int ava1_node_info_encode(const ava1_node_info_t *m, ava1_w_t *w);
+int ava1_node_info_decode(const uint8_t *buf, size_t len, ava1_node_info_t *m);
+
+int ava1_node_info_append(ava1_w_t *blob, const ava1_node_info_t *m);
+int ava1_node_info_next(ava1_r_t *it, ava1_node_info_t *out);
+int ava1_node_info_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint16_t version_min;
+    uint16_t version_max;
+    uint64_t caps;
+} ava1_hello_info_t;
+
+int ava1_hello_info_encode(const ava1_hello_info_t *m, ava1_w_t *w);
+int ava1_hello_info_decode(const uint8_t *buf, size_t len, ava1_hello_info_t *m);
+
+int ava1_hello_info_append(ava1_w_t *blob, const ava1_hello_info_t *m);
+int ava1_hello_info_next(ava1_r_t *it, ava1_hello_info_t *out);
+int ava1_hello_info_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint16_t version;
+    uint64_t caps;
+    uint8_t session_id[16];
+    int has_name;
+    const uint8_t *name;
+    uint16_t name_len;
+} ava1_server_info_t;
+
+int ava1_server_info_encode(const ava1_server_info_t *m, ava1_w_t *w);
+int ava1_server_info_decode(const uint8_t *buf, size_t len, ava1_server_info_t *m);
+
+int ava1_server_info_append(ava1_w_t *blob, const ava1_server_info_t *m);
+int ava1_server_info_next(ava1_r_t *it, ava1_server_info_t *out);
+int ava1_server_info_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    int has_name;
+    const uint8_t *name;
+    uint16_t name_len;
+} ava1_client_info_t;
+
+int ava1_client_info_encode(const ava1_client_info_t *m, ava1_w_t *w);
+int ava1_client_info_decode(const uint8_t *buf, size_t len, ava1_client_info_t *m);
+
+int ava1_client_info_append(ava1_w_t *blob, const ava1_client_info_t *m);
+int ava1_client_info_next(ava1_r_t *it, ava1_client_info_t *out);
+int ava1_client_info_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint16_t seconds;
+} ava1_pairing_open_t;
+
+int ava1_pairing_open_encode(const ava1_pairing_open_t *m, ava1_w_t *w);
+int ava1_pairing_open_decode(const uint8_t *buf, size_t len, ava1_pairing_open_t *m);
+
+int ava1_pairing_open_append(ava1_w_t *blob, const ava1_pairing_open_t *m);
+int ava1_pairing_open_next(ava1_r_t *it, ava1_pairing_open_t *out);
+int ava1_pairing_open_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint16_t mib;
+} ava1_crypto_bench_t;
+
+int ava1_crypto_bench_encode(const ava1_crypto_bench_t *m, ava1_w_t *w);
+int ava1_crypto_bench_decode(const uint8_t *buf, size_t len, ava1_crypto_bench_t *m);
+
+int ava1_crypto_bench_append(ava1_w_t *blob, const ava1_crypto_bench_t *m);
+int ava1_crypto_bench_next(ava1_r_t *it, ava1_crypto_bench_t *out);
+int ava1_crypto_bench_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint64_t bytes;
+    uint64_t micros;
+    int has_open_micros;
+    uint64_t open_micros;
+    int has_backend;
+    const uint8_t *backend;
+    uint16_t backend_len;
+} ava1_crypto_bench_result_t;
+
+int ava1_crypto_bench_result_encode(const ava1_crypto_bench_result_t *m, ava1_w_t *w);
+int ava1_crypto_bench_result_decode(const uint8_t *buf, size_t len, ava1_crypto_bench_result_t *m);
+
+int ava1_crypto_bench_result_append(ava1_w_t *blob, const ava1_crypto_bench_result_t *m);
+int ava1_crypto_bench_result_next(ava1_r_t *it, ava1_crypto_bench_result_t *out);
+int ava1_crypto_bench_result_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
     const uint8_t *noise;
     uint32_t noise_len;
 } ava1_hs1_t;
@@ -154,78 +254,6 @@ typedef struct {
 
 int ava1_rpc_response_encode(const ava1_rpc_response_t *m, ava1_w_t *w);
 int ava1_rpc_response_decode(const uint8_t *buf, size_t len, ava1_rpc_response_t *m);
-
-typedef struct {
-    const uint8_t *version;
-    uint16_t version_len;
-    const uint8_t *platform;
-    uint16_t platform_len;
-    const uint8_t *name;
-    uint16_t name_len;
-    int has_firmware;
-    const uint8_t *firmware;
-    uint16_t firmware_len;
-} ava1_node_info_t;
-
-int ava1_node_info_encode(const ava1_node_info_t *m, ava1_w_t *w);
-int ava1_node_info_decode(const uint8_t *buf, size_t len, ava1_node_info_t *m);
-
-typedef struct {
-    uint16_t version_min;
-    uint16_t version_max;
-    uint64_t caps;
-} ava1_hello_info_t;
-
-int ava1_hello_info_encode(const ava1_hello_info_t *m, ava1_w_t *w);
-int ava1_hello_info_decode(const uint8_t *buf, size_t len, ava1_hello_info_t *m);
-
-typedef struct {
-    uint16_t version;
-    uint64_t caps;
-    uint8_t session_id[16];
-    int has_name;
-    const uint8_t *name;
-    uint16_t name_len;
-} ava1_server_info_t;
-
-int ava1_server_info_encode(const ava1_server_info_t *m, ava1_w_t *w);
-int ava1_server_info_decode(const uint8_t *buf, size_t len, ava1_server_info_t *m);
-
-typedef struct {
-    int has_name;
-    const uint8_t *name;
-    uint16_t name_len;
-} ava1_client_info_t;
-
-int ava1_client_info_encode(const ava1_client_info_t *m, ava1_w_t *w);
-int ava1_client_info_decode(const uint8_t *buf, size_t len, ava1_client_info_t *m);
-
-typedef struct {
-    uint16_t seconds;
-} ava1_pairing_open_t;
-
-int ava1_pairing_open_encode(const ava1_pairing_open_t *m, ava1_w_t *w);
-int ava1_pairing_open_decode(const uint8_t *buf, size_t len, ava1_pairing_open_t *m);
-
-typedef struct {
-    uint16_t mib;
-} ava1_crypto_bench_t;
-
-int ava1_crypto_bench_encode(const ava1_crypto_bench_t *m, ava1_w_t *w);
-int ava1_crypto_bench_decode(const uint8_t *buf, size_t len, ava1_crypto_bench_t *m);
-
-typedef struct {
-    uint64_t bytes;
-    uint64_t micros;
-    int has_open_micros;
-    uint64_t open_micros;
-    int has_backend;
-    const uint8_t *backend;
-    uint16_t backend_len;
-} ava1_crypto_bench_result_t;
-
-int ava1_crypto_bench_result_encode(const ava1_crypto_bench_result_t *m, ava1_w_t *w);
-int ava1_crypto_bench_result_decode(const uint8_t *buf, size_t len, ava1_crypto_bench_result_t *m);
 
 extern const char *const ava1_message_names[];
 extern const size_t ava1_message_count;

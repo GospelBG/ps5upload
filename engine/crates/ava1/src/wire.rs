@@ -70,6 +70,25 @@ impl Writer {
         self.buf[at..at + 4].copy_from_slice(&n.to_le_bytes());
         Ok(())
     }
+    /// A list of messages: u32 total length, then `u32 len ‖ item` per item (SPEC.md §3).
+    pub fn records<M: Message>(&mut self, items: &[M]) -> Result<(), EncodeError> {
+        let at = self.buf.len();
+        self.u32(0);
+        for m in items {
+            let item_at = self.buf.len();
+            self.u32(0);
+            m.encode_into(self)?;
+            self.patch_len(item_at)?;
+        }
+        self.patch_len(at)
+    }
+
+    fn patch_len(&mut self, at: usize) -> Result<(), EncodeError> {
+        let n = self.buf.len() - at - 4;
+        let n32 = u32::try_from(n).map_err(|_| EncodeError::BytesTooLong(n))?;
+        self.buf[at..at + 4].copy_from_slice(&n32.to_le_bytes());
+        Ok(())
+    }
 }
 
 pub struct Reader<'a> {
@@ -111,6 +130,17 @@ impl<'a> Reader<'a> {
     pub fn str(&mut self) -> Result<String, DecodeError> {
         let n = self.u16()? as usize;
         String::from_utf8(self.take(n)?.to_vec()).map_err(|_| DecodeError::Utf8)
+    }
+    /// A list of messages: u32 total length, then `u32 len ‖ item` per item (SPEC.md §3).
+    pub fn records<M: Message>(&mut self) -> Result<Vec<M>, DecodeError> {
+        let n = self.u32()? as usize;
+        let mut r = Reader::new(self.take(n)?);
+        let mut out = Vec::new();
+        while r.pos < r.b.len() {
+            let len = r.u32()? as usize;
+            out.push(M::decode(r.take(len)?)?);
+        }
+        Ok(out)
     }
     pub fn finish(&self) -> Result<(), DecodeError> {
         match self.b.len() - self.pos {
@@ -258,5 +288,64 @@ mod tests {
                 assert_eq!(gen::roundtrip(name, &b), Some(Ok(b.clone())), "{name}");
             }
         }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    struct Two {
+        a: u8,
+        s: String,
+    }
+    impl Message for Two {
+        const NAME: &'static str = "Two";
+        fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+            w.u8(self.a);
+            w.str(&self.s)?;
+            w.u16(0);
+            Ok(())
+        }
+        fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+            let mut r = Reader::new(b);
+            let m = Two {
+                a: r.u8()?,
+                s: r.str()?,
+            };
+            let _ = r.u16()?;
+            r.finish()?;
+            Ok(m)
+        }
+    }
+
+    #[test]
+    fn records_encode_as_length_prefixed_items() {
+        let items = vec![
+            Two {
+                a: 1,
+                s: "x".into(),
+            },
+            Two {
+                a: 2,
+                s: String::new(),
+            },
+        ];
+        let mut w = Writer::new();
+        w.records(&items).unwrap();
+        // blob = 06000000 ‖ 01 0100 78 0000 ‖ 05000000 ‖ 02 0000 0000 = 19 bytes
+        assert_eq!(w.buf, hex("1300000006000000010100780000050000000200000000"));
+        let mut r = Reader::new(&w.buf);
+        assert_eq!(r.records::<Two>().unwrap(), items);
+        r.finish().unwrap();
+        let mut w = Writer::new();
+        w.records::<Two>(&[]).unwrap();
+        assert_eq!(w.buf, hex("00000000"));
+    }
+
+    #[test]
+    fn records_with_a_bad_item_are_refused() {
+        // One item claims 9 bytes but the blob holds 5.
+        let b = hex("09000000090000000101007800");
+        assert_eq!(Reader::new(&b).records::<Two>(), Err(DecodeError::Short));
+        // An item with a trailing byte inside its own length.
+        let b = hex("0b0000000700000001010078000000");
+        assert!(Reader::new(&b).records::<Two>().is_err());
     }
 }

@@ -40,6 +40,8 @@ pub struct Msg {
 pub struct Field {
     pub name: String,
     pub ty: Ty,
+    #[serde(default)]
+    pub of: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +63,7 @@ pub enum Ty {
     B32,
     Bytes,
     Str,
+    Records,
 }
 
 /// Rust keywords (strict, reserved, and 2018+): a field with one of these names is
@@ -233,6 +236,10 @@ pub fn parse(src: &str) -> Result<Schema, String> {
             if matches!(ty, Ty::Bytes | Ty::Str) {
                 c_add(format!("{}_len", cid(n)))?;
             }
+            if matches!(ty, Ty::Records) {
+                c_add(format!("{}_len", cid(n)))?;
+                c_add(format!("{}_count", cid(n)))?;
+            }
         }
         for e in &m.ext {
             c_add(format!("has_{}", e.name))?;
@@ -242,6 +249,39 @@ pub fn parse(src: &str) -> Result<Schema, String> {
             if e.tag == 0 || !tags.insert(e.tag) {
                 return Err(format!("{}: ext tag {} is 0 or repeated", m.name, e.tag));
             }
+        }
+    }
+    let struct_names: HashSet<&str> = s.structs.iter().map(|st| st.name.as_str()).collect();
+    for m in s.messages.iter().chain(&s.structs) {
+        for f in &m.fields {
+            match (f.ty, f.of.as_deref()) {
+                (Ty::Records, Some(of)) if of == m.name => {
+                    return Err(format!(
+                        "{}.{}: a struct cannot list itself",
+                        m.name, f.name
+                    ))
+                }
+                (Ty::Records, Some(of)) if struct_names.contains(of) => {}
+                (Ty::Records, Some(of)) => {
+                    return Err(format!(
+                        "{}.{}: records of unknown struct {of}",
+                        m.name, f.name
+                    ))
+                }
+                (Ty::Records, None) => {
+                    return Err(format!("{}.{}: records needs `of`", m.name, f.name))
+                }
+                (_, Some(_)) => {
+                    return Err(format!("{}.{}: `of` is only for records", m.name, f.name))
+                }
+                (_, None) => {}
+            }
+        }
+        if let Some(e) = m.ext.iter().find(|e| e.ty == Ty::Records) {
+            return Err(format!(
+                "{}.{}: records cannot be an extension",
+                m.name, e.name
+            ));
         }
     }
     let mut types = HashSet::new();
@@ -268,16 +308,17 @@ pub fn parse(src: &str) -> Result<Schema, String> {
     Ok(s)
 }
 
-fn rust_ty(t: Ty) -> &'static str {
+fn rust_ty(t: Ty, of: Option<&str>) -> String {
     match t {
-        Ty::U8 => "u8",
-        Ty::U16 => "u16",
-        Ty::U32 => "u32",
-        Ty::U64 => "u64",
-        Ty::B16 => "[u8; 16]",
-        Ty::B32 => "[u8; 32]",
-        Ty::Bytes => "Vec<u8>",
-        Ty::Str => "String",
+        Ty::U8 => "u8".into(),
+        Ty::U16 => "u16".into(),
+        Ty::U32 => "u32".into(),
+        Ty::U64 => "u64".into(),
+        Ty::B16 => "[u8; 16]".into(),
+        Ty::B32 => "[u8; 32]".into(),
+        Ty::Bytes => "Vec<u8>".into(),
+        Ty::Str => "String".into(),
+        Ty::Records => format!("Vec<{}>", of.unwrap_or("()")),
     }
 }
 
@@ -290,6 +331,7 @@ fn rust_put(t: Ty, e: &str) -> String {
         Ty::B16 | Ty::B32 => format!("w.fixed(&{e});"),
         Ty::Bytes => format!("w.bytes(&{e})?;"),
         Ty::Str => format!("w.str(&{e})?;"),
+        Ty::Records => format!("w.records(&{e})?;"),
     }
 }
 
@@ -302,10 +344,11 @@ fn rust_put_ext(t: Ty) -> &'static str {
         Ty::B16 | Ty::B32 => "w.fixed(v); Ok(())",
         Ty::Bytes => "w.bytes(v)",
         Ty::Str => "w.str(v)",
+        Ty::Records => "unreachable!()",
     }
 }
 
-fn rust_get(t: Ty, r: &str) -> String {
+fn rust_get(t: Ty, r: &str, of: Option<&str>) -> String {
     match t {
         Ty::U8 => format!("{r}.u8()?"),
         Ty::U16 => format!("{r}.u16()?"),
@@ -315,21 +358,27 @@ fn rust_get(t: Ty, r: &str) -> String {
         Ty::B32 => format!("{r}.fixed::<32>()?"),
         Ty::Bytes => format!("{r}.bytes()?"),
         Ty::Str => format!("{r}.str()?"),
+        Ty::Records => format!("{r}.records::<{}>()?", of.unwrap_or("()")),
     }
 }
 
-fn rust_sample(t: Ty) -> &'static str {
+fn rust_sample(t: Ty, of: Option<&str>) -> String {
     match t {
-        Ty::U8 => "rng.next_u64() as u8",
-        Ty::U16 => "rng.next_u64() as u16",
-        Ty::U32 => "rng.next_u64() as u32",
-        Ty::U64 => "rng.next_u64()",
-        Ty::B16 => "{ let mut a = [0u8; 16]; rng.fill(&mut a); a }",
-        Ty::B32 => "{ let mut a = [0u8; 32]; rng.fill(&mut a); a }",
+        Ty::U8 => "rng.next_u64() as u8".into(),
+        Ty::U16 => "rng.next_u64() as u16".into(),
+        Ty::U32 => "rng.next_u64() as u32".into(),
+        Ty::U64 => "rng.next_u64()".into(),
+        Ty::B16 => "{ let mut a = [0u8; 16]; rng.fill(&mut a); a }".into(),
+        Ty::B32 => "{ let mut a = [0u8; 32]; rng.fill(&mut a); a }".into(),
         Ty::Bytes => {
             "{ let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }"
+                .into()
         }
-        Ty::Str => "rng.ascii(20)",
+        Ty::Str => "rng.ascii(20)".into(),
+        Ty::Records => format!(
+            "vec![{}::default(); rng.below(3) as usize]",
+            of.unwrap_or("()")
+        ),
     }
 }
 
@@ -340,10 +389,20 @@ fn emit_rust_msg(o: &mut String, m: &Msg) {
         m.name
     );
     for f in &m.fields {
-        let _ = writeln!(o, "    pub {}: {},", rid(&f.name), rust_ty(f.ty));
+        let _ = writeln!(
+            o,
+            "    pub {}: {},",
+            rid(&f.name),
+            rust_ty(f.ty, f.of.as_deref())
+        );
     }
     for e in &m.ext {
-        let _ = writeln!(o, "    pub {}: Option<{}>,", rid(&e.name), rust_ty(e.ty));
+        let _ = writeln!(
+            o,
+            "    pub {}: Option<{}>,",
+            rid(&e.name),
+            rust_ty(e.ty, None)
+        );
     }
     o.push_str("}\n\n");
     let _ = writeln!(
@@ -390,7 +449,12 @@ fn emit_rust_msg(o: &mut String, m: &Msg) {
         if assigns { "mut " } else { "" }
     );
     for f in &m.fields {
-        let _ = writeln!(o, "        m.{} = {};", rid(&f.name), rust_get(f.ty, "r"));
+        let _ = writeln!(
+            o,
+            "        m.{} = {};",
+            rid(&f.name),
+            rust_get(f.ty, "r", f.of.as_deref())
+        );
     }
     o.push_str("        let ext_n = r.u16()?;\n        for _ in 0..ext_n {\n            let tag = r.u16()?;\n            let len = r.u32()? as usize;\n            let v = r.take(len)?;\n");
     if m.ext.is_empty() {
@@ -401,7 +465,7 @@ fn emit_rust_msg(o: &mut String, m: &Msg) {
             let _ = writeln!(
                 o,
                 "                {} => {{\n                    if m.{}.is_some() {{ return Err(DecodeError::DupExt({})); }}\n                    let mut vr = Reader::new(v);\n                    m.{} = Some({});\n                    vr.finish()?;\n                }}",
-                e.tag, rid(&e.name), e.tag, rid(&e.name), rust_get(e.ty, "vr")
+                e.tag, rid(&e.name), e.tag, rid(&e.name), rust_get(e.ty, "vr", None)
             );
         }
         o.push_str("                _ => {}\n            }\n");
@@ -439,14 +503,19 @@ pub fn emit_rust(s: &Schema) -> String {
     for m in &all {
         let _ = write!(o, "        \"{}\" => {} {{", m.name, m.name);
         for f in &m.fields {
-            let _ = write!(o, " {}: {},", rid(&f.name), rust_sample(f.ty));
+            let _ = write!(
+                o,
+                " {}: {},",
+                rid(&f.name),
+                rust_sample(f.ty, f.of.as_deref())
+            );
         }
         for e in &m.ext {
             let _ = write!(
                 o,
                 " {}: if rng.below(2) == 1 {{ Some({}) }} else {{ None }},",
                 rid(&e.name),
-                rust_sample(e.ty)
+                rust_sample(e.ty, None)
             );
         }
         o.push_str(" }.to_bytes().ok(),\n");
@@ -484,6 +553,9 @@ fn c_decl(t: Ty, n: &str) -> String {
         Ty::B32 => format!("    uint8_t {n}[32];\n"),
         Ty::Bytes => format!("    const uint8_t *{n};\n    uint32_t {n}_len;\n"),
         Ty::Str => format!("    const uint8_t *{n};\n    uint16_t {n}_len;\n"),
+        Ty::Records => {
+            format!("    const uint8_t *{n};\n    uint32_t {n}_len;\n    uint32_t {n}_count;\n")
+        }
     }
 }
 
@@ -495,12 +567,12 @@ fn c_put(t: Ty, n: &str) -> String {
         Ty::U64 => format!("ava1_w_u64(w, m->{n});"),
         Ty::B16 => format!("ava1_w_fixed(w, m->{n}, 16);"),
         Ty::B32 => format!("ava1_w_fixed(w, m->{n}, 32);"),
-        Ty::Bytes => format!("ava1_w_bytes(w, m->{n}, m->{n}_len);"),
+        Ty::Bytes | Ty::Records => format!("ava1_w_bytes(w, m->{n}, m->{n}_len);"),
         Ty::Str => format!("ava1_w_str(w, m->{n}, m->{n}_len);"),
     }
 }
 
-fn c_get(t: Ty, r: &str, n: &str) -> String {
+fn c_get(t: Ty, r: &str, n: &str, of: Option<&str>) -> String {
     match t {
         Ty::U8 => format!("m->{n} = ava1_r_u8({r});"),
         Ty::U16 => format!("m->{n} = ava1_r_u16({r});"),
@@ -510,6 +582,10 @@ fn c_get(t: Ty, r: &str, n: &str) -> String {
         Ty::B32 => format!("ava1_r_fixed({r}, m->{n}, 32);"),
         Ty::Bytes => format!("m->{n} = ava1_r_bytes({r}, &m->{n}_len);"),
         Ty::Str => format!("m->{n} = ava1_r_str({r}, &m->{n}_len);"),
+        Ty::Records => format!(
+            "m->{n} = ava1_r_bytes({r}, &m->{n}_len);\n    if (!({r})->err) {{\n        int rc = ava1_{of}_count(m->{n}, m->{n}_len, &m->{n}_count);\n        if (rc != 0) return rc;\n    }}",
+            of = snake(of.unwrap_or("x"))
+        ),
     }
 }
 
@@ -533,7 +609,7 @@ pub fn emit_c_header(s: &Schema) -> String {
         );
     }
     o.push('\n');
-    for m in s.messages.iter().chain(&s.structs) {
+    for m in s.structs.iter().chain(&s.messages) {
         let sn = snake(&m.name);
         o.push_str("typedef struct {\n");
         for f in &m.fields {
@@ -555,6 +631,17 @@ pub fn emit_c_header(s: &Schema) -> String {
             o,
             "int ava1_{sn}_decode(const uint8_t *buf, size_t len, ava1_{sn}_t *m);\n"
         );
+        if m.frame_type.is_none() {
+            let _ = writeln!(
+                o,
+                "int ava1_{sn}_append(ava1_w_t *blob, const ava1_{sn}_t *m);"
+            );
+            let _ = writeln!(o, "int ava1_{sn}_next(ava1_r_t *it, ava1_{sn}_t *out);");
+            let _ = writeln!(
+                o,
+                "int ava1_{sn}_count(const uint8_t *p, uint32_t len, uint32_t *count);\n"
+            );
+        }
     }
     o.push_str("extern const char *const ava1_message_names[];\nextern const size_t ava1_message_count;\n\n");
     o.push_str(
@@ -567,7 +654,7 @@ pub fn emit_c_header(s: &Schema) -> String {
 pub fn emit_c_source(s: &Schema) -> String {
     let mut o = String::from(C_BANNER);
     o.push_str("#include \"ava1_gen.h\"\n\n#include <string.h>\n\n");
-    let all: Vec<&Msg> = s.messages.iter().chain(&s.structs).collect();
+    let all: Vec<&Msg> = s.structs.iter().chain(&s.messages).collect();
     for m in &all {
         let sn = snake(&m.name);
         let _ = writeln!(
@@ -608,7 +695,11 @@ pub fn emit_c_source(s: &Schema) -> String {
         );
         o.push_str("    ava1_r_t r;\n    uint16_t ext_n, i;\n    memset(m, 0, sizeof(*m));\n    ava1_r_init(&r, buf, len);\n");
         for f in &m.fields {
-            let _ = writeln!(o, "    {}", c_get(f.ty, "&r", &cid(&f.name)));
+            let _ = writeln!(
+                o,
+                "    {}",
+                c_get(f.ty, "&r", &cid(&f.name), f.of.as_deref())
+            );
         }
         o.push_str("    ext_n = ava1_r_u16(&r);\n    for (i = 0; i < ext_n && !r.err; i++) {\n");
         if m.ext.is_empty() {
@@ -621,12 +712,26 @@ pub fn emit_c_source(s: &Schema) -> String {
                     "        case {t}:\n            if (m->has_{n}) return AVA1_E_DUP_EXT;\n            m->has_{n} = 1;\n            {get}\n            break;",
                     t = e.tag,
                     n = e.name,
-                    get = c_get(e.ty, "&vr", &cid(&e.name))
+                    get = c_get(e.ty, "&vr", &cid(&e.name), None)
                 );
             }
             o.push_str("        default:\n            continue;\n        }\n        rc = ava1_r_finish(&vr);\n        if (rc != 0) return rc;\n");
         }
         o.push_str("    }\n    return ava1_r_finish(&r);\n}\n\n");
+        if m.frame_type.is_none() {
+            let _ = writeln!(
+                o,
+                "int ava1_{sn}_append(ava1_w_t *blob, const ava1_{sn}_t *m) {{\n    size_t at = ava1_w_len_begin(blob);\n    int rc = ava1_{sn}_encode(m, blob);\n    if (rc != 0) return rc;\n    ava1_w_len_end(blob, at);\n    return blob->err;\n}}\n"
+            );
+            let _ = writeln!(
+                o,
+                "int ava1_{sn}_next(ava1_r_t *it, ava1_{sn}_t *out) {{\n    uint32_t n;\n    const uint8_t *p;\n    int rc;\n    if (it->err) return it->err;\n    if (it->pos == it->len) return 0;\n    n = ava1_r_u32(it);\n    p = ava1_r_take(it, n);\n    if (it->err) return it->err;\n    rc = ava1_{sn}_decode(p, n, out);\n    return rc != 0 ? rc : 1;\n}}\n"
+            );
+            let _ = writeln!(
+                o,
+                "int ava1_{sn}_count(const uint8_t *p, uint32_t len, uint32_t *count) {{\n    ava1_r_t it;\n    ava1_{sn}_t tmp;\n    int rc;\n    *count = 0;\n    ava1_r_init(&it, p, len);\n    while ((rc = ava1_{sn}_next(&it, &tmp)) == 1) (*count)++;\n    return rc;\n}}\n"
+            );
+        }
     }
     o.push_str("const char *const ava1_message_names[] = {\n");
     for m in &all {

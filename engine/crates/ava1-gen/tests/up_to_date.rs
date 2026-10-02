@@ -41,6 +41,47 @@ fn the_schema_validator_rejects_mistakes() {
 }
 
 #[test]
+fn records_must_name_a_struct() {
+    let bad = [
+        // no `of`
+        "[[message]]\nname = \"A\"\ntype = 1\nfields = [{ name = \"r\", ty = \"records\" }]\n",
+        // `of` names nothing
+        "[[message]]\nname = \"A\"\ntype = 1\nfields = [{ name = \"r\", ty = \"records\", of = \"Nope\" }]\n",
+        // `of` names a message, not a struct
+        "[[message]]\nname = \"A\"\ntype = 1\nfields = [{ name = \"r\", ty = \"records\", of = \"A\" }]\n",
+        // `of` on a non-records field
+        "[[struct]]\nname = \"S\"\n[[message]]\nname = \"A\"\ntype = 1\nfields = [{ name = \"r\", ty = \"u8\", of = \"S\" }]\n",
+        // a struct that lists itself
+        "[[struct]]\nname = \"S\"\nfields = [{ name = \"r\", ty = \"records\", of = \"S\" }]\n",
+        // records in ext
+        "[[struct]]\nname = \"S\"\n[[message]]\nname = \"A\"\ntype = 1\next = [{ tag = 1, name = \"r\", ty = \"records\" }]\n",
+    ];
+    for b in bad {
+        assert!(ava1_gen::parse(b).is_err(), "accepted: {b}");
+    }
+    let good = "[[struct]]\nname = \"S\"\nfields = [{ name = \"v\", ty = \"u8\" }]\n[[message]]\nname = \"A\"\ntype = 1\nfields = [{ name = \"r\", ty = \"records\", of = \"S\" }]\n";
+    let s = ava1_gen::parse(good).unwrap();
+    let rs = ava1_gen::emit_rust(&s);
+    assert!(rs.contains("pub r: Vec<S>,"), "{rs}");
+    assert!(rs.contains("w.records(&self.r)?;"), "{rs}");
+    assert!(rs.contains("m.r = r.records::<S>()?;"), "{rs}");
+    let h = ava1_gen::emit_c_header(&s);
+    assert!(
+        h.contains("    const uint8_t *r;\n    uint32_t r_len;\n    uint32_t r_count;\n"),
+        "{h}"
+    );
+    assert!(
+        h.contains("int ava1_s_next(ava1_r_t *it, ava1_s_t *out);"),
+        "{h}"
+    );
+    let c = ava1_gen::emit_c_source(&s);
+    assert!(
+        c.contains("rc = ava1_s_count(m->r, m->r_len, &m->r_count);"),
+        "{c}"
+    );
+}
+
+#[test]
 fn keyword_field_names_are_escaped_not_emitted_raw() {
     let schema = ava1_gen::parse(
         "[[const]]\nname = \"BIG\"\nty = \"u64\"\nvalue = 18446744073709551615\n\
