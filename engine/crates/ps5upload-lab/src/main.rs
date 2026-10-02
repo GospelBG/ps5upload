@@ -25,6 +25,7 @@ use ps5upload_core::diagnostics::shell_run;
 use ps5upload_core::fs_ops::{app_launch, app_list_registered, app_register, app_unregister};
 use ps5upload_core::hash_shard;
 use ps5upload_core::hw::{hw_info, hw_temps, syslog_tail};
+use ps5upload_core::payload_lifecycle::{send_elf_to_loader, LoaderImage};
 use ps5upload_core::saves::list_saves;
 use ps5upload_core::transfer::{
     inspect_zip, transfer_dir, transfer_file, transfer_zip, TransferConfig,
@@ -171,6 +172,18 @@ fn do_shutdown(addr: &str) -> Result<()> {
         hdr.frame_type().unwrap_or(FrameType::Error)
     );
     println!("{}", String::from_utf8_lossy(&body));
+    Ok(())
+}
+
+/// Streams a local ELF to the console's loader on :9021 — the first step of a hardware
+/// pass, before any `ava1-*` command. `send_elf_to_loader` shuts the running payload down
+/// (mgmt port 9114) and waits the same 600 ms grace the desktop send uses.
+fn do_send_elf(addr: &str, file: &str) -> Result<()> {
+    let host = addr.split(':').next().unwrap_or(addr);
+    let bytes = std::fs::read(file).with_context(|| format!("read {file}"))?;
+    let n = send_elf_to_loader(host, 9021, &bytes, LoaderImage::Ps5Upload)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    println!("sent {n} bytes to {host}:9021");
     Ok(())
 }
 
@@ -756,6 +769,7 @@ fn usage() -> ! {
     eprintln!("  hello");
     eprintln!("  status");
     eprintln!("  shutdown");
+    eprintln!("  send-elf FILE      stream a local ELF to the loader on :9021 (shuts the running helper down first)");
     eprintln!("  takeover");
     eprintln!("  begin-tx TX_ID_HEX");
     eprintln!("  query-tx TX_ID_HEX");
@@ -967,6 +981,10 @@ fn main() -> Result<()> {
         "status" => do_status(addr),
         "volumes" => do_volumes(addr),
         "shutdown" => do_shutdown(addr),
+        "send-elf" => {
+            let file = rest.get(1).map(|s| s.as_str()).unwrap_or_else(|| usage());
+            do_send_elf(addr, file)
+        }
         "takeover" => do_takeover(addr),
         "begin-tx" => {
             let tx_id = rest.get(1).map(|s| s.as_str()).unwrap_or_else(|| usage());
