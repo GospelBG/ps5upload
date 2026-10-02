@@ -1,6 +1,6 @@
 #include "ava1_b3.h"
 
-#include <stdbool.h>
+#include <assert.h>
 #include <string.h>
 
 #include "blake3.h"
@@ -87,6 +87,9 @@ void ava1_b3_group_cv(const uint8_t *data, size_t len, uint64_t index, uint8_t c
 }
 
 void ava1_b3_root_from_cvs(const uint8_t (*cvs)[32], uint64_t n, uint8_t root[32]) {
+    /* The documented precondition. Without it a one-CV call would recurse into
+     * merge() with n = UINT64_MAX and read past the array (Rust panics here). */
+    assert(n >= 2);
     uint8_t l[32], r[32];
     uint64_t left = largest_pow2_below(n);
     merge(cvs, left, l);
