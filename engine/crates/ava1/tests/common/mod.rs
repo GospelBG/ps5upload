@@ -75,7 +75,7 @@ pub async fn raw_session(addr: SocketAddr, me: &Identity) -> (RawReader, RawWrit
         ava1::conn::FrameReader::new(rh),
         ava1::conn::FrameWriter::new(wh),
     );
-    let est = ava1::handshake::client(&mut r, &mut w, me, "raw", |_| true)
+    let est = ava1::handshake::client(&mut r, &mut w, me, "raw", |_| true, 0)
         .await
         .unwrap();
     assert!(est.pairing.is_none(), "raw sessions are for paired devices");
@@ -112,6 +112,34 @@ pub async fn paired_with(
     Arc<Mutex<PeerStore>>,
 ) {
     paired_opts(timing, Limits::default()).await
+}
+
+/// `paired()` with the server configured by `f` (a job host, extra hooks).
+pub async fn paired_ctx(
+    f: impl FnOnce(ServerCtx) -> ServerCtx,
+) -> (
+    SocketAddr,
+    Arc<ServerCtx>,
+    Arc<Identity>,
+    Arc<Mutex<PeerStore>>,
+) {
+    let (s_id, c_id) = (
+        Identity::generate().unwrap(),
+        Arc::new(Identity::generate().unwrap()),
+    );
+    let mut s_peers = PeerStore::in_memory();
+    s_peers.add(c_id.public(), "client").unwrap();
+    let mut c_peers = PeerStore::in_memory();
+    c_peers.add(s_id.public(), "server").unwrap();
+    let ctx = f(ServerCtx::new(
+        s_id,
+        "Rust test server",
+        s_peers,
+        node_info_rpc("Rust test server"),
+    )
+    .with_timing(fast()));
+    let (addr, ctx) = start(ctx).await;
+    (addr, ctx, c_id, Arc::new(Mutex::new(c_peers)))
 }
 
 pub async fn paired_opts(

@@ -1,7 +1,7 @@
 //! The client side of a session (SPEC.md §6–§8).
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,9 +12,10 @@ use tokio::task::AbortHandle;
 use crate::conn::{Frame, FrameReader, FrameWriter};
 use crate::gen::{self, Bye, Join, JoinAck, PairConfirm, PairResult, RpcRequest, RpcResponse};
 use crate::handshake::{self, Established};
-use crate::keys::{self, Identity};
+use crate::keys::{self, Identity, SessionKeys};
 use crate::link::{drive, Link, Outbox, DELIVER_DEPTH};
 use crate::peers::PeerStore;
+use crate::router::{is_data_type, BoxFut, ConnTx, JobId, JobLink, LaneOpener, Router};
 use crate::wire::{FrameMessage, Message};
 use crate::Ava1Error;
 
@@ -57,7 +58,8 @@ pub struct Session {
     link: Link,
     pending: Pending,
     next_req: AtomicU32,
-    pub(crate) lanes_live: Arc<Mutex<[bool; 9]>>,
+    router: Arc<Router>,
+    joiner: Arc<Joiner>,
     dispatcher: AbortHandle,
 }
 
@@ -73,6 +75,8 @@ impl std::fmt::Debug for Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Jobs hear about the session's end before the dispatcher goes away.
+        self.router.close("the session was closed");
         self.dispatcher.abort();
     }
 }
@@ -138,6 +142,7 @@ pub async fn connect_expecting(
             expected_key,
             |k| peers.lock().unwrap().contains(k),
             |h, proof| peers.lock().unwrap().launched_by_us(h, proof),
+            gen::CAP_DATA_PLANE,
         ),
     )
     .await
@@ -150,8 +155,20 @@ pub async fn connect_expecting(
     }
     let (tx, mut rx) = mpsc::channel(DELIVER_DEPTH);
     let (link, outbox) = drive(r, w, timing, tx);
+    let router = Arc::new(Router::default());
+    let joiner = Arc::new(Joiner {
+        addr: peer_addr,
+        timing,
+        keys: est.keys.clone(),
+        session_id: est.session_id,
+        paired: AtomicBool::new(est.pairing.is_none()),
+        lanes_live: Arc::default(),
+        router: router.clone(),
+        held: Mutex::default(),
+    });
     let pending: Pending = Arc::default();
     let p2 = pending.clone();
+    let r2 = router.clone();
     let dispatcher = tokio::spawn(async move {
         while let Some(f) = rx.recv().await {
             if f.ty == RpcResponse::TYPE || f.ty == PairResult::TYPE {
@@ -159,9 +176,12 @@ pub async fn connect_expecting(
                 if let Some(tx) = waiter {
                     let _ = tx.send(f);
                 }
+            } else if is_data_type(f.ty) {
+                let _ = r2.route_control(f); // a late frame for a finished job is dropped
             }
         }
         p2.lock().unwrap().clear();
+        r2.close("the session ended");
     })
     .abort_handle();
     Ok(Session {
@@ -173,7 +193,8 @@ pub async fn connect_expecting(
         link,
         pending,
         next_req: AtomicU32::new(1),
-        lanes_live: Arc::default(),
+        router,
+        joiner,
         dispatcher,
     })
 }
@@ -313,6 +334,7 @@ impl Session {
             .unwrap()
             .add(self.est.peer_key, &self.est.peer_name)?;
         self.est.pairing = None;
+        self.joiner.paired.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -358,16 +380,21 @@ impl Lane {
     }
 }
 
-impl Session {
-    /// Opens a data lane on the lowest free id (1..=8).
-    pub async fn open_lane(&self) -> Result<Lane, Ava1Error> {
-        self.open_lane_at(self.addr).await
-    }
+/// Everything needed to join lanes, shared with jobs (SPEC.md §9, §12).
+pub(crate) struct Joiner {
+    addr: SocketAddr,
+    timing: Timing,
+    keys: SessionKeys,
+    session_id: [u8; 16],
+    paired: AtomicBool,
+    lanes_live: Arc<Mutex<[bool; 9]>>,
+    router: Arc<Router>,
+    held: Mutex<HashMap<u16, Lane>>,
+}
 
-    /// `open_lane` against another address. Tests only.
-    #[doc(hidden)]
-    pub async fn open_lane_at(&self, addr: SocketAddr) -> Result<Lane, Ava1Error> {
-        if self.est.pairing.is_some() {
+impl Joiner {
+    async fn open_lane_at(&self, addr: SocketAddr) -> Result<Lane, Ava1Error> {
+        if !self.paired.load(Ordering::SeqCst) {
             return Err(Ava1Error::NotPaired);
         }
         let id = {
@@ -394,19 +421,6 @@ impl Session {
         })
     }
 
-    /// Joins `id` again while it is still open here — what a reconnect after a
-    /// dropped lane looks like to the server. Tests only.
-    #[doc(hidden)]
-    pub async fn reopen_lane_for_test(&self, id: u16) -> Result<Lane, Ava1Error> {
-        let (link, outbox) = self.join(id, self.addr).await?;
-        Ok(Lane {
-            id,
-            link,
-            _outbox: outbox,
-            _slot: None,
-        })
-    }
-
     async fn join(&self, id: u16, addr: SocketAddr) -> Result<(Link, Outbox), Ava1Error> {
         let t = self.timing.handshake;
         let stream = within(t, async { Ok(TcpStream::connect(addr).await?) }).await?;
@@ -414,7 +428,7 @@ impl Session {
         let (rh, wh) = stream.into_split();
         let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
         let client_nonce: [u8; 16] = keys::random_bytes()?;
-        let (k, sid) = (&self.est.keys, self.est.session_id);
+        let (k, sid) = (&self.keys, self.session_id);
         let tag = keys::join_tag(&k.c2s, &sid, id, &client_nonce);
         w.send_msg(
             0,
@@ -437,14 +451,87 @@ impl Session {
         }
         w.set_key(keys::lane_key(&k.c2s, id, &client_nonce, &ack.server_nonce));
         r.set_key(keys::lane_key(&k.s2c, id, &client_nonce, &ack.server_nonce));
+        // Lane frames may be as large as the frame cap (16 MiB), not the control cap.
+        r.set_max_body(crate::frame::MAX_BODY);
         let (tx, mut rx) = mpsc::channel::<Frame>(DELIVER_DEPTH);
         let (link, outbox) = drive(r, w, self.timing, tx);
         // The server keeps an older connection of this lane until this one has shown it
         // holds the lane key (SPEC.md §9): a sealed Ping, now, makes the takeover prompt.
         let _ = outbox.try_ping(0);
-        // Project 1 lanes carry heartbeats only; data frames arrive in project 2.
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let gen_no = self.router.lane_up(id, outbox.clone());
+        let router = self.router.clone();
+        // Ends when the lane's reader ends (close, death or drop): then the lane is down.
+        tokio::spawn(async move {
+            while let Some(f) = rx.recv().await {
+                if is_data_type(f.ty) {
+                    router.route_lane(id, f);
+                }
+            }
+            router.lane_down(id, gen_no);
+        });
         Ok((link, outbox))
+    }
+}
+
+impl LaneOpener for Joiner {
+    fn open(&self) -> BoxFut<'_, Result<u16, Ava1Error>> {
+        Box::pin(async move {
+            let lane = self.open_lane_at(self.addr).await?;
+            let id = lane.id;
+            self.held.lock().unwrap().insert(id, lane);
+            Ok(id)
+        })
+    }
+
+    fn close(&self, id: u16) {
+        // Dropping the Lane aborts its reader; the routing task then reports it down.
+        self.held.lock().unwrap().remove(&id);
+    }
+}
+
+impl Session {
+    /// Opens a data lane on the lowest free id (1..=8).
+    pub async fn open_lane(&self) -> Result<Lane, Ava1Error> {
+        self.joiner.open_lane_at(self.addr).await
+    }
+
+    /// `open_lane` against another address. Tests only.
+    #[doc(hidden)]
+    pub async fn open_lane_at(&self, addr: SocketAddr) -> Result<Lane, Ava1Error> {
+        self.joiner.open_lane_at(addr).await
+    }
+
+    /// Joins `id` again while it is still open here — what a reconnect after a
+    /// dropped lane looks like to the server. Tests only.
+    #[doc(hidden)]
+    pub async fn reopen_lane_for_test(&self, id: u16) -> Result<Lane, Ava1Error> {
+        let (link, outbox) = self.joiner.join(id, self.addr).await?;
+        Ok(Lane {
+            id,
+            link,
+            _outbox: outbox,
+            _slot: None,
+        })
+    }
+
+    /// The inbox and handles a job uses on this session.
+    pub fn job(&self, job_id: JobId) -> JobLink {
+        JobLink::new(
+            job_id,
+            self.router.clone(),
+            ConnTx::new(self.outbox.clone()),
+            Some(self.joiner.clone() as Arc<dyn LaneOpener>),
+        )
+    }
+
+    pub fn peer_caps(&self) -> u64 {
+        self.est.peer_caps
+    }
+
+    /// True when the other device has not accepted us yet: a person must compare codes.
+    /// False when it already trusts us (paired before, or it was launched by us).
+    pub fn needs_user_pairing(&self) -> bool {
+        self.est.pairing.is_some_and(|p| p.server_must_confirm)
     }
 }
 

@@ -18,6 +18,7 @@ use crate::keys::{self, Identity, SessionKeys};
 use crate::launch::LaunchSecret;
 use crate::link::{drive, Full, Outbox, DELIVER_DEPTH};
 use crate::peers::PeerStore;
+use crate::router::{is_data_type, job_of, ConnTx, JobHost, JobLink, Router};
 use crate::session::{RpcReply, Timing};
 use crate::wire::{FrameMessage, Message};
 use crate::Ava1Error;
@@ -72,6 +73,7 @@ pub(crate) struct SessionEntry {
     pub(crate) keys: SessionKeys,
     peer_key: [u8; 32],
     pub(crate) paired: AtomicBool,
+    pub(crate) router: Arc<Router>,
     /// Per lane id, how many connections have taken it over. A lane connection ends when
     /// its number is no longer the current one.
     lane_gen: watch::Sender<[u32; 9]>,
@@ -131,6 +133,8 @@ pub struct ServerCtx {
     log: LogHook,
     approve: PairHook,
     rpc: RpcHandler,
+    /// Hosts data-plane jobs (SPEC.md §11); its presence advertises CAP_DATA_PLANE.
+    jobs: Option<Arc<dyn JobHost>>,
     pub(crate) sessions: Mutex<HashMap<[u8; 16], Arc<SessionEntry>>>,
     conns: AtomicUsize,
     per_ip: Mutex<HashMap<IpAddr, usize>>,
@@ -154,6 +158,7 @@ impl ServerCtx {
             log: Box::new(|_| {}),
             approve: Box::new(|_| true),
             rpc,
+            jobs: None,
             sessions: Mutex::default(),
             conns: AtomicUsize::new(0),
             per_ip: Mutex::default(),
@@ -200,6 +205,12 @@ impl ServerCtx {
 
     pub fn with_timing(mut self, t: Timing) -> Self {
         self.timing = t;
+        self
+    }
+
+    /// Hosts data-plane jobs on this server and advertises CAP_DATA_PLANE.
+    pub fn with_jobs(mut self, host: Arc<dyn JobHost>) -> Self {
+        self.jobs = Some(host);
         self
     }
 
@@ -513,6 +524,11 @@ async fn control(
                     }
                 }
             },
+            if ctx.jobs.is_some() {
+                gen::CAP_DATA_PLANE
+            } else {
+                0
+            },
         ),
     )
     .await
@@ -527,6 +543,7 @@ async fn control(
         keys: est.keys.clone(),
         peer_key: est.peer_key,
         paired: AtomicBool::new(est.pairing.is_none()),
+        router: Arc::new(Router::default()),
         lane_gen: watch::Sender::new([0; 9]),
         nonces: Mutex::new(VecDeque::new()),
         ended: watch::Sender::new(false),
@@ -647,6 +664,28 @@ async fn control(
                     break;
                 }
             }
+            t if is_data_type(t) => {
+                // A known job's frames were delivered by the router; what comes back is
+                // for no job at all.
+                if let Some(f) = entry.router.route_control(f) {
+                    let opens = f.ty == gen::JobOpen::TYPE || f.ty == gen::Resume::TYPE;
+                    if let (Some(host), true, Some(job), true) = (
+                        &ctx.jobs,
+                        opens,
+                        job_of(&f),
+                        entry.paired.load(Ordering::SeqCst),
+                    ) {
+                        let link = JobLink::new(
+                            job,
+                            entry.router.clone(),
+                            ConnTx::new(outbox.clone()),
+                            None,
+                        );
+                        host.accept(link, f, est.peer_key);
+                    }
+                    // Anything else for an unknown job is a late frame: dropped.
+                }
+            }
             _ if f.ignorable() => {}
             _ => {
                 refuse_on(&outbox, gen::ERR_PROTOCOL, "unexpected frame").await;
@@ -655,7 +694,8 @@ async fn control(
         }
     }
     ctx.sessions.lock().unwrap().remove(&est.session_id);
-    // Lanes end with their session, at once.
+    // Jobs hear about the session's end; lanes end with the session, at once.
+    entry.router.close("the session ended");
     entry.end();
     drop(link);
     Ok(())
@@ -749,6 +789,8 @@ async fn lane(
         .map_err(|_| Ava1Error::Timeout)??;
     r.set_key(keys::lane_key(&entry.keys.c2s, j.lane_id, &cn, &sn));
     w.set_key(keys::lane_key(&entry.keys.s2c, j.lane_id, &cn, &sn));
+    // Lane frames may be as large as the frame cap (16 MiB), not the control cap.
+    r.set_max_body(crate::frame::MAX_BODY);
     // A Join can be captured and sent again by someone who does not hold the session
     // keys. So this connection takes the lane over — ending an older connection of the
     // same lane id — only once its first sealed frame has opened under the new lane
@@ -764,6 +806,7 @@ async fn lane(
     let (mut gens, mut ended) = (entry.lane_gen.subscribe(), entry.ended.subscribe());
     let (tx, mut rx) = mpsc::channel(DELIVER_DEPTH);
     let (link, outbox) = drive(r, w, ctx.timing, tx);
+    let lane_gen = entry.router.lane_up(j.lane_id, outbox.clone());
     // The proving frame is a frame like any other (a client sends a Ping).
     let mut first = Some(proof);
     loop {
@@ -778,9 +821,6 @@ async fn lane(
                 _ = over(&mut ended) => break,
             },
         };
-        // Project 1 lanes carry heartbeats only: anything else that is not marked
-        // ignorable is a protocol error. (After the first frame the link answers Pings
-        // itself and they never get here.)
         match f.ty {
             Ping::TYPE => {
                 let Ok(p) = f.decode::<Ping>() else {
@@ -797,6 +837,7 @@ async fn lane(
             }
             Pong::TYPE => {}
             gen::Bye::TYPE | gen::Error::TYPE => break,
+            t if is_data_type(t) => entry.router.route_lane(j.lane_id, f),
             _ if f.ignorable() => {}
             _ => {
                 refuse_on(&outbox, gen::ERR_PROTOCOL, "unexpected frame on a lane").await;
@@ -804,6 +845,7 @@ async fn lane(
             }
         }
     }
+    entry.router.lane_down(j.lane_id, lane_gen);
     drop(link);
     Ok(())
 }

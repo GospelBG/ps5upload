@@ -21,6 +21,8 @@ pub struct Established {
     pub session_id: [u8; 16],
     pub peer_key: [u8; 32],
     pub peer_name: String,
+    /// What the peer advertised in its info message (e.g. `CAP_DATA_PLANE`).
+    pub peer_caps: u64,
     /// `Some` until both devices have accepted each other.
     pub pairing: Option<PairingState>,
     /// Client side: the server proved a launch token this side issued (SPEC.md §5.2),
@@ -68,12 +70,13 @@ pub async fn client<R, W>(
     me: &Identity,
     my_name: &str,
     knows: impl Fn(&[u8; 32]) -> bool,
+    caps: u64,
 ) -> Result<Established, Ava1Error>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    client_expecting(r, w, me, my_name, None, knows).await
+    client_expecting(r, w, me, my_name, None, knows, caps).await
 }
 
 /// `client`, refusing any server whose static key is not `expected` (when given): the
@@ -86,12 +89,13 @@ pub async fn client_expecting<R, W>(
     my_name: &str,
     expected: Option<[u8; 32]>,
     knows: impl Fn(&[u8; 32]) -> bool,
+    caps: u64,
 ) -> Result<Established, Ava1Error>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    client_launched(r, w, me, my_name, expected, knows, |_, _| false).await
+    client_launched(r, w, me, my_name, expected, knows, |_, _| false, caps).await
 }
 
 /// Whether a `Welcome` proves we launched that server (SPEC.md §5.2). Three things have
@@ -111,6 +115,7 @@ fn proves_our_launch(
 /// `client_expecting`, also trusting a server it does not know whose Welcome carries a
 /// launch proof that `launched(h, proof)` recognises (SPEC.md §5.2) — the helper this
 /// side launched. Such a session is paired at once (`Established::launched`).
+#[allow(clippy::too_many_arguments)] // the closures are the config surface; caps is last
 pub async fn client_launched<R, W>(
     r: &mut FrameReader<R>,
     w: &mut FrameWriter<W>,
@@ -119,6 +124,7 @@ pub async fn client_launched<R, W>(
     expected: Option<[u8; 32]>,
     knows: impl Fn(&[u8; 32]) -> bool,
     launched: impl Fn(&[u8; 64], &[u8; 16]) -> bool,
+    caps: u64,
 ) -> Result<Established, Ava1Error>
 where
     R: AsyncRead + Unpin,
@@ -129,7 +135,7 @@ where
     let hello = HelloInfo {
         version_min: v,
         version_max: v,
-        caps: 0,
+        caps,
     }
     .to_bytes()?;
     w.send_msg(
@@ -186,6 +192,7 @@ where
         session_id: info.session_id,
         peer_key,
         peer_name: info.name.unwrap_or_default(),
+        peer_caps: info.caps,
         pairing,
         launched,
     })
@@ -198,16 +205,18 @@ pub async fn server<R, W>(
     me: &Identity,
     my_name: &str,
     admit: impl FnOnce(&[u8; 32]) -> Admission,
+    caps: u64,
 ) -> Result<Established, Ava1Error>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    server_launched(r, w, hs1_frame, me, my_name, None, admit).await
+    server_launched(r, w, hs1_frame, me, my_name, None, admit, caps).await
 }
 
 /// `server` for a node stamped with a launch token: a known client whose key is
 /// `launch.key` gets the proof in its Welcome (SPEC.md §5.2). No other client does.
+#[allow(clippy::too_many_arguments)] // the closure is the config surface; caps is last
 pub async fn server_launched<R, W>(
     r: &mut FrameReader<R>,
     w: &mut FrameWriter<W>,
@@ -216,6 +225,7 @@ pub async fn server_launched<R, W>(
     my_name: &str,
     launch: Option<&LaunchSecret>,
     admit: impl FnOnce(&[u8; 32]) -> Admission,
+    caps: u64,
 ) -> Result<Established, Ava1Error>
 where
     R: AsyncRead + Unpin,
@@ -241,7 +251,7 @@ where
     let session_id: [u8; 16] = keys::random_bytes()?;
     let si = ServerInfo {
         version: v,
-        caps: 0,
+        caps,
         session_id,
         name: Some(my_name.to_string()),
     }
@@ -294,6 +304,7 @@ where
         session_id,
         peer_key,
         peer_name: ci.name.unwrap_or_default(),
+        peer_caps: hello.caps,
         launched: false,
     })
 }
@@ -328,22 +339,35 @@ mod tests {
         let (c_pub, s_pub) = (c_id.public(), s_id.public());
         let ((mut cr, mut cw), (mut sr, mut sw)) = pipe();
         let c_fut = async move {
-            client(&mut cr, &mut cw, &c_id, "laptop", |k| {
-                client_knows_server && *k == s_pub
-            })
+            client(
+                &mut cr,
+                &mut cw,
+                &c_id,
+                "laptop",
+                |k| client_knows_server && *k == s_pub,
+                0,
+            )
             .await
         };
         let s_fut = async move {
             let first = sr.recv().await?;
-            server(&mut sr, &mut sw, first, &s_id, "console", |k| {
-                if server_knows_client && *k == c_pub {
-                    Admission::Known
-                } else if pairing_open {
-                    Admission::Pairing
-                } else {
-                    Admission::Refuse(gen::ERR_PAIRING_CLOSED, "pairing is closed")
-                }
-            })
+            server(
+                &mut sr,
+                &mut sw,
+                first,
+                &s_id,
+                "console",
+                |k| {
+                    if server_knows_client && *k == c_pub {
+                        Admission::Known
+                    } else if pairing_open {
+                        Admission::Pairing
+                    } else {
+                        Admission::Refuse(gen::ERR_PAIRING_CLOSED, "pairing is closed")
+                    }
+                },
+                0,
+            )
             .await
         };
         let (c, s) = tokio::join!(c_fut, s_fut);
@@ -376,6 +400,7 @@ mod tests {
                 seen.lock().unwrap().push((*h, *p));
                 accept(h, p)
             },
+            0,
         );
         let s_fut = async {
             let first = sr.recv().await?;
@@ -387,6 +412,7 @@ mod tests {
                 "console",
                 Some(&launch),
                 |_| Admission::Known,
+                0,
             )
             .await
         };
@@ -493,12 +519,28 @@ mod tests {
             token: [1; 16],
         };
         let ((mut cr, mut cw), (mut sr, mut sw)) = pipe();
-        let c_fut = client_launched(&mut cr, &mut cw, &c_id, "c", None, |_| false, |_, _| true);
+        let c_fut = client_launched(
+            &mut cr,
+            &mut cw,
+            &c_id,
+            "c",
+            None,
+            |_| false,
+            |_, _| true,
+            0,
+        );
         let s_fut = async {
             let first = sr.recv().await?;
-            server_launched(&mut sr, &mut sw, first, &s_id, "s", Some(&launch), |_| {
-                Admission::Pairing
-            })
+            server_launched(
+                &mut sr,
+                &mut sw,
+                first,
+                &s_id,
+                "s",
+                Some(&launch),
+                |_| Admission::Pairing,
+                0,
+            )
             .await
         };
         let (c, _s) = tokio::join!(c_fut, s_fut);
@@ -572,9 +614,15 @@ mod tests {
         .await
         .unwrap();
         let first = sr.recv().await.unwrap();
-        let s = server(&mut sr, &mut sw, first, &s_id, "console", |_| {
-            Admission::Known
-        })
+        let s = server(
+            &mut sr,
+            &mut sw,
+            first,
+            &s_id,
+            "console",
+            |_| Admission::Known,
+            0,
+        )
         .await;
         assert!(matches!(
             s,
@@ -594,13 +642,13 @@ mod tests {
         let ((mut cr, mut cw), (mut sr, mut sw)) = pipe();
         let s_task = async {
             let first = sr.recv().await.unwrap();
-            server(&mut sr, &mut sw, first, &s_id, "s", |_| Admission::Known)
+            server(&mut sr, &mut sw, first, &s_id, "s", |_| Admission::Known, 0)
                 .await
                 .unwrap();
             sr
         };
         let c_task = async {
-            client(&mut cr, &mut cw, &c_id, "c", |_| true)
+            client(&mut cr, &mut cw, &c_id, "c", |_| true, 0)
                 .await
                 .unwrap()
         };

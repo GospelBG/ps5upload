@@ -11,6 +11,7 @@ pub mod keys;
 pub mod launch;
 mod link;
 pub mod peers;
+pub mod router;
 pub mod server;
 pub mod session;
 pub mod trust;

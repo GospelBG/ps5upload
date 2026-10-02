@@ -35,6 +35,7 @@ pub(crate) const MAX_DEFERRALS: u32 = 2;
 enum Out {
     Frame {
         ty: u8,
+        flags: u8,
         channel: u32,
         body: Vec<u8>,
     },
@@ -92,10 +93,24 @@ impl Outbox {
     /// frame was not queued.
     pub(crate) async fn send<M: FrameMessage>(&self, channel: u32, m: &M) -> Result<(), Ava1Error> {
         let body = m.to_bytes()?;
+        self.send_frame(M::TYPE, 0, channel, body).await
+    }
+
+    /// Queues an already-encoded frame with exact header flags and channel, waiting for
+    /// room (the data plane's sends). The frame is queued whole or not at all, so a
+    /// dropped future never leaves half a frame on the wire.
+    pub(crate) async fn send_frame(
+        &self,
+        ty: u8,
+        flags: u8,
+        channel: u32,
+        body: Vec<u8>,
+    ) -> Result<(), Ava1Error> {
         let counted = Counted::new(&self.unwritten);
         self.tx
             .send(Out::Frame {
-                ty: M::TYPE,
+                ty,
+                flags,
                 channel,
                 body,
             })
@@ -110,6 +125,7 @@ impl Outbox {
         let body = m.to_bytes().map_err(|_| Full::Closed)?;
         self.try_queue(Out::Frame {
             ty: M::TYPE,
+            flags: 0,
             channel,
             body,
         })
@@ -251,7 +267,12 @@ where
         tokio::spawn(async move {
             while let Some(o) = out_rx.recv().await {
                 let sent = match o {
-                    Out::Frame { ty, channel, body } => writer.send(ty, channel, &body).await,
+                    Out::Frame {
+                        ty,
+                        flags,
+                        channel,
+                        body,
+                    } => writer.send_with_flags(ty, flags, channel, &body).await,
                     Out::Ping { seq } => {
                         let ping = Ping {
                             seq,

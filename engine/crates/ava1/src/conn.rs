@@ -88,7 +88,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     }
 
     pub async fn send(&mut self, ty: u8, channel: u32, body: &[u8]) -> Result<(), Ava1Error> {
-        self.send_flags(ty, 0, channel, body).await
+        self.send_with_flags(ty, 0, channel, body).await
     }
 
     pub async fn send_ignorable(
@@ -97,10 +97,13 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         channel: u32,
         body: &[u8],
     ) -> Result<(), Ava1Error> {
-        self.send_flags(ty, FLAG_IGNORABLE, channel, body).await
+        self.send_with_flags(ty, FLAG_IGNORABLE, channel, body)
+            .await
     }
 
-    async fn send_flags(
+    /// `send` with the exact header flags (e.g. `FLAG_IGNORABLE`) — the data plane
+    /// sends every frame this way.
+    pub async fn send_with_flags(
         &mut self,
         ty: u8,
         flags: u8,
