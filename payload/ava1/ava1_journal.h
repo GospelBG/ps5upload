@@ -29,6 +29,9 @@ typedef int (*ava1_jnl_visit_fn)(void *ctx, uint8_t kind, const uint8_t *body, s
 
 int ava1_jnl_create(ava1_jnl_t *j, const char *dir, const ava1_jnl_open_t *o);
 int ava1_jnl_open(ava1_jnl_t *j, const char *dir, ava1_jnl_visit_fn visit, void *ctx);
+/* Reads the journal's first record (its JnlOpen) without touching the file: 0, or -1 when
+ * there is no intact Open. `o->root` points into `buf`. */
+int ava1_jnl_peek_open(const char *dir, uint8_t *buf, size_t cap, ava1_jnl_open_t *o);
 int ava1_jnl_append(ava1_jnl_t *j, uint8_t kind, const uint8_t *body, size_t len); /* + fsync */
 /* Rewrites the journal as Open ‖ Snapshot ‖ Done. The snapshot carries no terminal
  * status, so pass the Done body (or NULL, 0 when the job is unfinished) — a compaction

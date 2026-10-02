@@ -326,6 +326,12 @@ pub mod ffi {
         pub fn ava1_test_recv_end(files: u32, bytes: u64, hash: *const u8) -> c_int;
         pub fn ava1_test_recv_resume(hash: *const u8) -> c_int;
         pub fn ava1_test_job_stopped() -> c_int;
+        pub fn ava1_test_recv_reopen(drop_old: c_int) -> c_int;
+        pub fn ava1_test_recv_last_open() -> c_int;
+        pub fn ava1_test_recv_ack_credit() -> u64;
+        pub fn ava1_test_recv_set(root: *const c_char, owner: u8, deny_write: c_int);
+        pub fn ava1_test_recv_args(kind: u8);
+        pub fn ava1_test_apply_reserve(n: usize, take: c_int) -> c_int;
     }
 }
 
@@ -1071,6 +1077,21 @@ fn recv_open_raw(
     unsafe { ffi::ava1_test_recv_open(j.as_ptr(), r.as_ptr(), flags, policy, entries, crash_at) }
 }
 
+/// What a JobOpen carries besides the root.
+#[derive(Clone, Copy, Debug)]
+pub struct OpenArgs {
+    pub kind: u8,
+    pub flags: u32,
+    pub policy: u8,
+    pub entries: u32,
+}
+
+impl OpenArgs {
+    pub const fn entries(self, n: u32) -> Self {
+        OpenArgs { entries: n, ..self }
+    }
+}
+
 /// The receiver driven directly (no network). It shares the data layer's lock and the apply
 /// calls of `CApplyJob` (chunk, record, root, wait, events), which act on its job.
 pub struct CRecv {
@@ -1124,6 +1145,62 @@ impl CRecv {
         self
     }
 
+    /// A restart whose JobOpen may be refused (see `last_open`).
+    pub fn restart_any(self, crash_at: i32) -> Self {
+        unsafe { ffi::ava1_test_recv_restart(crash_at) };
+        self
+    }
+
+    /// The last JobOpen's status (0 = open).
+    pub fn last_open(&self) -> i32 {
+        unsafe { ffi::ava1_test_recv_last_open() }
+    }
+
+    /// Another JobOpen for the job, without a restart. With `drop_old` the previous
+    /// session's reference is released first; refused, the previous one stays current.
+    pub fn reopen(&self, drop_old: bool) -> i32 {
+        unsafe { ffi::ava1_test_recv_reopen(drop_old as c_int) }
+    }
+
+    pub fn ack_credit(&self) -> u64 {
+        unsafe { ffi::ava1_test_recv_ack_credit() }
+    }
+
+    fn set(&self, root: Option<&Path>, owner: u8, deny: i32) {
+        let r = root.map(|p| CString::new(p.to_str().unwrap()).unwrap());
+        unsafe {
+            ffi::ava1_test_recv_set(
+                r.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                owner,
+                deny,
+            )
+        }
+    }
+
+    /// The root the next JobOpen names.
+    pub fn set_root(&self, root: &Path) {
+        self.set(Some(root), 0, -1)
+    }
+
+    /// The owner key (its first byte; 1 is the job's) the next JobOpen comes from.
+    pub fn set_owner(&self, b: u8) {
+        self.set(None, b, -1)
+    }
+
+    /// The data layer's may_write hook refuses every path.
+    pub fn deny_write(&self, on: bool) {
+        self.set(None, 0, on as i32)
+    }
+
+    /// Credit held as if a frame were in memory.
+    pub fn reserve(&self, n: usize) {
+        assert_eq!(unsafe { ffi::ava1_test_apply_reserve(n, 1) }, 0);
+    }
+
+    pub fn unreserve(&self, n: usize) {
+        unsafe { ffi::ava1_test_apply_reserve(n, 0) };
+    }
+
     pub fn wait_stopped(&self, ms: u64) {
         let t = std::time::Instant::now();
         while unsafe { ffi::ava1_test_job_stopped() } == 0 {
@@ -1149,10 +1226,12 @@ impl std::ops::Deref for CRecv {
     }
 }
 
-/// JobOpen's status for a job declaring `entries` entries (0 when accepted); the job, if
-/// opened, is stopped again.
-pub fn c_recv_open_status(jobs: &Path, root: &Path, entries: u32) -> i32 {
+/// JobOpen's status (0 when accepted); the job, if opened, is stopped again.
+pub fn c_recv_open_status(jobs: &Path, root: &Path, a: OpenArgs) -> i32 {
     let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
     let _job = CApplyJob::from_lock(lock);
-    recv_open_raw(jobs, root, 0, ava1::gen::POLICY_REPLACE, entries, 0)
+    unsafe { ffi::ava1_test_recv_args(a.kind) };
+    let rc = recv_open_raw(jobs, root, a.flags, a.policy, a.entries, 0);
+    unsafe { ffi::ava1_test_recv_args(ava1::gen::JOB_UPLOAD) };
+    rc
 }

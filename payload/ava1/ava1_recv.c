@@ -300,24 +300,34 @@ static ava1_job_t *refuse(ava1_job_open_ack_t *ack, uint16_t status, char *msg, 
     return NULL;
 }
 
-/* Stops a job and drops it from the table (its journal stays). Takes the caller's reference. */
-static void retire(ava1_job_t *j) {
-    pthread_mutex_lock(&j->mu);
-    j->stopping = 1;
-    pthread_cond_broadcast(&j->cv);
-    pthread_mutex_unlock(&j->mu);
-    ava1_job_free_one(j->id);
-    ava1_job_put(j);
+/* What this receiver understands: anything else in a JobOpen is a protocol error. */
+static int known_open(const ava1_recv_spec_t *s) {
+    const uint32_t flags = AVA1_JF_SINGLE_FILE | AVA1_JF_ORDERED | AVA1_JF_UNSAFE_READ | AVA1_JF_MOVE;
+    return s->kind >= AVA1_JOB_UPLOAD && s->kind <= AVA1_JOB_COPY && s->policy <= AVA1_POLICY_VERIFY &&
+           !(s->flags & ~flags);
+}
+
+/* The job a journal's Open describes is this JobOpen's job. */
+static int same_job(const ava1_jnl_open_t *o, const ava1_recv_spec_t *s) {
+    return memcmp(o->job_id, s->id, 16) == 0 && o->kind == s->kind && o->flags == s->flags &&
+           o->root_len == strlen(s->root) && memcmp(o->root, s->root, o->root_len) == 0;
 }
 
 ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, char *msg, size_t cap) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
     ava1_job_t *j;
     struct stat st;
+    int peeked;
+    uint8_t peek_staged;
     memset(ack, 0, sizeof *ack);
     memcpy(ack->job_id, s->id, 16);
     if (cap) msg[0] = 0;
-    if (!s->root || strlen(s->root) > AVA1_MAX_PATH || s->root[0] != '/' || !cfg->may_write || !cfg->may_write(s->root))
+    if (!known_open(s)) return refuse(ack, AVA1_ERR_PROTOCOL, msg, cap, "unknown job kind, policy or flags");
+    /* An absolute path whose rest follows the manifest path rules (SPEC.md §11.2): no
+     * trailing '/', no empty, "." or ".." component. */
+    if (!s->root || s->root[0] != '/' || !ava1_path_ok((const uint8_t *)s->root + 1, strlen(s->root) - 1))
+        return refuse(ack, AVA1_ERR_PATH, msg, cap, "the destination is not a valid path");
+    if (!cfg->may_write || !cfg->may_write(s->root))
         return refuse(ack, AVA1_ERR_PATH, msg, cap, "writing there is not allowed");
     if (s->entries > AVA1_MAX_ENTRIES) return refuse(ack, AVA1_ERR_PROTOCOL, msg, cap, "the manifest has too many entries");
     j = ava1_job_find(s->id);
@@ -326,18 +336,23 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
         return refuse(ack, AVA1_ERR_UNKNOWN_JOB, msg, cap, "this job belongs to another device");
     }
     if (j) {
-        int dead;
+        int dead, other;
         pthread_mutex_lock(&j->mu);
-        /* A job that failed in memory (disk full, I/O), was stopped, or now names another
-         * root restarts from its journal. One that ended for good stays and answers again. */
+        /* A job that failed in memory (disk full, I/O) or was stopped restarts from its
+         * journal. One that ended for good stays and answers again. */
         dead = j->stopping || (j->finished && j->final_status != AVA1_STATUS_OK && j->final_status != AVA1_ERR_EXISTS &&
-                               j->final_status != AVA1_ERR_CROSS_DEVICE) ||
-               j->kind != s->kind || j->flags != s->flags || strcmp(j->root, s->root) != 0;
+                               j->final_status != AVA1_ERR_CROSS_DEVICE);
+        other = j->kind != s->kind || j->flags != s->flags || strcmp(j->root, s->root) != 0;
         pthread_mutex_unlock(&j->mu);
-        if (dead) {
-            retire(j);
-            j = NULL;
+        if (other) {
+            ava1_job_put(j);
+            return refuse(ack, AVA1_ERR_PROTOCOL, msg, cap, "this job was opened for another destination");
         }
+        /* Its directory is reused only once its threads are gone: never while an old session
+         * still holds it. */
+        if (dead && ava1_job_retire(j) != 0)
+            return refuse(ack, AVA1_ERR_BUSY, msg, cap, "the job's previous session is still closing");
+        if (dead) j = NULL;
     }
     if (j) { /* re-attach: a new session for a job still in memory */
         pthread_mutex_lock(&j->mu);
@@ -356,6 +371,18 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
         pthread_mutex_unlock(&j->mu);
         return j;
     }
+    {
+        /* The journal on disk, read without touching it: a JobOpen for another root (or
+         * kind) is refused and the real job's journal kept as it is. */
+        char dir[sizeof j->dir];
+        uint8_t buf[AVA1_MAX_PATH + 256];
+        ava1_jnl_open_t o;
+        ava1_job_dir(cfg->jobs_dir, s->id, dir, sizeof dir);
+        peeked = ava1_jnl_peek_open(dir, buf, sizeof buf, &o) == 0;
+        if (peeked && !same_job(&o, s))
+            return refuse(ack, AVA1_ERR_PROTOCOL, msg, cap, "this job was opened for another destination");
+        peek_staged = peeked ? o.staged : 0;
+    }
     j = ava1_job_create(s->id, s->owner);
     if (!j) return refuse(ack, AVA1_ERR_BUSY, msg, cap, "too many jobs");
     j->kind = s->kind;
@@ -367,8 +394,16 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
     (void)ava1_mkdirs(cfg->jobs_dir, 0);
     ava1_job_dir(cfg->jobs_dir, s->id, j->dir, sizeof j->dir);
     if (load_from_disk(j) != 0) {
-        drop_state(j); /* nothing usable on disk: a new job */
-        j->staged = !(s->flags & AVA1_JF_SINGLE_FILE) && stat(s->root, &st) != 0;
+        drop_state(j); /* no usable progress on disk: a new job */
+        if (peeked) {
+            /* Its journal is this job's, only its progress is not usable (a crash between
+             * the manifest write and the journal): the staging choice and the hold on
+             * <root> still stand, or our own lock folder would turn into a merge target. */
+            j->staged = peek_staged & 1;
+            j->dest_held = (peek_staged & AVA1_STAGED_HELD) != 0;
+        } else {
+            j->staged = !(s->flags & AVA1_JF_SINGLE_FILE) && stat(s->root, &st) != 0;
+        }
         (void)ava1_mkdirs(j->dir, 0);
     }
     snprintf(j->base, sizeof j->base, "%s%s", j->root, j->staged ? ".ava-part" : "");
@@ -441,26 +476,44 @@ static uint64_t fnv(const char *s) {
  * keeps it only when kind, size and mtime are unchanged. Its outboard follows it to the new
  * id (two renames in the job directory, so no name is overwritten). A changed file that had
  * progress loses its old bytes and is marked in `changed` for a journaled reset. */
+/* Removes one of our own leftovers and remembers its folder for a sync. */
+static void drop_path(const char *p, int dir, ava1_dirent_t *d, uint32_t *nd) {
+    char parent[AVA1_PATH_CAP];
+    if (!p[0] || (dir ? rmdir(p) : unlink(p)) != 0) return;
+    ava1_parent_of(p, parent, sizeof parent);
+    if ((d[*nd].dir = strdup(parent)) != NULL) d[(*nd)++].id = 0;
+}
+
 static int remap(ava1_job_t *j, ava1_mstore_t *in, ava1_bits_t *changed) {
-    uint32_t cap = 1, i, *slot;
+    const uint32_t NONE = UINT32_MAX;
+    uint32_t cap = 1, i, *slot, *o2n, nd = 0, k, kept = 0;
     ava1_lfile_t **nlf;
-    ava1_bits_t ndone;
+    ava1_bits_t ndone, seen;
+    ava1_dirent_t *d;
     char a[600], b[600], p[AVA1_PATH_CAP];
-    int rc;
+    int rc, ours = j->staged && !(j->flags & AVA1_JF_SINGLE_FILE); /* the whole tree is ours */
     while (cap < 2u * j->m.n + 2u) cap *= 2;
     slot = calloc(cap, sizeof *slot);
+    o2n = malloc(((size_t)j->m.n + 1) * sizeof *o2n);
+    d = calloc(2 * (size_t)j->m.n + 2, sizeof *d); /* up to two removals an entry, + the job dir */
     nlf = calloc((size_t)in->n + 1, sizeof *nlf);
     memset(&ndone, 0, sizeof ndone);
-    if (!slot || !nlf || ava1_bits_init(&ndone, in->n) != 0 || ava1_bits_init(changed, in->n) != 0) {
+    memset(&seen, 0, sizeof seen);
+    if (!slot || !o2n || !d || !nlf || ava1_bits_init(&ndone, in->n) != 0 || ava1_bits_init(&seen, j->m.n) != 0 ||
+        ava1_bits_init(changed, in->n) != 0) {
         free(slot);
+        free(o2n);
+        free(d);
         free(nlf);
         ava1_bits_free(&ndone);
+        ava1_bits_free(&seen);
         return -1;
     }
     for (i = 0; i < j->m.n; i++) {
         uint32_t h = (uint32_t)fnv(ava1_mstore_path(&j->m, i)) & (cap - 1);
         while (slot[h]) h = (h + 1) & (cap - 1);
         slot[h] = i + 1;
+        o2n[i] = NONE;
     }
     for (i = 0; i < in->n; i++) {
         const ava1_ment_t *ne = &in->e[i];
@@ -469,7 +522,9 @@ static int remap(ava1_job_t *j, ava1_mstore_t *in, ava1_bits_t *changed) {
         for (; (o = slot[h]) != 0; h = (h + 1) & (cap - 1)) {
             const ava1_ment_t *oe = &j->m.e[o - 1];
             if (strcmp(ava1_mstore_path(&j->m, o - 1), path) != 0) continue;
+            ava1_bits_set(&seen, o - 1);
             if (oe->kind == ne->kind && oe->size == ne->size && oe->mtime == ne->mtime) {
+                o2n[o - 1] = i;
                 if (ava1_bits_get(&j->done, o - 1)) ava1_bits_set(&ndone, i);
                 if (j->lf[o - 1]) {
                     nlf[i] = j->lf[o - 1];
@@ -484,10 +539,29 @@ static int remap(ava1_job_t *j, ava1_mstore_t *in, ava1_bits_t *changed) {
                 free_lf(j->lf[o - 1]);
                 j->lf[o - 1] = NULL;
                 ava1_apply_path(j, o - 1, 1, p, sizeof p);
-                if (p[0]) (void)unlink(p);
+                drop_path(p, 0, d, &nd);
                 if (ne->kind == AVA1_ENTRY_FILE) ava1_bits_set(changed, i);
             }
             break;
+        }
+    }
+    /* Entries the new manifest no longer has: their part files go, and inside a staged tree
+     * (ours alone) their finished files and emptied folders too, or the final rename would
+     * deliver them. In place, a finished file is the user's now and stays. Children first. */
+    for (i = j->m.n; i-- > 0;) {
+        if (ava1_bits_get(&seen, i)) continue;
+        if (j->m.e[i].kind == AVA1_ENTRY_FILE) {
+            if (j->lf[i]) {
+                ava1_apply_path(j, i, 1, p, sizeof p);
+                drop_path(p, 0, d, &nd);
+            }
+            if (ours && ava1_bits_get(&j->done, i)) {
+                ava1_apply_path(j, i, 0, p, sizeof p);
+                drop_path(p, 0, d, &nd);
+            }
+        } else if (ours) {
+            ava1_apply_path(j, i, 0, p, sizeof p);
+            drop_path(p, 1, d, &nd);
         }
     }
     /* Second step of the outboard renames; drop the outboards nobody carried. */
@@ -502,8 +576,31 @@ static int remap(ava1_job_t *j, ava1_mstore_t *in, ava1_bits_t *changed) {
             snprintf(b, sizeof b, "%s/%u.ob", j->dir, i);
             (void)rename(a, b);
         }
-    rc = ava1_sync_dir(j->dir); /* the renames are durable before the journal names the new ids */
+    if ((d[nd].dir = strdup(j->dir)) != NULL) d[nd++].id = 0;
+    for (k = 0; k < nd;) { /* a folder removed itself needs no sync (its parent gets one) */
+        struct stat st;
+        if (lstat(d[k].dir, &st) == 0) {
+            k++;
+            continue;
+        }
+        free(d[k].dir);
+        d[k] = d[--nd];
+    }
+    /* the renames and removals are durable before the journal names the new ids */
+    rc = ava1_sync_dirset(j, d, nd, 0);
+    /* The resume check follows each file to its new id (M1): a torn tail is still caught. */
+    for (k = 0; k < j->last_ranges_n; k++) {
+        uint32_t f = j->last_ranges[k].file_id;
+        if (f < j->m.n && o2n[f] != NONE) {
+            j->last_ranges[kept] = j->last_ranges[k];
+            j->last_ranges[kept++].file_id = o2n[f];
+        }
+    }
+    j->last_ranges_n = kept;
     free(slot);
+    free(o2n);
+    free(d);
+    ava1_bits_free(&seen);
     pthread_mutex_lock(&j->mu);
     free(j->lf);
     ava1_bits_free(&j->done);
@@ -513,7 +610,6 @@ static int remap(ava1_job_t *j, ava1_mstore_t *in, ava1_bits_t *changed) {
     j->lf = nlf;
     j->done = ndone;
     pthread_mutex_unlock(&j->mu);
-    forget_ranges(j); /* the resume check is about the old ids; the commit root check still guards */
     return rc ? -1 : 0;
 }
 
@@ -557,6 +653,39 @@ typedef struct {
     pthread_mutex_t mu;
 } policy_t;
 
+/* The file at `p` is a regular file whose BLAKE3 (its root, SPEC.md §13.1) is `want`. */
+static int hashes_to(const char *p, const uint8_t want[32]) {
+    blake3_hasher h;
+    uint8_t *buf = malloc(1u << 20), out[32];
+    int fd = open(p, O_RDONLY | O_NOFOLLOW), ok = 0;
+    ssize_t k = -1;
+    if (buf && fd >= 0) {
+        blake3_hasher_init(&h);
+        while ((k = read(fd, buf, 1u << 20)) > 0) blake3_hasher_update(&h, buf, (size_t)k);
+        blake3_hasher_finalize(&h, out, 32);
+        ok = k == 0 && memcmp(out, want, 32) == 0;
+    }
+    if (fd >= 0) close(fd);
+    free(buf);
+    return ok;
+}
+
+/* Forgets a file's part in progress: part file, outboard and state (it is done another way). */
+static void drop_part(ava1_job_t *j, uint32_t id) {
+    char p[AVA1_PATH_CAP], f[AVA1_PATH_CAP], ob[600];
+    ava1_lfile_t *lf;
+    ava1_apply_path(j, id, 1, p, sizeof p);
+    ava1_apply_path(j, id, 0, f, sizeof f);
+    if (p[0] && strcmp(p, f) != 0) (void)unlink(p);
+    snprintf(ob, sizeof ob, "%s/%u.ob", j->dir, id);
+    (void)unlink(ob);
+    pthread_mutex_lock(&j->mu);
+    lf = j->lf[id];
+    j->lf[id] = NULL;
+    pthread_mutex_unlock(&j->mu);
+    free_lf(lf);
+}
+
 static int file_matches(ava1_job_t *j, uint32_t id) {
     const ava1_ment_t *e = &j->m.e[id];
     const uint8_t *want;
@@ -565,21 +694,7 @@ static int file_matches(ava1_job_t *j, uint32_t id) {
     ava1_apply_path(j, id, 0, p, sizeof p);
     if (!p[0] || lstat(p, &st) != 0 || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != e->size) return 0;
     if (j->policy == AVA1_POLICY_SKIP_EXISTING) return (uint64_t)st.st_mtime == e->mtime;
-    if (j->policy == AVA1_POLICY_VERIFY && (want = ava1_mstore_root(&j->m, id)) != NULL) {
-        blake3_hasher h;
-        uint8_t *buf = malloc(1u << 20), out[32];
-        int fd = open(p, O_RDONLY | O_NOFOLLOW), ok = 0;
-        ssize_t k = -1;
-        if (buf && fd >= 0) {
-            blake3_hasher_init(&h);
-            while ((k = read(fd, buf, 1u << 20)) > 0) blake3_hasher_update(&h, buf, (size_t)k);
-            blake3_hasher_finalize(&h, out, 32);
-            ok = k == 0 && memcmp(out, want, 32) == 0;
-        }
-        if (fd >= 0) close(fd);
-        free(buf);
-        return ok;
-    }
+    if (j->policy == AVA1_POLICY_VERIFY && (want = ava1_mstore_root(&j->m, id)) != NULL) return hashes_to(p, want);
     return 0;
 }
 
@@ -635,6 +750,7 @@ static void resume_check(ava1_job_t *j) {
         ava1_apply_path(j, g.file_id, 1, p, sizeof p);
         snprintf(obp, sizeof obp, "%s/%u.ob", j->dir, g.file_id);
         fd = p[0] ? open(p, O_RDONLY | O_NOFOLLOW) : -1;
+        if (fd < 0 && errno == ENOENT) continue; /* reconcile() decides what a missing part means */
         ob = open(obp, O_RDONLY);
         if (fd < 0 || ob < 0) bad = 1;
         for (gi = g.offset / AVA1_GROUP_LEN; !bad && gi * AVA1_GROUP_LEN < g.offset + g.len && gi * AVA1_GROUP_LEN < size; gi++) {
@@ -654,6 +770,62 @@ static void resume_check(ava1_job_t *j) {
     }
     free(buf);
     forget_ranges(j);
+}
+
+/* A file whose every range and root are durable but that is not done was mid-commit when
+ * the job stopped. Its part file still there: the commit runs again after the map. Gone:
+ * the rename happened, so the file in place is it if it hashes to the root — journal it
+ * done. A file with durable ranges whose part file is gone, or anything else, starts over.
+ * The commit itself never recreates a missing part. */
+static uint16_t reconcile(ava1_job_t *j, char *msg, size_t cap) {
+    ava1_bits_t ok;
+    uint32_t i;
+    int any = 0;
+    if (ava1_bits_init(&ok, j->m.n) != 0) {
+        snprintf(msg, cap, "out of memory");
+        return AVA1_ERR_INTERNAL;
+    }
+    for (i = 0; i < j->m.n; i++) {
+        ava1_lfile_t *lf = j->lf[i];
+        const ava1_ment_t *e = &j->m.e[i];
+        char p[AVA1_PATH_CAP], f[AVA1_PATH_CAP];
+        uint8_t root[32];
+        struct stat st;
+        int whole;
+        if (e->kind != AVA1_ENTRY_FILE || !lf || ava1_bits_get(&j->done, i)) continue;
+        pthread_mutex_lock(&j->mu);
+        whole = lf->has_root && lf->root_journaled && (e->size == 0 || ava1_rset_covers(&lf->durable, 0, e->size));
+        memcpy(root, lf->root, 32);
+        pthread_mutex_unlock(&j->mu);
+        if (!whole && !lf->durable.n) continue;
+        ava1_apply_path(j, i, 1, p, sizeof p);
+        ava1_apply_path(j, i, 0, f, sizeof f);
+        if (p[0] && lstat(p, &st) == 0 && S_ISREG(st.st_mode)) continue; /* whole: commit_ready */
+        /* The part file is gone: only a finished rename explains that for a whole file. */
+        if (whole && p[0] && f[0] && strcmp(p, f) != 0 && lstat(f, &st) == 0 && S_ISREG(st.st_mode) &&
+            (uint64_t)st.st_size == e->size && hashes_to(f, root)) {
+            ava1_bits_set(&ok, i);
+            any = 1;
+        } else {
+            ava1_apply_reset(j, i, 0);
+        }
+    }
+    if (any) {
+        if (journal_files(j, &ok) != 0) {
+            ava1_bits_free(&ok);
+            snprintf(msg, cap, "journal append failed");
+            return AVA1_ERR_IO;
+        }
+        for (i = 0; i < j->m.n; i++)
+            if (ava1_bits_get(&ok, i)) {
+                pthread_mutex_lock(&j->mu);
+                ava1_bits_set(&j->done, i);
+                pthread_mutex_unlock(&j->mu);
+                drop_part(j, i); /* only its outboard is left */
+            }
+    }
+    ava1_bits_free(&ok);
+    return AVA1_STATUS_OK;
 }
 
 /* The base folder and every directory entry (merge mode refuses one that is a symlink),
@@ -726,13 +898,13 @@ static uint16_t prepare(ava1_job_t *j, char *msg, size_t cap) {
                     snprintf(msg, cap, "journal append failed");
                     status = AVA1_ERR_IO;
                 } else {
-                    pthread_mutex_lock(&j->mu);
                     for (i = 0; i < j->m.n; i++)
                         if (ava1_bits_get(&pol.hit, i)) {
+                            pthread_mutex_lock(&j->mu);
                             ava1_bits_set(&j->done, i);
-                            if (j->lf[i]) ava1_rset_clear(&j->lf[i]->durable);
+                            pthread_mutex_unlock(&j->mu);
+                            if (j->lf[i]) drop_part(j, i); /* the existing file won */
                         }
-                    pthread_mutex_unlock(&j->mu);
                 }
             }
             ava1_bits_free(&pol.hit);
@@ -741,10 +913,26 @@ static uint16_t prepare(ava1_job_t *j, char *msg, size_t cap) {
         if (status != AVA1_STATUS_OK) return status;
     }
     resume_check(j);
-    return AVA1_STATUS_OK;
+    return reconcile(j, msg, cap);
 }
 
 /* ---- the job thread's events ------------------------------------------------------- */
+
+/* A held staged job whose .ava-part is gone, whose <root> is a folder and whose files are
+ * all done: the final rename happened. */
+static int staged_tree_landed(ava1_job_t *j) {
+    struct stat st;
+    int all;
+    if (!j->staged || !j->dest_held || (j->flags & AVA1_JF_SINGLE_FILE)) return 0;
+    if (lstat(j->base, &st) == 0 || errno != ENOENT) return 0;
+    if (lstat(j->root, &st) != 0 || !S_ISDIR(st.st_mode)) return 0;
+    pthread_mutex_lock(&j->mu);
+    recount(j);
+    all = j->files_done >= j->m.files;
+    if (all) j->prepared = 1;
+    pthread_mutex_unlock(&j->mu);
+    return all;
+}
 
 /* The map for a manifest that is in place: prepared once, then answered from the state. */
 static void answer(ava1_job_t *j) {
@@ -764,6 +952,12 @@ static void answer(ava1_job_t *j) {
         ava1_apply_fail(j, j->replay_status, "", 0, 0); /* the journal already has its Done */
         return;
     }
+    if (!j->prepared && staged_tree_landed(j)) {
+        /* Stopped between the staging rename and its journaled Done: the tree is in place. */
+        emit_map(j, AVA1_STATUS_OK, NULL);
+        ava1_apply_fail(j, AVA1_STATUS_OK, "", 0, 1);
+        return;
+    }
     if (!j->prepared && (st = prepare(j, msg, sizeof msg)) != AVA1_STATUS_OK) {
         emit_map(j, st, msg);
         /* An existing destination is final for this job; anything else may succeed on a retry. */
@@ -775,6 +969,9 @@ static void answer(ava1_job_t *j) {
     j->prepared = 1;
     pthread_mutex_unlock(&j->mu);
     emit_map(j, AVA1_STATUS_OK, NULL);
+    /* Files every byte and root of which are durable commit now: no sync batch may come to
+     * trigger it (nothing is left to send). */
+    ava1_apply_commit_ready(j);
 }
 
 /* A new or changed manifest becomes the job's: written, then journaled. */
@@ -802,6 +999,11 @@ static uint16_t adopt(ava1_job_t *j, ava1_mstore_t *in, const uint8_t hash[32], 
         ava1_bits_free(&changed);
         snprintf(msg, cap, "carrying the progress over failed");
         return AVA1_ERR_IO;
+    }
+    if (ava1_data_cfg()->crash_at == AVA1_CRASH_MID_REMAP && !fresh) {
+        ava1_bits_free(&changed);
+        ava1_apply_crash(j); /* tests: the renames are done, the manifest and journal are not */
+        return AVA1_STATUS_OK;
     }
     memcpy(j->manifest_hash, hash, 32);
     j->have_manifest = 1;

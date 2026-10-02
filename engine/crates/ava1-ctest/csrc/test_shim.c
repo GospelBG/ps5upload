@@ -927,9 +927,11 @@ static int t_same_device(const char *a, const char *b) {
     (void)b;
     return __atomic_load_n(&g_same_device, __ATOMIC_SEQ_CST);
 }
+static int g_deny_write;
+static uint8_t g_kind = AVA1_JOB_UPLOAD, g_owner = 1; /* the receiver driver's JobOpen */
 static int t_allow(const char *p) {
     (void)p;
-    return 1;
+    return !__atomic_load_n(&g_deny_write, __ATOMIC_SEQ_CST);
 }
 static int t_allow_read(const char *p, int u) {
     (void)p;
@@ -1189,6 +1191,9 @@ void ava1_test_apply_end(void) {
     ava1_apply_fault = NULL;
     ava1_test_apply_fail_dir_sync(UINT32_MAX - 1);
     ava1_test_apply_hold(0);
+    g_kind = AVA1_JOB_UPLOAD;
+    g_owner = 1;
+    __atomic_store_n(&g_deny_write, 0, __ATOMIC_SEQ_CST);
     g_trace = 0;
     free(g_dup);
     g_dup = NULL;
@@ -1204,6 +1209,7 @@ static char g_root[1024];
 static uint32_t g_flags, g_entries;
 static uint8_t g_policy;
 static ava1_job_open_ack_t g_ack;
+static int g_last_open;
 
 static void ev_reset(void) {
     pthread_mutex_lock(&g_ev_mu);
@@ -1218,14 +1224,16 @@ static int recv_open_now(void) {
     memset(&s, 0, sizeof s);
     memcpy(s.id, TEST_JOB, 16);
     memcpy(s.owner, TEST_OWNER, 32);
-    s.kind = AVA1_JOB_UPLOAD;
+    s.owner[0] = g_owner;
+    s.kind = g_kind;
     s.policy = g_policy;
     s.flags = g_flags;
     s.entries = g_entries;
     s.root = g_root;
     s.emit = rec_emit;
     g_job = ava1_recv_open(&s, &g_ack, msg, sizeof msg);
-    return g_job ? 0 : (int)g_ack.status;
+    g_last_open = g_job ? 0 : (int)g_ack.status;
+    return g_last_open;
 }
 
 static int recv_start(int crash_at) {
@@ -1288,4 +1296,42 @@ int ava1_test_job_stopped(void) {
     s = g_job->stopping;
     pthread_mutex_unlock(&g_job->mu);
     return s;
+}
+
+int ava1_test_recv_last_open(void) { return g_last_open; }
+uint64_t ava1_test_recv_ack_credit(void) { return g_ack.credit; }
+
+/* NULL root / owner 0 / deny < 0: unchanged. */
+void ava1_test_recv_set(const char *root, uint8_t owner, int deny) {
+    if (root) snprintf(g_root, sizeof g_root, "%s", root);
+    if (owner) g_owner = owner;
+    if (deny >= 0) __atomic_store_n(&g_deny_write, deny, __ATOMIC_SEQ_CST);
+}
+
+void ava1_test_recv_args(uint8_t kind) { g_kind = kind; }
+
+/* Another JobOpen in the same process. drop_old releases the current session's reference
+ * first; when the open is refused the current job (if kept) stays current. */
+int ava1_test_recv_reopen(int drop_old) {
+    ava1_job_t *old = g_job;
+    int rc;
+    if (drop_old && old) {
+        ava1_job_put(old);
+        old = NULL;
+    }
+    g_job = NULL;
+    rc = recv_open_now();
+    if (old) {
+        if (g_job) ava1_job_put(old);
+        else g_job = old;
+    }
+    return rc;
+}
+
+int ava1_test_apply_reserve(size_t n, int take) {
+    if (!take) {
+        ava1_apply_unreserve(g_job, n);
+        return 0;
+    }
+    return ava1_apply_reserve(g_job, n);
 }

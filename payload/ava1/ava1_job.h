@@ -117,6 +117,10 @@ void ava1_job_park_session(const uint8_t sid[16]); /* every job attached to sid 
 void ava1_job_reap(uint64_t now_ms);               /* frees parked jobs older than AVA1_PARK_MS */
 void ava1_job_free_all(void);
 void ava1_job_free_one(const uint8_t id[16]);      /* unlists it and drops the table's reference */
+/* Takes the caller's reference. When only the table and the caller hold the job, unlists
+ * it and frees it now (its threads joined, its files closed) and returns 0; otherwise drops
+ * the caller's reference and returns -1 (someone else may still be running it). */
+int ava1_job_retire(ava1_job_t *j);
 void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len);
 
 #endif

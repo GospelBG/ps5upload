@@ -172,6 +172,23 @@ int ava1_jnl_open(ava1_jnl_t *j, const char *dir, ava1_jnl_visit_fn visit, void 
     return 0;
 }
 
+int ava1_jnl_peek_open(const char *dir, uint8_t *buf, size_t cap, ava1_jnl_open_t *o) {
+    char p[600];
+    ssize_t n;
+    uint32_t len;
+    int fd;
+    path_in(dir, "journal", p, sizeof p);
+    if ((fd = open(p, O_RDONLY)) < 0) return -1;
+    n = pread(fd, buf, cap, 0);
+    close(fd);
+    if (n < (ssize_t)sizeof MAGIC + 8 || memcmp(buf, MAGIC, sizeof MAGIC) != 0) return -1;
+    len = get32(buf + sizeof MAGIC);
+    if (len < 2 || len > (size_t)n - sizeof MAGIC - 8) return -1;
+    if (ava1_crc32c(buf + sizeof MAGIC + 4, len) != get32(buf + sizeof MAGIC + 4 + len)) return -1;
+    if (buf[sizeof MAGIC + 4] != AVA1_JNL_OPEN) return -1;
+    return ava1_jnl_open_decode(buf + sizeof MAGIC + 5, len - 1, o) == 0 ? 0 : -1;
+}
+
 int ava1_jnl_append(ava1_jnl_t *j, uint8_t kind, const uint8_t *body, size_t len) {
     size_t rn;
     uint8_t *rec = frame_rec(kind, body, len, &rn);

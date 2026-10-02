@@ -280,10 +280,13 @@ fn an_empty_folder_is_a_valid_job() {
 fn an_entry_count_past_the_cap_is_refused_at_open() {
     let t = tmp("cap");
     assert_eq!(
-        c_recv_open_status(&t.join("jobs"), &t.join("dest"), 4_000_001),
+        c_recv_open_status(&t.join("jobs"), &t.join("dest"), OPEN_OK.entries(4_000_001)),
         gen::ERR_PROTOCOL as i32
     );
-    assert_eq!(c_recv_open_status(&t.join("jobs"), &t.join("dest"), 10), 0);
+    assert_eq!(
+        c_recv_open_status(&t.join("jobs"), &t.join("dest"), OPEN_OK.entries(10)),
+        0
+    );
 }
 
 #[test]
@@ -428,4 +431,415 @@ fn a_held_destination_that_gains_files_is_not_replaced() {
         },
         "{ev}"
     );
+}
+
+// ---- fix round 1 ------------------------------------------------------------------
+
+fn big(n: usize, seed: u8) -> Vec<u8> {
+    (0..n)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
+}
+
+fn send_big(r: &CRecv, id: u32, d: &[u8]) {
+    for o in (0..d.len()).step_by(GROUP as usize) {
+        r.chunk(id, o as u64, &d[o..(o + GROUP as usize).min(d.len())]);
+    }
+    r.root(id, *blake3::hash(d).as_bytes());
+}
+
+const OPEN_OK: OpenArgs = OpenArgs {
+    kind: gen::JOB_UPLOAD,
+    flags: 0,
+    policy: gen::POLICY_REPLACE,
+    entries: 0,
+};
+
+#[test]
+fn c1_a_crash_between_the_commit_rename_and_its_journal_keeps_the_file() {
+    let t = tmp("c1");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    std::fs::write(t.join("dest/big"), b"the old version").unwrap();
+    let d = big(2 * GROUP as usize + 5, 1);
+    let m = Manifest {
+        entries: vec![f("big", d.len() as u64, 3)],
+    };
+    // dies after rename(big.ava-part, big) and its directory sync, before the journal
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 4);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    send_big(&r, 0, &d);
+    r.wait_stopped(10_000);
+    assert_eq!(std::fs::read(t.join("dest/big")).unwrap(), d);
+    let r = r.restart(0);
+    r.manifest(&m);
+    let ev = r.wait_event("map status=0", 5000);
+    assert!(ev.contains("done=0+1"), "{ev}");
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+    assert_eq!(std::fs::read(t.join("dest/big")).unwrap(), d);
+}
+
+#[test]
+fn c2_a_crash_before_the_commit_finishes_on_resume_without_resending() {
+    let t = tmp("c2");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let d = big(3 * GROUP as usize, 2);
+    let m = Manifest {
+        entries: vec![f("big", d.len() as u64, 3)],
+    };
+    // every range and the root are journaled; dies as the commit starts
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 5);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    send_big(&r, 0, &d);
+    r.wait_stopped(10_000);
+    let r = r.restart(0);
+    r.manifest(&m);
+    assert!(r.wait_event("map status=0", 5000).contains("partial=1"));
+    assert_eq!(r.wait(10_000), 0, "{}", r.events()); // nothing sent again
+    assert!(!r.events().contains("retry"), "{}", r.events());
+    assert_eq!(std::fs::read(t.join("dest/big")).unwrap(), d);
+}
+
+#[test]
+fn i1_a_crash_after_the_staging_rename_finishes_ok() {
+    let t = tmp("i1");
+    let m = small_files(2);
+    // dies after rename(dest.ava-part, dest) and its sync, before Done is journaled
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 6);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    send_all(&r, 2);
+    r.wait_stopped(10_000);
+    assert!(t.join("dest/d/1").exists());
+    let r = r.restart(0);
+    r.manifest(&m);
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+    assert_eq!(std::fs::read(t.join("dest/d/1")).unwrap(), body(1));
+}
+
+#[test]
+fn i2_a_failed_job_still_held_by_its_session_is_busy_not_reused() {
+    let t = tmp("i2");
+    std::fs::create_dir_all(t.join("dest/f1")).unwrap(); // file 1 lands on a folder: ERR_IO
+    let m = Manifest {
+        entries: vec![f("f0", 1, 1), f("f1", 1, 1)],
+    };
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    r.record(1, b"b", *blake3::hash(b"b").as_bytes());
+    assert_eq!(r.wait(10_000), gen::ERR_IO as i32);
+    // the failed job's old session still holds it: its threads may still run
+    assert_eq!(r.reopen(false), gen::ERR_BUSY as i32);
+    std::fs::remove_dir(t.join("dest/f1")).unwrap();
+    assert_eq!(r.reopen(true), 0); // released: retired, reloaded from its journal
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    r.record(0, b"a", *blake3::hash(b"a").as_bytes());
+    r.record(1, b"b", *blake3::hash(b"b").as_bytes());
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+}
+
+#[test]
+fn i3_files_removed_from_the_manifest_leave_nothing_in_the_staged_tree() {
+    let t = tmp("i3");
+    let d = big(2 * GROUP as usize + 1, 3);
+    let m = Manifest {
+        entries: vec![
+            f("big", d.len() as u64, 1),
+            Entry {
+                kind: ENTRY_DIR,
+                mode: 0o755,
+                size: 0,
+                mtime: 0,
+                path: "gone".into(),
+                root: None,
+            },
+            f("gone/x", 4, 1),
+            f("keep", 4, 1),
+        ],
+    };
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    r.chunk(0, 0, &d[..GROUP as usize]);
+    r.record(2, b"xxxx", *blake3::hash(b"xxxx").as_bytes());
+    r.wait_event("durable files=2+1", 5000);
+    r.wait_event("ranges=1", 5000);
+    let r = r.restart(0);
+    let m2 = Manifest {
+        entries: vec![f("keep", 4, 1)],
+    };
+    r.manifest(&m2);
+    r.wait_event("map status=0", 5000);
+    r.record(0, b"kkkk", *blake3::hash(b"kkkk").as_bytes());
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+    let mut names: Vec<String> = std::fs::read_dir(t.join("dest"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["keep".to_string()]);
+}
+
+#[test]
+fn i3_merge_mode_never_deletes_the_users_files() {
+    let t = tmp("i3m");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let d = big(2 * GROUP as usize + 1, 4);
+    let m = Manifest {
+        entries: vec![f("a", 4, 1), f("big", d.len() as u64, 1), f("keep", 4, 1)],
+    };
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    r.record(0, b"aaaa", *blake3::hash(b"aaaa").as_bytes());
+    r.chunk(1, 0, &d[..GROUP as usize]);
+    r.wait_event("ranges=1", 5000);
+    let r = r.restart(0);
+    r.manifest(&Manifest {
+        entries: vec![f("keep", 4, 1)],
+    });
+    r.wait_event("map status=0", 5000);
+    r.record(0, b"kkkk", *blake3::hash(b"kkkk").as_bytes());
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+    assert_eq!(std::fs::read(t.join("dest/a")).unwrap(), b"aaaa"); // in place: the user's now
+    assert!(!t.join("dest/big.ava-part").exists());
+}
+
+#[test]
+fn i4_a_changed_manifest_during_a_tiny_file_backlog_does_not_deadlock() {
+    let t = tmp("i4");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let n = 700;
+    let m = small_files(n);
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    r.hold_batches(true);
+    send_all(&r, n);
+    r.wait_pending(512, 5000); // full: a worker now waits in pend_add
+    let mut m2 = m.clone();
+    m2.entries[n].mtime += 1;
+    r.manifest(&m2);
+    let t0 = std::time::Instant::now();
+    while r.events().matches("map status=0").count() < 2 {
+        assert!(t0.elapsed().as_secs() < 10, "no second map: {}", r.events());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    r.hold_batches(false);
+}
+
+#[test]
+fn i5_a_journal_dropped_for_its_manifest_keeps_the_staging_choice() {
+    let t = tmp("i5");
+    let m = small_files(2);
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    let jd = job_dir(&t.join("jobs"), &[7; 16]);
+    let r = r.restart(0);
+    // a crash between the manifest write and the journal's compaction: they disagree
+    ava1::journal::write_manifest(&jd, &small_files(3)).unwrap();
+    let r = r.restart(0);
+    assert_eq!(
+        r.ack_staged(),
+        1,
+        "our own lock folder is not a merge target"
+    );
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    send_all(&r, 2);
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+    assert!(!t.join("dest.ava-part").exists());
+}
+
+#[test]
+fn i6_job_open_fields_are_validated() {
+    let t = tmp("i6");
+    let (j, ok) = (t.join("jobs"), t.join("dest"));
+    let p = gen::ERR_PROTOCOL as i32;
+    for bad in ["dest/", "a/../dest", "a//dest", "a/./dest"] {
+        let root = std::path::PathBuf::from(format!("{}/{bad}", t.display()));
+        assert_eq!(
+            c_recv_open_status(&j, &root, OPEN_OK),
+            gen::ERR_PATH as i32,
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        c_recv_open_status(&j, &ok, OpenArgs { kind: 0, ..OPEN_OK }),
+        p
+    );
+    assert_eq!(
+        c_recv_open_status(&j, &ok, OpenArgs { kind: 9, ..OPEN_OK }),
+        p
+    );
+    assert_eq!(
+        c_recv_open_status(
+            &j,
+            &ok,
+            OpenArgs {
+                policy: 3,
+                ..OPEN_OK
+            }
+        ),
+        p
+    );
+    assert_eq!(
+        c_recv_open_status(
+            &j,
+            &ok,
+            OpenArgs {
+                flags: 0x100,
+                ..OPEN_OK
+            }
+        ),
+        p
+    );
+    assert_eq!(c_recv_open_status(&j, &ok, OPEN_OK), 0);
+}
+
+#[test]
+fn i7_reattach_gives_the_free_credit_and_checks_the_owner() {
+    let t = tmp("i7a");
+    let m = small_files(1);
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 0);
+    let c = r.ack_credit();
+    assert!(c >= 8 << 20, "{c}");
+    r.reserve(1 << 20); // a frame in memory, not yet freed
+    r.set_owner(2);
+    assert_eq!(r.reopen(false), gen::ERR_UNKNOWN_JOB as i32);
+    r.set_owner(1);
+    assert_eq!(r.reopen(false), 0); // the same job, a new session
+    assert_eq!(r.ack_credit(), c - (1 << 20));
+    r.unreserve(1 << 20);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    send_all(&r, 1);
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+}
+
+#[test]
+fn i7_a_job_open_for_another_root_is_refused_and_the_journal_kept() {
+    let t = tmp("i7b");
+    let m = small_files(1);
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    let jd = job_dir(&t.join("jobs"), &[7; 16]);
+    let before = std::fs::read(jd.join("journal")).unwrap();
+    r.set_root(&t.join("elsewhere"));
+    assert_eq!(r.reopen(false), gen::ERR_PROTOCOL as i32); // in memory
+    let r = r.restart_any(0); // memory gone: the open is refused from the journal on disk
+    assert_eq!(r.last_open(), gen::ERR_PROTOCOL as i32);
+    assert_eq!(std::fs::read(jd.join("journal")).unwrap(), before);
+    r.set_root(&t.join("dest"));
+    assert_eq!(r.reopen(true), 0);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    send_all(&r, 1);
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+}
+
+#[test]
+fn i7_writing_where_it_is_not_allowed_is_refused() {
+    let t = tmp("i7c");
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 0);
+    r.deny_write(true);
+    r.set_root(&t.join("other"));
+    assert_eq!(r.reopen(true), gen::ERR_PATH as i32);
+    r.deny_write(false);
+}
+
+#[test]
+fn i7_dying_mid_remap_resumes() {
+    let t = tmp("i7d");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let g = GROUP as usize;
+    let d = big(2 * g + 9, 5);
+    let m = Manifest {
+        entries: vec![f("a", 4, 9), f("big", d.len() as u64, 9)],
+    };
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 7);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    r.chunk(1, 0, &d[..g]);
+    r.wait_event("durable", 5000);
+    let r = r.restart(7);
+    let m2 = Manifest {
+        entries: vec![f("0new", 4, 9), f("a", 4, 9), f("big", d.len() as u64, 9)],
+    };
+    r.manifest(&m2); // dies after the outboard renames, before the manifest and journal
+    r.wait_stopped(10_000);
+    let r = r.restart(0);
+    r.manifest(&m2);
+    r.wait_event("map status=0", 5000);
+    r.record(0, b"new!", *blake3::hash(b"new!").as_bytes());
+    r.record(1, b"aaaa", *blake3::hash(b"aaaa").as_bytes());
+    send_big(&r, 2, &d); // whatever the map says, the whole file is acceptable
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+    assert_eq!(std::fs::read(t.join("dest/big")).unwrap(), d);
+}
+
+#[test]
+fn m1_the_resume_check_follows_a_file_to_its_new_id() {
+    let t = tmp("m1");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let d = big(3 * GROUP as usize, 6);
+    let m = Manifest {
+        entries: vec![f("big", d.len() as u64, 5)],
+    };
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    r.chunk(0, 0, &d[..2 * GROUP as usize]);
+    r.wait_event("durable", 5000);
+    let r = r.restart(0);
+    let part = t.join("dest/big.ava-part");
+    let mut b = std::fs::read(&part).unwrap();
+    b[GROUP as usize + 10] ^= 0xff;
+    std::fs::write(&part, &b).unwrap();
+    let m2 = Manifest {
+        entries: vec![f("a", 1, 5), f("big", d.len() as u64, 5)],
+    };
+    r.manifest(&m2); // big moves to id 1; its torn tail is still caught
+    assert!(r.wait_event("map status=0", 5000).contains("partial=0"));
+}
+
+#[test]
+fn m9_a_policy_match_drops_the_part_in_progress() {
+    let t = tmp("m9");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let d = big(3 * GROUP as usize, 7);
+    let m = Manifest {
+        entries: vec![f("big", d.len() as u64, 1_600_000_000)],
+    };
+    let r = CRecv::open(
+        &t.join("jobs"),
+        &t.join("dest"),
+        0,
+        gen::POLICY_SKIP_EXISTING,
+        0,
+    );
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    r.chunk(0, 0, &d[..GROUP as usize]);
+    r.wait_event("durable", 5000);
+    let r = r.restart(0);
+    // the file turned up complete meanwhile
+    std::fs::write(t.join("dest/big"), &d).unwrap();
+    let ft = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(t.join("dest/big"))
+        .unwrap()
+        .set_modified(ft)
+        .unwrap();
+    r.manifest(&m);
+    assert!(r.wait_event("map status=0", 5000).contains("done=0+1"));
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+    assert!(!t.join("dest/big.ava-part").exists());
+    assert!(!job_dir(&t.join("jobs"), &[7; 16]).join("0.ob").exists());
 }

@@ -17,6 +17,10 @@
 #define AVA1_CRASH_AFTER_SYNC 1     /* tests: die after fsync, before the journal */
 #define AVA1_CRASH_AFTER_JOURNAL 2  /* tests: die after the journal, before Durable */
 #define AVA1_CRASH_AFTER_TAKE 3     /* tests: die after taking <root>, before the journal (Task 13) */
+#define AVA1_CRASH_COMMIT_RENAMED 4 /* tests: die after a commit's rename + dir sync, before its journal */
+#define AVA1_CRASH_BEFORE_COMMIT 5  /* tests: die as a fully durable file's commit starts */
+#define AVA1_CRASH_STAGED_RENAMED 6 /* tests: die after the staging rename + sync, before Done */
+#define AVA1_CRASH_MID_REMAP 7      /* tests: die after a remap's outboard renames */
 
 /* `owned` buffers are freed by the apply engine (always, including on error); their
  * length returns to the sender as credit. */
@@ -44,6 +48,8 @@ void ava1_apply_compact(ava1_job_t *j);
 /* Job thread only: waits until no work is queued or running, then makes what was applied
  * durable (one sync batch) and drops what could not be, so the manifest can change. */
 void ava1_apply_quiesce(ava1_job_t *j);
+/* Job thread only: commits every large file whose ranges and root are all durable. */
+void ava1_apply_commit_ready(ava1_job_t *j);
 /* Sends a finished job's JobDone again (a sender that lost the first one asks again). */
 void ava1_apply_done_again(ava1_job_t *j);
 

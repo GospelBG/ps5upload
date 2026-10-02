@@ -172,6 +172,24 @@ void ava1_job_free_one(const uint8_t id[16]) {
     if (j) ava1_job_put(j);
 }
 
+int ava1_job_retire(ava1_job_t *j) {
+    int i, ok;
+    pthread_mutex_lock(&T.mu);
+    ok = j->refs == 2; /* the table's and the caller's: nobody else can be running it */
+    if (ok) {
+        for (i = 0; i < AVA1_MAX_JOBS; i++)
+            if (T.jobs[i] == j) T.jobs[i] = NULL;
+        j->refs = 1;
+    }
+    pthread_mutex_unlock(&T.mu);
+    if (!ok) {
+        ava1_job_put(j);
+        return -1;
+    }
+    ava1_job_put(j); /* the last reference: stops and joins its threads now */
+    return 0;
+}
+
 void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len) {
     if (j->emit) j->emit(j, type, flags, body, len);
 }

@@ -471,7 +471,9 @@ int ava1_apply_parallel(ava1_job_t *j, void (*fn)(ava1_job_t *, void *, uint32_t
 /* ---- applying ---------------------------------------------------------------------- */
 
 /* The large file's state with open descriptors; caller holds j->mu. NULL + *err on failure. */
-static ava1_lfile_t *lfile_open(ava1_job_t *j, uint32_t id, int *err) {
+/* create == 0 (the commit's reopen): a missing part file or outboard is ENOENT, never a new
+ * empty file — an empty part would hash to nothing and be renamed over the real file. */
+static ava1_lfile_t *lfile_open(ava1_job_t *j, uint32_t id, int *err, int create) {
     ava1_lfile_t *lf = ava1_lfile_get(j, id);
     const ava1_ment_t *e = &j->m.e[id];
     char path[PATH_CAP];
@@ -487,8 +489,9 @@ static ava1_lfile_t *lfile_open(ava1_job_t *j, uint32_t id, int *err) {
         *err = ENAMETOOLONG;
         return NULL;
     }
-    lf->fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
-    if (lf->fd < 0 && errno == ENOENT && mkparents(path) == 0) lf->fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+    lf->fd = open(path, O_RDWR | (create ? O_CREAT : 0) | O_NOFOLLOW, 0600);
+    if (lf->fd < 0 && create && errno == ENOENT && mkparents(path) == 0)
+        lf->fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
     if (lf->fd < 0) {
         *err = errno;
         return NULL;
@@ -502,7 +505,7 @@ static ava1_lfile_t *lfile_open(ava1_job_t *j, uint32_t id, int *err) {
     }
     if (groups_of(e->size) >= 2) {
         ob_path(j, id, path, sizeof path);
-        lf->ob_fd = open(path, O_RDWR | O_CREAT, 0600);
+        lf->ob_fd = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
         if (lf->ob_fd < 0) {
             *err = errno;
             goto fail;
@@ -526,7 +529,7 @@ static int write_chunk(ava1_job_t *j, uint32_t id, uint64_t off, const uint8_t *
         pthread_mutex_unlock(&j->mu);
         return 0; /* a late duplicate */
     }
-    lf = lfile_open(j, id, &err);
+    lf = lfile_open(j, id, &err, 1);
     /* Our own descriptors: the job thread may close lf's at commit while we write, and a
      * reused descriptor number would then take these bytes into some other file. */
     fd = lf ? dup(lf->fd) : -1;
@@ -1096,8 +1099,17 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
     uint8_t root[32], want[32];
     int err = 0;
     pthread_mutex_lock(&j->mu);
-    if (lf->fd < 0 && !lfile_open(j, id, &err)) {
+    if (cfg->crash_at == AVA1_CRASH_BEFORE_COMMIT) {
         pthread_mutex_unlock(&j->mu);
+        ava1_apply_crash(j);
+        return;
+    }
+    if (lf->fd < 0 && !lfile_open(j, id, &err, 0)) {
+        pthread_mutex_unlock(&j->mu);
+        if (err == ENOENT) { /* its bytes are gone: start the file over */
+            ava1_apply_reset(j, id, AVA1_RETRY_IO);
+            return;
+        }
         ava1_apply_fail(j, AVA1_ERR_IO, "reopen for commit failed", err, 0);
         return;
     }
@@ -1159,6 +1171,10 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
             return;
         }
         HOOK(j, AVA1_HOOK_DIR_SYNCED, id);
+        if (cfg->crash_at == AVA1_CRASH_COMMIT_RENAMED) {
+            ava1_apply_crash(j);
+            return;
+        }
     }
     {
         ava1_jnl_batch_t b;
@@ -1188,7 +1204,7 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
     }
 }
 
-static void commit_ready(ava1_job_t *j) {
+void ava1_apply_commit_ready(ava1_job_t *j) {
     uint32_t i;
     for (i = 0; i < j->m.n && !j->finished; i++) {
         ava1_lfile_t *lf = j->lf[i];
@@ -1237,6 +1253,10 @@ static void finish(ava1_job_t *j) {
             return;
         }
         HOOK(j, AVA1_HOOK_DIR_SYNCED, UINT32_MAX);
+        if (cfg->crash_at == AVA1_CRASH_STAGED_RENAMED) {
+            ava1_apply_crash(j);
+            return;
+        }
     }
     ava1_apply_fail(j, AVA1_STATUS_OK, "", 0, 1); /* the success path: see ava1_apply_fail */
 }
@@ -1246,8 +1266,16 @@ void ava1_apply_quiesce(ava1_job_t *j) {
     int pend, ok;
     pthread_mutex_lock(&j->mu);
     while ((j->q_len || j->busy) && !j->stopping) {
+        /* A worker may be waiting in pend_add for room: make it, or nobody ever will. */
+        int sync = j->pend_n != 0, can = j->prepared && !j->finished && !j->final_status;
+        if (sync && !can) {
+            for (i = 0; i < j->pend_n; i++) close(j->pend_fd[i]); /* unsynced: sent again */
+            j->pend_n = 0;
+            pthread_cond_broadcast(&j->cv);
+        }
         pthread_mutex_unlock(&j->mu);
-        ava1_platform_sleep_ms(2);
+        if (sync && can) sync_batch(j);
+        else ava1_platform_sleep_ms(2);
         pthread_mutex_lock(&j->mu);
     }
     pend = j->pend_n || j->unsynced_bytes || j->roots_new;
@@ -1328,7 +1356,7 @@ static void *job_main(void *arg) {
         if (batch) {
             sync_batch(j);
             j->last_batch_ms = now;
-            if (!j->stopping) commit_ready(j);
+            if (!j->stopping) ava1_apply_commit_ready(j);
         }
         if (all_done(j)) finish(j);
         if (now - j->status_ms >= 250) {
