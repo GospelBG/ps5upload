@@ -53,13 +53,24 @@ static uint8_t *frame_rec(uint8_t kind, const uint8_t *body, size_t len, size_t 
 static int sync_dir(const char *dir) {
     int fd = open(dir, O_RDONLY);
     if (fd < 0) return -errno;
-    (void)fsync(fd);
+    /* The directory fsync is the step that makes a rename durable — the one failure it
+     * exists to catch (EIO) must not be swallowed, or callers report durability they
+     * do not have. Rust propagates it the same way (SPEC.md §14.1). */
+    int rc = fsync(fd) != 0 ? -errno : 0;
     close(fd);
-    return 0;
+    return rc;
 }
 
 static void path_in(const char *dir, const char *name, char *out, size_t cap) {
     snprintf(out, cap, "%s/%s", dir, name);
+}
+
+/* Bounded copy of `dir` into the journal handle: the stored copy is what compact()
+ * later renames through, so a silent truncation would act on the wrong path. */
+static int set_dir(ava1_jnl_t *j, const char *dir) {
+    int w = snprintf(j->dir, sizeof j->dir, "%s", dir);
+    if (w < 0 || (size_t)w >= sizeof j->dir) return -ENAMETOOLONG;
+    return 0;
 }
 
 /* tmp → fsync → rename → fsync(dir). The caller owns same-directory placement. */
@@ -89,7 +100,8 @@ int ava1_jnl_create(ava1_jnl_t *j, const char *dir, const ava1_jnl_open_t *o) {
     char p[600];
     memset(j, 0, sizeof *j);
     j->fd = -1;
-    snprintf(j->dir, sizeof j->dir, "%s", dir);
+    rc = set_dir(j, dir);
+    if (rc != 0) return rc;
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) return -errno; /* parent must exist */
     ava1_w_init(&w, body, sizeof body);
     if (ava1_jnl_open_encode(o, &w) != 0) return AVA1_E_SPACE;
@@ -113,7 +125,10 @@ int ava1_jnl_open(ava1_jnl_t *j, const char *dir, ava1_jnl_visit_fn visit, void 
     int fd;
     memset(j, 0, sizeof *j);
     j->fd = -1;
-    snprintf(j->dir, sizeof j->dir, "%s", dir);
+    {
+        int rc = set_dir(j, dir);
+        if (rc != 0) return rc;
+    }
     path_in(dir, "journal", p, sizeof p);
     fd = open(p, O_RDWR);
     if (fd < 0) return -errno;
@@ -134,9 +149,12 @@ int ava1_jnl_open(ava1_jnl_t *j, const char *dir, ava1_jnl_visit_fn visit, void 
         close(fd);
         return AVA1_E_PROTO;
     }
-    while (n - at >= 4) {
+    while (n - at >= 8) {
         uint32_t len = get32(b + at);
-        if (len == 0 || n - at - 4 < (size_t)len + 4) break;
+        /* A record is 8 + len bytes. `n - at >= 8` makes the subtraction safe, and
+         * comparing against the remaining bytes (rather than len + 8, which wraps on a
+         * 32-bit host) keeps a hostile length from walking off the buffer. */
+        if (len == 0 || len > n - at - 8) break;
         if (ava1_crc32c(b + at + 4, len) != get32(b + at + 4 + len)) break;
         if (visit && visit(ctx, b[at + 4], b + at + 5, len - 1) != 0) break;
         at += 8 + len;
@@ -166,29 +184,37 @@ int ava1_jnl_append(ava1_jnl_t *j, uint8_t kind, const uint8_t *body, size_t len
     return rc;
 }
 
+/* The snapshot carries done/ranges/roots but not the job's terminal status, so the
+ * Done body is written back after it (NULL when the job is unfinished) — a compaction
+ * must never lose state (SPEC.md §14.2). */
 int ava1_jnl_compact(ava1_jnl_t *j, const uint8_t *open_body, size_t open_len,
-                     const uint8_t *snap_body, size_t snap_len) {
-    size_t an, bn;
+                     const uint8_t *snap_body, size_t snap_len,
+                     const uint8_t *done_body, size_t done_len) {
+    size_t an, bn, dn = 0;
     uint8_t *a = frame_rec(AVA1_JNL_OPEN, open_body, open_len, &an);
     uint8_t *b = frame_rec(AVA1_JNL_SNAPSHOT, snap_body, snap_len, &bn);
-    uint8_t *all = (a && b) ? malloc(sizeof MAGIC + an + bn) : NULL;
+    uint8_t *d = done_body ? frame_rec(AVA1_JNL_DONE, done_body, done_len, &dn) : NULL;
+    size_t total = sizeof MAGIC + an + bn + dn;
+    uint8_t *all = (a && b && (d || !done_body)) ? malloc(total) : NULL;
     char p[600];
     int rc = -ENOMEM;
     if (all) {
         memcpy(all, MAGIC, sizeof MAGIC);
         memcpy(all + sizeof MAGIC, a, an);
         memcpy(all + sizeof MAGIC + an, b, bn);
-        rc = write_file_atomic(j->dir, "journal", all, sizeof MAGIC + an + bn, NULL, 0);
+        if (d) memcpy(all + sizeof MAGIC + an + bn, d, dn);
+        rc = write_file_atomic(j->dir, "journal", all, total, NULL, 0);
     }
     if (rc == 0) {
         close(j->fd);
         path_in(j->dir, "journal", p, sizeof p);
         j->fd = open(p, O_WRONLY | O_APPEND);
         if (j->fd < 0) rc = -errno;
-        else j->len = sizeof MAGIC + an + bn;
+        else j->len = total;
     }
     free(a);
     free(b);
+    free(d);
     free(all);
     return rc;
 }
@@ -239,10 +265,16 @@ void ava1_job_dir(const char *jobs_dir, const uint8_t job_id[16], char *out, siz
 }
 
 static int rm_tree(const char *p) {
-    DIR *d = opendir(p);
+    DIR *d;
     struct dirent *e;
+    struct stat st;
     char q[1100];
-    if (!d) return unlink(p) == 0 ? 0 : -errno;
+    /* lstat, not stat: a symlink is removed, never followed — Rust's remove_dir_all has
+     * the same rule, and following one here would delete a tree outside the job dir. */
+    if (lstat(p, &st) != 0) return -errno;
+    if (!S_ISDIR(st.st_mode)) return unlink(p) == 0 ? 0 : -errno;
+    d = opendir(p);
+    if (!d) return -errno;
     while ((e = readdir(d)) != NULL) {
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
         snprintf(q, sizeof q, "%s/%s", p, e->d_name);

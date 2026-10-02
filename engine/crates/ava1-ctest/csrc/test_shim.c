@@ -591,3 +591,17 @@ int ava1_test_journal_write_sample(const char *dir) {
     ava1_jnl_close(&j);
     return rc;
 }
+
+/* Test-only: compacts the journal at `dir` with bodies the Rust test built, so the C
+ * compaction's byte layout and its Done-preservation are judged by the Rust reader.
+ * Returns 0 or a negative error. */
+int ava1_test_journal_compact(const char *dir, const uint8_t *open_b, size_t open_n,
+                              const uint8_t *snap_b, size_t snap_n, const uint8_t *done_b,
+                              size_t done_n) {
+    ava1_jnl_t j;
+    int rc = ava1_jnl_open(&j, dir, NULL, NULL);
+    if (rc != 0) return rc;
+    rc = ava1_jnl_compact(&j, open_b, open_n, snap_b, snap_n, done_b, done_n);
+    ava1_jnl_close(&j);
+    return rc;
+}

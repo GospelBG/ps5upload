@@ -30,8 +30,12 @@ typedef int (*ava1_jnl_visit_fn)(void *ctx, uint8_t kind, const uint8_t *body, s
 int ava1_jnl_create(ava1_jnl_t *j, const char *dir, const ava1_jnl_open_t *o);
 int ava1_jnl_open(ava1_jnl_t *j, const char *dir, ava1_jnl_visit_fn visit, void *ctx);
 int ava1_jnl_append(ava1_jnl_t *j, uint8_t kind, const uint8_t *body, size_t len); /* + fsync */
+/* Rewrites the journal as Open ‖ Snapshot ‖ Done. The snapshot carries no terminal
+ * status, so pass the Done body (or NULL, 0 when the job is unfinished) — a compaction
+ * must never lose state. */
 int ava1_jnl_compact(ava1_jnl_t *j, const uint8_t *open_body, size_t open_len,
-                     const uint8_t *snap_body, size_t snap_len);
+                     const uint8_t *snap_body, size_t snap_len,
+                     const uint8_t *done_body, size_t done_len);
 void ava1_jnl_close(ava1_jnl_t *j);
 int ava1_manifest_file_write(const char *dir, const uint8_t *blob, size_t len);
 int ava1_manifest_file_read(const char *dir, uint8_t **blob, size_t *len); /* malloc'd */

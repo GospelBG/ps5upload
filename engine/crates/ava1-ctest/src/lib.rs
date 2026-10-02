@@ -234,6 +234,15 @@ pub mod ffi {
         ) -> usize;
         pub fn ava1_test_journal_dump(dir: *const c_char, out: *mut u8, cap: usize) -> usize;
         pub fn ava1_test_journal_write_sample(dir: *const c_char) -> c_int;
+        pub fn ava1_test_journal_compact(
+            dir: *const c_char,
+            open: *const u8,
+            open_len: usize,
+            snap: *const u8,
+            snap_len: usize,
+            done: *const u8,
+            done_len: usize,
+        ) -> c_int;
         pub fn ava1_test_bits_runs(
             n: u32,
             set: *const u32,
@@ -634,4 +643,22 @@ pub fn c_journal_dump(dir: &Path) -> String {
 pub fn c_journal_write_sample(dir: &Path) -> i32 {
     let d = CString::new(dir.to_str().unwrap()).unwrap();
     unsafe { ffi::ava1_test_journal_write_sample(d.as_ptr()) }
+}
+
+/// Compacts the journal at `dir` with the C writer; `done` is None for an unfinished
+/// job. 0 or a negative error.
+pub fn c_journal_compact(dir: &Path, open: &[u8], snap: &[u8], done: Option<&[u8]>) -> i32 {
+    let d = CString::new(dir.to_str().unwrap()).unwrap();
+    let (dp, dn) = done.map_or((std::ptr::null(), 0), |b| (b.as_ptr(), b.len()));
+    unsafe {
+        ffi::ava1_test_journal_compact(
+            d.as_ptr(),
+            open.as_ptr(),
+            open.len(),
+            snap.as_ptr(),
+            snap.len(),
+            dp,
+            dn,
+        )
+    }
 }

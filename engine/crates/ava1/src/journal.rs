@@ -165,17 +165,27 @@ impl Journal {
         let (k, b) = r.encode()?;
         let fr = frame(k, &b);
         self.f.write_all(&fr)?;
-        self.f.sync_data()?;
+        // sync_all, not sync_data: GC reads the journal's mtime as its age source, and
+        // fdatasync does not flush an mtime — after a crash a long-lived journal could
+        // look days older than it is and be collected.
+        self.f.sync_all()?;
         self.len += fr.len() as u64;
         Ok(())
     }
 
-    pub fn compact(&mut self, open: &JnlOpen, snap: &JnlSnapshot) -> io::Result<()> {
+    /// Rewrites the journal as Open ‖ Snapshot ‖ Done. The snapshot carries no terminal
+    /// status, so a compaction of a finished job would lose it; the Done record is
+    /// written back for exactly that reason (SPEC.md §14.2 — compaction loses nothing).
+    pub fn compact(&mut self, open: &JnlOpen, st: &State) -> io::Result<()> {
         let mut all = MAGIC.to_vec();
         let (k, b) = Record::Open(open.clone()).encode()?;
         all.extend(frame(k, &b));
-        let (k, b) = Record::Snapshot(snap.clone()).encode()?;
+        let (k, b) = Record::Snapshot(st.snapshot()).encode()?;
         all.extend(frame(k, &b));
+        if let Some(status) = st.finished {
+            let (k, b) = Record::Done(status).encode()?;
+            all.extend(frame(k, &b));
+        }
         let tmp = self.dir.join("journal.tmp");
         {
             let mut f = File::create(&tmp)?;
@@ -491,16 +501,37 @@ mod tests {
             i += 1;
             assert!(i < 10_000, "the journal never crossed COMPACT_AT");
         }
-        j.compact(&open_rec(), &st.snapshot()).unwrap();
+        // A finished job compacts too: the snapshot carries no status, so if compact did
+        // not write the Done record back the terminal state would vanish on replay.
+        let done = Record::Done(7);
+        st.apply(&done);
+        j.append(&done).unwrap();
+        // And the compared state holds a range and a root, so the equality below is not
+        // vacuous about the snapshot's two records fields.
+        let extra = Record::Batch(JnlBatch {
+            ranges: vec![crate::gen::FileRange {
+                file_id: 9,
+                offset: 0,
+                len: 1 << 20,
+            }],
+            roots: vec![RootItem {
+                file_id: 9,
+                root: [0x5a; 32],
+            }],
+            ..Default::default()
+        });
+        st.apply(&extra);
+        j.append(&extra).unwrap();
+        j.compact(&open_rec(), &st).unwrap();
         assert!(j.len() < 1024);
         drop(j);
         let (_, recs) = Journal::open(&d).unwrap();
-        assert_eq!(recs.len(), 2); // open + snapshot
+        assert_eq!(recs.len(), 3); // open + snapshot + done
         let mut st2 = State::default();
         for r in &recs {
             st2.apply(r);
         }
-        assert_eq!(st2.done, st.done);
+        assert_eq!(st2, st, "a compaction must lose no state");
     }
 
     #[test]
