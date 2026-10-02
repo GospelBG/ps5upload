@@ -278,10 +278,14 @@ struct Sched {
     stalls: u32,
 }
 
-/// A stall every lane agrees on: frames are queued, none fits the window. When it
-/// persists — nothing sent, Received or credited anywhere — the receiver is applying
-/// nothing and will grant nothing, so the control loop fails the job loudly instead of
-/// parking it forever (I2).
+/// A genuine credit stall: frames are queued and the window cannot hold the smallest
+/// one, so no lane can send anything until the receiver grants Credit. When it persists
+/// — nothing sent, Received or credited anywhere — the receiver is applying nothing and
+/// will grant nothing, so the control loop fails the job loudly instead of parking it
+/// forever (I2). A lane that is blocked only by its own in-flight cap — a frame it sent
+/// larger than its cap, or a frame charged before its rate warmed — is ordinary
+/// backpressure and never marks a stall: the `Received` for those bytes unblocks the
+/// lane by itself.
 #[derive(Clone, Copy)]
 struct Stall {
     since: Instant,
@@ -301,7 +305,9 @@ struct Shared {
     /// Read-ahead, in KiB permits: readers acquire before reading, frames carry the
     /// permit until they are finally dropped.
     bytes_budget: Arc<Semaphore>,
-    /// The lanes' credit stall (I2), cleared by any send, Received or Credit.
+    /// The lanes' credit stall (I2): recorded when the window cannot hold the smallest
+    /// queued frame, cleared by any progress (a send, Received or Credit) or by a
+    /// re-check that finds the smallest queued frame fits the window again.
     stall: Mutex<Option<Stall>>,
 }
 
@@ -663,8 +669,9 @@ fn chunk_frame(
 /// then the governor's class preference). I2: `can_send` judges exactly the frame that
 /// leaves the queue — but a front frame that does not fit no longer blocks the frames
 /// behind it (the head-of-line credit stall): the scan skips it and takes a later one
-/// that fits. `None` with a non-empty queue means nothing fits at all (the caller
-/// records the stall).
+/// that fits. `None` with a non-empty queue means nothing fits this lane at all — the
+/// caller tells the window's reason (credit) from the lane's own in-flight cap and
+/// records a stall only for the former.
 fn pick_any(s: &mut Sched, lane: u16, w: &Window, cap: u64) -> Option<OutFrame> {
     let fits = |f: &OutFrame| w.can_send(lane, f.body.len() as u64, cap);
     if !s.requeue.is_empty() {
@@ -689,6 +696,19 @@ fn pick_any(s: &mut Sched, lane: u16, w: &Window, cap: u64) -> Option<OutFrame> 
         }
     }
     None
+}
+
+/// The smallest queued frame's body length, or `None` when no frame is queued. The
+/// stall rule (I2) compares this against the window: a frame the window cannot hold
+/// means no lane can send anything (a credit stall); one that fits the window but not
+/// a lane's in-flight cap is that lane's backpressure, never a stall.
+fn smallest_queued(s: &Sched) -> Option<u64> {
+    s.requeue
+        .iter()
+        .chain(s.bundles.iter())
+        .chain(s.chunks.iter())
+        .map(|f| f.body.len() as u64)
+        .min()
 }
 
 /// One tick's lane-rate update: EWMA-smoothed bytes/s per lane, from the raw bytes acked
@@ -744,28 +764,35 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
                     let pending =
                         !s.requeue.is_empty() || !s.bundles.is_empty() || !s.chunks.is_empty();
                     if pending {
-                        s.credit_starved = true;
-                        // I2: nothing fits. When this persists with no send, Received or
-                        // Credit anywhere, the receiver is applying nothing and will grant
-                        // nothing — the control loop fails the job loudly instead of
-                        // parking it forever. Record the window and the smallest queued
-                        // frame once (progress clears it; the earliest mark wins).
                         let grant = w.available();
-                        let smallest = s
-                            .requeue
-                            .iter()
-                            .chain(s.bundles.iter())
-                            .chain(s.chunks.iter())
-                            .map(|f| f.body.len() as u64)
-                            .min()
-                            .unwrap_or(0);
+                        let smallest = smallest_queued(&s).unwrap_or(0);
                         let mut stall = sh.stall.lock().unwrap();
-                        if stall.is_none() {
-                            *stall = Some(Stall {
-                                since: Instant::now(),
-                                grant,
-                                smallest,
-                            });
+                        if smallest > grant {
+                            // I2: a genuine credit stall — the window cannot hold the
+                            // smallest queued frame, so nothing can be sent on any lane
+                            // until the receiver grants Credit. When that persists with
+                            // no send, Received or Credit anywhere, the receiver is
+                            // applying nothing and will grant nothing — the control loop
+                            // fails the job loudly instead of parking it forever. Record
+                            // the window and the smallest queued frame once (progress
+                            // clears it; the earliest mark wins).
+                            s.credit_starved = true;
+                            if stall.is_none() {
+                                *stall = Some(Stall {
+                                    since: Instant::now(),
+                                    grant,
+                                    smallest,
+                                });
+                            }
+                        } else {
+                            // The smallest frame fits the window but not this lane's
+                            // in-flight cap (a frame larger than the cap, or charged
+                            // before its rate warmed): ordinary per-lane backpressure.
+                            // The Received for those bytes — or another lane's send —
+                            // moves the job by itself; it must never mark a stall, and
+                            // a stale mark from a window that has since changed is
+                            // cleared here.
+                            *stall = None;
                         }
                     } else {
                         s.source_starved = true;
@@ -986,8 +1013,7 @@ pub async fn run_upload(
                 Some(Inbound::Lane { .. }) => {} // an uploader receives nothing on lanes
                 Some(Inbound::Control(f)) => match f.ty {
                     Received::TYPE => match f.decode::<Received>() {
-                        Ok(r) => {
-                            let got = sh.window.lock().unwrap().received(r.seq);
+                        Ok(r) => {                            let got = sh.window.lock().unwrap().received(r.seq);
                             let mut s = sh.sched.lock().unwrap();
                             if let (Some(len), Some((lane, fr))) = (got, s.inflight.remove(&r.seq)) {
                                 if fr.class == Class::Bundle {
@@ -1007,8 +1033,7 @@ pub async fn run_upload(
                         Err(e) => break Err(SendError::Protocol(e.to_string())),
                     },
                     Credit::TYPE => match f.decode::<Credit>() {
-                        Ok(c) => {
-                            sh.window.lock().unwrap().credit(c.bytes);
+                        Ok(c) => {                            sh.window.lock().unwrap().credit(c.bytes);
                             *sh.stall.lock().unwrap() = None; // the window moved: not a deadlock
                             sh.wake();
                         }
@@ -1687,6 +1712,151 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), h)
             .await
             .expect("the lane task did not stop")
+            .unwrap();
+    }
+
+    /// A lane task over an in-memory pipe with a custom window: the task, the shared
+    /// state, what the peer reads off the wire, and the stop flag. The caller keeps the
+    /// `Link` alive for the connection.
+    type LaneHarness = (
+        tokio::task::JoinHandle<()>,
+        Arc<Shared>,
+        tokio::sync::mpsc::UnboundedReceiver<Result<u32, ()>>,
+        Arc<AtomicBool>,
+        crate::link::Link,
+    );
+
+    fn lane_harness(credit: u64, chunk: u32) -> LaneHarness {
+        let timing = Timing {
+            ping_every: Duration::from_secs(3600),
+            dead_after: Duration::from_secs(3600),
+            handshake: Duration::from_secs(1),
+            min_frame_rate: crate::link::MIN_FRAME_RATE,
+        };
+        let (a, b) = duplex(1 << 20);
+        let (ar, aw) = split(a);
+        let (tx, _rx) = mpsc::channel(crate::link::DELIVER_DEPTH);
+        let (link, outbox) =
+            crate::link::drive(FrameReader::new(ar), FrameWriter::new(aw), timing, tx);
+        let mut peer = FrameReader::new(b);
+        peer.set_max_body(crate::frame::MAX_BODY);
+        let (drain_tx, drain_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok(f) = peer.recv().await {
+                // Only lane data frames count: the link's heartbeat Ping (channel 0)
+                // lands here too, and it is not a send.
+                if is_data_type(f.ty) {
+                    let _ = drain_tx.send(Ok(f.channel));
+                }
+            }
+            let _ = drain_tx.send(Err(()));
+        });
+        let router = Arc::new(Router::default());
+        router.lane_up(1, outbox);
+        let sh = Arc::new(Shared {
+            sched: Mutex::new(Sched {
+                floor: 4,
+                decision: Some(governor::Decision {
+                    lanes: 1,
+                    chunk: 4 << 20,
+                    bundle: 1 << 20,
+                    bottleneck: gen::BN_NETWORK,
+                    mode: Mode::StreamOnly,
+                    prefer: Class::Stream,
+                    sequential: false,
+                }),
+                ..Default::default()
+            }),
+            window: Mutex::new(Window::new(credit)),
+            wake_tx: watch::channel(0).0,
+            chunk: AtomicU32::new(chunk),
+            bundle: AtomicU32::new(governor::START_BUNDLE),
+            bytes_budget: Arc::new(Semaphore::new(READ_AHEAD_KIB as usize)),
+            stall: Mutex::new(None),
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = tokio::spawn(lane_task(
+            router.lane(1).unwrap(),
+            sh.clone(),
+            None,
+            stop.clone(),
+        ));
+        (h, sh, drain_rx, stop, link)
+    }
+
+    #[tokio::test]
+    async fn a_lane_blocked_by_its_inflight_cap_is_backpressure_never_a_stall() {
+        // Fix round 2: `can_send`'s in-flight cap clause is per-lane backpressure. A lane
+        // that sent a frame larger than its cap (or charged one before its rate warmed)
+        // can send nothing further until the `Received` for those bytes arrives — the job
+        // resumes by itself. The stall detector must never mark that: the tick would fail
+        // a healthy job at STALL_FATAL.
+        let (h, sh, mut wire, stop, _link) = lane_harness(16 << 20, governor::START_CHUNK);
+        // 8 MiB in flight on lane 1 (a frame charged before the rate warmed), 8 MiB of the
+        // window left, and a queued frame that fits the window but not the cap: the lane's
+        // rate is still 0, so `cap = chunk = 4 MiB < 8 MiB + the frame`.
+        assert!(sh.window.lock().unwrap().sent(1, 77, 8 << 20));
+        sh.sched
+            .lock()
+            .unwrap()
+            .chunks
+            .push_back(test_frame(Chunk::TYPE, 1 << 20));
+        sh.wake();
+        // The lane gets every chance to (wrongly) mark the stall: nothing fits the cap.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            sh.stall.lock().unwrap().is_none(),
+            "a lane blocked by its in-flight cap marked a fatal stall"
+        );
+        let got = wire.try_recv();
+        assert!(got.is_err(), "the cap-blocked lane sent a frame: {got:?}");
+        // The Received for the charged bytes alone (no Credit) unblocks the lane, which
+        // then sends the queued frame — the job resumes by itself.
+        assert_eq!(sh.window.lock().unwrap().received(77), Some(8 << 20));
+        sh.wake();
+        tokio::time::timeout(Duration::from_secs(5), wire.recv())
+            .await
+            .expect("the lane resumed once the Received arrived")
+            .expect("a frame arrived")
+            .expect("the wire carried a frame");
+        stop.store(true, Ordering::Relaxed);
+        sh.wake();
+        tokio::time::timeout(Duration::from_secs(1), h)
+            .await
+            .expect("the lane task stopped")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_frame_the_window_cannot_hold_marks_a_credit_stall() {
+        // The detector's real case: the smallest queued frame is larger than the whole
+        // window, so nothing can be sent on any lane until the receiver grants Credit.
+        // That — and only that — records the stall the control loop's tick fails on.
+        let (h, sh, _wire, stop, _link) = lane_harness(512 << 10, governor::START_CHUNK);
+        sh.sched
+            .lock()
+            .unwrap()
+            .chunks
+            .push_back(test_frame(Chunk::TYPE, 1 << 20)); // one group + the header
+        sh.wake();
+        let st = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let st = *sh.stall.lock().unwrap();
+                if let Some(st) = st {
+                    return st;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the credit stall was recorded within the bound");
+        assert_eq!(st.grant, 512 << 10);
+        assert!(st.smallest >= 1 << 20, "smallest: {}", st.smallest);
+        stop.store(true, Ordering::Relaxed);
+        sh.wake();
+        tokio::time::timeout(Duration::from_secs(1), h)
+            .await
+            .expect("the lane task stopped")
             .unwrap();
     }
 
