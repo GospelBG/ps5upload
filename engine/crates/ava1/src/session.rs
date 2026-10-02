@@ -177,7 +177,7 @@ pub async fn connect_expecting(
                     let _ = tx.send(f);
                 }
             } else if is_data_type(f.ty) {
-                let _ = r2.route_control(f); // a late frame for a finished job is dropped
+                let _ = r2.route_control(f).await; // a late frame for a finished job is dropped
             }
         }
         p2.lock().unwrap().clear();
@@ -464,7 +464,7 @@ impl Joiner {
         tokio::spawn(async move {
             while let Some(f) = rx.recv().await {
                 if is_data_type(f.ty) {
-                    router.route_lane(id, f);
+                    router.route_lane(id, f).await;
                 }
             }
             router.lane_down(id, gen_no);

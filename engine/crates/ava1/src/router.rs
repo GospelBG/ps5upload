@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::conn::Frame;
 use crate::frame::FLAG_IGNORABLE;
-use crate::link::Outbox;
+use crate::link::{Outbox, DELIVER_DEPTH};
 use crate::wire::FrameMessage;
 use crate::Ava1Error;
 
@@ -38,6 +38,10 @@ pub enum Inbound {
 /// whole or not at all, so a caller that drops the future (a timeout, a `select!`)
 /// never leaves half a sealed frame on the wire, and a full queue (the peer not
 /// taking bytes) is the backpressure.
+///
+/// It is backpressure, not delivery: `Ok` means the frame is queued, and the queue
+/// drains when the writer gets to it. A job learns what really arrived from the peer
+/// (the acks `Received` and `Durable`), never from `Ok`.
 #[derive(Clone)]
 pub struct ConnTx {
     outbox: Outbox,
@@ -86,64 +90,157 @@ pub trait LaneOpener: Send + Sync {
 pub trait JobHost: Send + Sync {
     /// `first` is the JobOpen or Resume that created the job; `peer` is the static key
     /// of the device that sent it (a job is bound to it, SPEC.md §11.1).
+    ///
+    /// This runs on the session's control loop: spawn the job's own task and return, or
+    /// every RPC reply and every other job of that session waits behind it. Whatever the
+    /// job needs to do — walking a source tree, opening files — happens in that task.
     fn accept(&self, link: JobLink, first: Frame, peer: [u8; 32]);
+}
+
+/// One job's two channels. Frames ride a bounded channel so a job that stops reading
+/// slows the reader and the peer sees backpressure, instead of us growing a queue that
+/// holds whole 16 MiB frames; lifecycle events ride their own channel, which can never
+/// be full behind data because a lane change or a session end produces at most one.
+struct JobInbox {
+    data: mpsc::Sender<Inbound>,
+    events: mpsc::UnboundedSender<Inbound>,
+    /// This registration's identity, shared with its `Inbox` so a link can prove, when it
+    /// lets go, that it is still the current one. Deliberately not a sender clone: an
+    /// inbox holding its own sender would keep its channel open, so letting go of the
+    /// registration could never end `recv` — the channel must close with the router's copy.
+    id: Arc<()>,
+}
+
+/// What a job task reads: `Recv`'s items, events first.
+pub struct Inbox {
+    data: mpsc::Receiver<Inbound>,
+    events: mpsc::UnboundedReceiver<Inbound>,
+    id: Arc<()>,
+    events_done: bool,
+}
+
+impl Inbox {
+    /// `None` once the router has let go of this job and everything queued is read.
+    pub async fn recv(&mut self) -> Option<Inbound> {
+        // A `Closed` (or a lane change) behind a full data queue would be invisible, so
+        // events are drained first and never wait on data.
+        if let Ok(ev) = self.events.try_recv() {
+            return Some(ev);
+        }
+        loop {
+            if self.events_done {
+                return self.data.recv().await;
+            }
+            tokio::select! {
+                biased;
+                ev = self.events.recv() => match ev {
+                    Some(i) => return Some(i),
+                    None => self.events_done = true,
+                },
+                d = self.data.recv() => return d,
+            }
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct Router {
-    jobs: Mutex<HashMap<JobId, mpsc::UnboundedSender<Inbound>>>,
+    jobs: Mutex<HashMap<JobId, JobInbox>>,
     lanes: Mutex<BTreeMap<u16, LaneTx>>,
     next_gen: AtomicU64,
     closed: Mutex<Option<String>>,
 }
 
 impl Router {
-    /// A job's inbox. It first hears about lanes that are already up.
-    pub fn register(&self, job: JobId) -> mpsc::UnboundedReceiver<Inbound> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    /// A job's inbox. It first hears about lanes that are already up, and — if it is
+    /// registering over its own id (a retry, a resume) — the job it replaces hears why.
+    pub fn register(&self, job: JobId) -> Inbox {
+        let (data, rx) = mpsc::channel(DELIVER_DEPTH);
+        let (events, erx) = mpsc::unbounded_channel();
         if let Some(why) = self.closed.lock().unwrap().clone() {
-            let _ = tx.send(Inbound::Closed(why));
+            let _ = events.send(Inbound::Closed(why));
         }
-        for id in self.lanes.lock().unwrap().keys() {
-            let _ = tx.send(Inbound::LaneUp(*id));
+        // Lanes, then jobs — the same order every other method takes them, and both held
+        // across the snapshot and the insert so a lane that comes up now is either in the
+        // snapshot or in a broadcast that finds this inbox, never in neither.
+        let lanes = self.lanes.lock().unwrap();
+        for id in lanes.keys() {
+            let _ = events.send(Inbound::LaneUp(*id));
         }
-        self.jobs.lock().unwrap().insert(job, tx);
-        rx
+        let id = Arc::new(());
+        let inbox = JobInbox {
+            data,
+            events,
+            id: id.clone(),
+        };
+        let replaced = self.jobs.lock().unwrap().insert(job, inbox);
+        drop(lanes);
+        if let Some(old) = replaced {
+            // Dropping the old data sender ends its reader too; the event tells it why
+            // rather than leaving it to hang on a job that no longer exists.
+            let _ = old.events.send(Inbound::Closed("superseded".into()));
+        }
+        Inbox {
+            data: rx,
+            events: erx,
+            id,
+            events_done: false,
+        }
     }
 
-    pub fn unregister(&self, job: &JobId) {
-        self.jobs.lock().unwrap().remove(job);
+    /// Only the registration that is still current may unregister: a link that was
+    /// replaced (or a second one for the same id) leaves the newer one alone.
+    pub fn unregister(&self, job: &JobId, id: &Arc<()>) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if jobs.get(job).is_some_and(|i| Arc::ptr_eq(&i.id, id)) {
+            jobs.remove(job);
+        }
     }
 
     pub fn has_job(&self, job: &JobId) -> bool {
         self.jobs.lock().unwrap().contains_key(job)
     }
 
-    /// Gives the frame back when no job is registered for it (the caller decides).
-    pub fn route_control(&self, f: Frame) -> Option<Frame> {
+    /// Gives the frame back when no job is registered for it (the caller decides). Waits
+    /// for room in the job's bounded inbox, so a job that stops reading holds this reader
+    /// — and the connection's own queue behind it — rather than this side growing.
+    pub async fn route_control(&self, f: Frame) -> Option<Frame> {
         let job = job_of(&f)?;
-        let jobs = self.jobs.lock().unwrap();
-        match jobs.get(&job) {
-            Some(tx) => {
-                let _ = tx.send(Inbound::Control(f));
-                None
-            }
-            None => Some(f),
+        let Some(tx) = self.jobs.lock().unwrap().get(&job).map(|i| i.data.clone()) else {
+            return Some(f);
+        };
+        match tx.send(Inbound::Control(f)).await {
+            Ok(()) => None,
+            // The job let go between the lookup and the send: the caller decides again.
+            Err(e) => match e.0 {
+                Inbound::Control(f) => Some(f),
+                _ => None,
+            },
         }
     }
 
-    /// Lane frames for unknown jobs are dropped: credit only exists inside a job.
-    pub fn route_lane(&self, lane: u16, f: Frame) {
+    /// Lane frames for unknown jobs are dropped: credit only exists inside a job. Like
+    /// `route_control`, this waits for the job to make room.
+    pub async fn route_lane(&self, lane: u16, f: Frame) {
         if let Some(job) = job_of(&f) {
-            if let Some(tx) = self.jobs.lock().unwrap().get(&job) {
-                let _ = tx.send(Inbound::Lane { lane, frame: f });
+            let tx = self.jobs.lock().unwrap().get(&job).map(|i| i.data.clone());
+            if let Some(tx) = tx {
+                let _ = tx.send(Inbound::Lane { lane, frame: f }).await;
             }
         }
     }
 
     pub(crate) fn lane_up(&self, id: u16, outbox: Outbox) -> u64 {
         let gen = self.next_gen.fetch_add(1, Ordering::Relaxed) + 1;
-        self.lanes.lock().unwrap().insert(
+        // A lane that comes up as the session ends is nobody's: the job has already been
+        // told the session closed, and that message is terminal.
+        if self.closed.lock().unwrap().is_some() {
+            return gen;
+        }
+        // Lanes, then jobs (see `register`): the broadcast must not miss an inbox that is
+        // registering at this instant.
+        let mut lanes = self.lanes.lock().unwrap();
+        lanes.insert(
             id,
             LaneTx {
                 id,
@@ -152,21 +249,15 @@ impl Router {
             },
         );
         self.broadcast(|| Inbound::LaneUp(id));
+        drop(lanes);
         gen
     }
 
     /// Only the generation that came up is taken down (a lane id can be re-joined).
     pub(crate) fn lane_down(&self, id: u16, gen: u64) {
-        let removed = {
-            let mut l = self.lanes.lock().unwrap();
-            if l.get(&id).is_some_and(|t| t.gen == gen) {
-                l.remove(&id);
-                true
-            } else {
-                false
-            }
-        };
-        if removed {
+        let mut l = self.lanes.lock().unwrap();
+        if l.get(&id).is_some_and(|t| t.gen == gen) {
+            l.remove(&id);
             self.broadcast(|| Inbound::LaneDown(id));
         }
     }
@@ -187,21 +278,27 @@ impl Router {
             }
             *c = Some(why.to_string());
         }
-        self.lanes.lock().unwrap().clear();
+        let mut lanes = self.lanes.lock().unwrap();
+        lanes.clear();
         self.broadcast(|| Inbound::Closed(why.to_string()));
+        drop(lanes);
     }
 
+    /// Lifecycle events only: they go on the channel that is never full behind data.
     fn broadcast(&self, ev: impl Fn() -> Inbound) {
-        for tx in self.jobs.lock().unwrap().values() {
-            let _ = tx.send(ev());
+        for inbox in self.jobs.lock().unwrap().values() {
+            let _ = inbox.events.send(ev());
         }
     }
 }
 
 /// What a job task holds: its inbox, the control connection, and the session's lanes.
+/// `rx.recv()` yields the session's frames and its lifecycle events, events first; `None`
+/// means this job is over (the session closed, or another registration took the id) and
+/// nothing queued remains.
 pub struct JobLink {
     pub job_id: JobId,
-    pub rx: mpsc::UnboundedReceiver<Inbound>,
+    pub rx: Inbox,
     pub control: ConnTx,
     router: Arc<Router>,
     opener: Option<Arc<dyn LaneOpener>>,
@@ -239,6 +336,129 @@ impl JobLink {
 
 impl Drop for JobLink {
     fn drop(&mut self) {
-        self.router.unregister(&self.job_id);
+        self.router.unregister(&self.job_id, &self.rx.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conn::{FrameReader, FrameWriter};
+    use crate::session::Timing;
+    use tokio::io::{duplex, split};
+    use tokio::time::{timeout, Duration};
+
+    /// A lane frame for `job`: only the first 16 bytes matter to the router.
+    fn frame_for(job: JobId) -> Frame {
+        let mut body = vec![0u8; 32];
+        body[..16].copy_from_slice(&job);
+        Frame {
+            ty: crate::gen::Chunk::TYPE,
+            flags: 0,
+            channel: 0,
+            body,
+        }
+    }
+
+    /// A real `Outbox` (a duplex pipe with `drive` behind it), for the tests that need a
+    /// lane to come up.
+    fn outbox() -> Outbox {
+        let (a, _b) = duplex(4096);
+        let (r, w) = split(a);
+        let (tx, _rx) = mpsc::channel(1);
+        let (_link, outbox) = crate::link::drive(
+            FrameReader::new(r),
+            FrameWriter::new(w),
+            Timing::default(),
+            tx,
+        );
+        outbox
+    }
+
+    #[tokio::test]
+    async fn a_job_that_stops_reading_slows_the_router_instead_of_queueing_frames() {
+        // SPEC.md §12: every hop is bounded so a slow consumer pushes back to the sender.
+        // A job that stops reading must hold the reader, never grow a queue of frames.
+        let router = Router::default();
+        let mut inbox = router.register([7; 16]);
+        for _ in 0..DELIVER_DEPTH {
+            router.route_lane(1, frame_for([7; 16])).await;
+        }
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                router.route_lane(1, frame_for([7; 16]))
+            )
+            .await
+            .is_err(),
+            "the inbox held more than its bound"
+        );
+        // Reading again makes room, and the held frame lands.
+        assert!(matches!(inbox.recv().await, Some(Inbound::Lane { .. })));
+        assert!(
+            timeout(
+                Duration::from_secs(1),
+                router.route_lane(1, frame_for([7; 16]))
+            )
+            .await
+            .is_ok(),
+            "the router kept waiting after the job read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_inbox_still_hears_the_session_end() {
+        // Lifecycle events ride their own channel: a `Closed` behind 64 unread frames
+        // would leave a job waiting on a session that is gone.
+        let router = Router::default();
+        let mut inbox = router.register([8; 16]);
+        for _ in 0..DELIVER_DEPTH {
+            router.route_lane(1, frame_for([8; 16])).await;
+        }
+        router.close("done");
+        let ev = timeout(Duration::from_secs(1), inbox.recv())
+            .await
+            .expect("no event within 1 s");
+        assert!(matches!(ev, Some(Inbound::Closed(why)) if why == "done"));
+    }
+
+    #[tokio::test]
+    async fn a_second_registration_ends_the_first_and_a_stale_link_cannot_take_the_id() {
+        let router = Router::default();
+        let mut first = router.register([9; 16]);
+        let mut second = router.register([9; 16]);
+        let ev = timeout(Duration::from_secs(1), first.recv())
+            .await
+            .expect("no event within 1 s");
+        assert!(
+            matches!(ev, Some(Inbound::Closed(_))),
+            "the replaced job is told why"
+        );
+        assert!(first.recv().await.is_none(), "and then its channel ends");
+        // The old link letting go must not unregister the one that replaced it.
+        let stale = first.id.clone();
+        router.unregister(&[9; 16], &stale);
+        assert!(router.has_job(&[9; 16]), "a stale link took the id away");
+        router.route_lane(1, frame_for([9; 16])).await;
+        assert!(matches!(second.recv().await, Some(Inbound::Lane { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_lane_that_comes_up_as_the_session_ends_is_not_reported() {
+        let router = Router::default();
+        let mut inbox = router.register([10; 16]);
+        router.close("done");
+        let ev = timeout(Duration::from_secs(1), inbox.recv())
+            .await
+            .expect("no event within 1 s");
+        assert!(matches!(ev, Some(Inbound::Closed(_))));
+        router.lane_up(3, outbox());
+        assert!(router.lanes().is_empty(), "a closed router has no lanes");
+        assert!(
+            timeout(Duration::from_millis(100), inbox.recv())
+                .await
+                .is_err(),
+            "a lane came up after the session ended"
+        );
     }
 }

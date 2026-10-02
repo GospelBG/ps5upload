@@ -667,7 +667,7 @@ async fn control(
             t if is_data_type(t) => {
                 // A known job's frames were delivered by the router; what comes back is
                 // for no job at all.
-                if let Some(f) = entry.router.route_control(f) {
+                if let Some(f) = entry.router.route_control(f).await {
                     let opens = f.ty == gen::JobOpen::TYPE || f.ty == gen::Resume::TYPE;
                     if let (Some(host), true, Some(job), true) = (
                         &ctx.jobs,
@@ -789,15 +789,16 @@ async fn lane(
         .map_err(|_| Ava1Error::Timeout)??;
     r.set_key(keys::lane_key(&entry.keys.c2s, j.lane_id, &cn, &sn));
     w.set_key(keys::lane_key(&entry.keys.s2c, j.lane_id, &cn, &sn));
-    // Lane frames may be as large as the frame cap (16 MiB), not the control cap.
-    r.set_max_body(crate::frame::MAX_BODY);
     // A Join can be captured and sent again by someone who does not hold the session
     // keys. So this connection takes the lane over — ending an older connection of the
     // same lane id — only once its first sealed frame has opened under the new lane
-    // key. Until then the older connection is left alone.
+    // key. Until then the older connection is left alone, and its bodies stay capped at
+    // the control size: a forged Join must not buy a 16 MiB buffer per attempt.
     let proof = tokio::time::timeout_at(deadline, r.recv())
         .await
         .map_err(|_| Ava1Error::Timeout)??;
+    // Only now, with the lane key proven, may frames be as large as the frame cap.
+    r.set_max_body(crate::frame::MAX_BODY);
     let mut gen_no = 0;
     entry.lane_gen.send_modify(|g| {
         g[lane] += 1;
@@ -837,7 +838,7 @@ async fn lane(
             }
             Pong::TYPE => {}
             gen::Bye::TYPE | gen::Error::TYPE => break,
-            t if is_data_type(t) => entry.router.route_lane(j.lane_id, f),
+            t if is_data_type(t) => entry.router.route_lane(j.lane_id, f).await,
             _ if f.ignorable() => {}
             _ => {
                 refuse_on(&outbox, gen::ERR_PROTOCOL, "unexpected frame on a lane").await;
