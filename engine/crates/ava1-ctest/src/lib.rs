@@ -135,6 +135,12 @@ pub mod ffi {
         pub fn ava1_aead_allow_simd(allow: c_int);
     }
 
+    extern "C" {
+        pub fn ava1_b3_group_cv(data: *const u8, len: usize, index: u64, cv: *mut u8);
+        pub fn ava1_b3_root_from_cvs(cvs: *const [u8; 32], n: u64, root: *mut u8);
+        pub fn ava1_b3_hash(data: *const u8, len: usize, out: *mut u8);
+    }
+
     #[repr(C)]
     pub struct CPeer {
         pub key: [u8; 32],
@@ -289,6 +295,24 @@ pub fn c_header_decode(b: &[u8; 16]) -> Result<Header, i32> {
 
 pub fn c_utf8_valid(b: &[u8]) -> bool {
     unsafe { ffi::ava1_utf8_valid(b.as_ptr(), b.len()) != 0 }
+}
+
+pub fn c_b3_group_cv(d: &[u8], index: u64) -> [u8; 32] {
+    let mut cv = [0u8; 32];
+    unsafe { ffi::ava1_b3_group_cv(d.as_ptr(), d.len(), index, cv.as_mut_ptr()) };
+    cv
+}
+
+pub fn c_b3_root(cvs: &[[u8; 32]]) -> [u8; 32] {
+    let mut r = [0u8; 32];
+    unsafe { ffi::ava1_b3_root_from_cvs(cvs.as_ptr(), cvs.len() as u64, r.as_mut_ptr()) };
+    r
+}
+
+pub fn c_b3_hash(d: &[u8]) -> [u8; 32] {
+    let mut r = [0u8; 32];
+    unsafe { ffi::ava1_b3_hash(d.as_ptr(), d.len(), r.as_mut_ptr()) };
+    r
 }
 
 pub fn c_identity(secret: [u8; 32]) -> ffi::CIdentity {

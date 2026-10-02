@@ -197,6 +197,7 @@ version = "5.41.0"
 dependencies = [
  "ava1",
  "ava1-chaos",
+ "blake3",
  "cc",
  "serde_json",
  "tokio",

@@ -14,6 +14,23 @@ fn main() {
         .include(&mono)
         .warnings(false)
         .compile("ava1third");
+    let b3 = p.join("third_party/blake3");
+    // Portable only on the host: the x86 assembly and NEON paths are the payload's concern;
+    // the test pins the algorithm, and blake3_hash_many dispatches to the portable code.
+    cc::Build::new()
+        .files([
+            b3.join("blake3.c"),
+            b3.join("blake3_dispatch.c"),
+            b3.join("blake3_portable.c"),
+        ])
+        .define("BLAKE3_NO_SSE2", None)
+        .define("BLAKE3_NO_SSE41", None)
+        .define("BLAKE3_NO_AVX2", None)
+        .define("BLAKE3_NO_AVX512", None)
+        .define("BLAKE3_USE_NEON", "0")
+        .include(&b3)
+        .warnings(false)
+        .compile("ava1b3");
     cc::Build::new()
         .files([
             ava1.join("ava1_wire.c"),
@@ -25,6 +42,7 @@ fn main() {
             ava1.join("ava1_store.c"),
             ava1.join("ava1_server.c"),
             ava1.join("ava1_trust.c"),
+            ava1.join("ava1_b3.c"),
             ava1.join("platform_posix.c"),
             ava1.join("gen/ava1_gen.c"),
             here.join("csrc/sizes.c"),
@@ -34,6 +52,14 @@ fn main() {
         .include(&ava1)
         .include(ava1.join("gen"))
         .include(&mono)
+        .include(&b3)
+        // blake3_impl.h must see the same configuration in ava1_b3.c as in the
+        // ava1b3 build, whose blake3_hash_many it calls.
+        .define("BLAKE3_NO_SSE2", None)
+        .define("BLAKE3_NO_SSE41", None)
+        .define("BLAKE3_NO_AVX2", None)
+        .define("BLAKE3_NO_AVX512", None)
+        .define("BLAKE3_USE_NEON", "0")
         // Only for ps5_firmware.h, which the payload's AVA1 glue uses (node.info).
         .include(p.join("include"))
         .warnings(true)
@@ -57,6 +83,7 @@ fn main() {
     }
     println!("cargo:rerun-if-changed={}", ava1.display());
     println!("cargo:rerun-if-changed={}", mono.display());
+    println!("cargo:rerun-if-changed={}", b3.display());
     println!(
         "cargo:rerun-if-changed={}",
         p.join("include/ps5_firmware.h").display()
