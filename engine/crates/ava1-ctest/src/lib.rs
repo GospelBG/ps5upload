@@ -252,6 +252,16 @@ pub mod ffi {
         ) -> usize;
         pub fn ava1_wtune_init(t: *mut CTuneRaw, start: u8, min: u8, max: u8);
         pub fn ava1_wtune_step(t: *mut CTuneRaw, files_per_s: f64, backlog: c_int) -> u8;
+        pub fn ava1_test_mstore_pages(
+            pages: *const *const u8,
+            lens: *const usize,
+            n: usize,
+            hash: *mut u8,
+            count: *mut u32,
+            bytes: *mut u64,
+        ) -> c_int;
+        pub fn ava1_test_mstore_walk(root: *const c_char, hash: *mut u8, count: *mut u32) -> c_int;
+        pub fn ava1_test_thread_smoke(stack_bytes: *mut usize) -> c_int;
     }
 }
 
@@ -628,6 +638,42 @@ impl CTune {
     pub fn step(&mut self, rate: f64, backlog: bool) -> u8 {
         unsafe { ffi::ava1_wtune_step(&mut self.0, rate, backlog as c_int) }
     }
+}
+
+/// Rebuilds the C manifest store from the pages the Rust side encoded and reports
+/// the C store's hash, entry count and total bytes.
+pub fn c_mstore_from_pages(pages: &[Vec<u8>]) -> (i32, [u8; 32], u32, u64) {
+    let ptrs: Vec<*const u8> = pages.iter().map(|p| p.as_ptr()).collect();
+    let lens: Vec<usize> = pages.iter().map(|p| p.len()).collect();
+    let (mut h, mut n, mut b) = ([0u8; 32], 0u32, 0u64);
+    let rc = unsafe {
+        ffi::ava1_test_mstore_pages(
+            ptrs.as_ptr(),
+            lens.as_ptr(),
+            pages.len(),
+            h.as_mut_ptr(),
+            &mut n,
+            &mut b,
+        )
+    };
+    (rc, h, n, b)
+}
+
+/// Walks `root` with the C store and reports its hash and entry count.
+pub fn c_mstore_walk(root: &Path) -> (i32, [u8; 32], u32) {
+    let r = CString::new(root.to_str().unwrap()).unwrap();
+    let (mut h, mut n) = ([0u8; 32], 0u32);
+    let rc = unsafe { ffi::ava1_test_mstore_walk(r.as_ptr(), h.as_mut_ptr(), &mut n) };
+    (rc, h, n)
+}
+
+/// Starts a thread through ava1_thread_start; (rc, observed stack size in bytes).
+/// rc is 0 only when the 200 KiB frame survived and the observed stack is within
+/// [200 KiB, AVA1_THREAD_STACK + 4 KiB].
+pub fn c_thread_smoke() -> (i32, usize) {
+    let mut sz = 0usize;
+    let rc = unsafe { ffi::ava1_test_thread_smoke(&mut sz) };
+    (rc, sz)
 }
 
 /// The C replay of the journal at `dir`, as the text `c_style_dump` builds for the

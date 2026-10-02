@@ -12,8 +12,10 @@
 
 #include "ava1_gen.h"
 #include "ava1_journal.h"
+#include "ava1_manifest.h"
 #include "ava1_ranges.h"
 #include "ava1_server.h"
+#include "ava1_thread.h"
 
 static uint32_t g_pair_requests, g_last_code, g_logs;
 
@@ -604,4 +606,82 @@ int ava1_test_journal_compact(const char *dir, const uint8_t *open_b, size_t ope
     rc = ava1_jnl_compact(&j, open_b, open_n, snap_b, snap_n, done_b, done_n);
     ava1_jnl_close(&j);
     return rc;
+}
+
+/* ---------------------------------------------------------------------------
+ * The manifest store (ava1_manifest.c): decode the pages a Rust test encoded,
+ * or walk a real tree, and report the C store's hash, entry count and bytes.
+ */
+
+int ava1_test_mstore_pages(const uint8_t *const *pages, const size_t *lens, size_t n,
+                           uint8_t hash[32], uint32_t *count, uint64_t *bytes) {
+    ava1_mstore_t m;
+    size_t i;
+    int rc = 0;
+    memset(&m, 0, sizeof m);
+    for (i = 0; i < n && rc == 0; i++) {
+        ava1_manifest_page_t p;
+        rc = ava1_manifest_page_decode(pages[i], lens[i], &p);
+        if (rc == 0) rc = ava1_mstore_add_page(&m, &p);
+    }
+    ava1_mstore_hash(&m, hash);
+    *count = m.n;
+    *bytes = m.bytes;
+    ava1_mstore_free(&m);
+    return rc;
+}
+
+int ava1_test_mstore_walk(const char *root, uint8_t hash[32], uint32_t *count) {
+    ava1_mstore_t m;
+    int rc;
+    memset(&m, 0, sizeof m);
+    rc = ava1_mstore_walk(&m, root);
+    ava1_mstore_hash(&m, hash);
+    *count = m.n;
+    ava1_mstore_free(&m);
+    return rc;
+}
+
+/* ---------------------------------------------------------------------------
+ * ava1_thread_start: the mandated 256 KiB stacks (SPEC.md §15).
+ */
+
+static void *smoke(void *arg) {
+    volatile uint8_t big[200 * 1024]; /* more than the 64 KiB default-alike rules allow */
+    size_t sz = 0;
+#if defined(__APPLE__)
+    /* macOS pads the reported allocation (measured +12..20 KiB over the request);
+     * the smoke's ceiling allows that slack below, and the default 512 KiB stack
+     * still fails it. */
+    sz = pthread_get_stacksize_np(pthread_self());
+#else
+    {
+        pthread_attr_t a;
+        if (pthread_getattr_np(pthread_self(), &a) == 0) {
+            pthread_attr_getstacksize(&a, &sz);
+            pthread_attr_destroy(&a);
+        }
+    }
+#endif
+    big[0] = 1;
+    big[sizeof big - 1] = 2;
+    *(size_t *)arg = sz;
+    return (void *)(uintptr_t)(big[0] + big[sizeof big - 1] == 3 ? 0 : 1);
+}
+
+/* 0 only when the 200 KiB frame survived AND the observed stack is within
+ * [200 KiB, AVA1_THREAD_STACK + 4 KiB] — 64 KiB of ceiling on macOS, whose
+ * pthreads pad the reported allocation — the default pthread stack must not pass. */
+int ava1_test_thread_smoke(size_t *stack_bytes) {
+    pthread_t t;
+    void *ret = (void *)1;
+    size_t sz = 0, max = AVA1_THREAD_STACK + 4096u;
+#if defined(__APPLE__)
+    max = AVA1_THREAD_STACK + 64u * 1024u;
+#endif
+    if (ava1_thread_start(smoke, &sz, &t) != 0) return -2;
+    pthread_join(t, &ret);
+    *stack_bytes = sz;
+    if ((uintptr_t)ret != 0) return -1;
+    return (sz >= 200u * 1024u && sz <= max) ? 0 : -3;
 }
