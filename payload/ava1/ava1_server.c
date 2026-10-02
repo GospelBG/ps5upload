@@ -73,6 +73,9 @@ typedef struct {
      * control thread leaves, but no lane may join it and it is no longer counted. */
     int superseded;
     conn_t *members[MEMBERS];
+    /* The live connection per lane (lane 0 = control); each holds a reference
+     * (ava1_server_send/_post/_lanes). */
+    conn_t *conn[AVA1_MAX_LANES + 1];
 } sess_t;
 
 static struct {
@@ -310,10 +313,19 @@ static void sess_fill(int idx, conn_t *k, const uint8_t sid[16], const uint8_t c
 }
 
 static void sess_remove(int idx, const uint8_t sid[16]) {
+    conn_t *held[AVA1_MAX_LANES + 1];
+    int n = 0;
+    uint16_t l;
     pthread_mutex_lock(&mu);
-    if (S.sessions[idx].used && memcmp(S.sessions[idx].sid, sid, 16) == 0)
+    if (S.sessions[idx].used && memcmp(S.sessions[idx].sid, sid, 16) == 0) {
+        /* The lane threads each hold their own reference and withdraw it themselves;
+         * these are the registry's references, released after the slot is wiped. */
+        for (l = 0; l <= AVA1_MAX_LANES; l++)
+            if (S.sessions[idx].conn[l]) held[n++] = S.sessions[idx].conn[l];
         crypto_wipe(&S.sessions[idx], sizeof S.sessions[idx]);
+    }
     pthread_mutex_unlock(&mu);
+    while (n > 0) conn_put(held[--n]);
 }
 
 /* Caller holds mu. A live (not superseded) session. */
@@ -336,6 +348,92 @@ static int lane_current(int idx, const uint8_t sid[16], uint16_t lane, uint32_t 
     ok = sess_is_locked(idx, sid) && !S.sessions[idx].superseded && S.sessions[idx].lane_gen[lane] == gen;
     pthread_mutex_unlock(&mu);
     return ok;
+}
+
+static int is_data_type(uint8_t t) { return t >= 0x20 && t <= 0x3F; }
+
+/* Publishes `k` as the session's connection for `lane` (taking a reference). */
+static void conn_publish(int idx, const uint8_t sid[16], uint16_t lane, conn_t *k) {
+    conn_t *old = NULL;
+    if (lane > AVA1_MAX_LANES) return;
+    pthread_mutex_lock(&mu);
+    if (sess_is_locked(idx, sid)) {
+        old = S.sessions[idx].conn[lane];
+        S.sessions[idx].conn[lane] = k;
+        k->refs++;
+    }
+    pthread_mutex_unlock(&mu);
+    if (old) conn_put(old);
+}
+
+/* Withdraws `k` if it is still the published connection for `lane`. */
+static void conn_withdraw(int idx, const uint8_t sid[16], uint16_t lane, conn_t *k) {
+    int mine = 0;
+    if (lane > AVA1_MAX_LANES) return;
+    pthread_mutex_lock(&mu);
+    if (sess_is_locked(idx, sid) && S.sessions[idx].conn[lane] == k) {
+        S.sessions[idx].conn[lane] = NULL;
+        mine = 1;
+    }
+    pthread_mutex_unlock(&mu);
+    if (mine) conn_put(k);
+}
+
+/* A referenced connection for (sid, lane), or NULL. Release with conn_put. */
+static conn_t *conn_lookup(const uint8_t sid[16], uint16_t lane) {
+    conn_t *k = NULL;
+    int idx;
+    if (lane > AVA1_MAX_LANES) return NULL;
+    pthread_mutex_lock(&mu);
+    idx = sess_find_locked(sid);
+    if (idx >= 0 && S.sessions[idx].conn[lane]) {
+        k = S.sessions[idx].conn[lane];
+        k->refs++;
+    }
+    pthread_mutex_unlock(&mu);
+    return k;
+}
+
+int ava1_server_send(const uint8_t sid[16], uint16_t lane, uint8_t type, uint8_t flags, uint32_t channel,
+                     const uint8_t *body, size_t len) {
+    conn_t *k = conn_lookup(sid, lane);
+    int rc;
+    if (!k) return AVA1_E_CLOSED;
+    rc = ava1_conn_send_flags(&k->io, type, flags, channel, body, len);
+    conn_put(k);
+    return rc;
+}
+
+int ava1_server_send_frame(const uint8_t sid[16], uint16_t lane, uint8_t type, uint32_t channel, uint8_t *frame,
+                           size_t body_len) {
+    conn_t *k = conn_lookup(sid, lane);
+    int rc;
+    if (!k) return AVA1_E_CLOSED;
+    rc = ava1_conn_send_frame(&k->io, type, channel, frame, body_len);
+    conn_put(k);
+    return rc;
+}
+
+int ava1_server_post(const uint8_t sid[16], uint16_t lane, uint8_t type, uint8_t flags, uint32_t channel,
+                     const uint8_t *body, size_t len) {
+    conn_t *k = conn_lookup(sid, lane);
+    int rc;
+    if (!k) return AVA1_E_CLOSED;
+    rc = ava1_conn_post(&k->io, type, flags, channel, body, len);
+    conn_put(k);
+    return rc;
+}
+
+int ava1_server_lanes(const uint8_t sid[16], uint16_t out[AVA1_MAX_LANES]) {
+    int idx, n = 0;
+    uint16_t l;
+    pthread_mutex_lock(&mu);
+    idx = sess_find_locked(sid);
+    if (idx >= 0)
+        for (l = 1; l <= AVA1_MAX_LANES; l++)
+            if (S.sessions[idx].conn[l]) out[n++] = l;
+    pthread_mutex_unlock(&mu);
+    return n;
 }
 
 /* Caller holds mu. */
@@ -510,6 +608,17 @@ static int do_rpc(conn_t *k, int idx, const uint8_t sid[16], uint32_t ch, const 
 /* 0 = keep going; nonzero = close the connection. */
 static int handle_frame(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane, uint8_t type,
                         uint8_t flags, uint32_t ch, const uint8_t *body, size_t len) {
+    if (is_data_type(type)) {
+        int paired;
+        uint8_t peer[32];
+        if (lane != 0) return 0; /* lane data frames are handled in serve_loop */
+        pthread_mutex_lock(&mu);
+        paired = sess_is_locked(idx, sid) && S.sessions[idx].paired;
+        memcpy(peer, S.sessions[idx].peer_key, 32);
+        pthread_mutex_unlock(&mu);
+        if (!paired || !S.cfg.data || !S.cfg.data->on_control) return 0;
+        return S.cfg.data->on_control(sid, peer, type, flags, body, len) != 0;
+    }
     switch (type) {
     case AVA1_TYPE_PING: {
         ava1_ping_t p;
@@ -602,11 +711,26 @@ static void serve_loop(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane,
     k->io.tick_arg = &x;
     k->io.tick_ms = S.cfg.ping_every_ms;
     while (serve_tick(&x) == 0) {
-        uint8_t type, flags;
-        uint32_t ch;
-        size_t len;
-        if (ava1_conn_recv(&k->io, &type, &flags, &ch, buf, CTRL_MAX - AVA1_TAG_LEN, &len) != 0) break;
-        if (handle_frame(k, idx, sid, lane, type, flags, ch, buf, len) != 0) break;
+        ava1_header_t h;
+        size_t blen;
+        uint8_t *heap = NULL;
+        if (ava1_conn_recv_header(&k->io, &h, &blen) != 0) break;
+        if (lane != 0 && is_data_type(h.type)) {
+            /* A lane data frame's body never touches the 64 KiB control buffer: it is
+             * admitted against credit, read into its own heap buffer and handed over. */
+            const ava1_data_hooks_t *dh = S.cfg.data;
+            if (!dh || !dh->admit || !dh->on_lane || dh->admit(sid, lane, blen) != 0) break;
+            heap = malloc(blen ? blen : 1);
+            if (!heap || ava1_conn_recv_body(&k->io, heap, blen) != 0) {
+                free(heap);
+                dh->on_lane(sid, lane, h.type, h.channel, NULL, blen);
+                break;
+            }
+            if (dh->on_lane(sid, lane, h.type, h.channel, heap, blen) != 0) break;
+            continue;
+        }
+        if (blen > CTRL_MAX || ava1_conn_recv_body(&k->io, buf, blen) != 0) break;
+        if (handle_frame(k, idx, sid, lane, h.type, h.flags, h.channel, buf, blen) != 0) break;
     }
     k->io.tick = NULL;
 }
@@ -672,6 +796,7 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     }
     memset(&si, 0, sizeof si);
     si.version = AVA1_PROTOCOL_VERSION;
+    si.caps = S.cfg.caps;
     memcpy(si.session_id, sid, 16);
     si.has_name = 1;
     si.name = (const uint8_t *)S.cfg.name;
@@ -734,7 +859,10 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
         pthread_mutex_unlock(&mu);
     }
     if (notify && S.cfg.on_pair_request) S.cfg.on_pair_request(peer_name, ava1_pairing_code(ns.h));
+    conn_publish(idx, sid, 0, k);
     serve_loop(k, idx, sid, 0, 0, buf);
+    if (S.cfg.data && S.cfg.data->on_session_end) S.cfg.data->on_session_end(sid);
+    conn_withdraw(idx, sid, 0, k);
     sess_remove(idx, sid);
 out:
     if (!filled) sess_release(idx);
@@ -813,8 +941,13 @@ static void run_lane(conn_t *k, uint8_t *buf, size_t len) {
         paired = 0;
     }
     pthread_mutex_unlock(&mu);
-    if (paired && handle_frame(k, idx, j.session_id, j.lane_id, type, flags, ch, buf, len) == 0)
+    if (paired && handle_frame(k, idx, j.session_id, j.lane_id, type, flags, ch, buf, len) == 0) {
+        conn_publish(idx, j.session_id, j.lane_id, k);
+        if (S.cfg.data && S.cfg.data->on_lane_change) S.cfg.data->on_lane_change(j.session_id, j.lane_id, 1);
         serve_loop(k, idx, j.session_id, j.lane_id, gen, buf);
+        conn_withdraw(idx, j.session_id, j.lane_id, k);
+        if (S.cfg.data && S.cfg.data->on_lane_change) S.cfg.data->on_lane_change(j.session_id, j.lane_id, 0);
+    }
 wipe:
     crypto_wipe(expect, sizeof expect);
     crypto_wipe(c2s, sizeof c2s);

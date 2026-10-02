@@ -175,6 +175,18 @@ pub mod ffi {
             peers_path: *const c_char,
             opts: *const TestOpts,
         ) -> c_int;
+        /// The C server with the echo data hooks (test_shim.c).
+        pub fn ava1_test_server_start_echo(
+            secret: *const u8,
+            peers_path: *const c_char,
+            ping_ms: u32,
+            dead_ms: u32,
+            handshake_ms: u32,
+        ) -> c_int;
+        /// ava1_conn_post's bounded queue (test_shim.c): fill it while the writer
+        /// cannot drain, read every frame back whole and in order, then check the
+        /// bound refuses with AVA1_E_BUSY and breaks the connection. 0 = ok.
+        pub fn ava1_test_post_queue(key: *const u8) -> c_int;
         pub fn ava1_test_sizeof_opts() -> usize;
         pub fn ava1_test_pair_requests() -> u32;
         pub fn ava1_test_last_pair_code() -> u32;
@@ -419,6 +431,26 @@ impl CServer {
         }
     }
 
+    /// The C server with the echo data hooks (test_shim.c).
+    pub fn start_echo(
+        secret: [u8; 32],
+        peers_path: &Path,
+        ping_ms: u32,
+        dead_ms: u32,
+        hs_ms: u32,
+    ) -> Self {
+        let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        let p = CString::new(peers_path.to_str().unwrap()).unwrap();
+        let rc = unsafe {
+            ffi::ava1_test_server_start_echo(secret.as_ptr(), p.as_ptr(), ping_ms, dead_ms, hs_ms)
+        };
+        assert!(rc > 0, "C server failed to start: {rc}");
+        CServer {
+            port: rc as u16,
+            _lock: lock,
+        }
+    }
+
     pub fn addr(&self) -> String {
         format!("127.0.0.1:{}", self.port)
     }
@@ -493,4 +525,11 @@ pub fn c_peers_load(path: &Path, key: &[u8; 32]) -> (i32, bool) {
         let ps = ps.assume_init_ref();
         (ps.n, ffi::ava1_peers_contains(ps, key.as_ptr()) != 0)
     }
+}
+
+/// ava1_conn_post's bounded queue (test_shim.c): fills it while the writer cannot
+/// drain, reads every frame back whole and in order, then checks the bound refuses
+/// with AVA1_E_BUSY and breaks the connection. 0 = ok, negative = which check failed.
+pub fn c_post_queue(key: [u8; 32]) -> i32 {
+    unsafe { ffi::ava1_test_post_queue(key.as_ptr()) }
 }

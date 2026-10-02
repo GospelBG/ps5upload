@@ -6,7 +6,27 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "ava1_gen.h"
 #include "ava1_keys.h"
+
+/* The data layer's view of the server (SPEC.md §12). Hooks run on a connection's reader
+ * thread and must not block. */
+typedef struct {
+    /* A data-plane frame on the control connection of a paired session. Body borrowed. */
+    int (*on_control)(const uint8_t sid[16], const uint8_t peer[32], uint8_t type, uint8_t flags,
+                      const uint8_t *body, size_t len);
+    /* Before reading a lane data frame's body: reserve `len` bytes (credit). Nonzero
+     * refuses the frame and closes the lane. */
+    int (*admit)(const uint8_t sid[16], uint16_t lane, size_t len);
+    /* A lane data frame. Takes ownership of `body` (free with free()). body == NULL means
+     * the admitted frame never arrived: release its reservation. Nonzero closes the lane. */
+    int (*on_lane)(const uint8_t sid[16], uint16_t lane, uint8_t type, uint32_t seq, uint8_t *body,
+                   size_t len);
+    /* A lane joined (up = 1) or ended (up = 0). */
+    void (*on_lane_change)(const uint8_t sid[16], uint16_t lane, int up);
+    /* The control connection ended: park the session's jobs. */
+    void (*on_session_end)(const uint8_t sid[16]);
+} ava1_data_hooks_t;
 
 typedef struct ava1_server_cfg {
     uint16_t port;              /* 0 = any free port (tests) */
@@ -42,6 +62,9 @@ typedef struct ava1_server_cfg {
     /* Runs on a worker thread. Returns an AVA1 status; writes the body to out. */
     int (*rpc)(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap,
                size_t *out_len);
+    /* NULL: data-plane frames are ignored and CAP_DATA_PLANE is not advertised. */
+    const ava1_data_hooks_t *data;
+    uint64_t caps; /* advertised in ServerInfo */
 } ava1_server_cfg_t;
 
 /* 0, or a negative errno. Waits up to 5 s for an earlier server's connections to end. */
@@ -52,5 +75,21 @@ int ava1_server_pairing_open(void);
 int ava1_server_conns(void);
 /* Stops accepting; open connections notice within one ping interval. */
 void ava1_server_stop(void);
+
+/* The waiting send, for job threads, workers and lane writers: returns when the frame
+ * is written. AVA1_E_CLOSED when the session (or lane) is not live. */
+int ava1_server_send(const uint8_t sid[16], uint16_t lane, uint8_t type, uint8_t flags, uint32_t channel,
+                     const uint8_t *body, size_t len);
+/* Like ava1_server_send, but seals `frame` in place (header room ‖ body ‖ tag room)
+ * and writes it once: the send for large frames, which never copy the body. */
+int ava1_server_send_frame(const uint8_t sid[16], uint16_t lane, uint8_t type, uint32_t channel,
+                           uint8_t *frame, size_t body_len);
+/* The non-blocking send, for hooks (which run on reader threads): copies `body` onto
+ * the connection's bounded writer queue and returns at once. A full queue closes that
+ * connection and returns AVA1_E_BUSY. A hook never calls ava1_server_send. */
+int ava1_server_post(const uint8_t sid[16], uint16_t lane, uint8_t type, uint8_t flags, uint32_t channel,
+                     const uint8_t *body, size_t len);
+/* The ids of the session's live lanes (1..AVA1_MAX_LANES); returns how many. */
+int ava1_server_lanes(const uint8_t sid[16], uint16_t out[AVA1_MAX_LANES]);
 
 #endif

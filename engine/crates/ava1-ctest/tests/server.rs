@@ -497,7 +497,7 @@ async fn raw_session(addr: &str, me: &Identity) -> (RawR, RawW) {
     let stream = sock.connect(addr.parse().unwrap()).await.unwrap();
     let (rh, wh) = stream.into_split();
     let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
-    let est = ava1::handshake::client(&mut r, &mut w, me, "raw", |_| true)
+    let est = ava1::handshake::client(&mut r, &mut w, me, "raw", |_| true, 0)
         .await
         .unwrap();
     assert!(est.pairing.is_none());
@@ -1112,6 +1112,7 @@ async fn each_c_handshake_proves_afresh_and_an_old_proof_does_not_replay() {
                 *got.lock().unwrap() = Some((*h, *p));
                 ava1::launch::proof(&token, h) == *p
             },
+            0,
         )
         .await
         .unwrap();

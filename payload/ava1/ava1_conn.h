@@ -1,11 +1,28 @@
 /* Frames on a socket, sealed after the handshake (SPEC.md §2, §4.4). One reader
- * thread per connection; writers (that thread and RPC workers) share `wmu`. */
+ * thread per connection; writers (that thread, RPC workers and job threads) share
+ * `wmu`. */
 #ifndef AVA1_CONN_H
 #define AVA1_CONN_H
 
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include "ava1_frame.h"
+
+/* ava1_conn_post's queue: at most this many frames (or bytes) in flight. A full
+ * queue breaks the connection (the peer is not draining, so it is of no use). */
+#define AVA1_Q_ENTRIES 64u
+#define AVA1_Q_BYTES (4u * 1024u * 1024u)
+
+/* One frame queued by ava1_conn_post: `len` body bytes follow the struct. */
+typedef struct ava1_qitem {
+    struct ava1_qitem *next;
+    uint8_t type;
+    uint8_t flags;
+    uint32_t channel;
+    size_t len;
+} ava1_qitem_t;
 
 typedef struct {
     int fd;
@@ -33,20 +50,54 @@ typedef struct {
     /* Writes: a send with no progress for send_idle_ms, or slower than min_rate over the
      * frame, fails and breaks the connection; 0 = blocking (SO_SNDTIMEO applies). */
     uint32_t send_idle_ms;
+    /* The header being read: the AEAD's associated data (ava1_conn_recv_header /
+     * ava1_conn_recv_body). Reader thread only. */
+    uint8_t rx_hdr[AVA1_HEADER_LEN];
+    /* The bounded queue ava1_conn_post enqueues on and a lazily started writer thread
+     * drains with ava1_conn_send_flags, so a reader thread never waits on a socket.
+     * ava1_conn_destroy closes the queue (dropping pending frames) and joins the thread. */
+    pthread_mutex_t qmu;
+    pthread_cond_t qcv;
+    pthread_t q_thread;
+    int q_started; /* the writer thread is draining */
+    int q_closed;  /* no more posts: the writer drops pending items and exits */
+    unsigned q_n;
+    size_t q_bytes;
+    ava1_qitem_t *q_head, *q_tail;
 } ava1_conn_t;
 
 /* CLOCK_MONOTONIC in milliseconds. */
 uint64_t ava1_now_ms(void);
 
 void ava1_conn_init(ava1_conn_t *c, int fd);
-/* Wipes keys and destroys the lock; does not close fd. */
+/* Wipes keys, ends the post queue's writer thread and destroys the locks; does not
+ * close fd. */
 void ava1_conn_destroy(ava1_conn_t *c);
 int ava1_conn_send(ava1_conn_t *c, uint8_t type, uint32_t channel, const uint8_t *body, size_t len);
+/* Like send, with frame flags of the caller's choosing. */
+int ava1_conn_send_flags(ava1_conn_t *c, uint8_t type, uint8_t flags, uint32_t channel,
+                         const uint8_t *body, size_t len);
 /* Like send, but returns AVA1_E_BUSY instead of waiting when another writer holds the
  * connection: for liveness Pings and Pongs, which data in flight makes unnecessary. */
 int ava1_conn_try_send(ava1_conn_t *c, uint8_t type, uint32_t channel, const uint8_t *body, size_t len);
+/* Sends `frame` in place: AVA1_HEADER_LEN bytes of header room, the body, then
+ * AVA1_TAG_LEN bytes of tag room; the header and (keyed) the seal land in the buffer,
+ * and the whole frame is written once. */
+int ava1_conn_send_frame(ava1_conn_t *c, uint8_t type, uint32_t channel, uint8_t *frame, size_t body_len);
+/* The header of one frame; *body_len is its body length (the MAC is not counted).
+ * Reader thread only. AVA1_E_* on failure. */
+int ava1_conn_recv_header(ava1_conn_t *c, ava1_header_t *h, size_t *body_len);
+/* The body of the frame whose header ava1_conn_recv_header just read (into buf;
+ * keyed: opened in place). Bounded by the same liveness as a single read. Reader
+ * thread only. */
+int ava1_conn_recv_body(ava1_conn_t *c, uint8_t *buf, size_t body_len);
 /* Reads one frame; the opened body goes to buf. Reader thread only. AVA1_E_* on failure. */
 int ava1_conn_recv(ava1_conn_t *c, uint8_t *type, uint8_t *flags, uint32_t *channel, uint8_t *buf,
                    size_t cap, size_t *len);
+/* The non-blocking send: copies `body` onto the connection's bounded writer queue and
+ * returns at once (never waits on the socket, so a reader thread may call it). A full
+ * queue returns AVA1_E_BUSY and breaks the connection. */
+int ava1_conn_post(ava1_conn_t *c, uint8_t type, uint8_t flags, uint32_t channel, const uint8_t *body,
+                   size_t len);
 
 #endif
