@@ -58,6 +58,8 @@ pub mod ffi {
     extern "C" {
         pub static mut ava1_trust_slot: [u8; 64];
         pub fn ava1_trust_slot_key(out: *mut u8) -> c_int;
+        pub fn ava1_trust_slot_token(out: *mut u8) -> c_int;
+        pub fn ava1_launch_proof(token: *const u8, h: *const u8, out: *mut u8);
     }
 
     extern "C" {
@@ -160,6 +162,11 @@ pub mod ffi {
         pub max_unpaired: u32,
         pub pair_confirm_ms: u32,
         pub notify_every_ms: u32,
+        /// 1: the trust slot's key is `launch_key` and, with 2, its token `launch_token`
+        /// (what ava1_glue.c passes the server from the slot).
+        pub launch: u32,
+        pub launch_key: [u8; 32],
+        pub launch_token: [u8; 16],
     }
 
     extern "C" {
@@ -168,6 +175,7 @@ pub mod ffi {
             peers_path: *const c_char,
             opts: *const TestOpts,
         ) -> c_int;
+        pub fn ava1_test_sizeof_opts() -> usize;
         pub fn ava1_test_pair_requests() -> u32;
         pub fn ava1_test_last_pair_code() -> u32;
         pub fn ava1_test_logs() -> u32;

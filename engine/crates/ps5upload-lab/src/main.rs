@@ -474,6 +474,7 @@ mod ava1_cmds {
 
     use anyhow::{anyhow, bail, Context, Result};
     use ava1::keys::Identity;
+    use ava1::launch::LaunchTokens;
     use ava1::peers::PeerStore;
     use ava1::session::{connect, Session, Timing};
 
@@ -515,7 +516,12 @@ mod ava1_cmds {
     }
 
     async fn session(addr: &str) -> Result<Session> {
-        let peers = Arc::new(Mutex::new(PeerStore::load(&ava_dir().join("peers"))?));
+        // The launch tokens this lab stamped (ava1-stamp): a helper it launched proves
+        // one and is trusted without a pairing code (SPEC.md §5.2).
+        let peers = Arc::new(Mutex::new(
+            PeerStore::load(&ava_dir().join("peers"))?
+                .with_launch_tokens(LaunchTokens::at(&ava_dir().join("launch_tokens"))),
+        ));
         let mut s = connect(
             &ava1_addr(addr),
             identity()?,
@@ -668,9 +674,25 @@ mod ava1_cmds {
     pub fn stamp(input: &str, output: &str) -> Result<()> {
         let mut b = std::fs::read(input).with_context(|| format!("read {input}"))?;
         let key = identity()?.public();
-        ava1::trust::stamp(&mut b, &key).map_err(|e| anyhow!("{input}: {e}"))?;
+        // A fresh launch token with every stamp (SPEC.md §5.2): the helper we are about
+        // to send proves it holds this one, so it needs no pairing code. A token that
+        // cannot be kept is not stamped — the key alone still works, with a code.
+        let tokens = LaunchTokens::at(&ava_dir().join("launch_tokens"));
+        let mut failure = None;
+        let outcome = ava1::trust::stamp_helper(&mut b, Some(&key), || match tokens.issue() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                failure = Some(e.to_string());
+                None
+            }
+        });
+        outcome.map_err(|e| anyhow!("{input}: {e}"))?;
         std::fs::write(output, &b).with_context(|| format!("write {output}"))?;
-        println!("stamped {output} with {}", ava1::hex::encode(&key));
+        let proof = match failure {
+            None => " and a launch token".to_string(),
+            Some(e) => format!(" (no launch token: {e} — the console will show a pairing code)"),
+        };
+        println!("stamped {output} with {}{proof}", ava1::hex::encode(&key));
         Ok(())
     }
 

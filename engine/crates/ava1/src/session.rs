@@ -130,12 +130,24 @@ pub async fn connect_expecting(
     let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
     let est = tokio::time::timeout_at(
         deadline,
-        handshake::client_expecting(&mut r, &mut w, &me, my_name, expected_key, |k| {
-            peers.lock().unwrap().contains(k)
-        }),
+        handshake::client_launched(
+            &mut r,
+            &mut w,
+            &me,
+            my_name,
+            expected_key,
+            |k| peers.lock().unwrap().contains(k),
+            |h, proof| peers.lock().unwrap().launched_by_us(h, proof),
+        ),
     )
     .await
     .map_err(|_| Ava1Error::Timeout)??;
+    if est.launched {
+        // The helper we launched (SPEC.md §5.2): remember it like a confirmed pairing.
+        // A key that cannot be stored still leaves this session paired — the proof
+        // holds — and the token pairs the next session too until it expires.
+        let _ = peers.lock().unwrap().add(est.peer_key, &est.peer_name);
+    }
     let (tx, mut rx) = mpsc::channel(DELIVER_DEPTH);
     let (link, outbox) = drive(r, w, timing, tx);
     let pending: Pending = Arc::default();

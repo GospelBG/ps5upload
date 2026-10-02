@@ -953,3 +953,177 @@ async fn a_c_reader_kept_from_reading_past_dead_after_keeps_a_live_session() {
     );
     drop(a_confirm);
 }
+
+// ---- Launch tokens (SPEC.md §5.2) ----
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// The C server as ava1_glue.c starts it from a stamped slot: the launcher's key in its
+/// peers file, and the slot's key (state 1) or key and token (state 2) in its config.
+/// The pairing window is open, as on a fresh console.
+fn launched_c_server(d: &std::path::Path, launcher: [u8; 32], token: Option<[u8; 16]>) -> CServer {
+    PeerStore::load(&d.join("peers"))
+        .unwrap()
+        .add(launcher, "launcher")
+        .unwrap();
+    CServer::start_with(
+        SECRET,
+        &d.join("peers"),
+        ffi::TestOpts {
+            launch: if token.is_some() { 2 } else { 1 },
+            launch_key: launcher,
+            launch_token: token.unwrap_or_default(),
+            ..opts(60)
+        },
+    )
+}
+
+fn launch_client(tokens: ava1::launch::LaunchTokens) -> (Arc<Identity>, Arc<Mutex<PeerStore>>) {
+    (
+        Arc::new(Identity::generate().unwrap()),
+        Arc::new(Mutex::new(
+            PeerStore::in_memory().with_launch_tokens(tokens),
+        )),
+    )
+}
+
+fn c_server_key() -> [u8; 32] {
+    Identity::from_secret(SECRET).public()
+}
+
+#[test]
+fn the_test_options_mirror_the_c_struct() {
+    assert_eq!(
+        unsafe { ffi::ava1_test_sizeof_opts() },
+        std::mem::size_of::<ffi::TestOpts>()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_helper_launched_with_a_token_pairs_with_no_code() {
+    let d = dir("launch-ok");
+    let tokens = ava1::launch::LaunchTokens::in_memory();
+    let token = tokens.issue().unwrap();
+    let (me, peers) = launch_client(tokens);
+    let srv = launched_c_server(&d, me.public(), Some(token));
+    let s = connect(&srv.addr(), me, peers.clone(), "laptop", fast())
+        .await
+        .unwrap();
+    assert_eq!(s.pairing_code(), None, "no prompt");
+    assert!(peers.lock().unwrap().contains(&c_server_key()));
+    assert_eq!(s.node_info().await.unwrap().name, "C test server");
+    s.open_lane().await.unwrap();
+    assert_eq!(
+        unsafe { ffi::ava1_test_pair_requests() },
+        0,
+        "nothing shown on the console"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_helper_with_a_token_we_did_not_issue_means_pairing() {
+    let d = dir("launch-wrong");
+    let tokens = ava1::launch::LaunchTokens::in_memory();
+    tokens.issue().unwrap();
+    let (me, peers) = launch_client(tokens);
+    let srv = launched_c_server(&d, me.public(), Some([0x99; 16]));
+    let s = connect(&srv.addr(), me, peers.clone(), "laptop", fast())
+        .await
+        .unwrap();
+    assert!(s.pairing_code().is_some());
+    assert!(!peers.lock().unwrap().contains(&c_server_key()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_helper_with_an_expired_token_means_pairing() {
+    let d = dir("launch-expired");
+    let tokens = ava1::launch::LaunchTokens::in_memory();
+    let token = [0x42; 16];
+    tokens
+        .record(token, now_unix() - ava1::launch::TOKEN_TTL_S - 60)
+        .unwrap();
+    let (me, peers) = launch_client(tokens);
+    let srv = launched_c_server(&d, me.public(), Some(token));
+    let s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    assert!(s.pairing_code().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_helper_stamped_with_a_key_only_pairs_as_before() {
+    let d = dir("launch-keyonly");
+    let tokens = ava1::launch::LaunchTokens::in_memory();
+    tokens.issue().unwrap();
+    let (me, peers) = launch_client(tokens);
+    let srv = launched_c_server(&d, me.public(), None);
+    let mut s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    assert!(s.pairing_code().is_some());
+    s.confirm_pairing().await.unwrap();
+    s.node_info().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_client_of_the_c_helper_gets_no_proof() {
+    let d = dir("launch-other");
+    let tokens = ava1::launch::LaunchTokens::in_memory();
+    let token = tokens.issue().unwrap();
+    let launcher = Identity::generate().unwrap().public();
+    let srv = launched_c_server(&d, launcher, Some(token));
+    // The launcher is a peer, so the automatic window stayed shut: open one, as a paired
+    // device's pairing.open would.
+    srv.open_pairing(60);
+    // Holds the token, but is not the launcher's key: no proof is ever sent to it.
+    let (me, peers) = launch_client(tokens);
+    let s = connect(&srv.addr(), me, peers.clone(), "phone", fast())
+        .await
+        .unwrap();
+    assert!(s.pairing_code().is_some());
+    assert!(!peers.lock().unwrap().contains(&c_server_key()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_c_handshake_proves_afresh_and_an_old_proof_does_not_replay() {
+    let d = dir("launch-replay");
+    let me = Identity::generate().unwrap();
+    let token = [0x6c; 16];
+    let srv = launched_c_server(&d, me.public(), Some(token));
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let stream = TcpStream::connect(srv.addr()).await.unwrap();
+        let (rh, wh) = stream.into_split();
+        let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+        let got = std::sync::Mutex::new(None);
+        let est = ava1::handshake::client_launched(
+            &mut r,
+            &mut w,
+            &me,
+            "raw",
+            None,
+            |_| false,
+            |h, p| {
+                *got.lock().unwrap() = Some((*h, *p));
+                ava1::launch::proof(&token, h) == *p
+            },
+        )
+        .await
+        .unwrap();
+        assert!(est.launched && est.pairing.is_none());
+        seen.push(got.into_inner().unwrap().expect("a proof was sent"));
+    }
+    let ((h1, p1), (h2, p2)) = (seen[0], seen[1]);
+    assert_ne!(h1, h2);
+    assert_ne!(p1, p2);
+    assert_ne!(
+        ava1::launch::proof(&token, &h2),
+        p1,
+        "the first proof fails on the second handshake"
+    );
+}

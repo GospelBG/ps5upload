@@ -133,7 +133,7 @@ static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t 
 
 int ava1_payload_start(void) {
     ava1_server_cfg_t cfg;
-    uint8_t launcher[32];
+    uint8_t launcher[32], token[16];
     memset(&cfg, 0, sizeof cfg);
     if (mkdir("/data/ps5upload", 0755) != 0 && errno != EEXIST) return -errno;
     if (mkdir(AVA1_DIR, 0755) != 0 && errno != EEXIST) return -errno;
@@ -161,11 +161,20 @@ int ava1_payload_start(void) {
             on_log("ava1: launcher not trusted: cannot write " AVA1_DIR "/peers");
         }
         free(peers);
+        /* A launch token (SPEC.md §5.2) lives in memory only: the server proves it to
+         * the launcher in each Welcome, so the engine needs no pairing code either. */
+        if (ava1_trust_slot_token(token) == 0) {
+            cfg.has_launch = 1;
+            memcpy(cfg.launch_key, launcher, 32);
+            memcpy(cfg.launch_token, token, 16);
+            crypto_wipe(token, sizeof token);
+        }
     }
     {
         /* The server keeps its own copy: do not leave the private key on this stack. */
         int rc = ava1_server_start(&cfg);
         crypto_wipe(&cfg.identity, sizeof cfg.identity);
+        crypto_wipe(cfg.launch_token, sizeof cfg.launch_token);
         return rc;
     }
 }

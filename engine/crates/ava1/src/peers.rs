@@ -18,6 +18,9 @@ pub struct PeerStore {
     /// The file exists but could not be read: nothing is known, and nothing is ever
     /// written over it (that would unpair every device it lists).
     unreadable: Option<String>,
+    /// Tokens this side stamped into helpers it launched (SPEC.md §5.2): a server that
+    /// proves one is stored without a pairing code.
+    launch: Option<crate::launch::LaunchTokens>,
 }
 
 impl PeerStore {
@@ -34,6 +37,7 @@ impl PeerStore {
             path: Some(path.to_path_buf()),
             peers: Vec::new(),
             unreadable: Some(format!("{}: {e}", path.display())),
+            launch: None,
         })
     }
 
@@ -57,7 +61,20 @@ impl PeerStore {
             path: Some(path.to_path_buf()),
             peers,
             unreadable: None,
+            launch: None,
         })
+    }
+
+    /// Recognise servers launched with one of these tokens (SPEC.md §5.2).
+    pub fn with_launch_tokens(mut self, t: crate::launch::LaunchTokens) -> Self {
+        self.launch = Some(t);
+        self
+    }
+
+    /// Whether a Welcome's `launch_proof` on handshake `h` was made with a token this
+    /// side issued and that has not expired.
+    pub fn launched_by_us(&self, h: &[u8; 64], proof: &[u8; 16]) -> bool {
+        self.launch.as_ref().is_some_and(|t| t.recognises(h, proof))
     }
 
     pub fn contains(&self, key: &[u8; 32]) -> bool {

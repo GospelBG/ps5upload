@@ -2,6 +2,10 @@
 
 pub const MAGIC: &[u8; 9] = b"AVA1TRUST";
 pub const SLOT_LEN: usize = 64;
+/// Slot states: never stamped, a key, a key and a launch token (SPEC.md §5.2).
+pub const STATE_EMPTY: u8 = 0;
+pub const STATE_KEY: u8 = 1;
+pub const STATE_LAUNCH: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TrustError {
@@ -11,7 +15,8 @@ pub enum TrustError {
     Many(usize),
 }
 
-/// Offsets of every slot: magic, state 0 or 1, zeros at 10..16 and 48..64.
+/// Offsets of every slot: magic, state 0..=2, zeros at 10..16, and zeros at 48..64
+/// unless the state says a launch token is there.
 fn slots(elf: &[u8]) -> Vec<usize> {
     if elf.len() < SLOT_LEN {
         return Vec::new();
@@ -19,39 +24,73 @@ fn slots(elf: &[u8]) -> Vec<usize> {
     (0..=elf.len() - SLOT_LEN)
         .filter(|&o| {
             &elf[o..o + 9] == MAGIC
-                && elf[o + 9] <= 1
+                && elf[o + 9] <= STATE_LAUNCH
                 && elf[o + 10..o + 16].iter().all(|&b| b == 0)
-                && elf[o + 48..o + 64].iter().all(|&b| b == 0)
+                && (elf[o + 9] == STATE_LAUNCH || elf[o + 48..o + 64].iter().all(|&b| b == 0))
         })
         .collect()
 }
 
-/// Writes `key` into the ELF's single trust slot (state 1).
-pub fn stamp(elf: &mut [u8], key: &[u8; 32]) -> Result<(), TrustError> {
+fn the_slot(elf: &[u8]) -> Result<usize, TrustError> {
     match slots(elf).as_slice() {
-        [o] => {
-            elf[*o + 9] = 1;
-            elf[*o + 16..*o + 48].copy_from_slice(key);
-            Ok(())
-        }
+        [o] => Ok(*o),
         [] => Err(TrustError::NoSlot),
         many => Err(TrustError::Many(many.len())),
     }
 }
 
+/// Writes `key` into the ELF's single trust slot (state 1; any launch token is cleared).
+pub fn stamp(elf: &mut [u8], key: &[u8; 32]) -> Result<(), TrustError> {
+    let o = the_slot(elf)?;
+    elf[o + 9] = STATE_KEY;
+    elf[o + 16..o + 48].copy_from_slice(key);
+    elf[o + 48..o + 64].fill(0);
+    Ok(())
+}
+
+/// Writes `key` and a launch `token` into the single trust slot (state 2): the helper
+/// proves to the holder of `token` that it is the one that was launched (SPEC.md §5.2).
+pub fn stamp_launch(elf: &mut [u8], key: &[u8; 32], token: &[u8; 16]) -> Result<(), TrustError> {
+    let o = the_slot(elf)?;
+    elf[o + 9] = STATE_LAUNCH;
+    elf[o + 16..o + 48].copy_from_slice(key);
+    elf[o + 48..o + 64].copy_from_slice(token);
+    Ok(())
+}
+
 /// What every sender of the ps5upload helper does before it sends: stamp `key` (the
-/// sending engine's AVA1 public key) so the console trusts that engine without pairing.
-/// `Err` is a reason to log, never a reason not to send: an unstamped helper still
-/// runs, and the console falls back to its pairing window.
-pub fn stamp_helper(elf: &mut [u8], key: Option<&[u8; 32]>) -> Result<(), String> {
+/// sending engine's AVA1 public key) so the console trusts that engine without pairing,
+/// and — when `token` gives one — a fresh launch token, so the engine trusts the console
+/// without pairing too. `token` is called only once the ELF is known to be stampable,
+/// so no token is minted for an ELF that will not carry it. `Err` is a reason to log,
+/// never a reason not to send: an unstamped helper still runs, and the console falls
+/// back to its pairing window.
+pub fn stamp_helper(
+    elf: &mut [u8],
+    key: Option<&[u8; 32]>,
+    token: impl FnOnce() -> Option<[u8; 16]>,
+) -> Result<(), String> {
     let key = key.ok_or("AVA1 trust not stamped: this engine has no AVA1 identity")?;
-    stamp(elf, key).map_err(|e| format!("AVA1 trust not stamped: {e}"))
+    the_slot(elf).map_err(|e| format!("AVA1 trust not stamped: {e}"))?;
+    match token() {
+        Some(t) => stamp_launch(elf, key, &t),
+        None => stamp(elf, key),
+    }
+    .map_err(|e| format!("AVA1 trust not stamped: {e}"))
 }
 
 /// The stamped key, if the ELF has exactly one stamped slot.
 pub fn read(elf: &[u8]) -> Option<[u8; 32]> {
     match slots(elf).as_slice() {
-        [o] if elf[*o + 9] == 1 => elf[*o + 16..*o + 48].try_into().ok(),
+        [o] if elf[*o + 9] != STATE_EMPTY => elf[*o + 16..*o + 48].try_into().ok(),
+        _ => None,
+    }
+}
+
+/// The launch token, if the ELF has exactly one slot and it carries one.
+pub fn read_token(elf: &[u8]) -> Option<[u8; 16]> {
+    match slots(elf).as_slice() {
+        [o] if elf[*o + 9] == STATE_LAUNCH => elf[*o + 48..*o + 64].try_into().ok(),
         _ => None,
     }
 }
@@ -85,16 +124,68 @@ mod tests {
     #[test]
     fn stamp_helper_reports_why_it_did_not_stamp() {
         let mut elf = elf_with(1);
-        assert!(stamp_helper(&mut elf, None)
+        assert!(stamp_helper(&mut elf, None, || None)
             .unwrap_err()
             .contains("no AVA1 identity"));
         assert_eq!(read(&elf), None);
-        stamp_helper(&mut elf, Some(&[3; 32])).unwrap();
+        stamp_helper(&mut elf, Some(&[3; 32]), || None).unwrap();
         assert_eq!(read(&elf), Some([3; 32]));
         let mut old_build = elf_with(0);
         let before = old_build.clone();
-        assert!(stamp_helper(&mut old_build, Some(&[3; 32])).is_err());
+        assert!(stamp_helper(&mut old_build, Some(&[3; 32]), || None).is_err());
         assert_eq!(old_build, before, "an ELF without a slot is sent unchanged");
+    }
+
+    #[test]
+    fn a_launch_stamp_carries_the_token_and_a_key_stamp_clears_it() {
+        let mut elf = elf_with(1);
+        stamp_launch(&mut elf, &[7; 32], &[0xa5; 16]).unwrap();
+        assert_eq!(elf[1009], 2);
+        assert_eq!(read(&elf), Some([7; 32]));
+        assert_eq!(read_token(&elf), Some([0xa5; 16]));
+        // A stamped ELF is still found, and can be stamped again either way.
+        stamp_launch(&mut elf, &[8; 32], &[0x5a; 16]).unwrap();
+        assert_eq!(
+            (read(&elf), read_token(&elf)),
+            (Some([8; 32]), Some([0x5a; 16]))
+        );
+        stamp(&mut elf, &[9; 32]).unwrap();
+        assert_eq!((read(&elf), read_token(&elf)), (Some([9; 32]), None));
+        assert!(
+            elf[1048..1064].iter().all(|&b| b == 0),
+            "key-only stamp zeroes the token"
+        );
+    }
+
+    #[test]
+    fn stamp_helper_mints_a_token_only_for_a_slot_it_can_stamp() {
+        let mut elf = elf_with(1);
+        let mut minted = 0;
+        stamp_helper(&mut elf, Some(&[3; 32]), || {
+            minted += 1;
+            Some([4; 16])
+        })
+        .unwrap();
+        assert_eq!(
+            (read(&elf), read_token(&elf)),
+            (Some([3; 32]), Some([4; 16]))
+        );
+        // No token to give: the key alone, as before.
+        stamp_helper(&mut elf, Some(&[3; 32]), || None).unwrap();
+        assert_eq!((read(&elf), read_token(&elf)), (Some([3; 32]), None));
+        // No slot, or no key: nothing is minted.
+        let mut old_build = elf_with(0);
+        assert!(stamp_helper(&mut old_build, Some(&[3; 32]), || {
+            minted += 1;
+            Some([4; 16])
+        })
+        .is_err());
+        assert!(stamp_helper(&mut elf_with(1), None, || {
+            minted += 1;
+            Some([4; 16])
+        })
+        .is_err());
+        assert_eq!(minted, 1);
     }
 
     #[test]

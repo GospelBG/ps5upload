@@ -82,10 +82,13 @@ fields = [{ name = "noise", ty = "bytes" }]   # payload: ClientInfo (encrypted)
 
 # First sealed frame from the server, after Hs3: under XX the server learns the
 # client's key only in message 3, so "do I know you" cannot travel earlier.
+# launch_proof: sent only to the key in this server's trust slot, when the slot also
+# carries a launch token (SPEC.md §5.2). Older clients skip it.
 [[message]]
 name = "Welcome"
 type = 0x04
 fields = [{ name = "knows_you", ty = "u8" }]
+ext = [{ tag = 1, name = "launch_proof", ty = "b16" }]
 
 [[message]]
 name = "PairConfirm"

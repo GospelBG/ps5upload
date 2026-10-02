@@ -65,6 +65,8 @@ int ava1_hs3_decode(const uint8_t *buf, size_t len, ava1_hs3_t *m);
 
 typedef struct {
     uint8_t knows_you;
+    int has_launch_proof;
+    uint8_t launch_proof[16];
 } ava1_welcome_t;
 
 int ava1_welcome_encode(const ava1_welcome_t *m, ava1_w_t *w);

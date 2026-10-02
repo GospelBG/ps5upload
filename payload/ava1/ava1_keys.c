@@ -77,3 +77,18 @@ uint32_t ava1_pairing_code(const uint8_t hash[64]) {
     return ((uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24)) %
            1000000u;
 }
+
+void ava1_launch_proof(const uint8_t token[16], const uint8_t h[64], uint8_t out[16]) {
+    static const char label[] = "AVA1 launch";
+    crypto_blake2b_ctx c;
+    uint8_t key[32], d[32];
+    memset(key, 0, sizeof key);
+    memcpy(key, token, 16);
+    crypto_blake2b_keyed_init(&c, 32, key, 32);
+    crypto_blake2b_update(&c, (const uint8_t *)label, sizeof label - 1);
+    crypto_blake2b_update(&c, h, 64);
+    crypto_blake2b_final(&c, d);
+    memcpy(out, d, 16);
+    crypto_wipe(key, sizeof key);
+    crypto_wipe(d, sizeof d);
+}

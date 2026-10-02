@@ -125,6 +125,7 @@ impl FrameMessage for Hs3 {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Welcome {
     pub knows_you: u8,
+    pub launch_proof: Option<[u8; 16]>,
 }
 
 impl Message for Welcome {
@@ -132,7 +133,10 @@ impl Message for Welcome {
 
     fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.u8(self.knows_you);
-        w.u16(0);
+        let mut ext_n: u16 = 0;
+        if self.launch_proof.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.launch_proof { w.ext(1, |w| { w.fixed(v); Ok(()) })?; }
         Ok(())
     }
 
@@ -145,7 +149,15 @@ impl Message for Welcome {
             let tag = r.u16()?;
             let len = r.u32()? as usize;
             let v = r.take(len)?;
-            let _ = (tag, v);
+            match tag {
+                1 => {
+                    if m.launch_proof.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.launch_proof = Some(vr.fixed::<16>()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
         }
         r.finish()?;
         Ok(m)
@@ -817,7 +829,7 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "Hs1" => Hs1 { noise: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
         "Hs2" => Hs2 { noise: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
         "Hs3" => Hs3 { noise: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
-        "Welcome" => Welcome { knows_you: rng.next_u64() as u8, }.to_bytes().ok(),
+        "Welcome" => Welcome { knows_you: rng.next_u64() as u8, launch_proof: if rng.below(2) == 1 { Some({ let mut a = [0u8; 16]; rng.fill(&mut a); a }) } else { None }, }.to_bytes().ok(),
         "PairConfirm" => PairConfirm { }.to_bytes().ok(),
         "PairResult" => PairResult { accepted: rng.next_u64() as u8, }.to_bytes().ok(),
         "Join" => Join { session_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, lane_id: rng.next_u64() as u16, client_nonce: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, tag: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, }.to_bytes().ok(),

@@ -53,7 +53,12 @@ typedef struct {
     uint32_t max_unpaired;
     uint32_t pair_confirm_ms;
     uint32_t notify_every_ms;
+    uint32_t launch; /* 1: launch_key only; 2: launch_key and launch_token */
+    uint8_t launch_key[32];
+    uint8_t launch_token[16];
 } ava1_test_opts_t;
+
+size_t ava1_test_sizeof_opts(void) { return sizeof(ava1_test_opts_t); }
 
 int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, const ava1_test_opts_t *o) {
     ava1_server_cfg_t cfg;
@@ -72,6 +77,11 @@ int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, con
     cfg.max_unpaired = o->max_unpaired;
     cfg.pair_confirm_ms = o->pair_confirm_ms;
     cfg.notify_every_ms = o->notify_every_ms;
+    if (o->launch == 2) {
+        cfg.has_launch = 1;
+        memcpy(cfg.launch_key, o->launch_key, 32);
+        memcpy(cfg.launch_token, o->launch_token, 16);
+    }
     cfg.on_pair_request = on_pair;
     cfg.log = on_log;
     cfg.rpc = rpc;

@@ -71,8 +71,15 @@ int ava1_hs3_decode(const uint8_t *buf, size_t len, ava1_hs3_t *m) {
 }
 
 int ava1_welcome_encode(const ava1_welcome_t *m, ava1_w_t *w) {
+    uint16_t ext_n = 0;
     ava1_w_u8(w, m->knows_you);
-    ava1_w_u16(w, 0);
+    if (m->has_launch_proof) ext_n++;
+    ava1_w_u16(w, ext_n);
+    if (m->has_launch_proof) {
+        size_t at = ava1_w_ext_begin(w, 1);
+        ava1_w_fixed(w, m->launch_proof, 16);
+        ava1_w_ext_end(w, at);
+    }
     return w->err;
 }
 
@@ -84,10 +91,24 @@ int ava1_welcome_decode(const uint8_t *buf, size_t len, ava1_welcome_t *m) {
     m->knows_you = ava1_r_u8(&r);
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {
-        uint32_t vlen;
-        (void)ava1_r_u16(&r);
-        vlen = ava1_r_u32(&r);
-        (void)ava1_r_take(&r, vlen);
+        uint16_t tag = ava1_r_u16(&r);
+        uint32_t vlen = ava1_r_u32(&r);
+        const uint8_t *v = ava1_r_take(&r, vlen);
+        ava1_r_t vr;
+        int rc;
+        if (r.err) break;
+        ava1_r_init(&vr, v, vlen);
+        switch (tag) {
+        case 1:
+            if (m->has_launch_proof) return AVA1_E_DUP_EXT;
+            m->has_launch_proof = 1;
+            ava1_r_fixed(&vr, m->launch_proof, 16);
+            break;
+        default:
+            continue;
+        }
+        rc = ava1_r_finish(&vr);
+        if (rc != 0) return rc;
     }
     return ava1_r_finish(&r);
 }

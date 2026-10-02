@@ -4,6 +4,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::conn::{Frame, FrameReader, FrameWriter};
 use crate::gen::{self, ClientInfo, HelloInfo, Hs1, Hs2, Hs3, ServerInfo, Welcome};
 use crate::keys::{self, Handshake, Identity, SessionKeys};
+use crate::launch::{self, LaunchSecret};
 use crate::wire::{FrameMessage, Message};
 use crate::Ava1Error;
 
@@ -22,6 +23,9 @@ pub struct Established {
     pub peer_name: String,
     /// `Some` until both devices have accepted each other.
     pub pairing: Option<PairingState>,
+    /// Client side: the server proved a launch token this side issued (SPEC.md §5.2),
+    /// so it is trusted without pairing; the caller stores its key.
+    pub launched: bool,
 }
 
 /// What a server decides about a client once the handshake has shown its key.
@@ -87,6 +91,25 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    client_launched(r, w, me, my_name, expected, knows, |_, _| false).await
+}
+
+/// `client_expecting`, also trusting a server it does not know whose Welcome carries a
+/// launch proof that `launched(h, proof)` recognises (SPEC.md §5.2) — the helper this
+/// side launched. Such a session is paired at once (`Established::launched`).
+pub async fn client_launched<R, W>(
+    r: &mut FrameReader<R>,
+    w: &mut FrameWriter<W>,
+    me: &Identity,
+    my_name: &str,
+    expected: Option<[u8; 32]>,
+    knows: impl Fn(&[u8; 32]) -> bool,
+    launched: impl Fn(&[u8; 64], &[u8; 16]) -> bool,
+) -> Result<Established, Ava1Error>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let v = gen::PROTOCOL_VERSION;
     let mut hs = Handshake::initiator(me)?;
     let hello = HelloInfo {
@@ -139,7 +162,14 @@ where
     }
     let welcome: Welcome = f.decode()?;
     let known = knows(&peer_key);
-    let pairing = (!known || welcome.knows_you == 0).then(|| PairingState {
+    // A proof only counts from a server that already trusts us (it is sent only to the
+    // key in its trust slot), and only for a server we do not know yet.
+    let launched = !known
+        && welcome.knows_you != 0
+        && welcome
+            .launch_proof
+            .is_some_and(|p| launched(&keys.hash, &p));
+    let pairing = (!(known || launched) || welcome.knows_you == 0).then(|| PairingState {
         code: keys::pairing_code(&keys.hash),
         server_must_confirm: welcome.knows_you == 0,
     });
@@ -149,6 +179,7 @@ where
         peer_key,
         peer_name: info.name.unwrap_or_default(),
         pairing,
+        launched,
     })
 }
 
@@ -158,6 +189,24 @@ pub async fn server<R, W>(
     hs1_frame: Frame,
     me: &Identity,
     my_name: &str,
+    admit: impl FnOnce(&[u8; 32]) -> Admission,
+) -> Result<Established, Ava1Error>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    server_launched(r, w, hs1_frame, me, my_name, None, admit).await
+}
+
+/// `server` for a node stamped with a launch token: a known client whose key is
+/// `launch.key` gets the proof in its Welcome (SPEC.md §5.2). No other client does.
+pub async fn server_launched<R, W>(
+    r: &mut FrameReader<R>,
+    w: &mut FrameWriter<W>,
+    hs1_frame: Frame,
+    me: &Identity,
+    my_name: &str,
+    launch: Option<&LaunchSecret>,
     admit: impl FnOnce(&[u8; 32]) -> Admission,
 ) -> Result<Established, Ava1Error>
 where
@@ -217,10 +266,14 @@ where
             });
         }
     };
+    let launch_proof = launch
+        .filter(|l| known && l.key == peer_key)
+        .map(|l| launch::proof(&l.token, &keys.hash));
     w.send_msg(
         0,
         &Welcome {
             knows_you: u8::from(known),
+            launch_proof,
         },
     )
     .await?;
@@ -233,6 +286,7 @@ where
         session_id,
         peer_key,
         peer_name: ci.name.unwrap_or_default(),
+        launched: false,
     })
 }
 
@@ -286,6 +340,119 @@ mod tests {
         };
         let (c, s) = tokio::join!(c_fut, s_fut);
         Ends { c, s, c_pub, s_pub }
+    }
+
+    /// A server stamped with (launcher key, token) the client `c_is_launcher` or not;
+    /// the client accepts a proof iff `accept(h, proof)`. Returns the client's end and
+    /// every proof it was shown.
+    async fn run_launch(
+        c_is_launcher: bool,
+        accept: impl Fn(&[u8; 64], &[u8; 16]) -> bool,
+    ) -> (Result<Established, Ava1Error>, Vec<([u8; 64], [u8; 16])>) {
+        let (c_id, s_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let c_pub = c_id.public();
+        let launch = LaunchSecret {
+            key: if c_is_launcher { c_pub } else { [0x33; 32] },
+            token: [0x77; 16],
+        };
+        let seen = std::sync::Mutex::new(Vec::new());
+        let ((mut cr, mut cw), (mut sr, mut sw)) = pipe();
+        let c_fut = client_launched(
+            &mut cr,
+            &mut cw,
+            &c_id,
+            "laptop",
+            None,
+            |_| false,
+            |h, p| {
+                seen.lock().unwrap().push((*h, *p));
+                accept(h, p)
+            },
+        );
+        let s_fut = async {
+            let first = sr.recv().await?;
+            server_launched(
+                &mut sr,
+                &mut sw,
+                first,
+                &s_id,
+                "console",
+                Some(&launch),
+                |_| Admission::Known,
+            )
+            .await
+        };
+        let (c, s) = tokio::join!(c_fut, s_fut);
+        s.unwrap();
+        (c, seen.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_launched_server_proves_its_token_and_needs_no_pairing() {
+        let tok = [0x77u8; 16];
+        let (c, seen) = run_launch(true, |h, p| crate::launch::proof(&tok, h) == *p).await;
+        let c = c.unwrap();
+        assert_eq!(c.pairing, None);
+        assert!(c.launched);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].0, c.keys.hash,
+            "the proof is bound to this handshake"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proof_this_side_does_not_recognise_falls_back_to_pairing() {
+        let (c, seen) = run_launch(true, |_, _| false).await;
+        let c = c.unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(!c.launched);
+        let p = c.pairing.expect("pairing code shown");
+        assert!(
+            !p.server_must_confirm,
+            "the server already trusts its launcher"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_launching_key_is_shown_a_proof() {
+        let (c, seen) = run_launch(false, |_, _| true).await;
+        assert!(seen.is_empty(), "another client key never receives a proof");
+        assert!(c.unwrap().pairing.is_some());
+    }
+
+    #[tokio::test]
+    async fn every_handshake_has_its_own_proof() {
+        let (_, a) = run_launch(true, |_, _| true).await;
+        let (_, b) = run_launch(true, |_, _| true).await;
+        assert_ne!(a[0].1, b[0].1);
+        let tok = [0x77u8; 16];
+        // Replaying the first Welcome's proof into the second handshake fails.
+        assert_ne!(crate::launch::proof(&tok, &b[0].0), a[0].1);
+        assert_eq!(crate::launch::proof(&tok, &b[0].0), b[0].1);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_does_not_know_its_launcher_sends_no_proof() {
+        // The launcher's key was forgotten (or never stored): the full pairing, both ways.
+        let (c_id, s_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let launch = LaunchSecret {
+            key: c_id.public(),
+            token: [1; 16],
+        };
+        let ((mut cr, mut cw), (mut sr, mut sw)) = pipe();
+        let c_fut = client_launched(&mut cr, &mut cw, &c_id, "c", None, |_| false, |_, _| true);
+        let s_fut = async {
+            let first = sr.recv().await?;
+            server_launched(&mut sr, &mut sw, first, &s_id, "s", Some(&launch), |_| {
+                Admission::Pairing
+            })
+            .await
+        };
+        let (c, _s) = tokio::join!(c_fut, s_fut);
+        let c = c.unwrap();
+        assert!(!c.launched);
+        assert!(c.pairing.unwrap().server_must_confirm);
     }
 
     #[tokio::test]

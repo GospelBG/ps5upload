@@ -26,5 +26,8 @@ void ava1_join_tag(const uint8_t c2s[32], const uint8_t sid[16], uint16_t lane,
 void ava1_join_ack_tag(const uint8_t s2c[32], const uint8_t sid[16], uint16_t lane,
                        const uint8_t client_nonce[16], const uint8_t server_nonce[16], uint8_t out[16]);
 uint32_t ava1_pairing_code(const uint8_t hash[64]);
+/* Launch proof (SPEC.md §5.2): the first 16 bytes of keyed BLAKE2b-256(key = token ‖ 16
+ * zero bytes, "AVA1 launch" ‖ h). */
+void ava1_launch_proof(const uint8_t token[16], const uint8_t h[64], uint8_t out[16]);
 
 #endif

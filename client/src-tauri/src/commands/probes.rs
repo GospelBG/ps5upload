@@ -392,28 +392,41 @@ pub async fn payload_send(ip: String, path: String, port: Option<u16>) -> serde_
     }
 }
 
-/// This engine's AVA1 public key, or `None` if the engine is unreachable or silent.
-async fn fetch_ava1_key(url: &str) -> Option<[u8; 32]> {
+/// This engine's AVA1 public key and the launch token that goes with it (SPEC.md §5.2),
+/// or `None` if the engine is unreachable or silent.
+async fn fetch_ava1_identity(url: &str) -> Option<([u8; 32], Option<[u8; 16]>)> {
     // A wedged engine must not hang the send: give up after 2 s and send unstamped.
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         let client = crate::engine_http::engine_client_builder().build().ok()?;
         let v: serde_json::Value = client.get(url).send().await.ok()?.json().await.ok()?;
         let k = ava1::hex::decode(v.get("public_key")?.as_str()?)?;
-        <[u8; 32]>::try_from(k).ok()
+        let key = <[u8; 32]>::try_from(k).ok()?;
+        // Absent when the engine does not count this caller as local: the token is the
+        // engine's own secret, and it stamps its own sends without us.
+        let token = v
+            .get("launch_token")
+            .and_then(|t| t.as_str())
+            .and_then(ava1::hex::decode)
+            .and_then(|t| <[u8; 16]>::try_from(t).ok());
+        Some((key, token))
     })
     .await
     .ok()
     .flatten()
 }
 
-/// Stamps this engine's AVA1 key into a ps5upload helper ELF so the console trusts this
-/// engine without pairing (SPEC.md §5.1). An unreachable engine or an ELF without a slot
-/// (an older build) is sent unchanged; the console then opens its pairing window instead.
+/// Stamps this engine's AVA1 key — and a launch token, when the engine gives one — into a
+/// ps5upload helper ELF, so the console trusts this engine without pairing and this engine
+/// trusts the console it just launched without a pairing code either (SPEC.md §5.1, §5.2).
+/// An unreachable engine or an ELF without a slot (an older build) is sent unchanged; the
+/// console then opens its pairing window instead.
 async fn stamp_ava1_trust(bytes: &mut [u8]) {
     let url = format!("{}/api/ava1/identity", crate::engine::url());
-    let key = fetch_ava1_key(&url).await;
+    let fetched = fetch_ava1_identity(&url).await;
+    let key = fetched.as_ref().map(|(k, _)| k);
+    let token = fetched.and_then(|(_, t)| t);
     // The same step the engine's own helper sends take (ava1_api::stamped_helper).
-    if let Err(why) = ava1::trust::stamp_helper(bytes, key.as_ref()) {
+    if let Err(why) = ava1::trust::stamp_helper(bytes, key, || token) {
         eprintln!("[payload_send] {why}");
     }
 }
@@ -762,7 +775,7 @@ mod ava1_fetch_tests {
             }
         });
         let t = std::time::Instant::now();
-        assert!(super::fetch_ava1_key(&url).await.is_none());
+        assert!(super::fetch_ava1_identity(&url).await.is_none());
         assert!(t.elapsed() < std::time::Duration::from_secs(3));
     }
 }

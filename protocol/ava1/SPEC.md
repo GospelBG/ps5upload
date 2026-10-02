@@ -98,9 +98,32 @@ six digits. A man in the middle yields different h, so different codes.
    window, accepts no pairing, and never writes the file.
 
 5.1 Trust slot: the payload ELF carries a 64-byte array — "AVA1TRUST" (9 bytes),
-state (0 empty, 1 stamped), 6 zero bytes, 32-byte X25519 key, 16 zero bytes. An
-engine sending the ELF writes state 1 and its key into the single slot; the
-payload adds that key to its peers at startup. Exactly one slot must exist.
+state (0 empty, 1 key, 2 key + launch token), 6 zero bytes, 32-byte X25519 key,
+and a 16-byte launch token in state 2 (§5.2), zero otherwise. An engine sending
+the ELF writes its key into the single slot; the payload adds that key to its
+peers at startup. Exactly one slot must exist. A slot counts as a slot in states
+0 and 1 only while its last 16 bytes are zero, so data that happens to start
+"AVA1TRUST" is not one; state 2 is identified by its state byte.
+
+5.2 Launch token: whoever stamps the ELF may also write a fresh random 16-byte
+token into it (state 2) and keep it for itself — the reference side stores them in
+`<data dir>/ava/launch_tokens`, one `<32 hex token> <unix seconds>` per line, mode
+0600, written atomically, at most 32 kept (oldest dropped) and each good for 24 h.
+The payload keeps the token in memory only. When the handshake's client static key
+equals the slot's key, the server adds an ignorable extension field `launch_proof`
+to `Welcome`: the first 16 bytes of BLAKE2b-256(key = the token followed by 16 zero
+bytes, "AVA1 launch" ‖ h), h being the handshake hash. No other client gets a
+proof, a proof differs every handshake, and the token itself never travels.
+`vectors/launch.txt` pins the derivation.
+
+A client that recognises the proof — one of its unexpired tokens, on this
+handshake — stores the server's key and treats the session as paired with no
+pairing code. A client that does not recognise it (another token, expired, or an
+old proof replayed under a new h) pairs with the code as usual. The token proves
+"this console is the helper I launched" to the side that sent it; an attacker who
+read the ELF in transit can forge a proof, but that attacker could have replaced
+the ELF outright — it is sent unauthenticated — so the token grants nothing a
+pairing code would not, and removes one prompt from the common case.
 
 ## 6. Liveness
 Every connection sends `Ping{seq, t_us}` every 2 s (default) on channel 0, also

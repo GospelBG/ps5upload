@@ -15,6 +15,7 @@ use crate::gen::{
 };
 use crate::handshake::{self, refuse, Admission};
 use crate::keys::{self, Identity, SessionKeys};
+use crate::launch::LaunchSecret;
 use crate::link::{drive, Full, Outbox, DELIVER_DEPTH};
 use crate::peers::PeerStore;
 use crate::session::{RpcReply, Timing};
@@ -117,6 +118,10 @@ async fn taken_over(gens: &mut watch::Receiver<[u32; 9]>, lane: usize, gen_no: u
 pub struct ServerCtx {
     identity: Identity,
     name: String,
+    /// The key in this node's trust slot (SPEC.md §5.1): known without pairing.
+    launcher: Option<[u8; 32]>,
+    /// The slot's launch token, if it carried one (SPEC.md §5.2).
+    launch: Option<LaunchSecret>,
     timing: Timing,
     limits: Limits,
     peers: Mutex<PeerStore>,
@@ -138,6 +143,8 @@ impl ServerCtx {
         Self {
             identity,
             name: name.to_string(),
+            launcher: None,
+            launch: None,
             timing: Timing::default(),
             limits: Limits::default(),
             peers: Mutex::new(peers),
@@ -153,6 +160,25 @@ impl ServerCtx {
             session_slots: AtomicUsize::new(0),
             unpaired: AtomicUsize::new(0),
         }
+    }
+
+    /// Trusts `key` without pairing, as a payload trusts the key stamped into its trust
+    /// slot (SPEC.md §5.1).
+    pub fn with_launcher(mut self, key: [u8; 32]) -> Self {
+        self.launcher = Some(key);
+        self
+    }
+
+    /// `with_launcher`, for a slot that also carried a launch `token`: the launcher's
+    /// Welcome then proves the token (SPEC.md §5.2).
+    pub fn with_launch(mut self, key: [u8; 32], token: [u8; 16]) -> Self {
+        self.launcher = Some(key);
+        self.launch = Some(LaunchSecret { key, token });
+        self
+    }
+
+    fn is_known(&self, key: &[u8; 32]) -> bool {
+        self.launcher.as_ref() == Some(key) || self.peers.lock().unwrap().contains(key)
     }
 
     pub fn with_limits(mut self, l: Limits) -> Self {
@@ -452,29 +478,37 @@ async fn control(
     let mut unpaired_slot: Option<UnpairedSlot> = None;
     let est = tokio::time::timeout_at(
         deadline,
-        handshake::server(&mut r, &mut w, first, &ctx.identity, &ctx.name, |k| {
-            // Message 3 has just proved the client holds `k`. Any session that key still
-            // has is replaced, before the limits below (and before Welcome, so the
-            // client's lanes find the old connections' counts already given back).
-            if ctx.peers.lock().unwrap().contains(k) {
-                ctx.supersede(k);
-                Admission::Known
-            } else if !ctx.pairing_open() {
-                Admission::Refuse(
-                    gen::ERR_PAIRING_CLOSED,
-                    "this device is not paired and pairing is closed",
-                )
-            } else {
-                ctx.supersede(k);
-                match UnpairedSlot::take(ctx) {
-                    Some(slot) => {
-                        unpaired_slot = Some(slot);
-                        Admission::Pairing
+        handshake::server_launched(
+            &mut r,
+            &mut w,
+            first,
+            &ctx.identity,
+            &ctx.name,
+            ctx.launch.as_ref(),
+            |k| {
+                // Message 3 has just proved the client holds `k`. Any session that key still
+                // has is replaced, before the limits below (and before Welcome, so the
+                // client's lanes find the old connections' counts already given back).
+                if ctx.is_known(k) {
+                    ctx.supersede(k);
+                    Admission::Known
+                } else if !ctx.pairing_open() {
+                    Admission::Refuse(
+                        gen::ERR_PAIRING_CLOSED,
+                        "this device is not paired and pairing is closed",
+                    )
+                } else {
+                    ctx.supersede(k);
+                    match UnpairedSlot::take(ctx) {
+                        Some(slot) => {
+                            unpaired_slot = Some(slot);
+                            Admission::Pairing
+                        }
+                        None => Admission::Refuse(gen::ERR_BUSY, "too many devices are pairing"),
                     }
-                    None => Admission::Refuse(gen::ERR_BUSY, "too many devices are pairing"),
                 }
-            }
-        }),
+            },
+        ),
     )
     .await
     .map_err(|_| Ava1Error::Timeout)??;

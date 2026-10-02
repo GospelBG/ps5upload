@@ -712,6 +712,10 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     }
     memset(&wel, 0, sizeof wel);
     wel.knows_you = known ? 1 : 0;
+    if (known && S.cfg.has_launch && memcmp(ns.rs, S.cfg.launch_key, 32) == 0) {
+        wel.has_launch_proof = 1;
+        ava1_launch_proof(S.cfg.launch_token, ns.h, wel.launch_proof);
+    }
     ava1_w_init(&w, pl, sizeof pl);
     if (ava1_welcome_encode(&wel, &w) != 0 || ava1_conn_send(&k->io, AVA1_TYPE_WELCOME, 0, pl, w.len) != 0)
         goto out;

@@ -8,6 +8,7 @@ pub mod gen;
 pub mod handshake;
 pub mod hex;
 pub mod keys;
+pub mod launch;
 mod link;
 pub mod peers;
 pub mod server;

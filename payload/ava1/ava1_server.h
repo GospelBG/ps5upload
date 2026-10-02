@@ -30,6 +30,11 @@ typedef struct ava1_server_cfg {
     uint32_t pair_confirm_ms;
     /* At most one on_pair_request per this long; 0 = 10 000 ms. */
     uint32_t notify_every_ms;
+    /* The trust slot carried a launch token (SPEC.md §5.2): a known client whose key is
+     * launch_key gets ava1_launch_proof(launch_token, h) in its Welcome. No other does. */
+    int has_launch;
+    uint8_t launch_key[32];
+    uint8_t launch_token[16];
     /* An unknown device started pairing: show its name and the code. */
     void (*on_pair_request)(const char *peer_name, uint32_t code);
     /* What an operator should know (an unreadable peers file, a pairing not stored). */
