@@ -338,6 +338,28 @@ fn peer_file_skips_garbage_lines() {
 }
 
 #[test]
+fn a_peer_removal_that_cannot_be_saved_changes_nothing() {
+    let d = temp_dir("remove-rollback");
+    let path = d.join("sub").join("peers");
+    let mut store = PeerStore::load(&path).unwrap();
+    store.add([1; 32], "one").unwrap();
+    store.add([2; 32], "two").unwrap();
+    // The directory turns into a file: nothing can be written there any more.
+    std::fs::remove_dir_all(d.join("sub")).unwrap();
+    std::fs::write(d.join("sub"), b"in the way").unwrap();
+    assert!(store.remove(&[1; 32]).is_err());
+    assert!(
+        store.contains(&[1; 32]),
+        "forgotten in memory though the file still lists it"
+    );
+    assert_eq!(store.list().len(), 2);
+    // Once the file can be written again, the removal goes through.
+    std::fs::remove_file(d.join("sub")).unwrap();
+    assert!(store.remove(&[1; 32]).unwrap());
+    assert!(!PeerStore::load(&path).unwrap().contains(&[1; 32]));
+}
+
+#[test]
 fn peer_store_keeps_at_most_32_and_replaces_by_key() {
     let d = temp_dir("cap");
     let mut s = PeerStore::load(&d.join("peers")).unwrap();

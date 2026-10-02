@@ -427,6 +427,9 @@ impl Session {
         r.set_key(keys::lane_key(&k.s2c, id, &client_nonce, &ack.server_nonce));
         let (tx, mut rx) = mpsc::channel::<Frame>(DELIVER_DEPTH);
         let (link, outbox) = drive(r, w, self.timing, tx);
+        // The server keeps an older connection of this lane until this one has shown it
+        // holds the lane key (SPEC.md §9): a sealed Ping, now, makes the takeover prompt.
+        let _ = outbox.try_ping(0);
         // Project 1 lanes carry heartbeats only; data frames arrive in project 2.
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         Ok((link, outbox))

@@ -238,3 +238,30 @@ fn a_missing_peers_file_is_an_empty_store_not_an_unreadable_one() {
         .unwrap()
         .contains(&[2; 32]));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_devices_confirming_at_the_same_moment_get_one_pairing() {
+    // The owner's approval takes a while (a prompt, a slow disk): long enough for a
+    // second PairConfirm to arrive while the first is still being decided.
+    let ctx = ServerCtx::new(
+        Identity::generate().unwrap(),
+        "console",
+        PeerStore::in_memory(),
+        node_info_rpc("console"),
+    )
+    .with_timing(fast())
+    .with_approve(Box::new(|_| {
+        std::thread::sleep(Duration::from_millis(150));
+        true
+    }));
+    assert!(ctx.open_pairing_if_unpaired(Duration::from_secs(60)));
+    let (addr, ctx) = start(ctx).await;
+    let (mut a, mut b) = (stranger(addr).await.unwrap(), stranger(addr).await.unwrap());
+    let (ra, rb) = tokio::join!(a.confirm_pairing(), b.confirm_pairing());
+    assert_eq!(
+        u8::from(ra.is_ok()) + u8::from(rb.is_ok()),
+        1,
+        "one window, one pairing: {ra:?} {rb:?}"
+    );
+    assert!(!ctx.pairing_open());
+}

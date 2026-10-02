@@ -2,15 +2,17 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::conn::{Frame, FrameReader, FrameWriter};
-use crate::gen::{self, Hs1, Join, JoinAck, PairConfirm, PairResult, RpcRequest, RpcResponse};
+use crate::gen::{
+    self, Hs1, Join, JoinAck, PairConfirm, PairResult, Ping, Pong, RpcRequest, RpcResponse,
+};
 use crate::handshake::{self, refuse, Admission};
 use crate::keys::{self, Identity, SessionKeys};
 use crate::link::{drive, Full, Outbox, DELIVER_DEPTH};
@@ -67,9 +69,49 @@ pub type LogHook = Box<dyn Fn(&str) + Send + Sync>;
 
 pub(crate) struct SessionEntry {
     pub(crate) keys: SessionKeys,
+    peer_key: [u8; 32],
     pub(crate) paired: AtomicBool,
-    pub(crate) lane_gen: Mutex<[u32; 9]>,
+    /// Per lane id, how many connections have taken it over. A lane connection ends when
+    /// its number is no longer the current one.
+    lane_gen: watch::Sender<[u32; 9]>,
     pub(crate) nonces: Mutex<VecDeque<[u8; 16]>>,
+    /// True once the session is over (its control connection ended, or the same device
+    /// connected again): the control connection and every lane end at once.
+    ended: watch::Sender<bool>,
+    /// The session's connections, so their per-address counts can be given back the
+    /// moment the session is superseded, before their tasks have wound down.
+    conns: Mutex<Vec<Weak<ConnSlot>>>,
+    /// Held while the session is welcomed but unconfirmed.
+    unpaired: Mutex<Option<UnpairedSlot>>,
+}
+
+impl SessionEntry {
+    fn adopt(&self, slot: &Arc<ConnSlot>) {
+        let mut conns = self.conns.lock().unwrap();
+        conns.retain(|c| c.strong_count() > 0);
+        conns.push(Arc::downgrade(slot));
+    }
+
+    /// Ends the session now: wakes its connections' tasks and frees what it held.
+    fn end(&self) {
+        self.ended.send_replace(true);
+        for c in self.conns.lock().unwrap().drain(..) {
+            if let Some(c) = c.upgrade() {
+                c.release_ip();
+            }
+        }
+        self.unpaired.lock().unwrap().take();
+    }
+}
+
+/// Resolves once the session is over.
+async fn over(ended: &mut watch::Receiver<bool>) {
+    let _ = ended.wait_for(|e| *e).await;
+}
+
+/// Resolves once `lane` has been taken over by a connection newer than `gen_no`.
+async fn taken_over(gens: &mut watch::Receiver<[u32; 9]>, lane: usize, gen_no: u32) {
+    let _ = gens.wait_for(|g| g[lane] != gen_no).await;
 }
 
 pub struct ServerCtx {
@@ -185,6 +227,52 @@ impl ServerCtx {
         self.sessions.lock().unwrap().len()
     }
 
+    /// One session per device (SPEC.md §8): a device that completes a new handshake
+    /// replaces whatever session it had. A client reconnecting after its link died must
+    /// not be refused because of its own dead connections, which linger until
+    /// `dead_after`: they are ended here and their per-address counts given back at
+    /// once.
+    fn supersede(&self, peer_key: &[u8; 32]) {
+        let old: Vec<Arc<SessionEntry>> = {
+            let mut map = self.sessions.lock().unwrap();
+            let ids: Vec<[u8; 16]> = map
+                .iter()
+                .filter(|(_, e)| &e.peer_key == peer_key)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.iter().filter_map(|id| map.remove(id)).collect()
+        };
+        for e in old {
+            e.end();
+        }
+    }
+
+    /// Decides a PairConfirm. One window, one pairing: the window check, the store and
+    /// the closing of the window happen under one lock, so two devices confirming at the
+    /// same moment cannot both get in. The owner's approval (which may wait on a person)
+    /// is asked first, outside the lock, and the window checked again after it.
+    fn accept_pairing(&self, req: &PairRequest) -> bool {
+        if !self.pairing_open() || !(self.approve)(req) {
+            return false;
+        }
+        let mut until = self.pairing_until.lock().unwrap();
+        if !until.is_some_and(|t| Instant::now() < t) {
+            return false;
+        }
+        let stored = self.peers.lock().unwrap().add(req.peer_key, &req.peer_name);
+        match stored {
+            Ok(()) => {
+                // Whoever else is waiting must ask again.
+                *until = None;
+                true
+            }
+            Err(e) => {
+                (self.log)(&format!("ava1: pairing not stored: {e}"));
+                false
+            }
+        }
+    }
+
     /// Shows a pairing request to the user, at most once per `notify_every`: a stranger
     /// reconnecting in a loop must not flood the screen.
     fn notify_limited(&self, req: &PairRequest) {
@@ -203,6 +291,8 @@ impl ServerCtx {
 struct ConnSlot {
     ctx: Arc<ServerCtx>,
     ip: IpAddr,
+    /// Still counted against its address. Cleared early when its session is superseded.
+    ip_held: AtomicBool,
 }
 
 impl ConnSlot {
@@ -227,12 +317,15 @@ impl ConnSlot {
         Ok(Self {
             ctx: ctx.clone(),
             ip,
+            ip_held: AtomicBool::new(true),
         })
     }
-}
 
-impl Drop for ConnSlot {
-    fn drop(&mut self) {
+    /// Gives back this connection's place in its address's count (once).
+    fn release_ip(&self) {
+        if !self.ip_held.swap(false, Ordering::SeqCst) {
+            return;
+        }
         let mut per_ip = self.ctx.per_ip.lock().unwrap();
         if let Some(n) = per_ip.get_mut(&self.ip) {
             *n -= 1;
@@ -240,7 +333,12 @@ impl Drop for ConnSlot {
                 per_ip.remove(&self.ip);
             }
         }
-        drop(per_ip);
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.release_ip();
         self.ctx.conns.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -288,9 +386,9 @@ pub async fn serve(listener: TcpListener, ctx: Arc<ServerCtx>) {
                 continue;
             }
         };
-        let ctx = ctx.clone();
+        let (ctx, slot) = (ctx.clone(), Arc::new(slot));
         tokio::spawn(async move {
-            let _ = handle(s, &ctx).await;
+            let _ = handle(s, &ctx, &slot).await;
             drop(slot);
         });
     }
@@ -314,7 +412,7 @@ impl Drop for SessionSlot {
     }
 }
 
-async fn handle(s: TcpStream, ctx: &Arc<ServerCtx>) -> Result<(), Ava1Error> {
+async fn handle(s: TcpStream, ctx: &Arc<ServerCtx>, slot: &Arc<ConnSlot>) -> Result<(), Ava1Error> {
     s.set_nodelay(true)?;
     let (rh, wh) = s.into_split();
     let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
@@ -325,8 +423,8 @@ async fn handle(s: TcpStream, ctx: &Arc<ServerCtx>) -> Result<(), Ava1Error> {
         .await
         .map_err(|_| Ava1Error::Timeout)??;
     match first.ty {
-        Hs1::TYPE => control(r, w, first, ctx, deadline).await,
-        Join::TYPE => lane(r, w, first, ctx, deadline).await,
+        Hs1::TYPE => control(r, w, first, ctx, slot, deadline).await,
+        Join::TYPE => lane(r, w, first, ctx, slot, deadline).await,
         t => {
             refuse_by(deadline, &mut w, gen::ERR_PROTOCOL, "expected Hs1 or Join").await;
             Err(Ava1Error::Unexpected(t))
@@ -339,6 +437,7 @@ async fn control(
     mut w: FrameWriter<OwnedWriteHalf>,
     first: Frame,
     ctx: &Arc<ServerCtx>,
+    slot: &Arc<ConnSlot>,
     deadline: tokio::time::Instant,
 ) -> Result<(), Ava1Error> {
     // Reserve atomically before the handshake; released on every exit path by the guard.
@@ -354,7 +453,11 @@ async fn control(
     let est = tokio::time::timeout_at(
         deadline,
         handshake::server(&mut r, &mut w, first, &ctx.identity, &ctx.name, |k| {
+            // Message 3 has just proved the client holds `k`. Any session that key still
+            // has is replaced, before the limits below (and before Welcome, so the
+            // client's lanes find the old connections' counts already given back).
             if ctx.peers.lock().unwrap().contains(k) {
+                ctx.supersede(k);
                 Admission::Known
             } else if !ctx.pairing_open() {
                 Admission::Refuse(
@@ -362,6 +465,7 @@ async fn control(
                     "this device is not paired and pairing is closed",
                 )
             } else {
+                ctx.supersede(k);
                 match UnpairedSlot::take(ctx) {
                     Some(slot) => {
                         unpaired_slot = Some(slot);
@@ -382,10 +486,16 @@ async fn control(
     };
     let entry = Arc::new(SessionEntry {
         keys: est.keys.clone(),
+        peer_key: est.peer_key,
         paired: AtomicBool::new(est.pairing.is_none()),
-        lane_gen: Mutex::new([0; 9]),
+        lane_gen: watch::Sender::new([0; 9]),
         nonces: Mutex::new(VecDeque::new()),
+        ended: watch::Sender::new(false),
+        conns: Mutex::default(),
+        unpaired: Mutex::new(unpaired_slot),
     });
+    entry.adopt(slot);
+    let mut ended = entry.ended.subscribe();
     ctx.sessions
         .lock()
         .unwrap()
@@ -413,10 +523,12 @@ async fn control(
                 Some(f) => f,
                 None => break,
             },
+            // The same device connected again: this session is the old one.
+            _ = over(&mut ended) => break,
             _ = check.tick() => {
                 // An unconfirmed session is only useful while it can still be confirmed:
                 // it ends with the pairing window, or after the confirm deadline.
-                if unpaired_slot.is_some()
+                if !entry.paired.load(Ordering::SeqCst)
                     && (!ctx.pairing_open() || welcomed.elapsed() > ctx.limits.pair_confirm)
                 {
                     refuse_on(&outbox, gen::ERR_PAIRING_CLOSED, "pairing was not confirmed in time").await;
@@ -483,19 +595,10 @@ async fn control(
             }
             PairConfirm::TYPE => {
                 let already = entry.paired.load(Ordering::SeqCst);
-                let accepted = already
-                    || (ctx.pairing_open() && (ctx.approve)(&req) && {
-                        let stored = ctx.peers.lock().unwrap().add(req.peer_key, &req.peer_name);
-                        if let Err(e) = &stored {
-                            (ctx.log)(&format!("ava1: pairing not stored: {e}"));
-                        }
-                        stored.is_ok()
-                    });
+                let accepted = already || ctx.accept_pairing(&req);
                 entry.paired.store(accepted, Ordering::SeqCst);
                 if accepted && !already {
-                    // One window, one pairing: whoever else is waiting must ask again.
-                    ctx.close_pairing();
-                    unpaired_slot = None;
+                    entry.unpaired.lock().unwrap().take();
                 }
                 let result = PairResult {
                     accepted: u8::from(accepted),
@@ -513,6 +616,8 @@ async fn control(
         }
     }
     ctx.sessions.lock().unwrap().remove(&est.session_id);
+    // Lanes end with their session, at once.
+    entry.end();
     drop(link);
     Ok(())
 }
@@ -550,6 +655,7 @@ async fn lane(
     mut w: FrameWriter<OwnedWriteHalf>,
     first: Frame,
     ctx: &Arc<ServerCtx>,
+    slot: &Arc<ConnSlot>,
     deadline: tokio::time::Instant,
 ) -> Result<(), Ava1Error> {
     let j: Join = first.decode()?;
@@ -587,12 +693,8 @@ async fn lane(
         refuse_by(deadline, &mut w, gen::ERR_NOT_PAIRED, "pair first").await;
         return Err(Ava1Error::NotPaired);
     }
+    entry.adopt(slot);
     let lane = j.lane_id as usize;
-    let gen_no = {
-        let mut g = entry.lane_gen.lock().unwrap();
-        g[lane] += 1;
-        g[lane]
-    };
     // A fresh server nonce per join: even a replayed Join (one older than the nonce
     // window) gets keys never used before, so no (key, counter) pair repeats.
     let server_nonce: [u8; 16] = keys::random_bytes()?;
@@ -608,26 +710,58 @@ async fn lane(
         .map_err(|_| Ava1Error::Timeout)??;
     r.set_key(keys::lane_key(&entry.keys.c2s, j.lane_id, &cn, &sn));
     w.set_key(keys::lane_key(&entry.keys.s2c, j.lane_id, &cn, &sn));
+    // A Join can be captured and sent again by someone who does not hold the session
+    // keys. So this connection takes the lane over — ending an older connection of the
+    // same lane id — only once its first sealed frame has opened under the new lane
+    // key. Until then the older connection is left alone.
+    let proof = tokio::time::timeout_at(deadline, r.recv())
+        .await
+        .map_err(|_| Ava1Error::Timeout)??;
+    let mut gen_no = 0;
+    entry.lane_gen.send_modify(|g| {
+        g[lane] += 1;
+        gen_no = g[lane];
+    });
+    let (mut gens, mut ended) = (entry.lane_gen.subscribe(), entry.ended.subscribe());
     let (tx, mut rx) = mpsc::channel(DELIVER_DEPTH);
     let (link, outbox) = drive(r, w, ctx.timing, tx);
+    // The proving frame is a frame like any other (a client sends a Ping).
+    let mut first = Some(proof);
     loop {
-        tokio::select! {
-            // Project 1 lanes carry heartbeats only (handled by the link): anything else
-            // that is not marked ignorable is a protocol error.
-            f = rx.recv() => match f {
-                None => break,
-                Some(f) if f.ignorable() => {}
-                Some(_) => {
-                    refuse_on(&outbox, gen::ERR_PROTOCOL, "unexpected frame on a lane").await;
-                    break;
-                }
+        let f = match first.take() {
+            Some(f) => f,
+            None => tokio::select! {
+                f = rx.recv() => match f {
+                    Some(f) => f,
+                    None => break,
+                },
+                _ = taken_over(&mut gens, lane, gen_no) => break,
+                _ = over(&mut ended) => break,
             },
-            _ = tokio::time::sleep(ctx.timing.ping_every) => {
-                let superseded = entry.lane_gen.lock().unwrap()[lane] != gen_no;
-                let session_gone = !ctx.sessions.lock().unwrap().contains_key(&j.session_id);
-                if superseded || session_gone {
+        };
+        // Project 1 lanes carry heartbeats only: anything else that is not marked
+        // ignorable is a protocol error. (After the first frame the link answers Pings
+        // itself and they never get here.)
+        match f.ty {
+            Ping::TYPE => {
+                let Ok(p) = f.decode::<Ping>() else {
+                    refuse_on(&outbox, gen::ERR_PROTOCOL, "malformed Ping").await;
+                    break;
+                };
+                let pong = Pong {
+                    seq: p.seq,
+                    t_us: p.t_us,
+                };
+                if outbox.try_send(0, &pong) == Err(Full::Closed) {
                     break;
                 }
+            }
+            Pong::TYPE => {}
+            gen::Bye::TYPE | gen::Error::TYPE => break,
+            _ if f.ignorable() => {}
+            _ => {
+                refuse_on(&outbox, gen::ERR_PROTOCOL, "unexpected frame on a lane").await;
+                break;
             }
         }
     }

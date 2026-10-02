@@ -237,3 +237,48 @@ async fn a_peer_that_never_reads_its_replies_is_dropped() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_client_whose_link_died_reconnects_at_once_with_all_its_lanes() {
+    // The link dies without a FIN (Wi-Fi gone, console asleep): the server still counts
+    // the old control connection and its 8 lanes until dead_after. One address may hold
+    // 12 connections, so without superseding the old session the new one would get its
+    // control connection and two lanes, and ERR_BUSY for the third.
+    let t = Timing {
+        dead_after: Duration::from_secs(5),
+        ..fast()
+    };
+    let (addr, ctx, me, peers) = paired_with(t).await;
+    let proxy = ChaosProxy::start(addr, ChaosConfig::default())
+        .await
+        .unwrap();
+    let old = connect(&proxy.addr.to_string(), me.clone(), peers.clone(), "c", t)
+        .await
+        .unwrap();
+    let mut old_lanes = Vec::new();
+    for _ in 0..gen::MAX_LANES {
+        old_lanes.push(old.open_lane().await.unwrap());
+    }
+    assert_eq!(ctx.connections(), 9);
+    proxy.blackhole(true);
+    let new = connect(&addr.to_string(), me, peers, "c", t).await.unwrap();
+    let mut lanes = Vec::new();
+    for i in 0..gen::MAX_LANES {
+        match new.open_lane().await {
+            Ok(l) => lanes.push(l),
+            Err(e) => panic!("lane {} of the new session: {e:?}", i + 1),
+        }
+    }
+    new.node_info().await.unwrap();
+    assert_eq!(
+        ctx.sessions(),
+        1,
+        "the old session is gone, not waiting to die"
+    );
+    // The old connections themselves end right away, not after dead_after.
+    wait_for(Duration::from_secs(2), || ctx.connections() == 9)
+        .await
+        .expect("the superseded session's connections are closed");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!new.is_closed() && lanes.iter().all(|l| !l.is_closed()));
+}

@@ -98,14 +98,16 @@ impl PeerStore {
         self.save().inspect_err(|_| self.peers = before)
     }
 
+    /// Forgets `key`; saves. Whether it was there. Nothing changes unless the save
+    /// succeeds.
     pub fn remove(&mut self, key: &[u8; 32]) -> io::Result<bool> {
         self.refuse_if_unreadable()?;
-        let before = self.peers.len();
+        let before = self.peers.clone();
         self.peers.retain(|p| &p.key != key);
-        if self.peers.len() == before {
+        if self.peers.len() == before.len() {
             return Ok(false);
         }
-        self.save()?;
+        self.save().inspect_err(|_| self.peers = before)?;
         Ok(true)
     }
 

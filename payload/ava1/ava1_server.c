@@ -44,7 +44,14 @@ typedef struct {
     ava1_conn_t io;
     int refs;    /* under mu */
     uint32_t ip; /* source address (network order), for the per-address limit */
+    int ip_held; /* under mu: still counted against ip (given back early on supersede) */
+    int member;  /* under mu: the session slot this connection is listed in, or -1 */
 } conn_t;
+
+/* Connections one session lists: its control, 8 lanes, and joins still proving
+ * themselves. One that finds the list full simply is not listed (it is still counted
+ * and released normally; it only misses the early release on supersede). */
+#define MEMBERS 24
 
 typedef struct {
     int used;
@@ -62,6 +69,10 @@ typedef struct {
     uint8_t nonces[NONCES][16];
     unsigned nonce_next;
     unsigned nonce_count;
+    /* The same device connected again: this session is over. It keeps its slot until its
+     * control thread leaves, but no lane may join it and it is no longer counted. */
+    int superseded;
+    conn_t *members[MEMBERS];
 } sess_t;
 
 static struct {
@@ -130,20 +141,70 @@ static void conn_get(conn_t *k) {
     pthread_mutex_unlock(&mu);
 }
 
+/* Caller holds mu. Gives back k's place in its address's count, once. */
+static void release_ip_locked(conn_t *k) {
+    int i;
+    if (!k->ip_held) return;
+    k->ip_held = 0;
+    for (i = 0; i < MAX_CONNS; i++) {
+        if (S.ips[i].n > 0 && S.ips[i].ip == k->ip) {
+            S.ips[i].n--;
+            break;
+        }
+    }
+}
+
+/* Caller holds mu. Lists k in session idx, so a supersede can reach it. */
+static void member_add_locked(int idx, conn_t *k) {
+    int i;
+    for (i = 0; i < MEMBERS; i++) {
+        if (!S.sessions[idx].members[i]) {
+            S.sessions[idx].members[i] = k;
+            k->member = idx;
+            return;
+        }
+    }
+}
+
+/* Takes k off its session's list; before k can be freed. */
+static void member_drop(conn_t *k) {
+    int i;
+    pthread_mutex_lock(&mu);
+    if (k->member >= 0) {
+        for (i = 0; i < MEMBERS; i++)
+            if (S.sessions[k->member].members[i] == k) S.sessions[k->member].members[i] = NULL;
+        k->member = -1;
+    }
+    pthread_mutex_unlock(&mu);
+}
+
+/* Caller holds mu. One session per device (SPEC.md §8): a device that has just proved
+ * its key in a new handshake replaces any session it still has. A client reconnecting
+ * after its link died must not be refused because of its own dead connections, which
+ * would otherwise linger until dead_after: they are shut down now (waking their
+ * threads) and their per-address counts given back at once. */
+static void supersede_locked(int keep, const uint8_t peer[32]) {
+    int i, m;
+    for (i = 0; i < MAX_SESSIONS; i++) {
+        sess_t *s = &S.sessions[i];
+        if (i == keep || !s->used || s->superseded || memcmp(s->peer_key, peer, 32) != 0) continue;
+        s->superseded = 1;
+        for (m = 0; m < MEMBERS; m++) {
+            if (!s->members[m]) continue;
+            release_ip_locked(s->members[m]);
+            shutdown(s->members[m]->io.fd, SHUT_RDWR);
+        }
+    }
+}
+
 /* The last reference closes the socket and frees the connection. */
 static void conn_put(conn_t *k) {
     int last;
     pthread_mutex_lock(&mu);
     last = --k->refs == 0;
     if (last) {
-        int i;
         S.conns--;
-        for (i = 0; i < MAX_CONNS; i++) {
-            if (S.ips[i].n > 0 && S.ips[i].ip == k->ip) {
-                S.ips[i].n--;
-                break;
-            }
-        }
+        release_ip_locked(k);
     }
     pthread_mutex_unlock(&mu);
     if (!last) return;
@@ -223,18 +284,19 @@ static unsigned unpaired_locked(void) {
     int i;
     for (i = 0; i < MAX_SESSIONS; i++) {
         const sess_t *s = &S.sessions[i];
-        if ((s->used && !s->paired) || (!s->used && s->reserved && s->unpaired_hold)) n++;
+        if ((s->used && !s->paired && !s->superseded) || (!s->used && s->reserved && s->unpaired_hold)) n++;
     }
     return n;
 }
 
-/* Fills a slot from sess_reserve. */
-static void sess_fill(int idx, const uint8_t sid[16], const uint8_t c2s[32], const uint8_t s2c[32],
+/* Fills a slot from sess_reserve; k is its control connection. */
+static void sess_fill(int idx, conn_t *k, const uint8_t sid[16], const uint8_t c2s[32], const uint8_t s2c[32],
                       int paired, const uint8_t peer[32], const char *name) {
     pthread_mutex_lock(&mu);
     {
         sess_t *s = &S.sessions[idx];
         memset(s, 0, sizeof *s);
+        member_add_locked(idx, k);
         s->used = 1;
         memcpy(s->sid, sid, 16);
         memcpy(s->c2s, c2s, 32);
@@ -254,11 +316,12 @@ static void sess_remove(int idx, const uint8_t sid[16]) {
     pthread_mutex_unlock(&mu);
 }
 
-/* Caller holds mu. */
+/* Caller holds mu. A live (not superseded) session. */
 static int sess_find_locked(const uint8_t sid[16]) {
     int i;
     for (i = 0; i < MAX_SESSIONS; i++)
-        if (S.sessions[i].used && memcmp(S.sessions[i].sid, sid, 16) == 0) return i;
+        if (S.sessions[i].used && !S.sessions[i].superseded && memcmp(S.sessions[i].sid, sid, 16) == 0)
+            return i;
     return -1;
 }
 
@@ -270,7 +333,7 @@ static int sess_is_locked(int idx, const uint8_t sid[16]) {
 static int lane_current(int idx, const uint8_t sid[16], uint16_t lane, uint32_t gen) {
     int ok;
     pthread_mutex_lock(&mu);
-    ok = sess_is_locked(idx, sid) && S.sessions[idx].lane_gen[lane] == gen;
+    ok = sess_is_locked(idx, sid) && !S.sessions[idx].superseded && S.sessions[idx].lane_gen[lane] == gen;
     pthread_mutex_unlock(&mu);
     return ok;
 }
@@ -631,19 +694,12 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     pthread_mutex_lock(&mu);
     known = ava1_peers_contains(&S.peers, ns.rs);
     open = now_ms() < S.pairing_until_ms;
+    /* Message 3 has just proved the client holds ns.rs: any session that key still has
+     * is replaced, before the limits below. */
+    if (known || open) supersede_locked(idx, ns.rs);
     if (!known && open) {
-        if (unpaired_locked() >= cfg_or(S.cfg.max_unpaired, MAX_UNPAIRED)) {
-            busy = 1;
-        } else {
-            uint64_t t = now_ms();
-            S.sessions[idx].unpaired_hold = 1;
-            /* A stranger reconnecting in a loop must not flood the screen. */
-            if (!S.notified || t - S.last_notify_ms >= cfg_or(S.cfg.notify_every_ms, NOTIFY_EVERY_MS)) {
-                S.notified = 1;
-                S.last_notify_ms = t;
-                notify = 1;
-            }
-        }
+        if (unpaired_locked() >= cfg_or(S.cfg.max_unpaired, MAX_UNPAIRED)) busy = 1;
+        else S.sessions[idx].unpaired_hold = 1;
     }
     pthread_mutex_unlock(&mu);
     if (!known && !open) {
@@ -659,8 +715,20 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     ava1_w_init(&w, pl, sizeof pl);
     if (ava1_welcome_encode(&wel, &w) != 0 || ava1_conn_send(&k->io, AVA1_TYPE_WELCOME, 0, pl, w.len) != 0)
         goto out;
-    sess_fill(idx, sid, c2s, s2c, known, ns.rs, peer_name);
+    sess_fill(idx, k, sid, c2s, s2c, known, ns.rs, peer_name);
     filled = 1;
+    if (!known) {
+        /* Only a device that was welcomed is shown, and a stranger reconnecting in a loop
+         * must not flood the screen. */
+        uint64_t t = now_ms();
+        pthread_mutex_lock(&mu);
+        if (!S.notified || t - S.last_notify_ms >= cfg_or(S.cfg.notify_every_ms, NOTIFY_EVERY_MS)) {
+            S.notified = 1;
+            S.last_notify_ms = t;
+            notify = 1;
+        }
+        pthread_mutex_unlock(&mu);
+    }
     if (notify && S.cfg.on_pair_request) S.cfg.on_pair_request(peer_name, ava1_pairing_code(ns.h));
     serve_loop(k, idx, sid, 0, 0, buf);
     sess_remove(idx, sid);
@@ -682,6 +750,8 @@ static void run_lane(conn_t *k, uint8_t *buf, size_t len) {
     ava1_w_t w;
     int idx, verified = 0, fresh = 0, paired = 0;
     uint32_t gen = 0;
+    uint8_t type, flags;
+    uint32_t ch;
     memset(c2s, 0, sizeof c2s);
     memset(s2c, 0, sizeof s2c);
     if (ava1_join_decode(buf, len, &j) != 0 || j.lane_id == 0 || j.lane_id > AVA1_MAX_LANES) {
@@ -700,9 +770,9 @@ static void run_lane(conn_t *k, uint8_t *buf, size_t len) {
             paired = s->paired;
         }
         if (fresh && paired) {
-            gen = ++s->lane_gen[j.lane_id];
             memcpy(c2s, s->c2s, 32);
             memcpy(s2c, s->s2c, 32);
+            member_add_locked(idx, k);
         }
     }
     pthread_mutex_unlock(&mu);
@@ -721,12 +791,26 @@ static void run_lane(conn_t *k, uint8_t *buf, size_t len) {
     }
     ava1_join_ack_tag(s2c, j.session_id, j.lane_id, j.client_nonce, ack.server_nonce, ack.tag);
     ava1_w_init(&w, out, sizeof out);
-    if (ava1_join_ack_encode(&ack, &w) == 0 && ava1_conn_send(&k->io, AVA1_TYPE_JOIN_ACK, 0, out, w.len) == 0) {
-        ava1_lane_key(c2s, j.lane_id, j.client_nonce, ack.server_nonce, k->io.recv_key);
-        ava1_lane_key(s2c, j.lane_id, j.client_nonce, ack.server_nonce, k->io.send_key);
-        k->io.keyed = 1;
-        serve_loop(k, idx, j.session_id, j.lane_id, gen, buf);
+    if (ava1_join_ack_encode(&ack, &w) != 0 || ava1_conn_send(&k->io, AVA1_TYPE_JOIN_ACK, 0, out, w.len) != 0)
+        goto wipe;
+    ava1_lane_key(c2s, j.lane_id, j.client_nonce, ack.server_nonce, k->io.recv_key);
+    ava1_lane_key(s2c, j.lane_id, j.client_nonce, ack.server_nonce, k->io.send_key);
+    k->io.keyed = 1;
+    /* A Join can be captured and sent again by someone without the session keys. So this
+     * connection takes the lane over (ending an older connection of the same id) only
+     * once its first sealed frame has opened under the new lane key, within the
+     * handshake deadline still in force. Until then the older connection stays. */
+    if (ava1_conn_recv(&k->io, &type, &flags, &ch, buf, CTRL_MAX - AVA1_TAG_LEN, &len) != 0) goto wipe;
+    pthread_mutex_lock(&mu);
+    if (sess_is_locked(idx, j.session_id) && !S.sessions[idx].superseded) {
+        gen = ++S.sessions[idx].lane_gen[j.lane_id];
+        paired = 1;
+    } else {
+        paired = 0;
     }
+    pthread_mutex_unlock(&mu);
+    if (paired && handle_frame(k, idx, j.session_id, j.lane_id, type, flags, ch, buf, len) == 0)
+        serve_loop(k, idx, j.session_id, j.lane_id, gen, buf);
 wipe:
     crypto_wipe(expect, sizeof expect);
     crypto_wipe(c2s, sizeof c2s);
@@ -749,6 +833,7 @@ static void *conn_main(void *arg) {
         }
         free(buf);
     }
+    member_drop(k);
     /* Wake any worker blocked writing to a peer that is gone, then drop our reference. */
     shutdown(k->io.fd, SHUT_RDWR);
     conn_put(k);
@@ -827,6 +912,8 @@ static void *accept_main(void *arg) {
         ava1_conn_init(&k->io, fd);
         k->refs = 1;
         k->ip = ip;
+        k->ip_held = 1;
+        k->member = -1;
         if (spawn_detached(conn_main, k) != 0) conn_put(k);
     }
     return NULL;

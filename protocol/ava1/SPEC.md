@@ -89,7 +89,8 @@ six digits. A man in the middle yields different h, so different codes.
    been accepted ends — sealed `Error(ERR_PAIRING_CLOSED)`, close — when the
    window closes or 60 s after its Welcome, whichever is first. At most 2 such
    sessions exist at a time; a third unknown client gets `Error(ERR_BUSY)` in
-   place of Welcome. A node shows at most one pairing request per 10 s.
+   place of Welcome. A node shows at most one pairing request per 10 s, and only
+   for a client it has sent Welcome to: a client gone before its Welcome uses none.
 7. Peer stores: `<64 hex key> <unix seconds> <name>` per line, ≤ 32 peers (oldest
    dropped), written atomically (temp file + rename in the same directory). A
    missing file is an empty store. A file that exists but cannot be read is not:
@@ -104,12 +105,17 @@ payload adds that key to its peers at startup. Exactly one slot must exist.
 ## 6. Liveness
 Every connection sends `Ping{seq, t_us}` every 2 s (default) on channel 0, also
 while it is in the middle of reading a large frame; the receiver answers `Pong`
-with the same values; the sender's RTT is now − t_us. A sender may skip a Ping or
-Pong while other frames are queued: they are proof of life too.
+with the same values; the sender's RTT is now − t_us. t_us is taken when the Ping is
+written, not when it is queued, so time spent behind other frames is not counted as
+round trip. A sender may skip a Ping or Pong while other frames are queued or being
+written: they are proof of life too.
 
 Liveness counts bytes, not frames: a connection is dead after 6 s (default,
 `dead_after`) with no byte received, so a 16 MiB frame on a slow link is never
-mistaken for silence. Each frame must also move at no less than a rate floor
+mistaken for silence. Silence is judged by what can be read: a reader that was busy
+elsewhere (writing, waiting to write) past `dead_after` checks the socket first and
+carries on if bytes are waiting; a process that was not running (a late timer tick)
+may put off the verdict for at most 2 ticks in a row. Each frame must also move at no less than a rate floor
 (default 8 KiB/s) after a `dead_after` grace — its deadline is dead_after +
 body_len / floor — so a peer cannot drip one frame forever. Writes obey the same
 two limits: a peer that takes no bytes for `dead_after` (it stopped reading), or
@@ -133,6 +139,12 @@ A server accepts at most 64 connections, 12 from one source address, and 16
 sessions (2 of them unconfirmed, §5); past any of these it sends
 `Error(ERR_BUSY)` and closes. The accept loop never stops on an accept error.
 
+One session per device: when a client completes a handshake (message 3 proves its
+key) while that key still has a session, the older session ends at once — its
+control connection and lanes are closed and their per-address counts given back
+before the new session's limits are checked. A client reconnecting after its link
+died silently is therefore never refused for its own dead connections.
+
 ## 9. Data lanes
 A client opens lane n (1..=8) by connecting and sending, unsealed,
 `Join{session_id, lane_id, client_nonce, tag}` with a fresh random client_nonce
@@ -142,8 +154,12 @@ this session's last 64 joins; and `ERR_NOT_PAIRED` while the session is not
 paired. Otherwise it draws a fresh random server_nonce and sends, unsealed,
 `JoinAck{lane_id, server_nonce, tag}` (JoinAck tag, §4.5); the client checks the
 tag. Both sides then seal everything after with lane_key(c2s|s2c, n, client_nonce,
-server_nonce) (§4.3), counters from 0. A join of a lane id that is
-still live supersedes the older connection. Lanes end with their session.
+server_nonce) (§4.3), counters from 0. The client sends a sealed Ping on the lane
+as soon as it has checked the JoinAck. A join of a lane id that is still live
+supersedes the older connection, but only once the new connection's first sealed
+frame has opened under the new lane key (within the handshake timeout): a replayed
+Join cannot prove the key and leaves the live lane alone. Lanes end with their
+session.
 In version 1 project 1, lanes carry only heartbeats; any other frame without the
 IGNORABLE flag is answered `Error(ERR_PROTOCOL)` and closes the lane.
 

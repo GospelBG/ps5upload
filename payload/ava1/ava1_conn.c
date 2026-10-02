@@ -76,6 +76,19 @@ static int write_all(ava1_conn_t *c, const uint8_t *p, size_t n, size_t *sent) {
     return 0;
 }
 
+/* 1 if a byte (or EOF) is waiting right now, 0 if not, <0 on error. */
+static int readable_now(int fd) {
+    struct pollfd pf;
+    int pr;
+    pf.fd = fd;
+    pf.events = POLLIN;
+    pf.revents = 0;
+    do {
+        pr = poll(&pf, 1, 0);
+    } while (pr < 0 && errno == EINTR);
+    return pr;
+}
+
 /* Reads exactly n bytes. Bounded by deadline_ms (absolute, the handshake or a frame's
  * rate floor) and idle_ms (since the last byte); calls tick while it waits. */
 static int read_all(ava1_conn_t *c, uint8_t *p, size_t n) {
@@ -92,7 +105,15 @@ static int read_all(ava1_conn_t *c, uint8_t *p, size_t n) {
             }
             if (c->idle_ms) {
                 uint64_t dead = c->last_rx_ms + c->idle_ms;
-                if (now >= dead) return AVA1_E_TIMEOUT;
+                if (now >= dead) {
+                    /* The limit can pass while this thread is away from the socket (waiting
+                     * to write, writing a reply): the peer's bytes may be waiting unread.
+                     * Silence is only what nothing to read right now proves. */
+                    int ready = readable_now(fd);
+                    if (ready < 0) return AVA1_E_IO;
+                    if (ready == 0) return AVA1_E_TIMEOUT;
+                    goto take;
+                }
                 if (wait < 0 || ms_until(dead, now) < wait) wait = ms_until(dead, now);
             }
             if (c->tick && (wait < 0 || (int)c->tick_ms < wait)) wait = c->tick_ms ? (int)c->tick_ms : 1;
@@ -107,6 +128,7 @@ static int read_all(ava1_conn_t *c, uint8_t *p, size_t n) {
             if (c->tick && c->tick(c->tick_arg) != 0) return AVA1_E_CLOSED;
             if (pr == 0) continue; /* the limits are checked at the top */
         }
+    take:
         k = recv(fd, p, n, 0);
         if (k == 0) return AVA1_E_CLOSED;
         if (k < 0) {

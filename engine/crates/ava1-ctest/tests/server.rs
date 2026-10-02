@@ -748,3 +748,208 @@ async fn the_c_server_reports_a_pairing_it_cannot_store() {
     // Nothing half-stored in memory either: the same device is still a stranger.
     assert!(srv.pairing_open());
 }
+
+/// Sends `j` on a fresh connection; returns the JoinAck's server nonce.
+async fn c_join_ack(addr: &str, j: &gen::Join) -> [u8; 16] {
+    let (rh, wh) = TcpStream::connect(addr).await.unwrap().into_split();
+    let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+    w.send_msg(0, j).await.unwrap();
+    r.recv()
+        .await
+        .unwrap()
+        .decode::<gen::JoinAck>()
+        .unwrap()
+        .server_nonce
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replayed_join_does_not_take_over_a_live_c_lane() {
+    let d = dir("replay-takeover");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    // A Join captured on the network, kept until the server has forgotten its nonce.
+    let captured = s.join_frame_for_test(1, [0x77; 16]);
+    c_join_ack(&srv.addr(), &captured).await;
+    for i in 0..70u8 {
+        c_join_ack(&srv.addr(), &s.join_frame_for_test(3, [i; 16])).await;
+        wait_conns(&srv, 1).await;
+    }
+    let live = s.open_lane().await.unwrap();
+    assert_eq!(live.id, 1);
+    let (rh, wh) = TcpStream::connect(srv.addr()).await.unwrap().into_split();
+    let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+    w.send_msg(0, &captured).await.unwrap();
+    r.recv().await.unwrap().decode::<gen::JoinAck>().unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!live.is_closed(), "a replayed Join ended the live lane");
+    w.set_key([0x13; 32]);
+    w.send_msg(0, &gen::Ping { seq: 1, t_us: 1 }).await.unwrap();
+    assert!(r.recv().await.is_err(), "the replayer is disconnected");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !live.is_closed(),
+        "a forged first frame ended the live lane"
+    );
+    // A genuine re-join still takes the lane over at once.
+    let again = s.reopen_lane_for_test(1).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), live.closed())
+        .await
+        .expect("the genuine re-join superseded the old connection");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!again.is_closed());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_notifies_only_once_welcome_is_sent() {
+    let d = dir("notify-after-welcome");
+    let srv = CServer::start_with(SECRET, &d.join("peers"), opts(60));
+    // A stranger that finishes the Noise handshake and resets the connection at once: the
+    // server's Welcome cannot be delivered, so nobody is there to pair with.
+    {
+        let me = Identity::generate().unwrap();
+        let stream = TcpStream::connect(srv.addr()).await.unwrap();
+        stream.set_zero_linger().unwrap();
+        let (rh, wh) = stream.into_split();
+        let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+        let mut hs = ava1::keys::Handshake::initiator(&me).unwrap();
+        let hello = gen::HelloInfo {
+            version_min: gen::PROTOCOL_VERSION,
+            version_max: gen::PROTOCOL_VERSION,
+            caps: 0,
+        };
+        use ava1::wire::Message;
+        let noise = hs.write(&hello.to_bytes().unwrap()).unwrap();
+        w.send_msg(0, &gen::Hs1 { noise }).await.unwrap();
+        let m2: gen::Hs2 = r.recv().await.unwrap().decode().unwrap();
+        hs.read(&m2.noise).unwrap();
+        let ci = gen::ClientInfo {
+            name: Some("ghost".into()),
+        };
+        let noise = hs.write(&ci.to_bytes().unwrap()).unwrap();
+        w.send_msg(0, &gen::Hs3 { noise }).await.unwrap();
+        // Dropping both halves with a zero linger sends RST.
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        srv.pair_requests().0,
+        0,
+        "nobody was welcomed, nothing shown"
+    );
+    // A real device asking a moment later is shown: the ghost spent no notification.
+    let _p = stranger(&srv).await.unwrap();
+    let t = Instant::now();
+    while srv.pair_requests().0 == 0 && t.elapsed() < Duration::from_secs(1) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(srv.pair_requests().0, 1, "the real request was not shown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_whose_link_died_reconnects_to_the_c_server_with_all_its_lanes() {
+    let d = dir("reconnect");
+    let (me, peers) = paired_client(&d.join("peers"));
+    // dead_after 5 s: the old connections would linger that long.
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 5000, 500);
+    let t = Timing {
+        dead_after: Duration::from_secs(5),
+        ..fast()
+    };
+    let proxy = ChaosProxy::start(srv.addr().parse().unwrap(), ChaosConfig::default())
+        .await
+        .unwrap();
+    let old = connect(
+        &proxy.addr.to_string(),
+        me.clone(),
+        peers.clone(),
+        "laptop",
+        t,
+    )
+    .await
+    .unwrap();
+    let mut old_lanes = Vec::new();
+    for _ in 0..gen::MAX_LANES {
+        old_lanes.push(old.open_lane().await.unwrap());
+    }
+    assert_eq!(srv.conns(), 9);
+    proxy.blackhole(true);
+    let new = connect(&srv.addr(), me, peers, "laptop", t).await.unwrap();
+    let mut lanes = Vec::new();
+    for i in 0..gen::MAX_LANES {
+        match new.open_lane().await {
+            Ok(l) => lanes.push(l),
+            Err(e) => panic!("lane {} of the new session: {e:?}", i + 1),
+        }
+    }
+    new.node_info().await.unwrap();
+    // The old connections end right away, not after dead_after.
+    wait_conns(&srv, 9).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!new.is_closed() && lanes.iter().all(|l| !l.is_closed()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_c_reader_kept_from_reading_past_dead_after_keeps_a_live_session() {
+    // The reader thread can spend dead_after and more outside recv() — here waiting for
+    // the peers-file lock while another session's pairing is being written — while its
+    // client keeps sending. Those bytes are waiting in the socket: the session is alive.
+    let d = dir("away");
+    let (me, _peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    srv.open_pairing(60);
+    // The pairing write goes to peers.tmp first. As a FIFO, opening it blocks until
+    // someone reads: the pairing below holds the lock for as long as the test likes.
+    let fifo = d.join("peers.tmp");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let mut a = stranger(&srv).await.unwrap();
+    let a_confirm = tokio::spawn(async move {
+        let _ = a.confirm_pairing().await;
+        a
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // A paired device confirms as well (harmless: already paired), so its reader waits
+    // for the same lock. It keeps pinging all the while.
+    let (mut r, mut w) = raw_session(&srv.addr(), &me).await;
+    w.send_msg(1, &gen::PairConfirm {}).await.unwrap();
+    let release = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1000));
+            let mut f = std::fs::File::open(&fifo).unwrap();
+            let mut sink = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut sink).unwrap();
+        })
+    };
+    for seq in 0..15 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        w.send_msg(0, &gen::Ping { seq, t_us: 1 }).await.unwrap();
+    }
+    release.join().unwrap();
+    let q = gen::RpcRequest {
+        method: gen::METHOD_NODE_INFO,
+        body: Vec::new(),
+    };
+    w.send_msg(2, &q).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let f = r.recv().await?;
+            if f.ty == gen::RpcResponse::TYPE {
+                return Ok::<_, Ava1Error>(f.decode::<gen::RpcResponse>()?.status);
+            }
+        }
+    })
+    .await
+    .expect("an answer");
+    assert_eq!(
+        got.unwrap(),
+        gen::STATUS_OK,
+        "the session was dropped though its client never went quiet"
+    );
+    drop(a_confirm);
+}

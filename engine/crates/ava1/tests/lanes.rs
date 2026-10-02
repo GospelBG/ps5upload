@@ -294,3 +294,86 @@ async fn an_unknown_frame_on_a_lane_is_a_protocol_error_unless_ignorable() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_replayed_join_does_not_take_over_a_live_lane() {
+    let (addr, _ctx, me, peers) = paired().await;
+    let s = connect(&addr.to_string(), me, peers, "c", fast())
+        .await
+        .unwrap();
+    // Someone on the network captures a Join for lane 1 ...
+    let captured = s.join_frame_for_test(1, [0x77; 16]);
+    join_ack(addr, &captured).await.unwrap();
+    // ... and keeps it until the server no longer remembers its nonce (64 joins later).
+    for i in 0..70u8 {
+        join_ack(addr, &s.join_frame_for_test(3, [i; 16]))
+            .await
+            .unwrap();
+    }
+    let live = s.open_lane().await.unwrap();
+    assert_eq!(live.id, 1);
+    // The replay is acked (with fresh nonces, so fresh keys) — but whoever sent it does
+    // not hold the session keys and cannot seal a frame, so it must not end the lane.
+    let (rh, wh) = TcpStream::connect(addr).await.unwrap().into_split();
+    let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+    w.send_msg(0, &captured).await.unwrap();
+    r.recv().await.unwrap().decode::<gen::JoinAck>().unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!live.is_closed(), "a replayed Join ended the live lane");
+    // A frame that does not open under the lane key proves nothing either.
+    w.set_key([0x13; 32]);
+    w.send_msg(0, &gen::Ping { seq: 1, t_us: 1 }).await.unwrap();
+    assert!(r.recv().await.is_err(), "the replayer is disconnected");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !live.is_closed(),
+        "a forged first frame ended the live lane"
+    );
+    assert!(live.rtt().is_some());
+}
+
+/// Changes a JoinAck in flight.
+type Alter = fn(&mut gen::JoinAck);
+
+/// A server in the middle of the client's join: passes the Join on to the real server
+/// and hands back its JoinAck after `alter` has changed it.
+async fn altering_join_relay(real: std::net::SocketAddr, alter: Alter) -> std::net::SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (c, _) = l.accept().await.unwrap();
+        let (crh, cwh) = c.into_split();
+        let (mut cr, mut cw) = (FrameReader::new(crh), FrameWriter::new(cwh));
+        let j: Join = cr.recv().await.unwrap().decode().unwrap();
+        let (srh, swh) = TcpStream::connect(real).await.unwrap().into_split();
+        let (mut sr, mut sw) = (FrameReader::new(srh), FrameWriter::new(swh));
+        sw.send_msg(0, &j).await.unwrap();
+        let mut ack: gen::JoinAck = sr.recv().await.unwrap().decode().unwrap();
+        alter(&mut ack);
+        cw.send_msg(0, &ack).await.unwrap();
+        // Hold both connections open: the client must refuse on the ack alone.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        drop((cr, sr, sw));
+    });
+    addr
+}
+
+#[tokio::test]
+async fn the_client_refuses_a_join_ack_that_was_altered() {
+    let (addr, _ctx, me, peers) = paired().await;
+    let s = connect(&addr.to_string(), me, peers, "c", fast())
+        .await
+        .unwrap();
+    let alterations: [(&str, Alter); 3] = [
+        ("a wrong tag", |a| a.tag[0] ^= 1),
+        ("another server nonce", |a| a.server_nonce[15] ^= 0x80),
+        ("another lane id", |a| a.lane_id += 1),
+    ];
+    for (what, alter) in alterations {
+        let relay = altering_join_relay(addr, alter).await;
+        let r = s.open_lane_at(relay).await;
+        assert!(matches!(r, Err(Ava1Error::BadTag)), "{what}: {:?}", r.err());
+    }
+    // The untouched server still gives this session a lane.
+    s.open_lane().await.unwrap();
+}
