@@ -24,6 +24,18 @@ pub struct Established {
     pub pairing: Option<PairingState>,
 }
 
+/// What a server decides about a client once the handshake has shown its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// A paired device.
+    Known,
+    /// Unknown, but the pairing window is open and there is room: Welcome with
+    /// `knows_you = 0`, then wait for its PairConfirm.
+    Pairing,
+    /// Refused with this sealed `Error`, then closed.
+    Refuse(u16, &'static str),
+}
+
 pub(crate) fn refused(f: &Frame) -> Ava1Error {
     match f.decode::<gen::Error>() {
         Ok(e) => Ava1Error::Refused {
@@ -125,8 +137,7 @@ pub async fn server<R, W>(
     hs1_frame: Frame,
     me: &Identity,
     my_name: &str,
-    knows: impl Fn(&[u8; 32]) -> bool,
-    pairing_open: bool,
+    admit: impl FnOnce(&[u8; 32]) -> Admission,
 ) -> Result<Established, Ava1Error>
 where
     R: AsyncRead + Unpin,
@@ -170,16 +181,21 @@ where
     let keys = hs.finish();
     w.set_key(keys::control_key(&keys.s2c));
     r.set_key(keys::control_key(&keys.c2s));
-    let known = knows(&peer_key);
-    if !known && !pairing_open {
-        refuse(
-            w,
-            gen::ERR_PAIRING_CLOSED,
-            "this device is not paired and pairing is closed",
-        )
-        .await;
-        return Err(Ava1Error::NotPaired);
-    }
+    let known = match admit(&peer_key) {
+        Admission::Known => true,
+        Admission::Pairing => false,
+        Admission::Refuse(code, message) => {
+            refuse(w, code, message).await;
+            return Err(if code == gen::ERR_PAIRING_CLOSED {
+                Ava1Error::NotPaired
+            } else {
+                Ava1Error::Refused {
+                    code,
+                    message: message.into(),
+                }
+            });
+        }
+    };
     w.send_msg(
         0,
         &Welcome {
@@ -236,15 +252,15 @@ mod tests {
         };
         let s_fut = async move {
             let first = sr.recv().await?;
-            server(
-                &mut sr,
-                &mut sw,
-                first,
-                &s_id,
-                "console",
-                |k| server_knows_client && *k == c_pub,
-                pairing_open,
-            )
+            server(&mut sr, &mut sw, first, &s_id, "console", |k| {
+                if server_knows_client && *k == c_pub {
+                    Admission::Known
+                } else if pairing_open {
+                    Admission::Pairing
+                } else {
+                    Admission::Refuse(gen::ERR_PAIRING_CLOSED, "pairing is closed")
+                }
+            })
             .await
         };
         let (c, s) = tokio::join!(c_fut, s_fut);
@@ -316,7 +332,10 @@ mod tests {
         .await
         .unwrap();
         let first = sr.recv().await.unwrap();
-        let s = server(&mut sr, &mut sw, first, &s_id, "console", |_| true, true).await;
+        let s = server(&mut sr, &mut sw, first, &s_id, "console", |_| {
+            Admission::Known
+        })
+        .await;
         assert!(matches!(
             s,
             Err(Ava1Error::Version {
@@ -335,7 +354,7 @@ mod tests {
         let ((mut cr, mut cw), (mut sr, mut sw)) = pipe();
         let s_task = async {
             let first = sr.recv().await.unwrap();
-            server(&mut sr, &mut sw, first, &s_id, "s", |_| true, false)
+            server(&mut sr, &mut sw, first, &s_id, "s", |_| Admission::Known)
                 .await
                 .unwrap();
             sr

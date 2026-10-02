@@ -22,10 +22,17 @@ typedef struct {
 /* Reads a 32-byte secret or creates one (0600). A file of the wrong size is an
  * error and is left untouched: replacing it would unpair every device. */
 int ava1_identity_load_or_create(const char *path, ava1_identity_t *id);
-/* Missing file = empty store; unreadable lines are skipped. */
+/* Missing file = empty store (0); unparseable lines are skipped. -1 when the file exists
+ * but cannot be read: the caller then knows no peers and must never write the file
+ * (that would unpair every device it lists) nor open its automatic pairing window. */
 int ava1_peers_load(ava1_peers_t *ps, const char *path);
 int ava1_peers_contains(const ava1_peers_t *ps, const uint8_t key[32]);
-/* Adds or replaces key (oldest dropped past AVA1_MAX_PEERS), then saves atomically. */
+/* Adds or replaces key in memory (oldest dropped past AVA1_MAX_PEERS). */
+void ava1_peers_put(ava1_peers_t *ps, const uint8_t key[32], const char *name, uint64_t added_unix);
+/* Writes the store atomically (temp file + fsync + rename in the same directory). Slow:
+ * never call it holding a lock other threads need. */
+int ava1_peers_save(const ava1_peers_t *ps, const char *path);
+/* put + save; *ps changes only if the save succeeded. */
 int ava1_peers_add(ava1_peers_t *ps, const uint8_t key[32], const char *name, uint64_t added_unix,
                    const char *path);
 

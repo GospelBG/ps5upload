@@ -6,6 +6,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,10 @@
 #define RPC_WORKERS 4
 #define RPC_OUT_MAX 16384u
 #define MAX_PAIRING_WINDOW_S 600u
+#define MAX_CONNS_PER_IP 12u
+#define MAX_UNPAIRED 2u
+#define PAIR_CONFIRM_MS 60000u
+#define NOTIFY_EVERY_MS 10000u
 #define THREAD_STACK (256u * 1024u)
 
 static const uint8_t PROLOGUE[] = { 'A', 'V', 'A', '1', ' ', 'v', '1' };
@@ -37,7 +42,8 @@ static const uint8_t PROLOGUE[] = { 'A', 'V', 'A', '1', ' ', 'v', '1' };
 /* A connection shared by its reader thread and any RPC workers: freed by the last. */
 typedef struct {
     ava1_conn_t io;
-    int refs; /* under mu */
+    int refs;    /* under mu */
+    uint32_t ip; /* source address (network order), for the per-address limit */
 } conn_t;
 
 typedef struct {
@@ -47,6 +53,8 @@ typedef struct {
     uint8_t c2s[32];
     uint8_t s2c[32];
     int paired;
+    int unpaired_hold;  /* reserved slot whose client is about to be welcomed unpaired */
+    uint64_t since_ms;  /* when the session was welcomed */
     uint8_t peer_key[32];
     char peer_name[64];
     int rpc_inflight;
@@ -67,9 +75,31 @@ static struct {
     int conns;
     uint64_t pairing_until_ms;
     ava1_peers_t peers;
+    int peers_ok; /* 0: the peers file could not be read; never write it */
+    uint64_t last_notify_ms;
+    int notified;
+    struct {
+        uint32_t ip;
+        int n;
+    } ips[MAX_CONNS];
 } S = { .listen_fd = -1 };
 
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+/* Serialises peers-file writes. Taken before mu, and held across the write so two
+ * pairings land in order; mu itself is never held during file I/O. */
+static pthread_mutex_t store_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void slog(const char *fmt, ...) {
+    char msg[256];
+    va_list ap;
+    if (!S.cfg.log) return;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    S.cfg.log(msg);
+}
+
+static uint32_t cfg_or(uint32_t v, uint32_t dflt) { return v ? v : dflt; }
 
 /* Monotonic only: a settimeofday jump on the console must not age or revive anything. */
 static uint64_t now_ms(void) { return ava1_now_ms(); }
@@ -105,7 +135,16 @@ static void conn_put(conn_t *k) {
     int last;
     pthread_mutex_lock(&mu);
     last = --k->refs == 0;
-    if (last) S.conns--;
+    if (last) {
+        int i;
+        S.conns--;
+        for (i = 0; i < MAX_CONNS; i++) {
+            if (S.ips[i].n > 0 && S.ips[i].ip == k->ip) {
+                S.ips[i].n--;
+                break;
+            }
+        }
+    }
     pthread_mutex_unlock(&mu);
     if (!last) return;
     close(k->io.fd);
@@ -171,8 +210,22 @@ static int sess_reserve(void) {
 
 static void sess_release(int idx) {
     pthread_mutex_lock(&mu);
-    if (!S.sessions[idx].used) S.sessions[idx].reserved = 0;
+    if (!S.sessions[idx].used) {
+        S.sessions[idx].reserved = 0;
+        S.sessions[idx].unpaired_hold = 0;
+    }
     pthread_mutex_unlock(&mu);
+}
+
+/* Caller holds mu. Sessions welcomed (or about to be) without being paired. */
+static unsigned unpaired_locked(void) {
+    unsigned n = 0;
+    int i;
+    for (i = 0; i < MAX_SESSIONS; i++) {
+        const sess_t *s = &S.sessions[i];
+        if ((s->used && !s->paired) || (!s->used && s->reserved && s->unpaired_hold)) n++;
+    }
+    return n;
 }
 
 /* Fills a slot from sess_reserve. */
@@ -187,6 +240,7 @@ static void sess_fill(int idx, const uint8_t sid[16], const uint8_t c2s[32], con
         memcpy(s->c2s, c2s, 32);
         memcpy(s->s2c, s2c, 32);
         s->paired = paired;
+        s->since_ms = now_ms();
         memcpy(s->peer_key, peer, 32);
         snprintf(s->peer_name, sizeof s->peer_name, "%s", name);
     }
@@ -257,20 +311,38 @@ static int pair_confirm(ava1_conn_t *c, int idx, uint32_t ch) {
     ava1_pair_result_t r;
     uint8_t b[16];
     ava1_w_t w;
-    int accepted = 0;
+    int accepted = 0, attempt = 0;
+    ava1_peers_t *next = malloc(sizeof *next);
+    pthread_mutex_lock(&store_mu);
     pthread_mutex_lock(&mu);
     {
         sess_t *s = &S.sessions[idx];
         if (s->paired) {
             accepted = 1;
-        } else if (now_ms() < S.pairing_until_ms &&
-                   ava1_peers_add(&S.peers, s->peer_key, s->peer_name, (uint64_t)time(NULL),
-                                  S.cfg.peers_path) == 0) {
-            s->paired = 1;
-            accepted = 1;
+        } else if (next && S.peers_ok && now_ms() < S.pairing_until_ms) {
+            *next = S.peers;
+            ava1_peers_put(next, s->peer_key, s->peer_name, (uint64_t)time(NULL));
+            attempt = 1;
         }
     }
     pthread_mutex_unlock(&mu);
+    if (attempt) {
+        /* The write and its fsync run outside mu: every other connection keeps going. */
+        int rc = ava1_peers_save(next, S.cfg.peers_path);
+        if (rc == 0) {
+            pthread_mutex_lock(&mu);
+            S.peers = *next;
+            S.sessions[idx].paired = 1;
+            /* One window, one pairing: whoever else is waiting must ask again. */
+            S.pairing_until_ms = 0;
+            pthread_mutex_unlock(&mu);
+            accepted = 1;
+        } else {
+            slog("ava1: pairing not stored: cannot write %s", S.cfg.peers_path);
+        }
+    }
+    pthread_mutex_unlock(&store_mu);
+    free(next);
     memset(&r, 0, sizeof r);
     r.accepted = (uint8_t)accepted;
     ava1_w_init(&w, b, sizeof b);
@@ -417,6 +489,20 @@ static int serve_tick(void *arg) {
     uint64_t t = now_ms();
     if (S.stopping) return 1;
     if (x->lane != 0 && !lane_current(x->idx, x->sid, x->lane, x->gen)) return 1;
+    if (x->lane == 0) {
+        /* An unconfirmed session is only useful while it can still be confirmed: it ends
+         * with the pairing window, or after the confirm deadline. */
+        int expired;
+        pthread_mutex_lock(&mu);
+        expired = !S.sessions[x->idx].paired &&
+                  (t >= S.pairing_until_ms ||
+                   t - S.sessions[x->idx].since_ms > cfg_or(S.cfg.pair_confirm_ms, PAIR_CONFIRM_MS));
+        pthread_mutex_unlock(&mu);
+        if (expired) {
+            (void)send_error(&x->k->io, AVA1_ERR_PAIRING_CLOSED, "pairing was not confirmed in time");
+            return 1;
+        }
+    }
     if (t - x->last_ping >= S.cfg.ping_every_ms) {
         if (send_liveness(&x->k->io, AVA1_TYPE_PING, ++x->ping_seq, t * 1000u) == AVA1_E_IO) return 1;
         x->last_ping = t;
@@ -485,7 +571,7 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     uint8_t type, flags;
     uint32_t ch;
     ava1_w_t w;
-    int known, open, idx, filled = 0;
+    int known, open, busy = 0, notify = 0, idx, filled = 0;
 
     memset(&ns, 0, sizeof ns);
     memset(&eph, 0, sizeof eph);
@@ -540,9 +626,27 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     pthread_mutex_lock(&mu);
     known = ava1_peers_contains(&S.peers, ns.rs);
     open = now_ms() < S.pairing_until_ms;
+    if (!known && open) {
+        if (unpaired_locked() >= cfg_or(S.cfg.max_unpaired, MAX_UNPAIRED)) {
+            busy = 1;
+        } else {
+            uint64_t t = now_ms();
+            S.sessions[idx].unpaired_hold = 1;
+            /* A stranger reconnecting in a loop must not flood the screen. */
+            if (!S.notified || t - S.last_notify_ms >= cfg_or(S.cfg.notify_every_ms, NOTIFY_EVERY_MS)) {
+                S.notified = 1;
+                S.last_notify_ms = t;
+                notify = 1;
+            }
+        }
+    }
     pthread_mutex_unlock(&mu);
     if (!known && !open) {
         (void)send_error(&k->io, AVA1_ERR_PAIRING_CLOSED, "this device is not paired and pairing is closed");
+        goto out;
+    }
+    if (busy) {
+        (void)send_error(&k->io, AVA1_ERR_BUSY, "too many devices are pairing");
         goto out;
     }
     memset(&wel, 0, sizeof wel);
@@ -552,7 +656,7 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
         goto out;
     sess_fill(idx, sid, c2s, s2c, known, ns.rs, peer_name);
     filled = 1;
-    if (!known && S.cfg.on_pair_request) S.cfg.on_pair_request(peer_name, ava1_pairing_code(ns.h));
+    if (notify && S.cfg.on_pair_request) S.cfg.on_pair_request(peer_name, ava1_pairing_code(ns.h));
     serve_loop(k, idx, sid, 0, 0, buf);
     sess_remove(idx, sid);
 out:
@@ -642,11 +746,11 @@ static void *conn_main(void *arg) {
     return NULL;
 }
 
-static void refuse_busy(int fd) {
+static void refuse_busy(int fd, const char *why) {
     ava1_conn_t c;
     ava1_conn_init(&c, fd);
     set_timeouts(fd, 1000);
-    (void)send_error(&c, AVA1_ERR_BUSY, "too many connections");
+    (void)send_error(&c, AVA1_ERR_BUSY, why);
     ava1_conn_destroy(&c);
     close(fd);
 }
@@ -655,7 +759,10 @@ static void *accept_main(void *arg) {
     (void)arg;
     while (!S.stopping) {
         struct pollfd p;
-        int fd, one = 1, admit, pr;
+        struct sockaddr_in from;
+        socklen_t from_len = sizeof from;
+        uint32_t ip;
+        int fd, one = 1, admit, per_ip = 0, pr, i, slot = -1;
         conn_t *k;
         p.fd = S.listen_fd;
         p.events = POLLIN;
@@ -666,7 +773,8 @@ static void *accept_main(void *arg) {
             continue;
         }
         if (pr == 0) continue;
-        fd = accept(S.listen_fd, NULL, NULL);
+        memset(&from, 0, sizeof from);
+        fd = accept(S.listen_fd, (struct sockaddr *)&from, &from_len);
         if (fd < 0) {
             /* Never leave this loop on an errno: Sony returns undocumented ones (163)
              * and once that killed the helper's accept loop. */
@@ -677,24 +785,39 @@ static void *accept_main(void *arg) {
 #ifdef SO_NOSIGPIPE
         (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
+        ip = from.sin_addr.s_addr;
+        k = calloc(1, sizeof *k);
         pthread_mutex_lock(&mu);
-        admit = S.conns < MAX_CONNS;
-        if (admit) S.conns++;
+        admit = k != NULL && S.conns < MAX_CONNS;
+        if (admit) {
+            /* This address's entry, or a free one (there is always one: at most
+             * MAX_CONNS connections are counted). */
+            for (i = 0; i < MAX_CONNS; i++) {
+                if (S.ips[i].n > 0 && S.ips[i].ip == ip) {
+                    slot = i;
+                    break;
+                }
+                if (S.ips[i].n == 0 && slot < 0) slot = i;
+            }
+            if (slot < 0 || (S.ips[slot].n > 0 &&
+                             (uint32_t)S.ips[slot].n >= cfg_or(S.cfg.max_conns_per_ip, MAX_CONNS_PER_IP))) {
+                admit = 0;
+                per_ip = 1;
+            } else {
+                S.ips[slot].ip = ip;
+                S.ips[slot].n++;
+                S.conns++;
+            }
+        }
         pthread_mutex_unlock(&mu);
         if (!admit) {
-            refuse_busy(fd);
-            continue;
-        }
-        k = calloc(1, sizeof *k);
-        if (!k) {
-            close(fd);
-            pthread_mutex_lock(&mu);
-            S.conns--;
-            pthread_mutex_unlock(&mu);
+            free(k);
+            refuse_busy(fd, per_ip ? "too many connections from this address" : "too many connections");
             continue;
         }
         ava1_conn_init(&k->io, fd);
         k->refs = 1;
+        k->ip = ip;
         if (spawn_detached(conn_main, k) != 0) conn_put(k);
     }
     return NULL;
@@ -715,9 +838,18 @@ int ava1_server_start(const ava1_server_cfg_t *cfg) {
     memset(S.sessions, 0, sizeof S.sessions);
     S.cfg = *cfg;
     S.stopping = 0;
-    if (ava1_peers_load(&S.peers, cfg->peers_path) != 0) memset(&S.peers, 0, sizeof S.peers);
+    memset(S.ips, 0, sizeof S.ips);
+    S.notified = 0;
+    S.last_notify_ms = 0;
+    S.peers_ok = ava1_peers_load(&S.peers, cfg->peers_path) == 0;
+    if (!S.peers_ok) {
+        /* Unknown is not empty: run for nobody rather than open pairing to anyone or
+         * overwrite a file that may list every paired device. */
+        memset(&S.peers, 0, sizeof S.peers);
+        slog("ava1: cannot read %s; pairing stays closed and the file is left alone", cfg->peers_path);
+    }
     /* Opens by itself only while nothing is paired (design review, flaw 2). */
-    S.pairing_until_ms = (cfg->pairing_window_s && S.peers.n == 0)
+    S.pairing_until_ms = (cfg->pairing_window_s && S.peers_ok && S.peers.n == 0)
                              ? now_ms() + (uint64_t)cfg->pairing_window_s * 1000u
                              : 0;
     pthread_mutex_unlock(&mu);

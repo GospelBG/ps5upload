@@ -21,7 +21,7 @@ pub enum Ava1Error {
     Refused { code: u16, message: String },
     #[error("no protocol version in common (they speak {min}..={max}, we speak {ours})")]
     Version { min: u16, max: u16, ours: u16 },
-    #[error("the other device is not paired")]
+    #[error("the devices are not paired yet")]
     NotPaired,
     #[error("the other device sent no usable key")]
     WeakKey,

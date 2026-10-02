@@ -25,6 +25,46 @@ fn fast() -> Timing {
     }
 }
 
+/// `fast()` server options with the per-address limit out of the way.
+fn roomy(handshake_ms: u32) -> ffi::TestOpts {
+    ffi::TestOpts {
+        ping_ms: 100,
+        dead_ms: 500,
+        handshake_ms,
+        max_conns_per_ip: 10_000,
+        ..Default::default()
+    }
+}
+
+fn opts(pairing_s: u32) -> ffi::TestOpts {
+    ffi::TestOpts {
+        pairing_s,
+        ping_ms: 100,
+        dead_ms: 500,
+        handshake_ms: 500,
+        ..Default::default()
+    }
+}
+
+async fn stranger(srv: &CServer) -> Result<ava1::session::Session, Ava1Error> {
+    connect(
+        &srv.addr(),
+        Arc::new(Identity::generate().unwrap()),
+        Arc::new(Mutex::new(PeerStore::in_memory())),
+        "phone",
+        fast(),
+    )
+    .await
+}
+
+fn is_busy<T>(r: &Result<T, Ava1Error>) -> bool {
+    matches!(r, Err(Ava1Error::Refused { code, .. }) if *code == gen::ERR_BUSY)
+}
+
+fn is_pairing_closed<T>(r: &Result<T, Ava1Error>) -> bool {
+    matches!(r, Err(Ava1Error::Refused { code, .. }) if *code == gen::ERR_PAIRING_CLOSED)
+}
+
 fn dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("ava1-c-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -96,12 +136,24 @@ async fn pairing_with_the_c_server() {
         (1, code),
         "the console shows the same code"
     );
+    assert!(matches!(
+        s.rpc(gen::METHOD_NODE_INFO, &[]).await,
+        Err(Ava1Error::NotPaired)
+    ));
     assert_eq!(
-        s.rpc(gen::METHOD_NODE_INFO, &[]).await.unwrap().status,
+        s.rpc_unchecked_for_test(gen::METHOD_NODE_INFO, &[])
+            .await
+            .unwrap()
+            .status,
         gen::ERR_NOT_PAIRED
     );
     assert!(matches!(s.open_lane().await, Err(Ava1Error::NotPaired)));
+    assert!(srv.pairing_open());
     s.confirm_pairing().await.unwrap();
+    assert!(
+        !srv.pairing_open(),
+        "a successful pairing closes the window"
+    );
     s.node_info().await.unwrap();
     let file = std::fs::read_to_string(d.join("peers")).unwrap();
     assert!(
@@ -245,7 +297,9 @@ async fn c_server_refuses_a_storm_then_recovers() {
     // Review focus 2.
     let d = dir("storm");
     let (me, peers) = paired_client(&d.join("peers"));
-    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 2000);
+    // One address may hold only 12 connections by default; lift that so the global
+    // limit is what refuses.
+    let srv = CServer::start_with(SECRET, &d.join("peers"), roomy(2000));
     let mut held = Vec::new();
     for _ in 0..64 {
         held.push(TcpStream::connect(srv.addr()).await.unwrap());
@@ -331,11 +385,9 @@ async fn c_server_drops_a_trickling_handshake() {
     let t = Instant::now();
     let mut header = [0u8; 16];
     header[..3].copy_from_slice(b"A1\x01");
-    let mut closed = false;
     for b in header {
         if raw.write_all(&[b]).await.is_err() {
-            closed = true;
-            break;
+            break; // already closed by the server
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         if t.elapsed() > Duration::from_millis(1200) {
@@ -347,7 +399,6 @@ async fn c_server_drops_a_trickling_handshake() {
         .await
         .unwrap()
         .unwrap_or(0);
-    assert!(closed || n == 0 || n > 0, "unreachable");
     assert_eq!(n, 0, "the server closed the trickling connection");
     assert!(
         t.elapsed() < Duration::from_millis(1500),
@@ -373,7 +424,7 @@ async fn c_server_refuses_a_17th_session_before_the_handshake() {
     for (i, id) in ids.iter().enumerate() {
         store.add(id.public(), &format!("c{i}")).unwrap();
     }
-    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 2000);
+    let srv = CServer::start_with(SECRET, &d.join("peers"), roomy(2000));
     let mut sessions = Vec::new();
     for id in &ids[..16] {
         sessions.push(
@@ -589,4 +640,111 @@ async fn the_c_server_drops_a_peer_that_never_reads_its_replies() {
         .node_info()
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_ends_unconfirmed_sessions_with_the_window_or_the_deadline() {
+    let d = dir("unconfirmed");
+    // Deadline: the window stays open, the session does not.
+    let srv = CServer::start_with(
+        SECRET,
+        &d.join("peers"),
+        ffi::TestOpts {
+            pair_confirm_ms: 400,
+            ..opts(60)
+        },
+    );
+    let s = stranger(&srv).await.unwrap();
+    let why = tokio::time::timeout(Duration::from_secs(5), s.closed())
+        .await
+        .expect("closed at the confirm deadline");
+    assert!(why.contains("not confirmed"), "{why}");
+    assert!(srv.pairing_open());
+    wait_conns(&srv, 0).await;
+    drop(srv);
+    // Window: closing it (here by letting 1 s run out) ends the waiting session.
+    let srv = CServer::start_with(SECRET, &d.join("peers"), opts(1));
+    let s = stranger(&srv).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), s.closed())
+        .await
+        .expect("closed with the window");
+    assert!(!srv.pairing_open());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_caps_unconfirmed_sessions_and_connections_per_address() {
+    let d = dir("caps");
+    let srv = CServer::start_with(SECRET, &d.join("peers"), opts(60));
+    let a = stranger(&srv).await.unwrap();
+    let _b = stranger(&srv).await.unwrap();
+    let c = stranger(&srv).await;
+    assert!(is_busy(&c), "a third unconfirmed device: {:?}", c.err());
+    assert_eq!(srv.pair_requests().0, 1, "one notification per 10 s");
+    a.close().await;
+    wait_conns(&srv, 1).await;
+    stranger(&srv).await.unwrap();
+    drop(srv);
+
+    let (me, peers) = paired_client(&d.join("peers2"));
+    let srv = CServer::start_with(
+        SECRET,
+        &d.join("peers2"),
+        ffi::TestOpts {
+            handshake_ms: 3000,
+            ..opts(0)
+        },
+    );
+    let mut held = Vec::new();
+    for _ in 0..12 {
+        held.push(TcpStream::connect(srv.addr()).await.unwrap());
+    }
+    let t = Instant::now();
+    while srv.conns() < 12 && t.elapsed() < Duration::from_secs(3) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let r = connect(&srv.addr(), me.clone(), peers.clone(), "laptop", fast()).await;
+    assert!(
+        is_busy(&r),
+        "a 13th connection from one address: {:?}",
+        r.err()
+    );
+    held.pop();
+    wait_conns(&srv, 11).await;
+    connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_with_an_unreadable_peers_file_pairs_no_one_and_leaves_it_alone() {
+    let d = dir("unreadable");
+    let path = d.join("peers");
+    std::fs::create_dir(&path).unwrap(); // exists, but reading it fails
+    let srv = CServer::start_with(SECRET, &path, opts(60));
+    assert!(srv.logs() >= 1, "the failure is logged");
+    assert!(
+        !srv.pairing_open(),
+        "no automatic window: unknown is not unpaired"
+    );
+    let r = stranger(&srv).await;
+    assert!(is_pairing_closed(&r), "{:?}", r.err());
+    // Even with the window forced open, nothing is accepted or written.
+    srv.open_pairing(60);
+    let mut s = stranger(&srv).await.unwrap();
+    assert!(s.confirm_pairing().await.is_err());
+    assert!(path.is_dir(), "left alone");
+    assert!(!d.join("peers.tmp").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_reports_a_pairing_it_cannot_store() {
+    let d = dir("nostore");
+    // The peers file's directory does not exist: loading finds no file (an empty store,
+    // so the window opens), but the pairing cannot be written.
+    let srv = CServer::start_with(SECRET, &d.join("gone").join("peers"), opts(60));
+    let mut s = stranger(&srv).await.unwrap();
+    assert!(s.confirm_pairing().await.is_err());
+    assert!(srv.logs() >= 1, "ava1_peers_save's failure is logged");
+    // Nothing half-stored in memory either: the same device is still a stranger.
+    assert!(srv.pairing_open());
 }

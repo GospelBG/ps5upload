@@ -6,7 +6,7 @@ use std::time::Duration;
 use ava1::gen;
 use ava1::keys::Identity;
 use ava1::peers::PeerStore;
-use ava1::server::{self, RpcHandler, ServerCtx};
+use ava1::server::{self, Limits, RpcHandler, ServerCtx};
 use ava1::session::{RpcReply, Timing};
 use ava1::wire::Message;
 use tokio::net::TcpListener;
@@ -94,9 +94,29 @@ pub async fn wait_for(limit: Duration, mut cond: impl FnMut() -> bool) -> Option
     Some(t.elapsed())
 }
 
+/// Limits that let one address (every test is 127.0.0.1) reach the global caps.
+pub fn roomy() -> Limits {
+    Limits {
+        conns_per_ip: 10_000,
+        ..Limits::default()
+    }
+}
+
 /// `paired()` with other timing.
 pub async fn paired_with(
     timing: Timing,
+) -> (
+    SocketAddr,
+    Arc<ServerCtx>,
+    Arc<Identity>,
+    Arc<Mutex<PeerStore>>,
+) {
+    paired_opts(timing, Limits::default()).await
+}
+
+pub async fn paired_opts(
+    timing: Timing,
+    limits: Limits,
 ) -> (
     SocketAddr,
     Arc<ServerCtx>,
@@ -117,7 +137,8 @@ pub async fn paired_with(
         s_peers,
         node_info_rpc("Rust test server"),
     )
-    .with_timing(timing);
+    .with_timing(timing)
+    .with_limits(limits);
     let (addr, ctx) = start(ctx).await;
     (addr, ctx, c_id, Arc::new(Mutex::new(c_peers)))
 }

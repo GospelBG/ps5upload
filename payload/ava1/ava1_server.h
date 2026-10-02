@@ -22,8 +22,18 @@ typedef struct ava1_server_cfg {
     /* Pairing opens by itself for this long after start, but only while the peers
      * file is empty (SPEC.md §5 item 6). 0 = never by itself. */
     uint32_t pairing_window_s;
+    /* Connections one source address may hold; 0 = 12. */
+    uint32_t max_conns_per_ip;
+    /* Sessions welcomed during a pairing window but not yet confirmed; 0 = 2. */
+    uint32_t max_unpaired;
+    /* Such a session ends when the window closes or after this long; 0 = 60 000 ms. */
+    uint32_t pair_confirm_ms;
+    /* At most one on_pair_request per this long; 0 = 10 000 ms. */
+    uint32_t notify_every_ms;
     /* An unknown device started pairing: show its name and the code. */
     void (*on_pair_request)(const char *peer_name, uint32_t code);
+    /* What an operator should know (an unreadable peers file, a pairing not stored). */
+    void (*log)(const char *msg);
     /* Runs on a worker thread. Returns an AVA1 status; writes the body to out. */
     int (*rpc)(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap,
                size_t *out_len);

@@ -26,6 +26,8 @@ static void on_pair_request(const char *peer_name, uint32_t code) {
     pop_notification(msg);
 }
 
+static void on_log(const char *msg) { fprintf(stderr, "%s\n", msg); }
+
 static uint64_t mono_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -95,10 +97,20 @@ int ava1_payload_start(void) {
     cfg.pairing_window_s = 300;
     cfg.on_pair_request = on_pair_request;
     cfg.rpc = rpc;
+    cfg.log = on_log;
     if (ava1_trust_slot_key(launcher) == 0) {
-        ava1_peers_t peers;
-        if (ava1_peers_load(&peers, cfg.peers_path) == 0 && !ava1_peers_contains(&peers, launcher))
-            (void)ava1_peers_add(&peers, launcher, "launcher", (uint64_t)time(NULL), cfg.peers_path);
+        /* Heap: ava1_peers_t is a few KB, more than this thread's stack should carry. */
+        ava1_peers_t *peers = malloc(sizeof *peers);
+        if (!peers) {
+            on_log("ava1: launcher not trusted: out of memory");
+        } else if (ava1_peers_load(peers, cfg.peers_path) != 0) {
+            /* The server logs the unreadable file itself and keeps pairing closed. */
+            on_log("ava1: launcher not trusted: the peers file could not be read");
+        } else if (!ava1_peers_contains(peers, launcher) &&
+                   ava1_peers_add(peers, launcher, "launcher", (uint64_t)time(NULL), cfg.peers_path) != 0) {
+            on_log("ava1: launcher not trusted: cannot write " AVA1_DIR "/peers");
+        }
+        free(peers);
     }
     return ava1_server_start(&cfg);
 }

@@ -69,13 +69,24 @@ six digits. A man in the middle yields different h, so different codes.
    code (§4.6). After the user confirms, a client whose server sent knows_you = 0
    sends `PairConfirm` (channel = request id); the server answers
    `PairResult{accepted}` on the same channel, accepting only while its pairing
-   window is open and its owner approves, then stores the client's key. Until
-   accepted, RPCs answer `ERR_NOT_PAIRED` and lanes are refused.
+   window is open and its owner approves, then stores the client's key; a key
+   that cannot be stored is not accepted. Until accepted, RPCs answer
+   `ERR_NOT_PAIRED` and lanes are refused. A client sends nothing but
+   `PairConfirm` (no RPC, no Join) while either side is unconfirmed: until the
+   user has compared the codes, the server is unverified.
 6. Pairing window: opens by itself for 5 minutes after start only while the node
    has no paired peer; otherwise `pairing.open` (method 2, body `PairingOpen`,
-   ≤ 600 s) from a paired session opens it.
+   ≤ 600 s) from a paired session opens it. Either kind of window closes as soon
+   as one pairing succeeds. A session welcomed with knows_you = 0 that has not
+   been accepted ends — sealed `Error(ERR_PAIRING_CLOSED)`, close — when the
+   window closes or 60 s after its Welcome, whichever is first. At most 2 such
+   sessions exist at a time; a third unknown client gets `Error(ERR_BUSY)` in
+   place of Welcome. A node shows at most one pairing request per 10 s.
 7. Peer stores: `<64 hex key> <unix seconds> <name>` per line, ≤ 32 peers (oldest
-   dropped), written atomically (temp file + rename in the same directory).
+   dropped), written atomically (temp file + rename in the same directory). A
+   missing file is an empty store. A file that exists but cannot be read is not:
+   the node runs, knows no peers, logs the failure, never opens its automatic
+   window, accepts no pairing, and never writes the file.
 
 5.1 Trust slot: the payload ELF carries a 64-byte array — "AVA1TRUST" (9 bytes),
 state (0 empty, 1 stamped), 6 zero bytes, 32-byte X25519 key, 16 zero bytes. An
@@ -109,7 +120,8 @@ answers `RpcResponse{status, body}` on the same channel. status 0 = OK; error
 statuses are the `ERR_*` constants. Methods: 1 = node.info → body `NodeInfo`.
 
 ## 8. Limits
-A server accepts at most 64 connections and 16 sessions; past either it sends
+A server accepts at most 64 connections, 12 from one source address, and 16
+sessions (2 of them unconfirmed, §5); past any of these it sends
 `Error(ERR_BUSY)` and closes. The accept loop never stops on an accept error.
 
 ## 9. Data lanes

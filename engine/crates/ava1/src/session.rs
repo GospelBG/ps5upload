@@ -207,7 +207,27 @@ impl Session {
         }
     }
 
+    /// Calls `method`. Refused locally (`NotPaired`) until the pairing is confirmed:
+    /// before that the other device is unverified, and nothing but PairConfirm is sent
+    /// to it.
     pub async fn rpc(&self, method: u16, body: &[u8]) -> Result<RpcReply, Ava1Error> {
+        if self.est.pairing.is_some() {
+            return Err(Ava1Error::NotPaired);
+        }
+        self.rpc_unchecked(method, body).await
+    }
+
+    /// `rpc` without the pairing check, to observe the server's own refusal. Tests only.
+    #[doc(hidden)]
+    pub async fn rpc_unchecked_for_test(
+        &self,
+        method: u16,
+        body: &[u8],
+    ) -> Result<RpcReply, Ava1Error> {
+        self.rpc_unchecked(method, body).await
+    }
+
+    async fn rpc_unchecked(&self, method: u16, body: &[u8]) -> Result<RpcReply, Ava1Error> {
         let f = self
             .request(RpcRequest {
                 method,

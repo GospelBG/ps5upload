@@ -93,6 +93,12 @@ int ava1_peers_load(ava1_peers_t *ps, const char *path) {
         memcpy(p.name, end, nl);
         ps->p[ps->n++] = p;
     }
+    if (ferror(f)) {
+        /* e.g. EISDIR or EIO: what is on disk is unknown, which is not "no peers". */
+        fclose(f);
+        memset(ps, 0, sizeof *ps);
+        return -1;
+    }
     fclose(f);
     return 0;
 }
@@ -104,11 +110,8 @@ int ava1_peers_contains(const ava1_peers_t *ps, const uint8_t key[32]) {
     return 0;
 }
 
-int ava1_peers_add(ava1_peers_t *ps, const uint8_t key[32], const char *name, uint64_t added_unix,
-                   const char *path) {
-    size_t cap = (size_t)AVA1_MAX_PEERS * 160, len = 0;
-    char *text;
-    int i, j, k, rc;
+void ava1_peers_put(ava1_peers_t *ps, const uint8_t key[32], const char *name, uint64_t added_unix) {
+    int i, j;
     for (i = 0, j = 0; i < ps->n; i++)
         if (memcmp(ps->p[i].key, key, 32) != 0) ps->p[j++] = ps->p[i];
     ps->n = j;
@@ -121,7 +124,12 @@ int ava1_peers_add(ava1_peers_t *ps, const uint8_t key[32], const char *name, ui
     ps->p[ps->n].added_unix = added_unix;
     snprintf(ps->p[ps->n].name, sizeof ps->p[0].name, "%s", name);
     ps->n++;
-    text = malloc(cap);
+}
+
+int ava1_peers_save(const ava1_peers_t *ps, const char *path) {
+    size_t cap = (size_t)AVA1_MAX_PEERS * 160, len = 0;
+    char *text = malloc(cap);
+    int i, k, rc;
     if (!text) return -1;
     for (i = 0; i < ps->n; i++) {
         for (k = 0; k < 32; k++) len += (size_t)snprintf(text + len, cap - len, "%02x", ps->p[i].key[k]);
@@ -130,5 +138,18 @@ int ava1_peers_add(ava1_peers_t *ps, const uint8_t key[32], const char *name, ui
     }
     rc = write_file_atomic(path, (const uint8_t *)text, len, 0600);
     free(text);
+    return rc;
+}
+
+int ava1_peers_add(ava1_peers_t *ps, const uint8_t key[32], const char *name, uint64_t added_unix,
+                   const char *path) {
+    ava1_peers_t *next = malloc(sizeof *next);
+    int rc;
+    if (!next) return -1;
+    *next = *ps;
+    ava1_peers_put(next, key, name, added_unix);
+    rc = ava1_peers_save(next, path);
+    if (rc == 0) *ps = *next;
+    free(next);
     return rc;
 }

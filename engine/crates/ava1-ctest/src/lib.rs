@@ -149,8 +149,12 @@ pub mod ffi {
         pub ping_ms: u32,
         pub dead_ms: u32,
         pub handshake_ms: u32,
-        /// 0 = the server's default.
+        /// 0 = the server's default, here and below.
         pub min_frame_rate: u32,
+        pub max_conns_per_ip: u32,
+        pub max_unpaired: u32,
+        pub pair_confirm_ms: u32,
+        pub notify_every_ms: u32,
     }
 
     extern "C" {
@@ -161,6 +165,9 @@ pub mod ffi {
         ) -> c_int;
         pub fn ava1_test_pair_requests() -> u32;
         pub fn ava1_test_last_pair_code() -> u32;
+        pub fn ava1_test_logs() -> u32;
+        pub fn ava1_server_open_pairing(seconds: u32);
+        pub fn ava1_server_pairing_open() -> c_int;
         pub fn ava1_server_stop();
         pub fn ava1_server_conns() -> c_int;
         pub fn ava1_identity_load_or_create(path: *const c_char, id: *mut CIdentity) -> c_int;
@@ -359,6 +366,19 @@ impl CServer {
 
     pub fn conns(&self) -> i32 {
         unsafe { ffi::ava1_server_conns() }
+    }
+
+    /// Lines the server has logged since it started.
+    pub fn logs(&self) -> u32 {
+        unsafe { ffi::ava1_test_logs() }
+    }
+
+    pub fn open_pairing(&self, seconds: u32) {
+        unsafe { ffi::ava1_server_open_pairing(seconds) }
+    }
+
+    pub fn pairing_open(&self) -> bool {
+        unsafe { ffi::ava1_server_pairing_open() != 0 }
     }
 
     pub fn pair_requests(&self) -> (u32, u32) {

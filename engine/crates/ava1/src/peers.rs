@@ -15,12 +15,31 @@ pub struct Peer {
 pub struct PeerStore {
     path: Option<PathBuf>,
     peers: Vec<Peer>,
+    /// The file exists but could not be read: nothing is known, and nothing is ever
+    /// written over it (that would unpair every device it lists).
+    unreadable: Option<String>,
 }
 
 impl PeerStore {
     /// Not saved anywhere (tests, one-off tools).
     pub fn in_memory() -> Self {
         Self::default()
+    }
+
+    /// `load`, or — when the file exists but cannot be read — a store that knows no one,
+    /// never writes the file, and reports why through `unreadable()`. A server keeps
+    /// running on it but must not open its automatic pairing window (SPEC.md §5 item 7).
+    pub fn load_or_unreadable(path: &Path) -> Self {
+        Self::load(path).unwrap_or_else(|e| Self {
+            path: Some(path.to_path_buf()),
+            peers: Vec::new(),
+            unreadable: Some(format!("{}: {e}", path.display())),
+        })
+    }
+
+    /// Why the peers file could not be read, if it could not.
+    pub fn unreadable(&self) -> Option<&str> {
+        self.unreadable.as_deref()
     }
 
     /// A missing file is an empty store; unreadable lines are skipped, never fatal.
@@ -37,6 +56,7 @@ impl PeerStore {
         Ok(Self {
             path: Some(path.to_path_buf()),
             peers,
+            unreadable: None,
         })
     }
 
@@ -48,8 +68,20 @@ impl PeerStore {
         &self.peers
     }
 
-    /// Adds or replaces `key`; drops the oldest peer past `MAX_PEERS`; saves.
+    fn refuse_if_unreadable(&self) -> io::Result<()> {
+        match &self.unreadable {
+            Some(why) => Err(io::Error::other(format!(
+                "the peers file could not be read ({why}); not overwriting it"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Adds or replaces `key`; drops the oldest peer past `MAX_PEERS`; saves. Nothing
+    /// changes unless the save succeeds.
     pub fn add(&mut self, key: [u8; 32], name: &str) -> io::Result<()> {
+        self.refuse_if_unreadable()?;
+        let before = self.peers.clone();
         self.peers.retain(|p| p.key != key);
         if self.peers.len() >= MAX_PEERS {
             self.peers.remove(0);
@@ -63,10 +95,11 @@ impl PeerStore {
             added_unix,
             name: clean_name(name),
         });
-        self.save()
+        self.save().inspect_err(|_| self.peers = before)
     }
 
     pub fn remove(&mut self, key: &[u8; 32]) -> io::Result<bool> {
+        self.refuse_if_unreadable()?;
         let before = self.peers.len();
         self.peers.retain(|p| &p.key != key);
         if self.peers.len() == before {

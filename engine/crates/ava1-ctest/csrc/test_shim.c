@@ -9,7 +9,12 @@
 #include "ava1_gen.h"
 #include "ava1_server.h"
 
-static uint32_t g_pair_requests, g_last_code;
+static uint32_t g_pair_requests, g_last_code, g_logs;
+
+static void on_log(const char *msg) {
+    (void)msg;
+    __atomic_add_fetch(&g_logs, 1, __ATOMIC_SEQ_CST);
+}
 
 static void on_pair(const char *name, uint32_t code) {
     (void)name;
@@ -44,6 +49,10 @@ typedef struct {
     uint32_t dead_ms;
     uint32_t handshake_ms;
     uint32_t min_frame_rate;
+    uint32_t max_conns_per_ip;
+    uint32_t max_unpaired;
+    uint32_t pair_confirm_ms;
+    uint32_t notify_every_ms;
 } ava1_test_opts_t;
 
 int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, const ava1_test_opts_t *o) {
@@ -59,8 +68,14 @@ int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, con
     cfg.handshake_ms = o->handshake_ms;
     cfg.min_frame_rate = o->min_frame_rate;
     cfg.pairing_window_s = o->pairing_s;
+    cfg.max_conns_per_ip = o->max_conns_per_ip;
+    cfg.max_unpaired = o->max_unpaired;
+    cfg.pair_confirm_ms = o->pair_confirm_ms;
+    cfg.notify_every_ms = o->notify_every_ms;
     cfg.on_pair_request = on_pair;
+    cfg.log = on_log;
     cfg.rpc = rpc;
+    __atomic_store_n(&g_logs, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_pair_requests, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_last_code, 0, __ATOMIC_SEQ_CST);
     rc = ava1_server_start(&cfg);
@@ -68,6 +83,7 @@ int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, con
 }
 
 uint32_t ava1_test_pair_requests(void) { return __atomic_load_n(&g_pair_requests, __ATOMIC_SEQ_CST); }
+uint32_t ava1_test_logs(void) { return __atomic_load_n(&g_logs, __ATOMIC_SEQ_CST); }
 uint32_t ava1_test_last_pair_code(void) { return __atomic_load_n(&g_last_code, __ATOMIC_SEQ_CST); }
 
 int ava1_test_conn_open_frame(const uint8_t key[32], const uint8_t *frame, size_t len) {

@@ -88,14 +88,30 @@ async fn pairing_shows_the_same_code_and_persists_on_both_sides() {
     .await
     .unwrap();
     let code = s.pairing_code().expect("pairing needed");
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for(Duration::from_secs(5), || seen.lock().unwrap().is_some())
+        .await
+        .expect("the server shows a code");
     assert_eq!(
         *seen.lock().unwrap(),
         Some(code),
         "the server shows the same code"
     );
+    // Until the user has confirmed the code the server is unverified: the client sends
+    // it nothing but PairConfirm, and the server answers anything else ERR_NOT_PAIRED.
+    assert!(matches!(
+        s.rpc(gen::METHOD_NODE_INFO, &[]).await,
+        Err(Ava1Error::NotPaired)
+    ));
+    assert!(matches!(s.node_info().await, Err(Ava1Error::NotPaired)));
+    assert!(matches!(
+        s.open_pairing(60).await,
+        Err(Ava1Error::NotPaired)
+    ));
     assert_eq!(
-        s.rpc(gen::METHOD_NODE_INFO, &[]).await.unwrap().status,
+        s.rpc_unchecked_for_test(gen::METHOD_NODE_INFO, &[])
+            .await
+            .unwrap()
+            .status,
         gen::ERR_NOT_PAIRED
     );
     s.confirm_pairing().await.unwrap();
@@ -163,13 +179,18 @@ async fn a_silent_half_handshake_is_dropped() {
 
 #[tokio::test]
 async fn a_connection_storm_is_refused_then_recovers() {
-    // Review focus 2.
-    let (addr, ctx, me, peers) = paired().await;
+    // Review focus 2. One address may hold only 12 connections by default; lift that
+    // here so the global limit is what refuses.
+    let (addr, ctx, me, peers) = paired_opts(fast(), roomy()).await;
     let mut held = Vec::new();
     for _ in 0..ava1::server::MAX_CONNS {
         held.push(TcpStream::connect(addr).await.unwrap());
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for(Duration::from_secs(5), || {
+        ctx.connections() == ava1::server::MAX_CONNS
+    })
+    .await
+    .expect("every held connection was accepted");
     let r = connect(&addr.to_string(), me.clone(), peers.clone(), "c", fast()).await;
     assert!(
         matches!(r, Err(Ava1Error::Refused { code, .. }) if code == gen::ERR_BUSY),
@@ -490,8 +511,12 @@ async fn the_session_limit_holds_under_a_handshake_storm() {
         handshake: Duration::from_secs(5),
         ..fast()
     };
-    let (addr, ctx) =
-        start(ServerCtx::new(s_id, "s", sp, node_info_rpc("s")).with_timing(timing)).await;
+    let (addr, ctx) = start(
+        ServerCtx::new(s_id, "s", sp, node_info_rpc("s"))
+            .with_timing(timing)
+            .with_limits(roomy()),
+    )
+    .await;
     let n = ava1::server::MAX_SESSIONS + 4;
     let a = addr.to_string();
     let results = futures_join_all((0..n).map(|_| {
