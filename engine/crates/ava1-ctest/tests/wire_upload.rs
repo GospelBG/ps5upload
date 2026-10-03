@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use ava1::conn::Frame;
 use ava1::gen::{
-    self, Bundle, BundleRecord, Chunk, FileRoot, JobDone, JobMap, JobOpen, JobOpenAck, ManifestEnd,
-    Received, Resume,
+    self, Bundle, BundleRecord, Chunk, Credit, FileRoot, JobDone, JobMap, JobOpen, JobOpenAck,
+    ManifestEnd, Received, Resume,
 };
 use ava1::manifest::{Entry, Manifest};
 use ava1::router::{Inbound, JobLink};
@@ -539,12 +539,66 @@ async fn a_closed_session_parks_its_job_and_a_new_session_takes_it_over() {
         })
         .await
         .unwrap();
-    let map: JobMap = next_control(&mut link).await.decode().unwrap();
+    // (the re-attach also re-sends the grant as a Credit, §11.5: skip it)
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
     assert_eq!(map.status, gen::ERR_UNKNOWN_JOB);
     assert_eq!(open(&mut link, job, &root).await.status, 0);
     assert_eq!(srv.job_attached(job), 1);
     send_manifest(&link, job, &m).await;
     let _map = next_control(&mut link).await;
+    let lane = link.opener().unwrap().open().await.unwrap();
+    link.lane(lane)
+        .unwrap()
+        .tx
+        .send_raw(Bundle::TYPE, 0, 1, bundle(job, 0, b"ok"))
+        .await
+        .unwrap();
+    let (_, done) = until_done(&mut link).await;
+    assert_eq!(done.status, 0);
+    assert_eq!(std::fs::read(root.join("x")).unwrap(), b"ok");
+}
+
+/// SPEC.md §11.5, "credit after Resume": a Resume of a parked job restarts the sender's
+/// window — the receiver sends the current grant as a Credit — and the job then completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_after_a_dropped_session_sends_credit_and_the_job_completes() {
+    let d = dir("wire-resume-credit");
+    let peers = d.join("peers");
+    let ids = paired_client(&peers);
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let job = [0x5du8; 16];
+    let root = d.join("dest");
+    let m = Manifest {
+        entries: vec![file("x", 2)],
+    };
+    let grant;
+    {
+        let s = session(&srv, &ids).await;
+        let mut link = s.job(job);
+        grant = open(&mut link, job, &root).await.credit;
+        assert!(grant > 0);
+        send_manifest(&link, job, &m).await;
+        let _map = next_of(&mut link, JobMap::TYPE).await;
+        s.close().await;
+    }
+    let t = Instant::now();
+    while srv.job_attached(job) != 0 {
+        assert!(t.elapsed() < Duration::from_secs(5), "never parked");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let s = session(&srv, &ids).await;
+    let mut link = s.job(job);
+    link.control
+        .send(&Resume {
+            job_id: job,
+            manifest_hash: m.hash(),
+        })
+        .await
+        .unwrap();
+    let credit: Credit = next_of(&mut link, Credit::TYPE).await.decode().unwrap();
+    assert_eq!(credit.bytes, grant, "the grant is re-sent as Credit");
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    assert_eq!(map.status, 0);
     let lane = link.opener().unwrap().open().await.unwrap();
     link.lane(lane)
         .unwrap()

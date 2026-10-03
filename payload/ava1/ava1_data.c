@@ -383,6 +383,19 @@ static void post_received(const uint8_t sid[16], const uint8_t job[16], uint16_t
     }
 }
 
+/* A Credit for `job` straight to the session (not through the job's emitter: the caller has
+ * already counted it, see the Resume case of route). */
+static void post_credit(const uint8_t sid[16], const uint8_t job[16], uint64_t n) {
+    ava1_credit_t c;
+    uint8_t b[64];
+    ava1_w_t w;
+    memset(&c, 0, sizeof c);
+    memcpy(c.job_id, job, 16);
+    c.bytes = n;
+    ava1_w_init(&w, b, sizeof b);
+    if (ava1_credit_encode(&c, &w) == 0) (void)ava1_server_post(sid, 0, AVA1_TYPE_CREDIT, 0, 0, b, w.len);
+}
+
 /* JobOpenAck: a refusal carries why. `post` for hooks; otherwise the waiting send. */
 static int send_ack(const uint8_t sid[16], const ava1_job_open_ack_t *ack, const char *msg, int post) {
     ava1_job_open_ack_t a = *ack;
@@ -1085,8 +1098,22 @@ static int route(const uint8_t sid[16], const uint8_t peer[32], uint8_t type, co
         /* ava1_job_attach uses ava1_job_attach_sid: the in-hand equivalent of
          * ava1_job_find_attach (the same listed check under the same lock), since this
          * frame already holds the job's reference. */
-        if (ava1_job_attach(j, sid, 0) != 0) post_unknown_map(sid, body);
-        else inbox_add(j, type, body, len);
+        {
+            /* SPEC.md §11.5: a Resume restarts the window like a JobOpen's ack does — the
+             * sender's allowance is exactly what is free now (the grant minus what the job
+             * still holds), counted here and sent as a Credit. */
+            uint64_t grant;
+            pthread_mutex_lock(&j->mu);
+            grant = j->credit > j->outstanding ? j->credit - j->outstanding : 0;
+            j->credit_back = 0; /* freed while detached is already in the grant */
+            pthread_mutex_unlock(&j->mu);
+            if (ava1_job_attach(j, sid, grant) != 0) {
+                post_unknown_map(sid, body);
+            } else {
+                if (grant) post_credit(sid, j->id, grant);
+                inbox_add(j, type, body, len);
+            }
+        }
         break;
     case AVA1_TYPE_JOB_CANCEL:
         if (ava1_data_spawn(cancel_main, j) == 0) return 0; /* the thread has our reference */

@@ -166,6 +166,36 @@ async fn pairing_with_the_c_server() {
         .contains(&me.public()));
 }
 
+/// SPEC.md §5: a data-plane frame on a control connection whose pairing is not accepted is a
+/// protocol error — a sealed Error(ERR_NOT_PAIRED), then the connection closes — not silence.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_data_frame_before_pairing_is_answered_not_paired_and_closes() {
+    let d = dir("unpaired-data");
+    let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);
+    let me = Arc::new(Identity::generate().unwrap());
+    let peers = Arc::new(Mutex::new(PeerStore::in_memory()));
+    let s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    assert!(s.pairing_code().is_some(), "not paired yet");
+    let job = [0x66; 16];
+    let link = s.job(job);
+    link.control
+        .send(&gen::Resume {
+            job_id: job,
+            manifest_hash: [0; 32],
+        })
+        .await
+        .unwrap();
+    let why = tokio::time::timeout(Duration::from_secs(5), s.closed())
+        .await
+        .expect("the server closed the connection");
+    assert!(
+        why.contains(&format!("error {}", gen::ERR_NOT_PAIRED)),
+        "sealed ERR_NOT_PAIRED: {why}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_c_server_refuses_strangers_when_pairing_is_closed() {
     let d = dir("closed");

@@ -645,7 +645,11 @@ static int handle_frame(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane
         paired = sess_is_locked(idx, sid) && S.sessions[idx].paired;
         if (paired) memcpy(peer, S.sessions[idx].peer_key, 32);
         pthread_mutex_unlock(&mu);
-        if (!paired || !S.cfg.data || !S.cfg.data->on_control) return 0;
+        if (!paired) { /* SPEC.md §5: nothing but PairConfirm before the pairing is accepted */
+            (void)send_error(&k->io, AVA1_ERR_NOT_PAIRED, "pair first");
+            return 1;
+        }
+        if (!S.cfg.data || !S.cfg.data->on_control) return 0;
         return S.cfg.data->on_control(sid, peer, type, flags, body, len) != 0;
     }
     switch (type) {
