@@ -16,6 +16,7 @@
 #define OPEN_MAX (16u << 20) /* control bytes queued behind one JobOpen still opening */
 
 uint32_t ava1_data_test_open_delay_ms;
+uint32_t ava1_data_test_open_work_delay_ms;
 uint32_t ava1_data_test_map_delay_ms;
 int ava1_data_test_ack_fail;
 int ava1_data_test_feeder_fail;
@@ -23,6 +24,10 @@ uint32_t ava1_data_test_feed_delay_ms;
 int ava1_data_test_reserve_fail;
 int ava1_data_test_lane_alloc_fail;
 int ava1_data_test_fb_force;
+
+/* Tests only: the slow work behind a JobOpen waits this long, so a test can land a
+ * pipelined cap refusal inside the open's window (between the two refusal checks). */
+void ava1_test_set_open_work_delay_ms(uint32_t ms) { ava1_data_test_open_work_delay_ms = ms; }
 
 static struct {
     ava1_data_cfg_t cfg;
@@ -114,6 +119,7 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     D.budget_free = D.cfg.budget;
     D.admitted = 0;
     ava1_data_test_open_delay_ms = ava1_data_test_map_delay_ms = ava1_data_test_feed_delay_ms = 0;
+    ava1_data_test_open_work_delay_ms = 0;
     ava1_data_test_ack_fail = ava1_data_test_feeder_fail = 0;
     ava1_data_test_reserve_fail = ava1_data_test_lane_alloc_fail = ava1_data_test_fb_force = 0;
     D.running = 1;
@@ -619,35 +625,41 @@ static int root_in_use(const uint8_t id[16], const char *root) {
     return busy;
 }
 
+/* Consumes `o`'s refusal flag under O.mu. The slot cannot be reused while its open runs
+ * (the drain that frees it follows open_now), so the flag always belongs to this open.
+ * 1 = a pipelined frame was not queued; `status`/`msg` carry why. */
+static int opening_refused(opening_t *o, uint16_t *status, char *msg, size_t cap) {
+    int refused;
+    pthread_mutex_lock(&O.mu);
+    refused = o->refused;
+    o->refused = 0;
+    *status = o->refuse_status;
+    o->refuse_status = 0;
+    snprintf(msg, cap, "%s", o->refuse_msg);
+    o->refuse_msg[0] = 0;
+    pthread_mutex_unlock(&O.mu);
+    return refused;
+}
+
 /* Runs on the open thread: the work behind a JobOpen (stat, mkdir, journal replay, thread
  * starts) never runs on a reader. */
 static void open_now(opening_t *o, const uint8_t sid[16], const uint8_t peer[32], const uint8_t *body,
                      size_t len) {
     ava1_job_open_t q;
     ava1_job_open_ack_t ack;
-    char root[AVA1_MAX_PATH + 1], msg[160] = "";
+    char root[AVA1_MAX_PATH + 1], msg[160] = "", refuse_msg[64] = "";
+    uint16_t refuse_status = 0;
     ava1_job_t *j = NULL;
     if (ava1_data_test_open_delay_ms) ava1_platform_sleep_ms(ava1_data_test_open_delay_ms);
     if (ava1_job_open_decode(body, len, &q) != 0) return; /* checked by the reader */
     /* A frame pipelined behind this open did not fit the global control cap (or could not
-     * be queued): the open is refused instead of letting a partial conversation through. */
-    if (o) {
-        int refused;
-        uint16_t refuse_status;
-        char refuse_msg[64];
-        pthread_mutex_lock(&O.mu);
-        refused = o->refused;
-        o->refused = 0;
-        refuse_status = o->refuse_status;
-        o->refuse_status = 0;
-        memcpy(refuse_msg, o->refuse_msg, sizeof refuse_msg);
-        o->refuse_msg[0] = 0;
-        pthread_mutex_unlock(&O.mu);
-        if (refused) {
-            refuse_open(sid, q.job_id, refuse_status ? refuse_status : AVA1_ERR_BUSY,
-                        refuse_msg[0] ? refuse_msg : "the job could not be opened");
-            return;
-        }
+     * be queued): the open is refused instead of letting a partial conversation through.
+     * Consumed before the work, so a refused open does none of it, and again after it:
+     * the flag can also be set while the work runs. */
+    if (o && opening_refused(o, &refuse_status, refuse_msg, sizeof refuse_msg)) {
+        refuse_open(sid, q.job_id, refuse_status ? refuse_status : AVA1_ERR_BUSY,
+                    refuse_msg[0] ? refuse_msg : "the job could not be opened");
+        return;
     }
     memset(&ack, 0, sizeof ack);
     memcpy(ack.job_id, q.job_id, 16);
@@ -675,6 +687,7 @@ static void open_now(opening_t *o, const uint8_t sid[16], const uint8_t peer[32]
         s.emit = net_emit;
         s.sid = sid;
         pthread_mutex_lock(&g_open_mu);
+        if (ava1_data_test_open_work_delay_ms) ava1_platform_sleep_ms(ava1_data_test_open_work_delay_ms);
         if (root_in_use(q.job_id, root)) {
             ack.status = AVA1_ERR_BUSY;
             snprintf(msg, sizeof msg, "another transfer is writing to this destination");
@@ -694,6 +707,19 @@ static void open_now(opening_t *o, const uint8_t sid[16], const uint8_t peer[32]
             }
         }
         pthread_mutex_unlock(&g_open_mu);
+    }
+    /* A refusal that landed while the work ran ends the open the same way one that landed
+     * before it does: the ack is refused and the job just created goes — its sender
+     * believes the open failed, so the job must not stay attached to it (its journal
+     * stays: a later JobOpen resumes). */
+    if (o && opening_refused(o, &refuse_status, refuse_msg, sizeof refuse_msg)) {
+        ack.status = refuse_status ? refuse_status : AVA1_ERR_BUSY;
+        snprintf(msg, sizeof msg, "%s", refuse_msg[0] ? refuse_msg : "the job could not be opened");
+        if (j) {
+            ava1_job_free_one(j->id);
+            ava1_job_put(j);
+            j = NULL;
+        }
     }
     /* Any send failure means the session is gone or breaking: a job left attached to it
      * would never be reached (and never reaped), so park it. */
@@ -967,8 +993,9 @@ static int data_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
     }
     pthread_mutex_lock(&j->cmu);
     if (!f) {
-        /* No memory for the frame after Received went out: the job cannot recover the
-         * frame, so it ends (the feeder records the failure: readers never take j->mu). */
+        /* No memory for the frame: Received has not gone out (it is posted only after the
+         * alloc succeeds), but the job still cannot recover the frame, so it ends (the
+         * feeder records the failure: readers never take j->mu). */
         j->in_oom = 1;
         pthread_cond_broadcast(&j->ccv);
         pthread_mutex_unlock(&j->cmu);

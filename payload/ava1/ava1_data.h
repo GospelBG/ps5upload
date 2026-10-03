@@ -49,6 +49,7 @@ int ava1_job_attach(ava1_job_t *j, const uint8_t sid[16], uint64_t credit);
 /* Tests only (0 in the payload): JobOpen's work waits this long before it starts, and an
  * OK map this long before it is sent. */
 extern uint32_t ava1_data_test_open_delay_ms;
+extern uint32_t ava1_data_test_open_work_delay_ms; /* the slow work of a JobOpen waits this long */
 extern uint32_t ava1_data_test_map_delay_ms;
 extern int ava1_data_test_ack_fail;        /* JobOpenAck's send "fails" with this code */
 extern int ava1_data_test_feeder_fail;     /* a job's feeder thread "cannot start" */
@@ -56,5 +57,7 @@ extern uint32_t ava1_data_test_feed_delay_ms; /* the feeder waits this long afte
 extern int ava1_data_test_reserve_fail;    /* ava1_apply_reserve "fails" for every lane frame */
 extern int ava1_data_test_lane_alloc_fail; /* the lane frame's calloc "fails" */
 extern int ava1_data_test_fb_force;   /* every Received goes through the waiting-send fallback */
+/* Tests only: sets ava1_data_test_open_work_delay_ms (the ctest suite's FFI). */
+void ava1_test_set_open_work_delay_ms(uint32_t ms);
 
 #endif

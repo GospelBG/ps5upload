@@ -1,5 +1,6 @@
 #include "ava1_job.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -22,7 +23,8 @@ static void retiring_add(const uint8_t id[16]) {
     unsigned i;
     for (i = 0; i < T.retiring_n; i++)
         if (memcmp(T.retiring[i], id, 16) == 0) return;
-    /* Full: every listed id is retiring, so no create can succeed anyway. */
+    /* Full: `create` refuses while the table is full (see there), so a new id cannot be
+     * unlisted here — this branch is unreachable by construction. */
     if (T.retiring_n < AVA1_MAX_JOBS) memcpy(T.retiring[T.retiring_n++], id, 16);
 }
 
@@ -97,6 +99,10 @@ static ava1_job_t *create(const uint8_t id[16], const uint8_t owner[32], const u
                 slot = -2; /* the previous job of this id is still being destroyed */
                 break;
             }
+    /* The retiring table is full: this job's own unlist could not be recorded, and the
+     * reopen guard is only complete while every retiring id is listed — refuse rather
+     * than let a create whose destroy would silently lose the guard through. */
+    if (slot >= 0 && T.retiring_n >= AVA1_MAX_JOBS) slot = -2;
     if (slot >= 0) T.jobs[slot] = j;
     pthread_mutex_unlock(&T.mu);
     if (slot < 0) {
@@ -372,4 +378,45 @@ void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *bo
     fn = j->emit;
     pthread_mutex_unlock(&j->cmu);
     if (fn) fn(j, type, flags, body, len);
+}
+
+/* ---- test driver (fix round 2, R4) ------------------------------------------------- */
+
+/* The retiring table full (AVA1_MAX_JOBS ids unlisted, every destroy still pending behind
+ * a held reference): a create must refuse — pre-fix it succeeded and its own unlist would
+ * have silently lost the reopen guard. 0, or the failed step. */
+int ava1_test_retiring_full_blocks_create(void) {
+    static const uint8_t OWNER[32] = { 1 };
+    ava1_data_cfg_t dc;
+    ava1_job_t *held[AVA1_MAX_JOBS];
+    ava1_job_t *again;
+    uint8_t id[16];
+    int i, rc = 0;
+    memset(&dc, 0, sizeof dc);
+    snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "%s", "/tmp/ava1-retiring-unused");
+    memset(held, 0, sizeof held);
+    if (ava1_data_start(&dc) != 0) return -100;
+    /* 32 detached jobs (parked from creation), each held by the caller: once the reaper
+     * unlists them all, every destroy is pending and the retiring table is full. */
+    for (i = 0; i < AVA1_MAX_JOBS && !rc; i++) {
+        memset(id, (int)(0x51u + i), 16);
+        if (!(held[i] = ava1_job_create(id, OWNER))) rc = -1;
+    }
+    if (!rc) {
+        ava1_job_reap(ava1_mono_ms() + 3600u * 1000u); /* unlists all 32: the table fills */
+        memset(id, 0x71, 16);
+        if ((again = ava1_job_create(id, OWNER))) {
+            rc = -2; /* a create succeeded while its unlist could never be recorded */
+            ava1_job_put(again);
+        }
+    }
+    for (i = 0; i < AVA1_MAX_JOBS; i++)
+        if (held[i]) ava1_job_put(held[i]); /* destroyed now: the table drains */
+    if (!rc) {
+        memset(id, 0x71, 16);
+        if (!(again = ava1_job_create(id, OWNER))) rc = -3; /* the drained table takes it */
+        else ava1_job_put(again);
+    }
+    ava1_data_stop();
+    return rc;
 }
