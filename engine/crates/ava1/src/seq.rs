@@ -62,7 +62,11 @@ pub trait SeqSource: Send + Sync {
     /// One forward pass from `restart`. For every entry in decode order the source
     /// calls `want(path, size)`; `Skip` means do not deliver it, anything else is
     /// delivered through `sink`. Entries before `restart` are not visited. The pass
-    /// returns early with an error when `sink` fails or `cancel` is set.
+    /// returns early with an error when `sink` fails or `cancel` is set. `cancel` is
+    /// raised for every way the job can end (cancel, lane or receiver failure, teardown),
+    /// not only a user cancel. A source MUST poll it at least every 1 MiB of input it
+    /// consumes, including while discarding a `Keep::Skip` stretch (which never reaches
+    /// the sink), or the job's teardown waits for the stretch to end.
     fn pass(
         &self,
         restart: Restart,
@@ -135,6 +139,28 @@ fn gone(c: &DecodeCtx) -> bool {
 
 /// The decode thread's body. Returns when the job ends (`stop`/`cancel`) or fails.
 pub(crate) fn run(c: DecodeCtx) {
+    // The flag handed to the source: set by `stop` OR `cancel`.
+    let abort = Arc::new(AtomicBool::new(false));
+    let fin = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (abort, fin, stop, cancel) =
+            (abort.clone(), fin.clone(), c.stop.clone(), c.cancel.clone());
+        std::thread::spawn(move || {
+            while !fin.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+                    abort.store(true, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    run_passes(&c, &abort);
+    fin.store(true, Ordering::Relaxed);
+    let _ = watcher.join();
+}
+
+fn run_passes(c: &DecodeCtx, abort: &AtomicBool) {
+    let c = c;
     let mut by_path: HashMap<String, u32> = HashMap::new();
     for (i, e) in c.manifest.entries.iter().enumerate() {
         if e.kind == gen::ENTRY_FILE {
@@ -171,12 +197,15 @@ pub(crate) fn run(c: DecodeCtx) {
     let mut passes = 0u32;
     loop {
         if !wants.is_empty() {
-            passes += 1;
-            if let Err(e) = one_pass(&c, &by_path, &mut wants) {
-                if !gone(&c) {
-                    let _ = c.tx.send(Read::Failed(e));
+            match one_pass(c, abort, &by_path, &mut wants) {
+                // A pass that had nothing to decode does not count against the cap.
+                Ok(ran) => passes += ran as u32,
+                Err(e) => {
+                    if !gone(c) {
+                        let _ = c.tx.send(Read::Failed(e));
+                    }
+                    return;
                 }
-                return;
             }
         }
         // Wait for a retry (the receiver may report a file that failed verification
@@ -213,9 +242,10 @@ pub(crate) fn run(c: DecodeCtx) {
 
 fn one_pass(
     c: &DecodeCtx,
+    abort: &AtomicBool,
     by_path: &Arc<HashMap<String, u32>>,
     wants: &mut BTreeMap<u32, Want>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     // A large file whose every missing group is absent and whose CVs are all known
     // needs no decoding: its root comes from the persisted outboard alone.
     let mut finished: HashSet<u32> = HashSet::new();
@@ -246,7 +276,7 @@ fn one_pass(
         .filter(|i| !finished.contains(i))
         .collect();
     if todo.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let restart = todo
         .iter()
@@ -272,7 +302,7 @@ fn one_pass(
             _ => Keep::Skip,
         }
     };
-    c.seq.pass(restart, &mut want, &mut sink, &c.cancel)?;
+    c.seq.pass(restart, &mut want, &mut sink, abort)?;
     if gone(c) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
     }
@@ -288,7 +318,7 @@ fn one_pass(
             ));
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn load_hasher(c: &DecodeCtx, id: u32, size: u64) -> FileHasher {
@@ -989,6 +1019,89 @@ mod tests {
         while let Ok(x) = r.rx.try_recv() {
             assert!(!matches!(x, Read::Failed(_)));
         }
+    }
+
+    /// Skips a huge stretch without ever calling the sink, polling the flag.
+    struct SkipForever;
+    impl SeqSource for SkipForever {
+        fn pass(
+            &self,
+            _r: Restart,
+            _w: &mut dyn FnMut(&str, u64) -> Keep,
+            _s: &mut dyn EntrySink,
+            cancel: &AtomicBool,
+        ) -> io::Result<()> {
+            for _ in 0..2000 {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(stopped());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        }
+        fn restart_for(&self, _id: u32) -> Restart {
+            Restart::START
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seq_stop_reaches_a_source_that_is_skipping() {
+        let (m, _s) = fixture(vec![("a", bytes(9, 1))], 1);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = DecodeCtx {
+            seq: Arc::new(SkipForever),
+            manifest: m.clone(),
+            need: Need::default(),
+            cutoff: CUT,
+            persist: None,
+            budget: Arc::new(Semaphore::new(1024)),
+            chunk: Box::new(|| GROUP),
+            tx,
+            stop: stop.clone(),
+            cancel: Arc::default(),
+            retries: Arc::default(),
+            rt: tokio::runtime::Handle::current(),
+        };
+        let h = std::thread::spawn(move || run(ctx));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let t = Instant::now();
+        stop.store(true, Ordering::Relaxed); // a lane failure ends the job: stop, not cancel
+        tokio::task::spawn_blocking(move || h.join().unwrap())
+            .await
+            .unwrap();
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seq_a_pass_with_nothing_to_do_does_not_count() {
+        // Every group of the only file is known: the first pass decodes nothing, so
+        // three retry passes are still allowed and the fourth request fails.
+        let big = big();
+        let (m, s) = fixture(vec![("big", big.clone())], 1);
+        let dir = std::env::temp_dir().join(format!("seq-nocount-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ob = Outboard::open(&dir.join("0.ob"), 3).unwrap();
+        for (i, g) in big.chunks(GROUP as usize).enumerate() {
+            ob.put(i as u64, &verify::group_cv(g, i as u64)).unwrap();
+        }
+        ob.sync().unwrap();
+        let mut need = Need::default();
+        let mut d = RangeSet::new();
+        d.insert(0, big.len() as u64);
+        need.partial.insert(0, d);
+        let mut r = start(&m, &s, need, Some(dir.clone()), 96 * 1024, 8 * GROUP);
+        assert!(matches!(r.next().await, Read::Root { .. }));
+        for _ in 0..3 {
+            r.retries.push(0);
+            let _ = std::fs::remove_file(dir.join("0.ob"));
+            assert!(matches!(r.next().await, Read::Chunk { .. }));
+            assert!(matches!(r.next().await, Read::Root { .. }));
+        }
+        r.retries.push(0);
+        assert!(matches!(r.next().await, Read::Failed(_)));
+        r.end();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]

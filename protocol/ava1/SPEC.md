@@ -675,10 +675,12 @@ CV exists, and a file whose every CV is known needs no decoding at all. There ar
 checkpoints: a resume costs a decode of at most the restart folder's prefix.
 
 17.3 `FileRetry` (§13) queues the file for a further pass over only the retried files
-(`Keep::All`, their outboards dropped). A job makes at most 3 passes; another request fails
-it. An entry that a pass never delivers, delivers twice, or delivers with a different size
+(`Keep::All`, their outboards dropped). A job makes at most 3 decoding passes (the first plus two retry passes; a pass that
+has nothing to decode is not counted); a further retry request fails it. An entry that a pass never delivers, delivers twice, or delivers with a different size
 than the manifest fails the job (the archive changed between listing and sending).
 
-17.4 Cancellation. `pass` receives the job's cancel flag, and every `EntrySink` call fails
+17.4 Cancellation. `pass` receives a flag raised by the job's cancel *or* by any other way the job ends (a lane,
+protocol or receiver failure) and must poll it at least every 1 MiB of input, including while
+skipping, and and every `EntrySink` call fails
 once the job is ending; `SeqSource::close` is called at teardown before the decode thread is
 joined. The bottleneck is `BN_SOURCE` while the decode thread is what the lanes wait on.
