@@ -434,7 +434,10 @@ lane never had `Received`, as for any dead lane (§12.3). A sender never sends a
 read time to fit the window (whole verification groups, one group minimum; a file's final piece keeps
 the whole-file rule), and a window that cannot hold one group — or whose smallest queued frame fits
 no lane for 10 s with nothing sent, received or credited — ends the job (`ERR_PROTOCOL`) instead of
-stalling. A lane's death does not refund window credit that the receiver has not accounted for
+stalling. The 10 s applies while the receiver holds no window bytes (a window that can never fit the
+frame). While it still holds some — a drive in a long flush has not yet returned its `Credit` — the
+receiver is slow, not dead, and the sender waits (a dead one is caught by §6 liveness), failing only
+after 10 minutes without progress. A lane's death does not refund window credit that the receiver has not accounted for
 (§12.3): its un-received frames are requeued with their bytes still charged, and the charge is
 released only when the receiver accounts for them (its `Credit` after the apply) or the job ends.
 

@@ -210,6 +210,9 @@ type LaneFrames = HashMap<u16, (u64, BTreeMap<u32, u64>)>;
 /// checked: `sent` refuses a frame larger than the credit instead of underflowing.
 pub struct Window {
     credit: u64,
+    /// The window as first granted: `initial - credit` is what the receiver still holds
+    /// (frames sent and not yet returned as `Credit`).
+    initial: u64,
     /// lane -> (unreceived bytes, seq -> frame length)
     lanes: LaneFrames,
     /// seq -> len, frames of dead lanes whose charge is held (I3): a lane's death
@@ -229,6 +232,7 @@ impl Window {
     pub fn new(credit: u64) -> Self {
         Self {
             credit,
+            initial: credit,
             lanes: HashMap::new(),
             refunded: HashMap::new(),
         }
@@ -297,6 +301,11 @@ impl Window {
     }
     pub fn available(&self) -> u64 {
         self.credit
+    }
+    /// Window bytes the receiver is holding: sent (or charged) and not yet returned as
+    /// `Credit`. Zero means the receiver has nothing it could still apply and return.
+    pub fn outstanding(&self) -> u64 {
+        self.initial.saturating_sub(self.credit)
     }
 }
 
@@ -414,6 +423,9 @@ enum Read {
 
 const READ_AHEAD_KIB: u32 = 96 * 1024;
 
+/// How often the large-file reader persists its outboard (a resume cache; see its use).
+const OUTBOARD_SYNC_EVERY: Duration = Duration::from_secs(1);
+
 /// The Chunk message overhead over its data (job 16 + file 4 + offset 8 + length 4 +
 /// extension count 2): the window counts lane-frame *body* bytes, so a piece's data must
 /// leave room for these (I2).
@@ -424,6 +436,23 @@ const CHUNK_HDR: u64 = 34;
 /// smallest queued frame and it applies nothing): the control loop fails it loudly
 /// instead of letting it park forever.
 const STALL_FATAL: Duration = Duration::from_secs(10);
+
+/// A credit stall while the receiver still holds window bytes is a slow receiver (a USB
+/// drive in a long flush), not a dead one: it returns the credit when it has applied them,
+/// and a receiver that really died is caught by the session's liveness. Only a stall with
+/// no progress at all for this long fails the job, so a drive that stalls for minutes
+/// does not fail an upload that FTX2 (which never waits on the drive) would finish.
+const STALL_SLOW_RECEIVER_FATAL: Duration = Duration::from_secs(600);
+
+/// How long a credit stall may last before the job fails, given the window bytes the
+/// receiver still holds.
+fn stall_limit(outstanding: u64) -> Duration {
+    if outstanding == 0 {
+        STALL_FATAL
+    } else {
+        STALL_SLOW_RECEIVER_FATAL
+    }
+}
 
 /// The next control frame, Status frames skipped (they are advisory). Shared with the
 /// receiver (`recv.rs`), which reads its manifest the same way.
@@ -639,7 +668,9 @@ fn spawn_readers(
         let grant = sh.window.lock().unwrap().available();
         let chunk = (chunk.min(grant.saturating_sub(CHUNK_HDR)) / GROUP * GROUP).max(GROUP);
         let plan = pieces(e.size, &durable, &|g| hasher.cv(g).is_some(), chunk);
-        for p in plan {
+        let last_piece = plan.len().saturating_sub(1);
+        let mut ob_synced = Instant::now();
+        for (pi, p) in plan.into_iter().enumerate() {
             if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
                 return;
             }
@@ -681,8 +712,15 @@ fn spawn_readers(
                     let _ = ob.put(gi, &cv);
                 }
             }
-            if let Some(ob) = ob.as_mut() {
-                let _ = ob.sync();
+            // The outboard is a resume cache: a sync costs a whole-image rewrite, an fsync
+            // (F_FULLFSYNC on macOS, ~10 ms) and a rename, so it runs about once a second and
+            // at the file's last piece, not once per 4 MiB piece. A crash between syncs only
+            // loses the CVs since the last one, which the resume re-hashes.
+            if pi == last_piece || ob_synced.elapsed() >= OUTBOARD_SYNC_EVERY {
+                if let Some(ob) = ob.as_mut() {
+                    let _ = ob.sync();
+                }
+                ob_synced = Instant::now();
             }
             if p.send {
                 let budget = budget.expect("send pieces hold a read-ahead permit");
@@ -1364,11 +1402,15 @@ pub async fn run_upload(
                 // I2: a stall that has persisted — nothing sent, Received or credited
                 // since it began — is a job the receiver can never advance: fail it
                 // loudly instead of parking forever.
-                if let Some(st) = *sh.stall.lock().unwrap() {
-                    if st.since.elapsed() >= STALL_FATAL {
+                // The receiver holding window bytes is a slow disk, not a window that can never
+                // fit a frame: only a stall with nothing outstanding fails quickly.
+                let stalled = *sh.stall.lock().unwrap();
+                if let Some(st) = stalled {
+                    let limit = stall_limit(sh.window.lock().unwrap().outstanding());
+                    if st.since.elapsed() >= limit {
                         break Err(SendError::Protocol(format!(
                             "no queued frame fits the receiver's window ({} bytes granted, the smallest queued frame is {} bytes) and nothing was sent, received or credited for {:?}",
-                            st.grant, st.smallest, STALL_FATAL
+                            st.grant, st.smallest, limit
                         )));
                     }
                 }
@@ -1538,6 +1580,26 @@ mod tests {
     use crate::wire::SplitMix;
     use std::io;
     use tokio::io::{duplex, split};
+
+    #[test]
+    fn a_stall_with_bytes_outstanding_is_a_slow_receiver_not_a_dead_one() {
+        // The Phat's USB drive stalled for over ten seconds with 64 MiB of window held:
+        // 18,260 bytes were left, the smallest queued frame was 26,806, and the job was
+        // failed although the receiver was only flushing. With nothing outstanding the
+        // window can never fit the frame, and that still fails fast.
+        let mut w = Window::new(64 << 20);
+        assert_eq!(w.outstanding(), 0);
+        assert_eq!(stall_limit(w.outstanding()), STALL_FATAL);
+        assert!(w.sent(0, 1, (64 << 20) - 18_260));
+        assert_eq!(w.available(), 18_260);
+        assert_eq!(w.outstanding(), (64 << 20) - 18_260);
+        assert!(stall_limit(w.outstanding()) >= Duration::from_secs(60));
+        w.received(1); // the frame reached the receiver; its bytes are still held there
+        assert!(stall_limit(w.outstanding()) >= Duration::from_secs(60));
+        w.credit((64 << 20) - 18_260); // applied and returned
+        assert_eq!(w.outstanding(), 0);
+        assert_eq!(stall_limit(w.outstanding()), STALL_FATAL);
+    }
 
     #[test]
     fn skip_set_is_the_complement_of_the_read_set() {
