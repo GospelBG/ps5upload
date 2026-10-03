@@ -357,18 +357,17 @@ async fn a_download_of_a_path_outside_the_share_is_refused_too() {
     );
 }
 
-/// SPEC.md §12.4 (ruling Q2): a frame larger than the credit still outstanding is refused
-/// with the sealed Error(ERR_CREDIT) — on the offending lane, then on the control
-/// connection, where the peer's link reader ends the whole session (a transport without a
-/// server-side lane close ends the session instead of one lane; the sender observes the
-/// same either way: its lane dies). Nothing of the frame is buffered or acknowledged.
+/// SPEC.md §12.4: a frame larger than the credit still outstanding is refused with the
+/// sealed Error(ERR_CREDIT) on the offending lane, and only that lane ends: the session and
+/// the job stay, and a second lane still delivers (Received). Nothing of the refused frame
+/// is buffered or acknowledged.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_over_credit_chunk_gets_the_sealed_error_and_the_session_ends() {
+async fn an_over_credit_chunk_closes_only_its_lane() {
     let d = common::temp_dir("rr-credit");
     let host = Arc::new(CreditHost {
         root: d.join("share"),
         jobs: d.join("hjobs"),
-        credit: 1 << 20,
+        credit: 2 << 20,
     });
     let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(host)).await;
     let s = connect(&addr.to_string(), id, peers, "client", common::fast())
@@ -387,10 +386,11 @@ async fn an_over_credit_chunk_gets_the_sealed_error_and_the_session_ends() {
     };
     let mut link = s.job(job);
     let (ack, _map) = open_and_map(&mut link, job, "in", &m).await;
-    assert_eq!(ack.credit, 1 << 20, "the grant is the job's credit");
-    // The lane that carries the oversized chunk, opened here so the test can watch it die.
+    assert_eq!(ack.credit, 2 << 20, "the grant is the job's credit");
     let lane_conn = s.open_lane().await.unwrap();
     let lane = lane_conn.id;
+    let good_conn = s.open_lane().await.unwrap();
+    let good = good_conn.id;
     let body = Chunk {
         job_id: job,
         file_id: 0,
@@ -405,45 +405,7 @@ async fn an_over_credit_chunk_gets_the_sealed_error_and_the_session_ends() {
         .send_raw(Chunk::TYPE, 0, 1, body)
         .await
         .unwrap();
-    // The receiver admits nothing: the frame is never acknowledged, so not even Received
-    // crosses for it — asserted here, not just claimed. The session end (ruling Q2) rides
-    // the control connection and the lane's death its own connection, so either may come
-    // first; and when the session ends first the router's lane map is cleared with it, so
-    // the inbox may never see a LaneDown at all — the lane's death is pinned below by the
-    // lane connection's own close reason instead.
-    let mut saw_received = false;
-    let mut saw_closed = false;
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let ev = link.rx.recv().await.expect("the job channel closed");
-            match ev {
-                Inbound::Closed(_) => {
-                    saw_closed = true;
-                    break;
-                }
-                Inbound::Control(f) if f.ty == Received::TYPE => saw_received = true,
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("the session end within 20 s");
-    assert!(saw_closed, "the job heard the session end");
-    assert!(
-        !saw_received,
-        "no Received crossed for a frame the receiver never admitted"
-    );
-    // The session ends with ERR_CREDIT: the control connection carried the sealed error
-    // and the peer's link reader ended the session with it.
-    let why = tokio::time::timeout(Duration::from_secs(20), s.closed())
-        .await
-        .expect("the session ended within 20 s");
-    assert!(
-        why.contains("17"),
-        "the session ended with the ERR_CREDIT reason: {why}"
-    );
-    // The sender observes the sealed error: the lane connection's close reason is the
-    // decoded Error — code 17 is ERR_CREDIT (SPEC.md §12.4, ruling Q2).
+    // The offending lane dies with the decoded sealed Error: code 17 is ERR_CREDIT.
     let why = tokio::time::timeout(Duration::from_secs(20), lane_conn.closed())
         .await
         .expect("the lane closed within 20 s");
@@ -451,6 +413,37 @@ async fn an_over_credit_chunk_gets_the_sealed_error_and_the_session_ends() {
         why.contains("error 17"),
         "the sealed ERR_CREDIT crossed: {why}"
     );
+    // The session and the job go on: a valid chunk on the other lane is Received, and
+    // nothing was Received for the refused frame (seq 1).
+    let ok = Chunk {
+        job_id: job,
+        file_id: 0,
+        offset: 0,
+        data: vec![0x5a; 1 << 20],
+    }
+    .to_bytes()
+    .unwrap();
+    link.lane(good)
+        .unwrap()
+        .tx
+        .send_raw(Chunk::TYPE, 0, 2, ok)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match link.rx.recv().await.expect("the job channel closed") {
+                Inbound::Closed(why) => panic!("the session ended: {why}"),
+                Inbound::Control(f) if f.ty == Received::TYPE => {
+                    let r: Received = f.decode().unwrap();
+                    assert_eq!(r.seq, 2, "Received only for the admitted frame");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("Received on the healthy lane within 20 s");
 }
 
 /// SPEC.md §12.4, the grant direction (ledger row 19): the sender's window is the grant
@@ -823,4 +816,96 @@ fn the_part_file_lives_in_the_final_files_parent_directory() {
     sink.commit(1).unwrap();
     assert_eq!(std::fs::read(root.join("a/b")).unwrap(), b"hello!!!");
     assert!(!root.join("a/b.ava-part").exists());
+}
+
+/// SPEC.md §11.5: `Resume` for a parked job of this peer answers its `JobMap` (the durable
+/// file is done) and the job continues; a Resume for an unknown job, or with a manifest hash
+/// that is not the stored one, answers `JobMap{status = ERR_UNKNOWN_JOB}` instead of silence.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_answers_a_job_map_for_a_parked_job_else_unknown_job() {
+    let d = common::temp_dir("rr-resume-frame");
+    let host = Arc::new(FolderHost {
+        root: d.join("share"),
+        jobs_dir: d.join("hjobs"),
+    });
+    let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(host)).await;
+    let job = [0x31; 16];
+    let file = |p: &str| Entry {
+        kind: gen::ENTRY_FILE,
+        mode: 0o644,
+        size: 4,
+        mtime: 0,
+        path: p.into(),
+        root: None,
+    };
+    let m = Manifest {
+        entries: vec![file("a"), file("b")],
+    };
+    {
+        let s = connect(
+            &addr.to_string(),
+            id.clone(),
+            peers.clone(),
+            "client",
+            common::fast(),
+        )
+        .await
+        .unwrap();
+        let mut link = s.job(job);
+        open_and_map(&mut link, job, "in", &m).await;
+        let lane = link.opener().unwrap().open().await.unwrap();
+        link.lane(lane)
+            .unwrap()
+            .tx
+            .send_raw(Bundle::TYPE, 0, 1, bundle_body(job, 0, b"one!"))
+            .await
+            .unwrap();
+        loop {
+            if next_control(&mut link).await.ty == Durable::TYPE {
+                break;
+            }
+        }
+        drop(s); // parked: file 1 never arrived
+    }
+    let s = connect(&addr.to_string(), id, peers, "client", common::fast())
+        .await
+        .unwrap();
+    // A job nobody knows.
+    let mut link = s.job([0x99; 16]);
+    link.control
+        .send(&gen::Resume {
+            job_id: [0x99; 16],
+            manifest_hash: m.hash(),
+        })
+        .await
+        .unwrap();
+    let map: JobMap = next_control(&mut link).await.decode().unwrap();
+    assert_eq!(map.status, gen::ERR_UNKNOWN_JOB);
+    drop(link);
+    // The parked job, with a manifest hash that is not the stored one.
+    let mut link = s.job(job);
+    link.control
+        .send(&gen::Resume {
+            job_id: job,
+            manifest_hash: [7; 32],
+        })
+        .await
+        .unwrap();
+    let map: JobMap = next_control(&mut link).await.decode().unwrap();
+    assert_eq!(map.status, gen::ERR_UNKNOWN_JOB);
+    drop(link);
+    // The parked job, with its own hash: the map, with the durable file done.
+    let mut link = s.job(job);
+    link.control
+        .send(&gen::Resume {
+            job_id: job,
+            manifest_hash: m.hash(),
+        })
+        .await
+        .unwrap();
+    let credit: Credit = next_control(&mut link).await.decode().unwrap();
+    assert_eq!(credit.bytes, 64 << 20, "the grant is re-sent as Credit");
+    let map: JobMap = next_control(&mut link).await.decode().unwrap();
+    assert_eq!(map.status, gen::STATUS_OK);
+    assert_eq!(map.done, vec![gen::FileRun { first: 0, count: 1 }]);
 }

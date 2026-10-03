@@ -332,7 +332,9 @@ manifest: the receiver answers `JobMap`, or `JobMap{status = ERR_UNKNOWN_JOB}` a
 sender falls back to `JobOpen`. A map larger than one control frame is sent as several
 `JobMap` pages; `last = 1` marks the final one. `Durable` is never paged: each is complete.
 Engines reopen with `JobOpen` after any interruption; `Resume` is optional for senders that
-keep their manifest and credit state, and the engine's own receiving host does not implement it.
+keep their manifest and credit state. A receiver answers `Resume` with the `JobMap` of a parked job
+of the same peer key whose stored manifest has that hash, else `JobMap{status = ERR_UNKNOWN_JOB}` —
+never silence.
 Credit restarts after any interruption and nothing outstanding carries across a reconnect: the
 grant in a `JobOpenAck` is an absolute number that sets the sender's window (a `Credit` that
 arrives later adds to it), and a `Resume` restarts the window the same way — the receiver resets
@@ -424,9 +426,9 @@ body, so a `Chunk` costs its data plus 34 bytes of framing; `Credit{bytes}` retu
 receiver frees buffers. A version 1 receiver grants 64 MiB, and never less than 8 MiB: a node whose
 global buffer budget cannot cover 8 MiB refuses the job with `ERR_BUSY`. A receiver that sees a
 lane frame exceed the credit still outstanding sends a sealed `Error{ERR_CREDIT}` on the offending
-lane and ends the session: it is a violation by the peer, not by the link. Nothing of the frame is
-buffered or acknowledged, and the sender observes ERR_CREDIT on its lane or its control
-connection. A sender never sends a piece larger than the credit already granted: pieces are sized at
+lane and closes that lane only: the session, the job and its other lanes go on. Nothing of the frame is
+buffered or acknowledged, and the sender observes ERR_CREDIT on that lane; it requeues the frames the
+lane never had `Received`, as for any dead lane (§12.3). A sender never sends a piece larger than the credit already granted: pieces are sized at
 read time to fit the window (whole verification groups, one group minimum; a file's final piece keeps
 the whole-file rule), and a window that cannot hold one group — or whose smallest queued frame fits
 no lane for 10 s with nothing sent, received or credited — ends the job (`ERR_PROTOCOL`) instead of

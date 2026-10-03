@@ -484,6 +484,26 @@ pub async fn receive_job(
     run(link, Arc::new(m), None, sink, o).await
 }
 
+/// The responder side of a `Resume` (SPEC.md §11.5): the stored manifest is already in hand, so
+/// there is no ack or manifest exchange — the job's `JobMap` goes out and the job continues
+/// exactly as a `JobOpen` resume would (journal replay, §13.4 re-check, map, data).
+pub async fn resume_job(
+    link: &mut JobLink,
+    manifest: Manifest,
+    sink: Arc<dyn Sink>,
+    o: RecvOptions,
+) -> Result<RecvReport, SendError> {
+    // No ack carries the grant on this path, so it goes out as a `Credit` (SPEC.md §11.5).
+    link.control
+        .send(&Credit {
+            job_id: link.job_id,
+            bytes: o.credit,
+        })
+        .await
+        .map_err(|e| SendError::Disconnected(e.to_string()))?;
+    run(link, Arc::new(manifest), None, sink, o).await
+}
+
 struct Large {
     /// The group CVs, shared with the sync batch: the batch syncs the very instance the
     /// loop puts CVs into (the outboard's shadow-rename model forbids a second instance
@@ -855,27 +875,10 @@ async fn run_loop(
                             })
                             .await;
                     }
-                    // Ruling Q2: a credit overrun is a peer protocol violation and ends the
-                    // whole session, not just the job — a transport without a server-side
-                    // session-end API closes it through the peer: the sealed Error also goes
-                    // on the control connection, where the peer's link reader ends the
-                    // session (and this side follows when the peer's sockets close). The
-                    // sender then learns ERR_CREDIT immediately instead of stalling on credit
-                    // it will never get.
-                    let _ = link
-                        .control
-                        .send(&gen::Error {
-                            code: gen::ERR_CREDIT,
-                            message: "a frame larger than the credit granted".into(),
-                        })
-                        .await;
-                    if let Some(op) = link.opener() {
-                        op.close(lane); // dial side only (ruling Q2)
-                    }
-                    return Err(SendError::Refused {
-                        status: gen::ERR_CREDIT,
-                        message: "the peer exceeded the credit granted".into(),
-                    });
+                    // Ruling: lane only. The sealed Error ends that lane when the peer reads
+                    // it (SPEC.md §12.4); the session and the job stay, other lanes go on,
+                    // and the refused frame is requeued by the sender as for any dead lane.
+                    continue;
                 }
                 link.control
                     .send(&Received {
