@@ -521,7 +521,12 @@ fields = [
   { name = "lanes", ty = "u8" },
   { name = "sequential", ty = "u8" },
 ]
-ext = [{ tag = 1, name = "current", ty = "str" }, { tag = 2, name = "state", ty = "u8" }]
+ext = [
+  { tag = 1, name = "current", ty = "str" },
+  { tag = 2, name = "state", ty = "u8" },
+  { tag = 3, name = "result", ty = "bytes" },   # job.run: the finished job's output (a handler's text body)
+  { tag = 4, name = "code", ty = "u16" },       # a failed job's ERR_* code
+]
 
 [[message]]
 name = "JobDone"
@@ -569,6 +574,568 @@ fields = [
 [[struct]]
 name = "DiskCalibrateResult"
 fields = [{ name = "points", ty = "records", of = "CalPoint" }]
+
+
+# ── Management RPCs (SPEC.md §7.3, MGMT_METHODS.md) ───────────────────────────
+# Method numbers by block; 97 and 99 stay unassigned (backup snapshot/restore run as job.run ops).
+[[const]]
+name = "METHOD_NODE_STATUS"
+ty = "u16"
+value = 4
+[[const]]
+name = "METHOD_NODE_SHUTDOWN"
+ty = "u16"
+value = 5
+[[const]]
+name = "METHOD_NODE_CLEANUP"
+ty = "u16"
+value = 6
+[[const]]
+name = "METHOD_LOG_KLOG"
+ty = "u16"
+value = 7
+[[const]]
+name = "METHOD_LOG_SYSLOG"
+ty = "u16"
+value = 8
+[[const]]
+name = "METHOD_NET_INTERFACES"
+ty = "u16"
+value = 9
+[[const]]
+name = "METHOD_NET_REACH"
+ty = "u16"
+value = 10
+[[const]]
+name = "METHOD_NET_SPEEDTEST"
+ty = "u16"
+value = 11
+[[const]]
+name = "METHOD_JOB_RUN"
+ty = "u16"
+value = 20
+[[const]]
+name = "METHOD_JOB_LIST"
+ty = "u16"
+value = 21
+[[const]]
+name = "METHOD_FS_VOLUMES"
+ty = "u16"
+value = 32
+[[const]]
+name = "METHOD_FS_LIST"
+ty = "u16"
+value = 33
+[[const]]
+name = "METHOD_FS_STAT"
+ty = "u16"
+value = 34
+[[const]]
+name = "METHOD_FS_MKDIR"
+ty = "u16"
+value = 35
+[[const]]
+name = "METHOD_FS_RENAME"
+ty = "u16"
+value = 36
+[[const]]
+name = "METHOD_FS_CHMOD"
+ty = "u16"
+value = 37
+[[const]]
+name = "METHOD_FS_READ"
+ty = "u16"
+value = 38
+[[const]]
+name = "METHOD_FS_WRITE"
+ty = "u16"
+value = 39
+[[const]]
+name = "METHOD_FS_MOUNT"
+ty = "u16"
+value = 40
+[[const]]
+name = "METHOD_FS_UNMOUNT"
+ty = "u16"
+value = 41
+[[const]]
+name = "METHOD_FS_MOUNT_PKG"
+ty = "u16"
+value = 42
+[[const]]
+name = "METHOD_FS_MOUNT_LWFS"
+ty = "u16"
+value = 43
+[[const]]
+name = "METHOD_APP_REGISTER"
+ty = "u16"
+value = 48
+[[const]]
+name = "METHOD_APP_UNREGISTER"
+ty = "u16"
+value = 49
+[[const]]
+name = "METHOD_APP_LAUNCH"
+ty = "u16"
+value = 50
+[[const]]
+name = "METHOD_APP_LIST"
+ty = "u16"
+value = 51
+[[const]]
+name = "METHOD_APP_LAUNCH_BROWSER"
+ty = "u16"
+value = 52
+[[const]]
+name = "METHOD_APP_LIFECYCLE"
+ty = "u16"
+value = 53
+[[const]]
+name = "METHOD_APP_INFO_QUERY"
+ty = "u16"
+value = 54
+[[const]]
+name = "METHOD_APP_INFO_SET"
+ty = "u16"
+value = 55
+[[const]]
+name = "METHOD_APP_DB_QUERY"
+ty = "u16"
+value = 56
+[[const]]
+name = "METHOD_PROC_FOCUS"
+ty = "u16"
+value = 57
+[[const]]
+name = "METHOD_PROC_LIST"
+ty = "u16"
+value = 58
+[[const]]
+name = "METHOD_PROC_PROCESS_LIST"
+ty = "u16"
+value = 59
+[[const]]
+name = "METHOD_PROC_KILL"
+ty = "u16"
+value = 60
+[[const]]
+name = "METHOD_PROC_MODULES"
+ty = "u16"
+value = 61
+[[const]]
+name = "METHOD_SAVES_LIST"
+ty = "u16"
+value = 64
+[[const]]
+name = "METHOD_SHOTS_LIST"
+ty = "u16"
+value = 65
+[[const]]
+name = "METHOD_VIDEOS_LIST"
+ty = "u16"
+value = 66
+[[const]]
+name = "METHOD_INDEX_START"
+ty = "u16"
+value = 67
+[[const]]
+name = "METHOD_INDEX_STATUS"
+ty = "u16"
+value = 68
+[[const]]
+name = "METHOD_INDEX_SEARCH"
+ty = "u16"
+value = 69
+[[const]]
+name = "METHOD_INDEX_CANCEL"
+ty = "u16"
+value = 70
+[[const]]
+name = "METHOD_HW_INFO"
+ty = "u16"
+value = 72
+[[const]]
+name = "METHOD_HW_TEMPS"
+ty = "u16"
+value = 73
+[[const]]
+name = "METHOD_HW_POWER"
+ty = "u16"
+value = 74
+[[const]]
+name = "METHOD_HW_STORAGE"
+ty = "u16"
+value = 75
+[[const]]
+name = "METHOD_HW_FAN_THRESHOLD"
+ty = "u16"
+value = 76
+[[const]]
+name = "METHOD_HW_FAN_CURVE_SET"
+ty = "u16"
+value = 77
+[[const]]
+name = "METHOD_HW_FAN_CURVE_GET"
+ty = "u16"
+value = 78
+[[const]]
+name = "METHOD_HW_DRIVE_SENSORS"
+ty = "u16"
+value = 79
+[[const]]
+name = "METHOD_POWER_CONTROL"
+ty = "u16"
+value = 80
+[[const]]
+name = "METHOD_POWER_TELEMETRY"
+ty = "u16"
+value = 81
+[[const]]
+name = "METHOD_TIME_GET"
+ty = "u16"
+value = 82
+[[const]]
+name = "METHOD_TIME_SET"
+ty = "u16"
+value = 83
+[[const]]
+name = "METHOD_TIME_STATE_GET"
+ty = "u16"
+value = 84
+[[const]]
+name = "METHOD_TIME_STATE_SET"
+ty = "u16"
+value = 85
+[[const]]
+name = "METHOD_PERIPH_CONTROL"
+ty = "u16"
+value = 86
+[[const]]
+name = "METHOD_SHELL_EXEC"
+ty = "u16"
+value = 87
+[[const]]
+name = "METHOD_PROFILE_INFO"
+ty = "u16"
+value = 88
+[[const]]
+name = "METHOD_PROFILE_SET_USERNAME"
+ty = "u16"
+value = 89
+[[const]]
+name = "METHOD_PROFILE_ACTIVATE"
+ty = "u16"
+value = 90
+[[const]]
+name = "METHOD_PROFILE_APPLY_AVATAR"
+ty = "u16"
+value = 91
+[[const]]
+name = "METHOD_PROFILE_CLEAR_SLOT"
+ty = "u16"
+value = 92
+[[const]]
+name = "METHOD_PROFILE_SET_LOCAL_USERNAME"
+ty = "u16"
+value = 93
+[[const]]
+name = "METHOD_USER_LIST"
+ty = "u16"
+value = 94
+[[const]]
+name = "METHOD_USER_CREATE"
+ty = "u16"
+value = 95
+[[const]]
+name = "METHOD_USER_DELETE"
+ty = "u16"
+value = 96
+[[const]]
+name = "METHOD_BACKUP_LIST"
+ty = "u16"
+value = 98
+[[const]]
+name = "METHOD_BACKUP_DELETE"
+ty = "u16"
+value = 100
+[[const]]
+name = "METHOD_CHEATS_LIST"
+ty = "u16"
+value = 104
+[[const]]
+name = "METHOD_CHEATS_GET"
+ty = "u16"
+value = 105
+[[const]]
+name = "METHOD_CHEATS_TOGGLE"
+ty = "u16"
+value = 106
+[[const]]
+name = "METHOD_CHEATS_DELETE"
+ty = "u16"
+value = 107
+[[const]]
+name = "METHOD_CHEATS_RELOAD"
+ty = "u16"
+value = 108
+[[const]]
+name = "METHOD_CHEATS_STATUS"
+ty = "u16"
+value = 109
+[[const]]
+name = "METHOD_CHEATS_ENGINE_SET"
+ty = "u16"
+value = 110
+[[const]]
+name = "METHOD_SMP_META_CONTROL"
+ty = "u16"
+value = 112
+[[const]]
+name = "METHOD_SMP_META_STATS"
+ty = "u16"
+value = 113
+[[const]]
+name = "METHOD_SDK_SCAN"
+ty = "u16"
+value = 114
+[[const]]
+name = "METHOD_SDK_PATCH"
+ty = "u16"
+value = 115
+[[const]]
+name = "METHOD_SDK_RESTORE"
+ty = "u16"
+value = 116
+[[const]]
+name = "METHOD_TMDB_FETCH"
+ty = "u16"
+value = 117
+[[const]]
+name = "METHOD_TMDB_STORE"
+ty = "u16"
+value = 118
+[[const]]
+name = "METHOD_FTP_START"
+ty = "u16"
+value = 119
+[[const]]
+name = "METHOD_FTP_STATUS"
+ty = "u16"
+value = 120
+[[const]]
+name = "METHOD_FWSPOOF_STATUS"
+ty = "u16"
+value = 121
+[[const]]
+name = "METHOD_NOTIF_LIST"
+ty = "u16"
+value = 122
+[[const]]
+name = "METHOD_NOTIF_SEND"
+ty = "u16"
+value = 123
+[[const]]
+name = "METHOD_NOTIF_CLEAR"
+ty = "u16"
+value = 124
+[[const]]
+name = "METHOD_TOAST_SEND"
+ty = "u16"
+value = 125
+[[const]]
+name = "METHOD_ACTIVITY_GET"
+ty = "u16"
+value = 126
+[[const]]
+name = "METHOD_ACTIVITY_DB_QUERY"
+ty = "u16"
+value = 127
+[[const]]
+name = "METHOD_ACTIVITY_RESET"
+ty = "u16"
+value = 128
+[[const]]
+name = "METHOD_RP_REQUEST"
+ty = "u16"
+value = 136
+[[const]]
+name = "METHOD_RP_STATUS"
+ty = "u16"
+value = 137
+[[const]]
+name = "METHOD_RP_CANCEL"
+ty = "u16"
+value = 138
+[[const]]
+name = "METHOD_RP_READINESS"
+ty = "u16"
+value = 139
+[[const]]
+name = "METHOD_RP_ENABLE"
+ty = "u16"
+value = 140
+[[const]]
+name = "METHOD_RP_DEVICES"
+ty = "u16"
+value = 141
+[[const]]
+name = "JOB_OP_DELETE"
+ty = "u8"
+value = 1
+[[const]]
+name = "JOB_OP_CHMOD_R"
+ty = "u8"
+value = 2
+[[const]]
+name = "JOB_OP_HASH"
+ty = "u8"
+value = 3
+[[const]]
+name = "JOB_OP_CRC32"
+ty = "u8"
+value = 4
+[[const]]
+name = "JOB_OP_FSCK"
+ty = "u8"
+value = 5
+[[const]]
+name = "JOB_OP_BACKUP_SNAPSHOT"
+ty = "u8"
+value = 6
+[[const]]
+name = "JOB_OP_BACKUP_RESTORE"
+ty = "u8"
+value = 7
+[[const]]
+name = "JOB_OP_CLEANUP"
+ty = "u8"
+value = 8
+[[const]]
+name = "JOB_OP_SDK_SCAN"
+ty = "u8"
+value = 9
+# fs.* entry kinds: ENTRY_FILE (0) and ENTRY_DIR (1) above, plus this for anything else.
+[[const]]
+name = "ENTRY_OTHER"
+ty = "u8"
+value = 2
+# FsRead.flags / FsWrite.flags
+[[const]]
+name = "FSR_UNSAFE"
+ty = "u32"
+value = 1
+[[const]]
+name = "FSW_CREATE_ONLY"
+ty = "u32"
+value = 1
+
+# Management bodies. Most methods carry the payload handler's existing text/JSON in MgmtText;
+# the filesystem, node and job methods are typed.
+[[struct]]
+name = "MgmtText"
+fields = [{ name = "body", ty = "bytes" }]
+ext = [{ tag = 1, name = "more", ty = "u8" }]     # 1 = call again with the next offset (paged methods)
+
+[[struct]]
+name = "NodeStatus"        # node.status; the handler's JSON minus the FTX2 transaction counters
+fields = [
+  { name = "version", ty = "str" },
+  { name = "ps5_kernel", ty = "str" },
+  { name = "instance_id", ty = "u64" },
+  { name = "started_at_unix", ty = "u64" },
+  { name = "command_count", ty = "u64" },
+  { name = "startup_reason", ty = "u16" },
+  { name = "ucred_elevated", ty = "u8" },
+  { name = "max_transfer_streams", ty = "u8" },
+  { name = "fan_threshold", ty = "u16" },
+  { name = "fan_reapply_sec", ty = "u16" },
+]
+ext = [{ tag = 1, name = "prior_instance", ty = "str" }]   # "clean" | "killed_externally" | "wedged" | "stale"
+
+[[struct]]
+name = "FsList"
+fields = [{ name = "path", ty = "str" }, { name = "offset", ty = "u32" }, { name = "limit", ty = "u16" }]
+
+[[struct]]
+name = "FsEntry"
+fields = [{ name = "name", ty = "str" }, { name = "kind", ty = "u8" }, { name = "size", ty = "u64" }]
+ext = [{ tag = 1, name = "mtime", ty = "u64" }, { tag = 2, name = "mode", ty = "u32" }]
+
+[[struct]]
+name = "FsListResult"
+fields = [
+  { name = "entries", ty = "records", of = "FsEntry" },
+  { name = "total_scanned", ty = "u32" },
+  { name = "more", ty = "u8" },
+]
+
+[[struct]]
+name = "FsPath"
+fields = [{ name = "path", ty = "str" }]
+
+[[struct]]
+name = "FsStat"
+fields = [
+  { name = "kind", ty = "u8" },
+  { name = "size", ty = "u64" },
+  { name = "mtime", ty = "u64" },
+  { name = "mode", ty = "u32" },
+  { name = "dev", ty = "u64" },
+]
+
+[[struct]]
+name = "FsMkdir"
+fields = [{ name = "path", ty = "str" }, { name = "mode", ty = "u32" }, { name = "parents", ty = "u8" }]
+
+[[struct]]
+name = "FsRename"
+fields = [{ name = "from", ty = "str" }, { name = "to", ty = "str" }, { name = "overwrite", ty = "u8" }]
+
+[[struct]]
+name = "FsChmod"
+fields = [{ name = "path", ty = "str" }, { name = "mode", ty = "u32" }]
+
+[[struct]]
+name = "FsRead"
+fields = [
+  { name = "path", ty = "str" },
+  { name = "offset", ty = "u64" },
+  { name = "len", ty = "u32" },
+  { name = "flags", ty = "u32" },
+]
+
+[[struct]]
+name = "FsReadResult"
+fields = [{ name = "data", ty = "bytes" }, { name = "eof", ty = "u8" }]
+
+[[struct]]
+name = "FsWrite"
+fields = [
+  { name = "path", ty = "str" },
+  { name = "mode", ty = "u32" },
+  { name = "flags", ty = "u32" },
+  { name = "data", ty = "bytes" },
+]
+
+[[struct]]
+name = "JobRun"
+fields = [{ name = "job_id", ty = "b16" }, { name = "op", ty = "u8" }, { name = "args", ty = "bytes" }]
+
+[[struct]]
+name = "JobEntry"
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "kind", ty = "u8" },
+  { name = "state", ty = "u8" },
+  { name = "files_done", ty = "u32" },
+  { name = "files_total", ty = "u32" },
+  { name = "bytes_done", ty = "u64" },
+  { name = "bytes_total", ty = "u64" },
+]
+
+[[struct]]
+name = "JobListResult"
+fields = [{ name = "jobs", ty = "records", of = "JobEntry" }]
 
 # Journal records (SPEC.md §14); never on the wire.
 [[struct]]

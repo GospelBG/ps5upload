@@ -26,7 +26,10 @@ use crate::Ava1Error;
 pub const MAX_CONNS: usize = 64;
 pub const MAX_SESSIONS: usize = 16;
 /// Calls in flight per session; more are answered `ERR_BUSY`.
-pub const RPC_WORKERS: usize = 4;
+pub const RPC_WORKERS: usize = 8;
+/// The largest RPC reply body (SPEC.md §7.4): what fits a control frame with room for
+/// framing. A handler that returns more is answered `ERR_INTERNAL`, never clipped.
+pub const RPC_REPLY_MAX: usize = 56 * 1024;
 /// The longest window `pairing.open` may ask for.
 pub const MAX_PAIRING_WINDOW_S: u16 = 600;
 /// Connections one source address may hold (a session is 1 control + up to 8 lanes).
@@ -636,6 +639,14 @@ async fn control(
                             status: gen::ERR_INTERNAL,
                             body: Vec::new(),
                         });
+                    let reply = if reply.body.len() > RPC_REPLY_MAX {
+                        RpcReply {
+                            status: gen::ERR_INTERNAL,
+                            body: b"reply exceeds the 56 KiB RPC cap".to_vec(),
+                        }
+                    } else {
+                        reply
+                    };
                     // Waits for room (bounded: a stuck peer ends the link, which fails this).
                     let _ = outbox
                         .send(

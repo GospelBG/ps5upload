@@ -117,6 +117,53 @@ async fn rust_client_talks_to_the_c_server() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_allows_eight_calls_in_flight_and_answers_the_ninth_busy() {
+    // SPEC.md §7.4: 8 in flight per session.
+    let d = dir("inflight");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let s = Arc::new(
+        connect(&srv.addr(), me, peers, "laptop", fast())
+            .await
+            .unwrap(),
+    );
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let s2 = s.clone();
+        held.push(tokio::spawn(async move { s2.rpc(0x7701, &[]).await }));
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        s.rpc(gen::METHOD_NODE_INFO, &[]).await.unwrap().status,
+        gen::ERR_BUSY
+    );
+    for h in held {
+        assert_eq!(h.await.unwrap().unwrap().status, gen::STATUS_OK);
+    }
+    assert_eq!(
+        s.rpc(gen::METHOD_NODE_INFO, &[]).await.unwrap().status,
+        gen::STATUS_OK
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_replies_up_to_56_kib_and_never_clips_a_larger_claim() {
+    // SPEC.md §7.4: RPC_OUT_MAX is 56 KiB; a handler claiming more is ERR_INTERNAL.
+    let d = dir("replycap");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    let ask = |n: u32| n.to_le_bytes().to_vec();
+    let r = s.rpc(0x7702, &ask(56 * 1024)).await.unwrap();
+    assert_eq!((r.status, r.body.len()), (gen::STATUS_OK, 56 * 1024));
+    assert!(r.body.iter().all(|b| *b == 0xAB));
+    let r = s.rpc(0x7702, &ask(56 * 1024 + 1)).await.unwrap();
+    assert_eq!(r.status, gen::ERR_INTERNAL);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pairing_with_the_c_server() {
     let d = dir("pair");
     let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);

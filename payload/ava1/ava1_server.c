@@ -28,8 +28,8 @@
 #define MAX_CONNS 64
 #define CTRL_MAX 65536u
 #define NONCES 64
-#define RPC_WORKERS 4
-#define RPC_OUT_MAX 16384u
+#define RPC_WORKERS 8
+#define RPC_OUT_MAX (56u * 1024u)
 #define MAX_PAIRING_WINDOW_S 600u
 #define MAX_CONNS_PER_IP 12u
 #define MAX_UNPAIRED 2u

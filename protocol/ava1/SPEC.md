@@ -183,7 +183,7 @@ answers `RpcResponse{status, body}` on the same channel; a request that does not
 decode is answered `Error(ERR_PROTOCOL)` and closes the connection. status 0 (`STATUS_OK`) = OK;
 error statuses are the `ERR_*` constants, and an error response's body is the cause as
 UTF-8 text (not an encoded message). An unpaired session's RPCs answer `ERR_NOT_PAIRED`; a
-session has at most 4 requests in flight and the next one answers `ERR_BUSY`. Only
+session has at most 8 requests in flight (§7.4) and the next one answers `ERR_BUSY`. Only
 `pairing.open` is answered on the reader; every other method runs on a worker, so a slow method never
 delays liveness.
 
@@ -198,11 +198,12 @@ delays liveness.
 | 17 | `job.status` | `JobRef{job_id}` | `Status`, ext `state` |
 | 18 | `job.cancel` | `JobRef{job_id}` | empty |
 | 19 | `disk.calibrate` | `DiskCalibrate{dir, files, size}` | `DiskCalibrateResult` (§16.10) |
+| 4–141 | management methods | see §7.3 and `MGMT_METHODS.md` | see §7.3 |
 
 `Status.state` is 0 while the job runs, 1 when it finished OK and 2 when it failed (the cause is
 in ext `current`). Methods 16–19 are the version 1 data-plane RPCs and exist only on a node that
-advertises `CAP_DATA_PLANE`; version 1 defines no others (management RPCs replacing FTX2 are
-project 3, §10). The behaviour of 16–18 is §15.5; of 19, §16.10.
+advertises `CAP_DATA_PLANE`; the management methods are §7.3. The behaviour of 16–18 is §15.5; of
+19, §16.10.
 
 7.2 Error codes. The numbers below are generated from `schema/ava1.toml`, whose constants are the
 normative table; the second column names the constant in the generated code.
@@ -216,7 +217,7 @@ normative table; the second column names the constant in the generated code.
 | 5 | `ERR_BAD_JOIN` | an unknown session, lane id outside 1..=8, wrong tag or replayed nonce (§9) |
 | 6 | `ERR_UNKNOWN_METHOD` | `RpcResponse` status for a method the node does not implement, including methods 16–19 on a node without the data plane |
 | 7 | `ERR_INTERNAL` | the node could not do what the peer asked for a reason that is neither the peer's nor the disk's: out of memory, a thread that would not start |
-| 8 | `ERR_BUSY` | a limit of §8 or §11.7: connections, sessions, an unconfirmed-session slot, in-flight RPCs (4 per session), jobs, a destination another job is writing, no buffer budget left for another job |
+| 8 | `ERR_BUSY` | a limit of §8 or §11.7: connections, sessions, an unconfirmed-session slot, in-flight RPCs (8 per session, §7.4), jobs, a destination another job is writing, no buffer budget left for another job |
 | 9 | `ERR_PATH` | a manifest or RPC path that breaks §11.2, a root the node's write or read policy refuses, a source that cannot be stat'd or a staging parent that is not a directory |
 | 10 | `ERR_NO_SPACE` | the destination drive is full (`ENOSPC` while writing) |
 | 11 | `ERR_UNKNOWN_JOB` | `Resume`, `job.status` or `job.cancel` for a job the node does not list, or lists for another peer key (the two are not told apart) |
@@ -226,6 +227,47 @@ normative table; the second column names the constant in the generated code.
 | 15 | `ERR_CANCELLED` | the job was cancelled (`job.cancel`, or a `JobCancel` carrying this reason) |
 | 16 | `ERR_CROSS_DEVICE` | a staged or part-file rename whose two sides are on different devices (`st_dev`); never attempted, because a cross-device `rename` panics the console's kernel |
 | 17 | `ERR_CREDIT` | a lane frame larger than the credit the receiver granted (§12.4) |
+
+7.3 Management methods (the console operations FTX2 carried on :9114). Numbers are assigned by
+block; the tracked list, one row per FTX2 frame with its payload handler and engine caller, is
+`MGMT_METHODS.md`. The generated constants `METHOD_*` in `schema/ava1.toml` are normative.
+
+| numbers | block | bodies |
+|---------|-------|--------|
+| 4–11 | node and diagnostics: `node.status`, `node.shutdown`, `node.cleanup`, `log.klog`, `log.syslog`, `net.interfaces`, `net.reach`, `net.speedtest` | `node.status` replies `NodeStatus`; the rest `MgmtText` |
+| 20–21 | `job.run`, `job.list` | `JobRun{job_id, op, args}` → `Status` (ext `state`, `result`, `code`); `job.list` → `JobListResult` |
+| 32–43 | filesystem: `fs.volumes`, `fs.list`, `fs.stat`, `fs.mkdir`, `fs.rename`, `fs.chmod`, `fs.read`, `fs.write`, `fs.mount`, `fs.unmount`, `fs.mount_pkg`, `fs.mount_lwfs` | `fs.list`, `fs.stat`, `fs.mkdir`, `fs.rename`, `fs.chmod`, `fs.read`, `fs.write` are typed (`FsList` → `FsListResult`, `FsPath` → `FsStat`, `FsMkdir`, `FsRename`, `FsChmod`, `FsRead` → `FsReadResult`, `FsWrite`); the others `MgmtText` |
+| 48–61 | apps, launch, install queries, processes | `MgmtText` |
+| 64–70 | saves, screenshots, videos, search index | `MgmtText` |
+| 72–87 | hardware, power, time, peripherals, `shell.exec` | `MgmtText` |
+| 88–100 | profiles, users, backups (97 and 99 are unassigned: backup snapshot and restore run as `job.run` ops) | `MgmtText` |
+| 104–128 | cheats, SMP metadata, SDK changer, TMDB, FTP, firmware spoof, notifications, activity | `MgmtText` |
+| 136–141 | Remote Play | `MgmtText` |
+
+A `MgmtText` body is the payload handler's existing request or reply (UTF-8 text, in practice
+JSON), carried unchanged in `MgmtText.body`; `more = 1` on a reply means the method is paged and
+the caller asks again with the next `offset`. Typing the text methods is deferred (§10): the text
+bodies are stable and tested, and the cutover does not need them typed.
+
+Errors: the response status is an `ERR_*` code (§7.2) and the body is the cause as UTF-8. A ported
+handler's cause is its legacy token (`fs_move_cross_mount`, `cleanup_path_denied`, ...), so the
+engine can build the same `payload rejected <LABEL>: <cause>` text FTX2 callers produced. No new
+error codes were added for management methods. `fs.rename` answers `ERR_CROSS_DEVICE` when the
+source and the destination's parent are on different devices (`st_dev`); it never calls `rename(2)`
+across devices.
+
+`job.run` starts a long operation (`op` is one of the `JOB_OP_*` constants) and answers at once with
+a `Status` whose `state` is 0; progress and the final result are read with `job.status`, which
+returns the same `Status` with ext `result` (the handler's text reply) and, for a failed job, ext
+`code` (the `ERR_*`) and the cause in ext `current`. `job.list` lists the node's jobs.
+
+7.4 RPC limits. A session has at most **8** requests in flight; the ninth answers `ERR_BUSY`
+(version 1 drafts said 4). A request or reply body is at most **56 KiB**: it must fit a control
+frame (64 KiB, `CONTROL_MAX_BODY`) with room for the response framing. A node whose handler produces
+more answers `ERR_INTERNAL` rather than clipping the reply. A method that can exceed the cap takes
+`offset` and `limit` and sets `more`; no management method may return a larger body. The engine
+reserves two of its permits per console for `node.status`, `job.status` and `job.cancel`, so a flood
+of slow calls never hides a cancel or liveness, and retries `ERR_BUSY` with backoff.
 
 ## 8. Limits
 A server accepts at most 64 connections, 12 from one source address, and 16
@@ -303,9 +345,10 @@ Not in version 1, each with its reason:
   fresh job per attempt (progress stays monotonic). FTX2 resumes mid-entry, so this is a
   regression against FTX2 and is listed as one in `CUTOVER.md`.
 - Resuming a download whose remote manifest changed: the engine restarts that job.
-- A same-drive `fs.move` over AVA1 (a rename, with the `st_dev` guard): the engine still asks the
-  FTX2 management port for it; only a cross-mount move (copy, verify, delete) is an AVA1 job.
-- Management RPCs that replace FTX2's :9114 frames (project 3).
+- A same-drive `fs.move` over AVA1 is `fs.rename` (§7.3), with the `st_dev` guard; a cross-mount
+  move (copy, verify, delete) is an AVA1 job.
+- Typed bodies for the management text methods (§7.3): the filesystem, node and job methods are
+  typed; the rest carry `MgmtText` and are typed method by method after the cutover.
 
 ## 11. Jobs and manifest
 
@@ -649,3 +692,7 @@ bottleneck, which already folds in the receiver's.
 measurements at 1, 2, 4, 8 and 16 workers. The request allows at most 20,000 files of at most
 1 MiB each, and `dir` must pass the node's write policy. The answer is a hint for the engine's
 starting worker count, never a contract. The node deletes every file and directory it created.
+
+## 17. Sequential sources
+Reserved for the sequential-source mode of the sender (7z, RAR; project 3, Task 10), which fills
+this section in.

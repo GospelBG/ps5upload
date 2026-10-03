@@ -1075,6 +1075,1014 @@ int ava1_disk_calibrate_result_count(const uint8_t *p, uint32_t len, uint32_t *c
     return rc;
 }
 
+int ava1_mgmt_text_encode(const ava1_mgmt_text_t *m, ava1_w_t *w) {
+    uint16_t ext_n = 0;
+    ava1_w_bytes(w, m->body, m->body_len);
+    if (m->has_more) ext_n++;
+    ava1_w_u16(w, ext_n);
+    if (m->has_more) {
+        size_t at = ava1_w_ext_begin(w, 1);
+        ava1_w_u8(w, m->more);
+        ava1_w_ext_end(w, at);
+    }
+    return w->err;
+}
+
+int ava1_mgmt_text_decode(const uint8_t *buf, size_t len, ava1_mgmt_text_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->body = ava1_r_bytes(&r, &m->body_len);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint16_t tag = ava1_r_u16(&r);
+        uint32_t vlen = ava1_r_u32(&r);
+        const uint8_t *v = ava1_r_take(&r, vlen);
+        ava1_r_t vr;
+        int rc;
+        if (r.err) break;
+        ava1_r_init(&vr, v, vlen);
+        switch (tag) {
+        case 1:
+            if (m->has_more) return AVA1_E_DUP_EXT;
+            m->has_more = 1;
+            m->more = ava1_r_u8(&vr);
+            break;
+        default:
+            continue;
+        }
+        rc = ava1_r_finish(&vr);
+        if (rc != 0) return rc;
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_mgmt_text_append(ava1_w_t *blob, const ava1_mgmt_text_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_mgmt_text_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_mgmt_text_next(ava1_r_t *it, ava1_mgmt_text_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_mgmt_text_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_mgmt_text_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_mgmt_text_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_mgmt_text_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_node_status_encode(const ava1_node_status_t *m, ava1_w_t *w) {
+    uint16_t ext_n = 0;
+    ava1_w_str(w, m->version, m->version_len);
+    ava1_w_str(w, m->ps5_kernel, m->ps5_kernel_len);
+    ava1_w_u64(w, m->instance_id);
+    ava1_w_u64(w, m->started_at_unix);
+    ava1_w_u64(w, m->command_count);
+    ava1_w_u16(w, m->startup_reason);
+    ava1_w_u8(w, m->ucred_elevated);
+    ava1_w_u8(w, m->max_transfer_streams);
+    ava1_w_u16(w, m->fan_threshold);
+    ava1_w_u16(w, m->fan_reapply_sec);
+    if (m->has_prior_instance) ext_n++;
+    ava1_w_u16(w, ext_n);
+    if (m->has_prior_instance) {
+        size_t at = ava1_w_ext_begin(w, 1);
+        ava1_w_str(w, m->prior_instance, m->prior_instance_len);
+        ava1_w_ext_end(w, at);
+    }
+    return w->err;
+}
+
+int ava1_node_status_decode(const uint8_t *buf, size_t len, ava1_node_status_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->version = ava1_r_str(&r, &m->version_len);
+    m->ps5_kernel = ava1_r_str(&r, &m->ps5_kernel_len);
+    m->instance_id = ava1_r_u64(&r);
+    m->started_at_unix = ava1_r_u64(&r);
+    m->command_count = ava1_r_u64(&r);
+    m->startup_reason = ava1_r_u16(&r);
+    m->ucred_elevated = ava1_r_u8(&r);
+    m->max_transfer_streams = ava1_r_u8(&r);
+    m->fan_threshold = ava1_r_u16(&r);
+    m->fan_reapply_sec = ava1_r_u16(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint16_t tag = ava1_r_u16(&r);
+        uint32_t vlen = ava1_r_u32(&r);
+        const uint8_t *v = ava1_r_take(&r, vlen);
+        ava1_r_t vr;
+        int rc;
+        if (r.err) break;
+        ava1_r_init(&vr, v, vlen);
+        switch (tag) {
+        case 1:
+            if (m->has_prior_instance) return AVA1_E_DUP_EXT;
+            m->has_prior_instance = 1;
+            m->prior_instance = ava1_r_str(&vr, &m->prior_instance_len);
+            break;
+        default:
+            continue;
+        }
+        rc = ava1_r_finish(&vr);
+        if (rc != 0) return rc;
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_node_status_append(ava1_w_t *blob, const ava1_node_status_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_node_status_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_node_status_next(ava1_r_t *it, ava1_node_status_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_node_status_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_node_status_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_node_status_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_node_status_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_fs_list_encode(const ava1_fs_list_t *m, ava1_w_t *w) {
+    ava1_w_str(w, m->path, m->path_len);
+    ava1_w_u32(w, m->offset);
+    ava1_w_u16(w, m->limit);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_fs_list_decode(const uint8_t *buf, size_t len, ava1_fs_list_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->path = ava1_r_str(&r, &m->path_len);
+    m->offset = ava1_r_u32(&r);
+    m->limit = ava1_r_u16(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_fs_list_append(ava1_w_t *blob, const ava1_fs_list_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_fs_list_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_fs_list_next(ava1_r_t *it, ava1_fs_list_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_fs_list_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_fs_list_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_fs_list_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_fs_list_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_fs_entry_encode(const ava1_fs_entry_t *m, ava1_w_t *w) {
+    uint16_t ext_n = 0;
+    ava1_w_str(w, m->name, m->name_len);
+    ava1_w_u8(w, m->kind);
+    ava1_w_u64(w, m->size);
+    if (m->has_mtime) ext_n++;
+    if (m->has_mode) ext_n++;
+    ava1_w_u16(w, ext_n);
+    if (m->has_mtime) {
+        size_t at = ava1_w_ext_begin(w, 1);
+        ava1_w_u64(w, m->mtime);
+        ava1_w_ext_end(w, at);
+    }
+    if (m->has_mode) {
+        size_t at = ava1_w_ext_begin(w, 2);
+        ava1_w_u32(w, m->mode);
+        ava1_w_ext_end(w, at);
+    }
+    return w->err;
+}
+
+int ava1_fs_entry_decode(const uint8_t *buf, size_t len, ava1_fs_entry_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->name = ava1_r_str(&r, &m->name_len);
+    m->kind = ava1_r_u8(&r);
+    m->size = ava1_r_u64(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint16_t tag = ava1_r_u16(&r);
+        uint32_t vlen = ava1_r_u32(&r);
+        const uint8_t *v = ava1_r_take(&r, vlen);
+        ava1_r_t vr;
+        int rc;
+        if (r.err) break;
+        ava1_r_init(&vr, v, vlen);
+        switch (tag) {
+        case 1:
+            if (m->has_mtime) return AVA1_E_DUP_EXT;
+            m->has_mtime = 1;
+            m->mtime = ava1_r_u64(&vr);
+            break;
+        case 2:
+            if (m->has_mode) return AVA1_E_DUP_EXT;
+            m->has_mode = 1;
+            m->mode = ava1_r_u32(&vr);
+            break;
+        default:
+            continue;
+        }
+        rc = ava1_r_finish(&vr);
+        if (rc != 0) return rc;
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_fs_entry_append(ava1_w_t *blob, const ava1_fs_entry_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_fs_entry_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_fs_entry_next(ava1_r_t *it, ava1_fs_entry_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_fs_entry_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_fs_entry_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_fs_entry_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_fs_entry_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_fs_list_result_encode(const ava1_fs_list_result_t *m, ava1_w_t *w) {
+    ava1_w_bytes(w, m->entries, m->entries_len);
+    ava1_w_u32(w, m->total_scanned);
+    ava1_w_u8(w, m->more);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_fs_list_result_decode(const uint8_t *buf, size_t len, ava1_fs_list_result_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->entries = ava1_r_bytes(&r, &m->entries_len);
+    if (!(&r)->err) {
+        int rc = ava1_fs_entry_count(m->entries, m->entries_len, &m->entries_count);
+        if (rc != 0) return rc;
+    }
+    m->total_scanned = ava1_r_u32(&r);
+    m->more = ava1_r_u8(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_fs_list_result_append(ava1_w_t *blob, const ava1_fs_list_result_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_fs_list_result_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_fs_list_result_next(ava1_r_t *it, ava1_fs_list_result_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_fs_list_result_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_fs_list_result_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_fs_list_result_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_fs_list_result_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_fs_path_encode(const ava1_fs_path_t *m, ava1_w_t *w) {
+    ava1_w_str(w, m->path, m->path_len);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_fs_path_decode(const uint8_t *buf, size_t len, ava1_fs_path_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->path = ava1_r_str(&r, &m->path_len);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_fs_path_append(ava1_w_t *blob, const ava1_fs_path_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_fs_path_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_fs_path_next(ava1_r_t *it, ava1_fs_path_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_fs_path_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_fs_path_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_fs_path_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_fs_path_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_fs_stat_encode(const ava1_fs_stat_t *m, ava1_w_t *w) {
+    ava1_w_u8(w, m->kind);
+    ava1_w_u64(w, m->size);
+    ava1_w_u64(w, m->mtime);
+    ava1_w_u32(w, m->mode);
+    ava1_w_u64(w, m->dev);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_fs_stat_decode(const uint8_t *buf, size_t len, ava1_fs_stat_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->kind = ava1_r_u8(&r);
+    m->size = ava1_r_u64(&r);
+    m->mtime = ava1_r_u64(&r);
+    m->mode = ava1_r_u32(&r);
+    m->dev = ava1_r_u64(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_fs_stat_append(ava1_w_t *blob, const ava1_fs_stat_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_fs_stat_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_fs_stat_next(ava1_r_t *it, ava1_fs_stat_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_fs_stat_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_fs_stat_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_fs_stat_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_fs_stat_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_fs_mkdir_encode(const ava1_fs_mkdir_t *m, ava1_w_t *w) {
+    ava1_w_str(w, m->path, m->path_len);
+    ava1_w_u32(w, m->mode);
+    ava1_w_u8(w, m->parents);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_fs_mkdir_decode(const uint8_t *buf, size_t len, ava1_fs_mkdir_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->path = ava1_r_str(&r, &m->path_len);
+    m->mode = ava1_r_u32(&r);
+    m->parents = ava1_r_u8(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_fs_mkdir_append(ava1_w_t *blob, const ava1_fs_mkdir_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_fs_mkdir_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_fs_mkdir_next(ava1_r_t *it, ava1_fs_mkdir_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_fs_mkdir_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_fs_mkdir_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_fs_mkdir_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_fs_mkdir_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_fs_rename_encode(const ava1_fs_rename_t *m, ava1_w_t *w) {
+    ava1_w_str(w, m->from, m->from_len);
+    ava1_w_str(w, m->to, m->to_len);
+    ava1_w_u8(w, m->overwrite);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_fs_rename_decode(const uint8_t *buf, size_t len, ava1_fs_rename_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->from = ava1_r_str(&r, &m->from_len);
+    m->to = ava1_r_str(&r, &m->to_len);
+    m->overwrite = ava1_r_u8(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_fs_rename_append(ava1_w_t *blob, const ava1_fs_rename_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_fs_rename_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_fs_rename_next(ava1_r_t *it, ava1_fs_rename_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_fs_rename_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_fs_rename_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_fs_rename_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_fs_rename_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_fs_chmod_encode(const ava1_fs_chmod_t *m, ava1_w_t *w) {
+    ava1_w_str(w, m->path, m->path_len);
+    ava1_w_u32(w, m->mode);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_fs_chmod_decode(const uint8_t *buf, size_t len, ava1_fs_chmod_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->path = ava1_r_str(&r, &m->path_len);
+    m->mode = ava1_r_u32(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_fs_chmod_append(ava1_w_t *blob, const ava1_fs_chmod_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_fs_chmod_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_fs_chmod_next(ava1_r_t *it, ava1_fs_chmod_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_fs_chmod_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_fs_chmod_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_fs_chmod_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_fs_chmod_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_fs_read_encode(const ava1_fs_read_t *m, ava1_w_t *w) {
+    ava1_w_str(w, m->path, m->path_len);
+    ava1_w_u64(w, m->offset);
+    ava1_w_u32(w, m->len);
+    ava1_w_u32(w, m->flags);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_fs_read_decode(const uint8_t *buf, size_t len, ava1_fs_read_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->path = ava1_r_str(&r, &m->path_len);
+    m->offset = ava1_r_u64(&r);
+    m->len = ava1_r_u32(&r);
+    m->flags = ava1_r_u32(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_fs_read_append(ava1_w_t *blob, const ava1_fs_read_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_fs_read_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_fs_read_next(ava1_r_t *it, ava1_fs_read_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_fs_read_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_fs_read_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_fs_read_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_fs_read_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_fs_read_result_encode(const ava1_fs_read_result_t *m, ava1_w_t *w) {
+    ava1_w_bytes(w, m->data, m->data_len);
+    ava1_w_u8(w, m->eof);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_fs_read_result_decode(const uint8_t *buf, size_t len, ava1_fs_read_result_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->data = ava1_r_bytes(&r, &m->data_len);
+    m->eof = ava1_r_u8(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_fs_read_result_append(ava1_w_t *blob, const ava1_fs_read_result_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_fs_read_result_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_fs_read_result_next(ava1_r_t *it, ava1_fs_read_result_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_fs_read_result_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_fs_read_result_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_fs_read_result_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_fs_read_result_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_fs_write_encode(const ava1_fs_write_t *m, ava1_w_t *w) {
+    ava1_w_str(w, m->path, m->path_len);
+    ava1_w_u32(w, m->mode);
+    ava1_w_u32(w, m->flags);
+    ava1_w_bytes(w, m->data, m->data_len);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_fs_write_decode(const uint8_t *buf, size_t len, ava1_fs_write_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->path = ava1_r_str(&r, &m->path_len);
+    m->mode = ava1_r_u32(&r);
+    m->flags = ava1_r_u32(&r);
+    m->data = ava1_r_bytes(&r, &m->data_len);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_fs_write_append(ava1_w_t *blob, const ava1_fs_write_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_fs_write_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_fs_write_next(ava1_r_t *it, ava1_fs_write_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_fs_write_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_fs_write_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_fs_write_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_fs_write_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_job_run_encode(const ava1_job_run_t *m, ava1_w_t *w) {
+    ava1_w_fixed(w, m->job_id, 16);
+    ava1_w_u8(w, m->op);
+    ava1_w_bytes(w, m->args, m->args_len);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_job_run_decode(const uint8_t *buf, size_t len, ava1_job_run_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    ava1_r_fixed(&r, m->job_id, 16);
+    m->op = ava1_r_u8(&r);
+    m->args = ava1_r_bytes(&r, &m->args_len);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_job_run_append(ava1_w_t *blob, const ava1_job_run_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_job_run_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_job_run_next(ava1_r_t *it, ava1_job_run_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_job_run_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_job_run_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_job_run_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_job_run_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_job_entry_encode(const ava1_job_entry_t *m, ava1_w_t *w) {
+    ava1_w_fixed(w, m->job_id, 16);
+    ava1_w_u8(w, m->kind);
+    ava1_w_u8(w, m->state);
+    ava1_w_u32(w, m->files_done);
+    ava1_w_u32(w, m->files_total);
+    ava1_w_u64(w, m->bytes_done);
+    ava1_w_u64(w, m->bytes_total);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_job_entry_decode(const uint8_t *buf, size_t len, ava1_job_entry_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    ava1_r_fixed(&r, m->job_id, 16);
+    m->kind = ava1_r_u8(&r);
+    m->state = ava1_r_u8(&r);
+    m->files_done = ava1_r_u32(&r);
+    m->files_total = ava1_r_u32(&r);
+    m->bytes_done = ava1_r_u64(&r);
+    m->bytes_total = ava1_r_u64(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_job_entry_append(ava1_w_t *blob, const ava1_job_entry_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_job_entry_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_job_entry_next(ava1_r_t *it, ava1_job_entry_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_job_entry_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_job_entry_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_job_entry_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_job_entry_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_job_list_result_encode(const ava1_job_list_result_t *m, ava1_w_t *w) {
+    ava1_w_bytes(w, m->jobs, m->jobs_len);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_job_list_result_decode(const uint8_t *buf, size_t len, ava1_job_list_result_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->jobs = ava1_r_bytes(&r, &m->jobs_len);
+    if (!(&r)->err) {
+        int rc = ava1_job_entry_count(m->jobs, m->jobs_len, &m->jobs_count);
+        if (rc != 0) return rc;
+    }
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_job_list_result_append(ava1_w_t *blob, const ava1_job_list_result_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_job_list_result_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_job_list_result_next(ava1_r_t *it, ava1_job_list_result_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_job_list_result_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_job_list_result_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_job_list_result_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_job_list_result_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
 int ava1_jnl_open_encode(const ava1_jnl_open_t *m, ava1_w_t *w) {
     ava1_w_fixed(w, m->job_id, 16);
     ava1_w_fixed(w, m->manifest_hash, 32);
@@ -2188,6 +3196,8 @@ int ava1_status_encode(const ava1_status_t *m, ava1_w_t *w) {
     ava1_w_u8(w, m->sequential);
     if (m->has_current) ext_n++;
     if (m->has_state) ext_n++;
+    if (m->has_result) ext_n++;
+    if (m->has_code) ext_n++;
     ava1_w_u16(w, ext_n);
     if (m->has_current) {
         size_t at = ava1_w_ext_begin(w, 1);
@@ -2197,6 +3207,16 @@ int ava1_status_encode(const ava1_status_t *m, ava1_w_t *w) {
     if (m->has_state) {
         size_t at = ava1_w_ext_begin(w, 2);
         ava1_w_u8(w, m->state);
+        ava1_w_ext_end(w, at);
+    }
+    if (m->has_result) {
+        size_t at = ava1_w_ext_begin(w, 3);
+        ava1_w_bytes(w, m->result, m->result_len);
+        ava1_w_ext_end(w, at);
+    }
+    if (m->has_code) {
+        size_t at = ava1_w_ext_begin(w, 4);
+        ava1_w_u16(w, m->code);
         ava1_w_ext_end(w, at);
     }
     return w->err;
@@ -2236,6 +3256,16 @@ int ava1_status_decode(const uint8_t *buf, size_t len, ava1_status_t *m) {
             if (m->has_state) return AVA1_E_DUP_EXT;
             m->has_state = 1;
             m->state = ava1_r_u8(&vr);
+            break;
+        case 3:
+            if (m->has_result) return AVA1_E_DUP_EXT;
+            m->has_result = 1;
+            m->result = ava1_r_bytes(&vr, &m->result_len);
+            break;
+        case 4:
+            if (m->has_code) return AVA1_E_DUP_EXT;
+            m->has_code = 1;
+            m->code = ava1_r_u16(&vr);
             break;
         default:
             continue;
@@ -2337,6 +3367,22 @@ const char *const ava1_message_names[] = {
     "DiskCalibrate",
     "CalPoint",
     "DiskCalibrateResult",
+    "MgmtText",
+    "NodeStatus",
+    "FsList",
+    "FsEntry",
+    "FsListResult",
+    "FsPath",
+    "FsStat",
+    "FsMkdir",
+    "FsRename",
+    "FsChmod",
+    "FsRead",
+    "FsReadResult",
+    "FsWrite",
+    "JobRun",
+    "JobEntry",
+    "JobListResult",
     "JnlOpen",
     "JnlBatch",
     "JnlReset",
@@ -2373,7 +3419,7 @@ const char *const ava1_message_names[] = {
     "JobDone",
     "JobCancel",
 };
-const size_t ava1_message_count = 52;
+const size_t ava1_message_count = 68;
 
 int ava1_roundtrip(const char *name, const uint8_t *in, size_t in_len, uint8_t *out, size_t cap,
                    size_t *out_len) {
@@ -2465,6 +3511,86 @@ int ava1_roundtrip(const char *name, const uint8_t *in, size_t in_len, uint8_t *
         ava1_disk_calibrate_result_t m;
         rc = ava1_disk_calibrate_result_decode(in, in_len, &m);
         if (rc == 0) rc = ava1_disk_calibrate_result_encode(&m, &w);
+    }
+    else if (strcmp(name, "MgmtText") == 0) {
+        ava1_mgmt_text_t m;
+        rc = ava1_mgmt_text_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_mgmt_text_encode(&m, &w);
+    }
+    else if (strcmp(name, "NodeStatus") == 0) {
+        ava1_node_status_t m;
+        rc = ava1_node_status_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_node_status_encode(&m, &w);
+    }
+    else if (strcmp(name, "FsList") == 0) {
+        ava1_fs_list_t m;
+        rc = ava1_fs_list_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_fs_list_encode(&m, &w);
+    }
+    else if (strcmp(name, "FsEntry") == 0) {
+        ava1_fs_entry_t m;
+        rc = ava1_fs_entry_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_fs_entry_encode(&m, &w);
+    }
+    else if (strcmp(name, "FsListResult") == 0) {
+        ava1_fs_list_result_t m;
+        rc = ava1_fs_list_result_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_fs_list_result_encode(&m, &w);
+    }
+    else if (strcmp(name, "FsPath") == 0) {
+        ava1_fs_path_t m;
+        rc = ava1_fs_path_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_fs_path_encode(&m, &w);
+    }
+    else if (strcmp(name, "FsStat") == 0) {
+        ava1_fs_stat_t m;
+        rc = ava1_fs_stat_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_fs_stat_encode(&m, &w);
+    }
+    else if (strcmp(name, "FsMkdir") == 0) {
+        ava1_fs_mkdir_t m;
+        rc = ava1_fs_mkdir_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_fs_mkdir_encode(&m, &w);
+    }
+    else if (strcmp(name, "FsRename") == 0) {
+        ava1_fs_rename_t m;
+        rc = ava1_fs_rename_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_fs_rename_encode(&m, &w);
+    }
+    else if (strcmp(name, "FsChmod") == 0) {
+        ava1_fs_chmod_t m;
+        rc = ava1_fs_chmod_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_fs_chmod_encode(&m, &w);
+    }
+    else if (strcmp(name, "FsRead") == 0) {
+        ava1_fs_read_t m;
+        rc = ava1_fs_read_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_fs_read_encode(&m, &w);
+    }
+    else if (strcmp(name, "FsReadResult") == 0) {
+        ava1_fs_read_result_t m;
+        rc = ava1_fs_read_result_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_fs_read_result_encode(&m, &w);
+    }
+    else if (strcmp(name, "FsWrite") == 0) {
+        ava1_fs_write_t m;
+        rc = ava1_fs_write_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_fs_write_encode(&m, &w);
+    }
+    else if (strcmp(name, "JobRun") == 0) {
+        ava1_job_run_t m;
+        rc = ava1_job_run_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_job_run_encode(&m, &w);
+    }
+    else if (strcmp(name, "JobEntry") == 0) {
+        ava1_job_entry_t m;
+        rc = ava1_job_entry_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_job_entry_encode(&m, &w);
+    }
+    else if (strcmp(name, "JobListResult") == 0) {
+        ava1_job_list_result_t m;
+        rc = ava1_job_list_result_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_job_list_result_encode(&m, &w);
     }
     else if (strcmp(name, "JnlOpen") == 0) {
         ava1_jnl_open_t m;
