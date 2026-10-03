@@ -35,6 +35,41 @@ pub fn launch_tokens() -> Option<ava1::launch::LaunchTokens> {
     Some(ava1::launch::LaunchTokens::at(&path))
 }
 
+/// SPEC.md §14.3: removes the AVA1 job directories (`ava/jobs`, `ava/send`) idle for more than
+/// seven days, except those of jobs running in this engine. Blocking file I/O.
+pub fn sweep_journals() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let n = ps5upload_ava1::pool().gc_journals(now, ps5upload_ava1::JOURNAL_MAX_AGE_S);
+    if n > 0 {
+        crate::log_info!("ava1: removed {n} expired job director(ies)");
+    }
+}
+
+/// Runs `run` once now and then every `period`, each time on a blocking thread so the sweep's
+/// file I/O never occupies the async runtime. A panic in one run does not end the schedule.
+pub(crate) fn spawn_periodic(
+    period: std::time::Duration,
+    run: impl Fn() + Send + Sync + 'static,
+) -> tokio::task::JoinHandle<()> {
+    let run = Arc::new(run);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await; // the first tick is immediate: the sweep at start
+            let r = run.clone();
+            let _ = tokio::task::spawn_blocking(move || r()).await;
+        }
+    })
+}
+
+/// The engine's journal sweep: at startup, then once a day (SPEC.md §14.3).
+pub fn spawn_journal_gc() {
+    spawn_periodic(ps5upload_ava1::JOURNAL_GC_EVERY, sweep_journals);
+}
+
 /// A token to stamp, or `None` (and a log line) when it could not be recorded — a token
 /// this side did not keep would pair nothing, so the key alone is stamped instead.
 fn fresh_token() -> Option<[u8; 16]> {
@@ -191,5 +226,28 @@ mod tests {
         if let (Some(a), Some(b)) = (a, b) {
             assert_eq!(a.public(), b.public());
         }
+    }
+
+    #[tokio::test]
+    async fn the_journal_sweep_runs_at_start_and_then_on_every_period() {
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        let h = super::spawn_periodic(std::time::Duration::from_millis(20), move || {
+            n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while n.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the sweep ran at start and repeated");
+        h.abort();
+    }
+
+    #[test]
+    fn the_sweep_is_daily_and_expires_after_seven_days() {
+        assert_eq!(ps5upload_ava1::JOURNAL_GC_EVERY.as_secs(), 86_400);
+        assert_eq!(ps5upload_ava1::JOURNAL_MAX_AGE_S, 7 * 86_400);
     }
 }

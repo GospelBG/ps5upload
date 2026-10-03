@@ -251,6 +251,7 @@ pub fn upload_with_in(
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     // Sender outboards (engine restart without re-reading); removed on success.
     let persist = pool.ava_dir().join("send").join(hex(&job_id));
+    let _live = pool.live_job(&job_id); // the journal sweep leaves a running job alone
     let dest = opts.root.clone();
     crate::block_on(async {
         SessionGate::identity(pool)?;

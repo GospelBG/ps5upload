@@ -100,7 +100,9 @@ six digits. A man in the middle yields different h, so different codes.
    that cannot be stored is not accepted. Until accepted, RPCs answer
    `ERR_NOT_PAIRED` and lanes are refused. A client sends nothing but
    `PairConfirm` (no RPC, no Join) while either side is unconfirmed: until the
-   user has compared the codes, the server is unverified.
+   user has compared the codes, the server is unverified. A data-plane frame (§11–§16) on a
+   control connection whose pairing is not accepted is a protocol error: the server answers a sealed
+   `Error(ERR_NOT_PAIRED)` and closes the connection.
 6. Pairing window: opens by itself for 5 minutes after start only while the node
    has no paired peer; otherwise `pairing.open` (method 2, body `PairingOpen`,
    ≤ 600 s) from a paired session opens it. Either kind of window closes as soon
@@ -499,7 +501,8 @@ durable ranges of the others), after the check in §13.4.
 14.3 Location: the console keeps job directories under `/data/ps5upload/ava/jobs/`, an engine
 under `<data dir>/ava/jobs/`. Each holds `journal`, `manifest` and one `<file_id>.ob` outboard
 per large file. A node removes a directory 7 days after its last write (directory or journal mtime), on
-start. A job whose session ended is parked for 10 minutes first (§11.7).
+start and then once a day; the engine also sweeps `<data dir>/ava/send` (sender outboards) and never
+touches the directory of a job that is running in the process. A job whose session ended is parked for 10 minutes first (§11.7).
 
 ## 15. Apply (receivers)
 

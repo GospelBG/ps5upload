@@ -579,6 +579,7 @@ fn run(
 ) -> Result<u64> {
     let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let jobs_dir = pool.ava_dir().join("jobs");
+    let _live = pool.live_job(&job_id); // the journal sweep leaves a running job alone
     crate::block_on(async {
         SessionGate::identity(pool)?;
         let mut sink = make_sink();
@@ -613,6 +614,7 @@ fn run(
             };
             gate.connected();
             let id = attempt_id(job_id, attempt, fresh_per_attempt);
+            let _live_attempt = pool.live_job(&id);
             let mut link = session.job(id);
             let _ticker = Ticker::start(progress.clone(), counters, base_bytes, base_files);
             let o = RecvOptions {

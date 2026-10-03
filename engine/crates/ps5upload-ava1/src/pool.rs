@@ -41,7 +41,33 @@ pub struct Pool {
     /// Connection attempts so far. A test seam (A4): the negative cache's hit path is
     /// pinned by counting, never by sleeping.
     attempts: AtomicUsize,
+    /// Job directories (hex job ids) of the jobs running in this process, with a count each:
+    /// the journal sweep never touches them (SPEC.md §14.3).
+    live: Mutex<HashMap<String, usize>>,
 }
+
+/// A job running in this process (see `Pool::live_job`).
+pub struct LiveJob<'a> {
+    pool: &'a Pool,
+    name: String,
+}
+
+impl Drop for LiveJob<'_> {
+    fn drop(&mut self) {
+        let mut l = self.pool.live.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = l.get_mut(&self.name) {
+            *n -= 1;
+            if *n == 0 {
+                l.remove(&self.name);
+            }
+        }
+    }
+}
+
+/// SPEC.md §14.3: a job directory idle for more than this is removed.
+pub const JOURNAL_MAX_AGE_S: u64 = 7 * 24 * 3600;
+/// How often the engine sweeps (and once at start).
+pub const JOURNAL_GC_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 impl Pool {
     pub(crate) fn unavailable() -> Pool {
@@ -52,6 +78,7 @@ impl Pool {
             sessions: tokio::sync::Mutex::default(),
             addr: None,
             attempts: AtomicUsize::new(0),
+            live: Mutex::default(),
         }
     }
 
@@ -75,6 +102,7 @@ impl Pool {
             sessions: tokio::sync::Mutex::default(),
             addr: None,
             attempts: AtomicUsize::new(0),
+            live: Mutex::default(),
         }
     }
 
@@ -87,6 +115,42 @@ impl Pool {
 
     pub fn ava_dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Marks the job with this id as running here until the guard drops: its directories
+    /// under `jobs/` and `send/` are not swept meanwhile.
+    pub fn live_job(&self, id: &[u8; 16]) -> LiveJob<'_> {
+        let name = ava1::hex::encode(id);
+        *self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(name.clone())
+            .or_insert(0) += 1;
+        LiveJob { pool: self, name }
+    }
+
+    /// SPEC.md §14.3: removes job directories under `<ava dir>/jobs` (receiver journals) and
+    /// `<ava dir>/send` (sender outboards) idle for more than `max_age_s` as of `now_unix`,
+    /// except jobs running in this process. Returns how many were removed. Blocking file I/O:
+    /// call it off the async runtime.
+    pub fn gc_journals(&self, now_unix: u64, max_age_s: u64) -> usize {
+        if self.dir.as_os_str().is_empty() {
+            return 0; // an unavailable pool has no directory
+        }
+        let live = |name: &str| {
+            self.live
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(name)
+        };
+        ["jobs", "send"]
+            .iter()
+            .map(|sub| {
+                ava1::journal::gc_except(&self.dir.join(sub), now_unix, max_age_s, &live)
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 
     pub fn has_identity(&self) -> bool {
@@ -264,5 +328,71 @@ mod data_dir_tests {
     fn no_data_directory_never_falls_back_to_the_current_directory() {
         assert_eq!(data_dir_from(None, None, None), None);
         assert_eq!(data_dir_from(Some(" "), Some(""), None), None);
+    }
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ps5u-poolgc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn age(dir: &Path, secs: u64) {
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        for p in [dir.to_path_buf(), dir.join("journal")] {
+            if let Ok(f) = std::fs::File::open(&p) {
+                f.set_modified(t).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn gc_sweeps_jobs_and_send_after_seven_days_but_never_a_live_job() {
+        let base = tmp("sweep");
+        let pool = Pool::new(base.join("ava"));
+        let d = pool.ava_dir().to_path_buf();
+        let old_job = [1u8; 16];
+        let live_job = [2u8; 16];
+        let fresh_job = [3u8; 16];
+        for sub in ["jobs", "send"] {
+            for id in [&old_job, &live_job, &fresh_job] {
+                let p = d.join(sub).join(ava1::hex::encode(id));
+                std::fs::create_dir_all(&p).unwrap();
+                std::fs::write(p.join("journal"), b"x").unwrap();
+            }
+        }
+        let eight_days = 8 * 24 * 3600;
+        for sub in ["jobs", "send"] {
+            for id in [&old_job, &live_job] {
+                age(&d.join(sub).join(ava1::hex::encode(id)), eight_days);
+            }
+        }
+        let guard = pool.live_job(&live_job);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(
+            pool.gc_journals(now, JOURNAL_MAX_AGE_S),
+            2,
+            "one per directory"
+        );
+        for sub in ["jobs", "send"] {
+            assert!(!d.join(sub).join(ava1::hex::encode(&old_job)).exists());
+            assert!(d.join(sub).join(ava1::hex::encode(&live_job)).exists());
+            assert!(d.join(sub).join(ava1::hex::encode(&fresh_job)).exists());
+        }
+        drop(guard);
+        assert_eq!(
+            pool.gc_journals(now, JOURNAL_MAX_AGE_S),
+            2,
+            "the finished job expires too"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

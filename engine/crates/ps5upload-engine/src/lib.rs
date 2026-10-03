@@ -9607,6 +9607,8 @@ pub struct EngineConfig {
 async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
     // Convert (and the package viewer) read games on saved servers and the console in place.
     fpkg_remote::register();
+    // SPEC.md §14.3: expire old AVA1 job directories at start and then daily.
+    ava1_api::spawn_journal_gc();
     // AVA1 cutover (Task 23, controller A4): one line at startup naming the
     // resolved transfer mode, its source (the environment or the default), and
     // the ava data dir when the mode can use AVA1. The benchmark phase compares

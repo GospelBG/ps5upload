@@ -520,6 +520,7 @@ pub fn ps5_to_ps5_between(
     SessionGate::identity(to_pool)?;
     let hex = ava1::hex::encode(&job_id);
     let persist = to_pool.ava_dir().join("send").join(&hex);
+    let _live = to_pool.live_job(&job_id); // the journal sweep leaves a running job alone
     let scratch = from_pool.ava_dir().join("relay").join(&hex);
     let _scratch = Scratch(scratch.clone());
     crate::block_on(async {

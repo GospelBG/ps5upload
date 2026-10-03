@@ -352,7 +352,20 @@ pub fn read_manifest(dir: &Path) -> io::Result<Manifest> {
 /// many were removed. A directory whose mtime cannot be read is left alone — never deleted on a
 /// guess.
 pub fn gc(jobs_dir: &Path, now_unix: u64, max_age_s: u64) -> io::Result<usize> {
+    gc_except(jobs_dir, now_unix, max_age_s, &|_| false)
+}
+
+/// `gc`, leaving alone every directory whose name `live` accepts (the job is running in this
+/// process: its journal is never swept, however old its mtime). An error on one directory does
+/// not stop the sweep of the rest; the first error is returned after it.
+pub fn gc_except(
+    jobs_dir: &Path,
+    now_unix: u64,
+    max_age_s: u64,
+    live: &dyn Fn(&str) -> bool,
+) -> io::Result<usize> {
     let mut n = 0;
+    let mut first_err = None;
     let Ok(rd) = fs::read_dir(jobs_dir) else {
         return Ok(0);
     };
@@ -361,13 +374,23 @@ pub fn gc(jobs_dir: &Path, now_unix: u64, max_age_s: u64) -> io::Result<usize> {
         if !p.is_dir() {
             continue;
         }
+        if e.file_name().to_str().is_some_and(live) {
+            continue;
+        }
         let Some(last) = last_write(&p) else { continue };
         if now_unix.saturating_sub(last) > max_age_s {
-            fs::remove_dir_all(&p)?;
-            n += 1;
+            match fs::remove_dir_all(&p) {
+                Ok(()) => n += 1,
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
         }
     }
-    Ok(n)
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(n),
+    }
 }
 
 /// The newest mtime of the directory itself and its journal, or `None` if neither is readable.
