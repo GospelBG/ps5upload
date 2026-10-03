@@ -47,7 +47,8 @@ static int is_stopping(ava1_job_t *j) {
 int ava1_sync_dir(const char *dir) {
     int fd = open(dir, O_RDONLY | O_DIRECTORY), rc = 0;
     if (fd < 0) return errno;
-    if (fsync(fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EOPNOTSUPP) rc = errno;
+    rc = ava1_fsync_retry(fd, NULL, NULL, NULL);
+    if (rc == EINVAL || rc == ENOTSUP || rc == EOPNOTSUPP) rc = 0; /* a filesystem that cannot sync a directory */
     close(fd);
     return rc;
 }
@@ -721,7 +722,7 @@ static void pend_gate_idle(void *a) {
 }
 
 /* Small files wait here (holding their fd) until a sync batch covers them. */
-static void pend_add(ava1_job_t *j, uint32_t id, int fd) {
+static void pend_add(ava1_job_t *j, uint32_t id, int fd, const uint8_t root[32]) {
     pthread_mutex_lock(&j->mu);
     while (j->pend_n >= AVA1_PEND_MAX && !j->stopping) {
         /* Run sync stripes ourselves: if every worker waited here, nobody would. */
@@ -743,12 +744,15 @@ static void pend_add(ava1_job_t *j, uint32_t id, int fd) {
         uint32_t c = j->pend_cap ? j->pend_cap * 2 : 256;
         uint32_t *a = realloc(j->pend_small, c * sizeof *a);
         int *b = a ? realloc(j->pend_fd, c * sizeof *b) : NULL;
+        uint8_t(*r)[32] = b ? realloc(j->pend_root, (size_t)c * sizeof *r) : NULL;
         if (a) j->pend_small = a;
         if (b) j->pend_fd = b;
-        if (a && b) j->pend_cap = c;
+        if (r) j->pend_root = r;
+        if (a && b && r) j->pend_cap = c;
     }
     if (j->pend_n < j->pend_cap) {
         j->pend_small[j->pend_n] = id;
+        memcpy(j->pend_root[j->pend_n], root, 32);
         j->pend_fd[j->pend_n++] = fd;
     } else {
         close(fd); /* out of memory: the file will be in no batch and is sent again on resume */
@@ -804,7 +808,7 @@ static int apply_record(ava1_job_t *j, const ava1_bundle_record_t *r) {
     j->bytes_received += r->data_len;
     j->applied_since_tune++;
     pthread_mutex_unlock(&j->mu);
-    pend_add(j, r->file_id, fd);
+    pend_add(j, r->file_id, fd, root);
     return 0;
 }
 
@@ -875,11 +879,56 @@ static int add_workers(ava1_job_t *j, uint8_t n) {
 
 /* ---- sync batches ------------------------------------------------------------------ */
 
+/* One large file's share of a batch, kept so its ranges can be re-read after a retried fsync. */
 typedef struct {
+    uint32_t id, fd_idx, rg_first, rg_n;
+    int fd, ob_fd, ob_idx; /* ob_idx < 0: no outboard */
+} chk_t;
+
+typedef struct {
+    ava1_job_t *job;
     int *fds;
-    uint32_t n, stripes;
+    const uint32_t *ids;          /* the first n_small fds belong to these small files */
+    const uint8_t (*roots)[32];   /* ... and carry these BLAKE3 roots */
+    uint8_t *retried;             /* per fd: a retry is what made its fsync succeed */
+    uint32_t n, n_small, stripes;
     int err, cut; /* cut: a stripe gave up because the job is stopping */
 } fdlist_t;
+
+static int stopping_cb(void *a) { return is_stopping(a); }
+
+/* A small file whose fsync needed a retry is read back and compared with the root it arrived
+ * with: if the kernel dropped dirty pages on the failed attempt, the retry succeeds on
+ * nothing, and this is where it shows. 0, or an errno. */
+static int reread_small(ava1_job_t *j, uint32_t id, const uint8_t root[32]) {
+    uint64_t size = j->m.e[id].size, got = 0;
+    uint8_t *buf = malloc(size ? (size_t)size : 1), h[32];
+    char path[PATH_CAP];
+    int rc = 0, fd;
+    if (!buf) return ENOMEM;
+    ava1_apply_path(j, id, 0, path, sizeof path); /* the pending descriptor is write-only */
+    fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        free(buf);
+        return errno;
+    }
+    while (got < size) {
+        ssize_t k = pread(fd, buf + got, (size_t)(size - got), (off_t)got);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) {
+            rc = k < 0 ? errno : EIO;
+            break;
+        }
+        got += (uint64_t)k;
+    }
+    if (!rc) {
+        ava1_b3_hash(buf, (size_t)size, h);
+        if (memcmp(h, root, 32) != 0) rc = EIO;
+    }
+    close(fd);
+    free(buf);
+    return rc;
+}
 
 static void sync_stripe(ava1_job_t *j, void *arg, uint32_t i) {
     fdlist_t *l = arg;
@@ -887,6 +936,7 @@ static void sync_stripe(ava1_job_t *j, void *arg, uint32_t i) {
     uint32_t delay = ava1_data_cfg()->fsync_delay_us;
     for (k = i; k < l->n; k += l->stripes) {
         uint32_t ms = delay ? (delay / 1000u ? delay / 1000u : 1u) : 0;
+        int e, retried = 0;
         while (ms && !is_stopping(j)) { /* a slow disk, in slices a stop can cut */
             uint32_t step = ms < 50u ? ms : 50u;
             ava1_platform_sleep_ms(step);
@@ -896,8 +946,47 @@ static void sync_stripe(ava1_job_t *j, void *arg, uint32_t i) {
             __atomic_store_n(&l->cut, 1, __ATOMIC_RELAXED);
             return;
         }
-        if (fsync(l->fds[k]) != 0) __atomic_store_n(&l->err, errno, __ATOMIC_RELAXED);
+        e = ava1_fsync_retry(l->fds[k], stopping_cb, j, &retried);
+        if (e) {
+            if (is_stopping(j)) __atomic_store_n(&l->cut, 1, __ATOMIC_RELAXED);
+            else __atomic_store_n(&l->err, e, __ATOMIC_RELAXED);
+        } else if (retried) {
+            l->retried[k] = 1;
+            if (k < l->n_small && (e = reread_small(l->job, l->ids[k], l->roots[k])) != 0)
+                __atomic_store_n(&l->err, e, __ATOMIC_RELAXED);
+        }
     }
+}
+
+/* A large file whose data or outboard fsync needed a retry: every range of this batch is read
+ * back and each group's chaining value compared with the outboard's. 0, or an errno. */
+static int reread_ranges(const chk_t *c, const ava1_file_range_t *rg, uint64_t size) {
+    uint32_t r;
+    uint8_t *buf = malloc(AVA1_GROUP_LEN);
+    int rc = 0;
+    if (!buf) return ENOMEM;
+    for (r = c->rg_first; r < c->rg_first + c->rg_n && !rc; r++) {
+        uint64_t g, end = rg[r].offset + rg[r].len;
+        for (g = rg[r].offset / AVA1_GROUP_LEN; g * AVA1_GROUP_LEN < end && !rc; g++) {
+            uint64_t gs = g * AVA1_GROUP_LEN, glen = size - gs < AVA1_GROUP_LEN ? size - gs : AVA1_GROUP_LEN, got = 0;
+            uint8_t cv[32], want[32];
+            while (got < glen) {
+                ssize_t k = pread(c->fd, buf + got, (size_t)(glen - got), (off_t)(gs + got));
+                if (k < 0 && errno == EINTR) continue;
+                if (k <= 0) {
+                    rc = k < 0 ? errno : EIO;
+                    break;
+                }
+                got += (uint64_t)k;
+            }
+            if (rc) break;
+            if (c->ob_fd < 0) continue; /* a one-group file: its root is the CV, checked at commit */
+            ava1_b3_group_cv(buf, (size_t)glen, g, cv);
+            if (pread(c->ob_fd, want, 32, (off_t)(g * 32u)) != 32 || memcmp(cv, want, 32) != 0) rc = EIO;
+        }
+    }
+    free(buf);
+    return rc;
 }
 
 static int u32cmp(const void *a, const void *b) {
@@ -963,6 +1052,10 @@ static void sync_batch(ava1_job_t *j) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
     uint32_t *ids, n_small, i, nr = 0, ng = 0, nroots = 0, cap_g = 0, nlf = 0, nnew = 0;
     uint32_t *snap = NULL, nsnap = 0, k; /* the large files with work (lfl_snapshot) */
+    uint8_t (*sroots)[32];
+    uint8_t *retried = NULL;
+    chk_t *chk = NULL;
+    uint32_t nchk = 0;
     uint64_t u0 = mono_us(), u1 = 0, u2 = 0, u3 = 0;
     uint32_t nfiles;
     uint32_t *newlf = NULL; /* large files whose part file's directory entry is not yet synced */
@@ -977,9 +1070,11 @@ static void sync_batch(ava1_job_t *j) {
     pthread_mutex_lock(&j->mu);
     ids = j->pend_small;
     sfds = j->pend_fd;
+    sroots = j->pend_root;
     n_small = nfiles = j->pend_n;
     j->pend_small = NULL;
     j->pend_fd = NULL;
+    j->pend_root = NULL;
     j->pend_n = j->pend_cap = 0;
     snap = lfl_snapshot(j, &nsnap);
     if (nsnap == UINT32_MAX) {
@@ -1002,7 +1097,9 @@ static void sync_batch(ava1_job_t *j) {
     roots = malloc(((size_t)nroots + 1u) * sizeof *roots);
     runs = malloc(((size_t)n_small + 1u) * sizeof *runs);
     newlf = malloc(((size_t)nlf + 1u) * sizeof *newlf);
-    if (!l.fds || !rg || !roots || !runs || !newlf) {
+    retried = calloc((size_t)n_small + 2u * nlf + 1u, 1);
+    chk = malloc(((size_t)nlf + 1u) * sizeof *chk);
+    if (!l.fds || !rg || !roots || !runs || !newlf || !retried || !chk) {
         pthread_mutex_unlock(&j->mu);
         ava1_apply_fail(j, AVA1_ERR_IO, "out of memory in a sync batch", ENOMEM, 0);
         goto out;
@@ -1014,6 +1111,14 @@ static void sync_batch(ava1_job_t *j) {
         size_t r;
         i = snap[k];
         if (lf->written.n) {
+            chk[nchk].id = i;
+            chk[nchk].fd = lf->fd;
+            chk[nchk].ob_fd = lf->ob_fd;
+            chk[nchk].fd_idx = l.n;
+            chk[nchk].ob_idx = lf->ob_fd >= 0 ? (int)l.n + 1 : -1;
+            chk[nchk].rg_first = ng;
+            chk[nchk].rg_n = (uint32_t)lf->written.n;
+            nchk++;
             for (r = 0; r < lf->written.n; r++) {
                 rg[ng].file_id = i;
                 rg[ng].offset = lf->written.v[2 * r];
@@ -1041,8 +1146,17 @@ static void sync_batch(ava1_job_t *j) {
 
     /* 1. data sync, spread over the workers */
     l.stripes = j->want_workers ? j->want_workers : 1;
+    l.job = j;
+    l.ids = ids;
+    l.roots = (const uint8_t(*)[32])sroots;
+    l.retried = retried;
+    l.n_small = n_small;
     /* A stop mid-sync: some data may be unsynced, so nothing is journaled or acknowledged. */
     if ((l.n && ava1_apply_parallel(j, sync_stripe, &l, l.stripes) != 0) || l.cut || is_stopping(j)) goto out;
+    for (k = 0; k < nchk && !l.err; k++) {
+        if (retried[chk[k].fd_idx] || (chk[k].ob_idx >= 0 && retried[chk[k].ob_idx]))
+            l.err = reread_ranges(&chk[k], rg, j->m.e[chk[k].id].size);
+    }
     if (l.err) {
         ava1_apply_fail(j, AVA1_ERR_IO, "fsync failed", l.err, 0);
         goto out;
@@ -1166,6 +1280,9 @@ out:
     free(snap);
     free(ids);
     free(sfds);
+    free(sroots);
+    free(retried);
+    free(chk);
     free(l.fds);
     free(rg);
     free(roots);
@@ -1344,8 +1461,8 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
         return;
     }
     ava1_platform_set_mtime(lf->fd, part, e->mtime);
-    if (fsync(lf->fd) != 0) {
-        ava1_apply_fail(j, AVA1_ERR_IO, "final sync failed", errno, 0);
+    if ((err = ava1_fsync_retry(lf->fd, stopping_cb, j, NULL)) != 0) {
+        ava1_apply_fail(j, AVA1_ERR_IO, "final sync failed", err, 0);
         return;
     }
     close(lf->fd);

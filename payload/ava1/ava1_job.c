@@ -209,6 +209,7 @@ static void job_destroy(ava1_job_t *j) {
     ava1_pend_release(j->pend_n);
     free(j->pend_small);
     free(j->pend_fd);
+    free(j->pend_root);
     free(j->last_ranges);
     ava1_mstore_free(&j->m_in);
     if (j->lf) {

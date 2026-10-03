@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ava1_frame.h"
@@ -25,6 +26,72 @@ static int write_all_fd(int fd, const uint8_t *p, size_t n) {
         n -= (size_t)k;
     }
     return 0;
+}
+
+/* ---- fsync with retry (SPEC.md §12.6) ------------------------------------------------ */
+
+/* Tests only (0 in the payload): the next `ava1_fsync_test_fail_n` calls of ava1_fsync_retry
+ * fail with this errno instead of reaching the disk. */
+int ava1_fsync_test_fail_n, ava1_fsync_test_errno;
+unsigned ava1_fsync_retries_total; /* retries made since start (a statistic) */
+
+/* Sony's kernel hands some errors back as 0x8002xxxx instead of an errno; the low 16 bits are the errno. */
+static int fsync_errno(int e) {
+    return (unsigned)e >= 0x80020000u && (unsigned)e <= 0x8002ffffu ? (int)((unsigned)e & 0xffffu) : e;
+}
+
+int ava1_fsync_transient(int e) {
+    e = fsync_errno(e);
+    /* EIO, ENOSPC, EDQUOT, EBADF, EROFS... are not hiccups: EIO in particular is the kernel
+     * saying the data did not reach the drive, and asking again proves nothing. */
+    return e == EINTR || e == EAGAIN || e == EBUSY || e == ETIMEDOUT || e == ENOENT || e == ENXIO || e == ENODEV;
+}
+
+static int fsync_once(int fd) {
+    int n = __atomic_load_n(&ava1_fsync_test_fail_n, __ATOMIC_SEQ_CST);
+    while (n > 0) {
+        if (__atomic_compare_exchange_n(&ava1_fsync_test_fail_n, &n, n - 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return ava1_fsync_test_errno ? ava1_fsync_test_errno : EIO;
+    }
+    return fsync(fd) == 0 ? 0 : errno;
+}
+
+#define FSYNC_TRIES 5u /* the first call and four retries */
+
+int ava1_fsync_retry(int fd, int (*stopping)(void *), void *arg, int *retried) {
+    static const unsigned backoff_ms[FSYNC_TRIES - 1] = { 20, 60, 200, 600 };
+    unsigned attempt;
+    int e = 0;
+    if (retried) *retried = 0;
+    for (attempt = 0; attempt < FSYNC_TRIES; attempt++) {
+        if (attempt) {
+            unsigned ms = backoff_ms[attempt - 1];
+            /* in slices a stop can cut */
+            while (ms) {
+                unsigned step = ms < 20u ? ms : 20u;
+                struct timespec ts = { 0, (long)step * 1000000L };
+                if (stopping && stopping(arg)) return e;
+                nanosleep(&ts, NULL);
+                ms -= step;
+            }
+        }
+        e = fsync_once(fd);
+        if (e == 0) {
+            if (attempt) {
+                if (retried) *retried = 1;
+                fprintf(stderr, "[ava1] fsync succeeded on retry %u\n", attempt);
+            }
+            return 0;
+        }
+        if (!ava1_fsync_transient(e) || attempt + 1 == FSYNC_TRIES) {
+            if (attempt) fprintf(stderr, "[ava1] fsync failed after %u retries: errno 0x%x\n", attempt, (unsigned)e);
+            return e;
+        }
+        __atomic_add_fetch(&ava1_fsync_retries_total, 1, __ATOMIC_RELAXED);
+        fprintf(stderr, "[ava1] fsync failed (errno 0x%x), retry %u of %u\n", (unsigned)e, attempt + 1,
+                FSYNC_TRIES - 1);
+    }
+    return e;
 }
 
 static void put32(uint8_t *p, uint32_t v) {
@@ -56,7 +123,7 @@ static int sync_dir(const char *dir) {
     /* The directory fsync is the step that makes a rename durable — the one failure it
      * exists to catch (EIO) must not be swallowed, or callers report durability they
      * do not have. Rust propagates it the same way (SPEC.md §14.1). */
-    int rc = fsync(fd) != 0 ? -errno : 0;
+    int e = ava1_fsync_retry(fd, NULL, NULL, NULL), rc = e ? -e : 0;
     close(fd);
     return rc;
 }
@@ -84,7 +151,7 @@ static int write_file_atomic(const char *dir, const char *name, const uint8_t *a
     if (fd < 0) return -errno;
     rc = write_all_fd(fd, a, an);
     if (rc == 0 && bn) rc = write_all_fd(fd, b, bn);
-    if (rc == 0 && fsync(fd) != 0) rc = -errno;
+    if (rc == 0 && (rc = ava1_fsync_retry(fd, NULL, NULL, NULL)) != 0) rc = -rc;
     close(fd);
     if (rc == 0 && rename(tmp, fin) != 0) rc = -errno; /* same directory */
     if (rc == 0) rc = sync_dir(dir);
@@ -196,7 +263,8 @@ int ava1_jnl_append(ava1_jnl_t *j, uint8_t kind, const uint8_t *body, size_t len
     if (!rec) return -ENOMEM;
     rc = write_all_fd(j->fd, rec, rn);
     free(rec);
-    if (rc == 0 && fsync(j->fd) != 0) rc = -errno;
+    /* The record is written; only its fsync is retried (appending it again would duplicate it). */
+    if (rc == 0 && (rc = ava1_fsync_retry(j->fd, NULL, NULL, NULL)) != 0) rc = -rc;
     if (rc == 0) j->len += rn;
     return rc;
 }

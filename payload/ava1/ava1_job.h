@@ -112,6 +112,7 @@ struct ava1_job {
     uint32_t q_len, q_busy_ticks, ticks;
     uint32_t *pend_small;           /* small files written, waiting for a sync batch */
     int *pend_fd;
+    uint8_t (*pend_root)[32];       /* their BLAKE3 roots (re-read after a retried fsync) */
     uint32_t pend_n, pend_cap;
     uint32_t batch_max;             /* small files per sync batch (tuned, Task 12) */
     uint64_t last_batch_ms, unsynced_bytes;

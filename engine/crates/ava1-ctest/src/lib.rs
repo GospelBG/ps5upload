@@ -318,6 +318,9 @@ pub mod ffi {
         pub fn ava1_test_apply_dup_on_commit(id: u32, off: u64, d: *const u8, len: usize) -> c_int;
         pub fn ava1_test_apply_fail_dir_sync(id: u32);
         pub fn ava1_test_apply_hold(on: c_int);
+        pub fn ava1_test_fsync_fault(point: c_int, n: c_int, err: c_int);
+        pub fn ava1_test_fsync_retries() -> u32;
+        pub fn ava1_test_fsync_pending_faults() -> c_int;
         pub fn ava1_test_apply_pending() -> u32;
         pub fn ava1_test_recv_open(
             jobs: *const c_char,
@@ -1309,6 +1312,22 @@ impl CApplyJob {
     /// While on, the job thread starts no sync batch (so a test decides what one batch holds).
     pub fn hold_batches(&self, on: bool) {
         unsafe { ffi::ava1_test_apply_hold(on as c_int) }
+    }
+
+    /// Fails the next `n` fsync tries with `err` (an errno value, or Sony's 0x80020002):
+    /// at once when `point` is None, else when the apply engine next reaches that hook.
+    pub fn fault_fsync(&self, point: Option<i32>, n: i32, err: i32) {
+        unsafe { ffi::ava1_test_fsync_fault(point.unwrap_or(-1), n, err) }
+    }
+
+    /// fsync retries made by the C engine since the process started.
+    pub fn fsync_retries(&self) -> u32 {
+        unsafe { ffi::ava1_test_fsync_retries() }
+    }
+
+    /// Faults armed and not yet used.
+    pub fn fsync_faults_left(&self) -> i32 {
+        unsafe { ffi::ava1_test_fsync_pending_faults() }
     }
 
     /// Waits until `n` small files are written and waiting for their batch.

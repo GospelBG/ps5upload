@@ -16,6 +16,19 @@
 #define AVA1_JNL_DONE 5
 #define AVA1_JNL_COMPACT_AT (1u << 20)
 
+/* fsync(fd), retried with backoff (20, 60, 200, 600 ms; 5 tries in all) while the error is
+ * one a drive can recover from (ava1_fsync_transient). 0, or the errno of the last try.
+ * `stopping` (may be NULL) is polled between tries and ends the wait early. *retried is set
+ * when a retry is what finally succeeded: the caller may then want to re-read what it
+ * synced (SPEC.md §12.6). Every retry is logged to stderr. */
+int ava1_fsync_retry(int fd, int (*stopping)(void *), void *arg, int *retried);
+/* EINTR, EAGAIN, EBUSY, ETIMEDOUT, ENOENT, ENXIO, ENODEV, also in Sony's 0x8002xxxx form;
+ * never EIO, ENOSPC or a read-only drive. */
+int ava1_fsync_transient(int e);
+/* Tests only: fail the next N ava1_fsync_retry calls (each try counts one) with errno E. */
+extern int ava1_fsync_test_fail_n, ava1_fsync_test_errno;
+extern unsigned ava1_fsync_retries_total;
+
 /* One writer per directory; ava1_jnl_open truncates a torn tail, so it must be the
  * only opener. */
 typedef struct {

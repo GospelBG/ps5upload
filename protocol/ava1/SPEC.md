@@ -450,6 +450,20 @@ rename, before it journals that commit. Likewise for new names: before a batch i
 that gained a file in it is synced once, after the file data. Where fsync does not reach stable
 storage (macOS), a receiver flushes the drive's cache once per batch after the per-file fsyncs.
 
+A transient `fsync` error does not fail the job at once. A receiver retries a failed `fsync` (file
+data, directory, journal append, final commit sync) up to four more times, waiting 20, 60, 200 and
+600 ms, when the error is one a drive can recover from: `EINTR`, `EAGAIN`, `EBUSY`, `ETIMEDOUT`,
+`ENOENT`, `ENXIO`, `ENODEV`, in Sony's `0x8002xxxx` form too (the console reports a USB drive's
+hiccup as `0x80020002`). `EIO` is never retried: it is the kernel saying the data did not reach the
+drive, and an fsync that "succeeds" afterwards proves nothing (the kernel may have dropped the dirty
+pages that failed). A retry that finally succeeds is not trusted alone either: the receiver reads
+back what that fsync covered — each small file is re-read and its BLAKE3 compared with the root it
+arrived with, each large-file range of the batch is re-read and its group chaining values compared
+with the outboard's — and a mismatch ends the job with `ERR_IO` before anything is journaled or
+acknowledged. Nothing is acknowledged while a retry is pending; every retry is logged
+(`[ava1] fsync failed (errno 0x80020002), retry 1 of 4`). Exhausted retries end the job with
+`ERR_IO` ("fsync failed"), as before.
+
 The console-local copy and move (§15.5) use the same standard in memory: a copy is a receiver job
 fed by an in-process reader, with no read-back of the destination; a move deletes a source file only
 after every destination group of that file is verified in memory, the file and its directory are

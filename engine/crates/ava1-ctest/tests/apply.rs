@@ -483,3 +483,184 @@ fn a_parent_sync_failure_after_the_staging_rename_still_reports_the_tree() {
     assert_eq!(std::fs::read(root.join("s")).unwrap(), b"s");
     assert!(job.events().contains("msg "), "{}", job.events());
 }
+
+// ---- G4: a transient fsync error is retried, a real one is not (SPEC.md §12.6) -----------
+
+/// Sony's kernel reports ENOENT as 0x80020002 on some fsync failures of a USB drive.
+const SONY_TRANSIENT: i32 = 0x8002_0002u32 as i32;
+
+#[test]
+fn a_transient_data_fsync_error_is_retried_and_the_job_succeeds() {
+    let t = tmp("fsyncretry");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let m = Manifest {
+        entries: vec![file("a", 3), file("b", 3)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    job.hold_batches(true);
+    job.record(0, b"aaa", *blake3::hash(b"aaa").as_bytes());
+    job.record(1, b"bbb", *blake3::hash(b"bbb").as_bytes());
+    job.wait_pending(2, 5000);
+    let before = job.fsync_retries();
+    job.fault_fsync(None, 2, SONY_TRANSIENT); // the batch's first two fsync tries fail
+    job.hold_batches(false);
+    assert_eq!(job.wait(15_000), 0, "{}", job.events());
+    assert_eq!(job.fsync_faults_left(), 0, "the fault was never reached");
+    assert!(job.fsync_retries() >= before + 2, "no retry was made");
+    assert_eq!(std::fs::read(root.join("a")).unwrap(), b"aaa");
+    assert_eq!(std::fs::read(root.join("b")).unwrap(), b"bbb");
+    assert!(job.events().contains("durable"), "{}", job.events());
+}
+
+#[test]
+fn a_transient_fsync_error_that_never_clears_fails_the_job_after_its_retries() {
+    let t = tmp("fsyncgiveup");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let m = Manifest {
+        entries: vec![file("a", 1)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    job.hold_batches(true);
+    job.record(0, b"a", *blake3::hash(b"a").as_bytes());
+    job.wait_pending(1, 5000);
+    let before = job.fsync_retries();
+    job.fault_fsync(None, 1000, SONY_TRANSIENT);
+    job.hold_batches(false);
+    assert_eq!(
+        job.wait(15_000),
+        ava1::gen::ERR_IO as i32,
+        "{}",
+        job.events()
+    );
+    assert_eq!(
+        job.fsync_retries() - before,
+        4,
+        "four retries, then the failure"
+    );
+    assert!(job.events().contains("fsync failed"), "{}", job.events());
+    assert!(
+        !job.events().contains("durable"),
+        "nothing may be acknowledged: {}",
+        job.events()
+    );
+}
+
+#[test]
+fn an_eio_from_fsync_is_never_retried() {
+    let t = tmp("fsynceio");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let m = Manifest {
+        entries: vec![file("a", 1)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    job.hold_batches(true);
+    job.record(0, b"a", *blake3::hash(b"a").as_bytes());
+    job.wait_pending(1, 5000);
+    let before = job.fsync_retries();
+    job.fault_fsync(None, 1000, 5); // EIO: the data did not reach the drive
+    job.hold_batches(false);
+    assert_eq!(
+        job.wait(15_000),
+        ava1::gen::ERR_IO as i32,
+        "{}",
+        job.events()
+    );
+    assert_eq!(job.fsync_retries(), before, "EIO must not be retried");
+}
+
+#[test]
+fn a_transient_journal_fsync_error_is_retried() {
+    let t = tmp("fsyncjnl");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let m = Manifest {
+        entries: vec![file("a", 1)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    job.trace(true);
+    job.hold_batches(true);
+    job.record(0, b"a", *blake3::hash(b"a").as_bytes());
+    job.wait_pending(1, 5000);
+    let before = job.fsync_retries();
+    // hook 7 (the new directory's sync) is followed by the journal append and its fsync
+    job.fault_fsync(Some(7), 1, SONY_TRANSIENT);
+    job.hold_batches(false);
+    assert_eq!(job.wait(15_000), 0, "{}", job.events());
+    assert_eq!(job.fsync_faults_left(), 0, "{}", job.events());
+    assert!(
+        job.fsync_retries() > before,
+        "the journal fsync was not retried"
+    );
+    assert!(job.events().contains("durable"), "{}", job.events());
+}
+
+#[test]
+fn a_retried_fsync_that_left_a_small_file_wrong_fails_instead_of_acknowledging() {
+    // The failed attempt may have dropped the dirty pages: the retry then "succeeds" on
+    // nothing. The engine reads the file back; a file that no longer matches its root is
+    // never acknowledged.
+    let t = tmp("fsyncdrop");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let m = Manifest {
+        entries: vec![file("a", 4)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    job.hold_batches(true);
+    job.record(0, b"good", *blake3::hash(b"good").as_bytes());
+    job.wait_pending(1, 5000);
+    std::fs::write(root.join("a"), [0u8; 4]).unwrap(); // the pages were lost: zeros on disk
+    job.fault_fsync(None, 1, SONY_TRANSIENT);
+    job.hold_batches(false);
+    assert_eq!(
+        job.wait(15_000),
+        ava1::gen::ERR_IO as i32,
+        "{}",
+        job.events()
+    );
+    assert!(!job.events().contains("durable"), "{}", job.events());
+}
+
+#[test]
+fn a_retried_fsync_on_a_large_file_is_reread_against_the_outboard() {
+    let t = tmp("fsynclarge");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let d = data(2 * GROUP as usize + 5, 3);
+    let m = Manifest {
+        entries: vec![file("big", d.len() as u64)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    job.hold_batches(true);
+    send_large(&job, 0, &d, false);
+    std::thread::sleep(std::time::Duration::from_millis(500)); // the chunks are written
+    job.fault_fsync(None, 1, SONY_TRANSIENT);
+    job.hold_batches(false);
+    assert_eq!(job.wait(15_000), 0, "{}", job.events());
+    assert_eq!(std::fs::read(root.join("big")).unwrap(), d);
+
+    // and a part file that no longer matches its outboard after the retry fails the job
+    let t2 = tmp("fsynclarge2");
+    let root2 = t2.join("dest");
+    std::fs::create_dir_all(&root2).unwrap();
+    drop(job);
+    let job = CApplyJob::begin(&t2.join("jobs"), &root2, 0, &m, 0);
+    job.hold_batches(true);
+    send_large(&job, 0, &d, false);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let part = root2.join("big.ava-part");
+    let mut bad = d.clone();
+    bad[GROUP as usize + 7] ^= 0xff;
+    std::fs::write(&part, &bad).unwrap();
+    job.fault_fsync(None, 1, SONY_TRANSIENT);
+    job.hold_batches(false);
+    assert_eq!(
+        job.wait(15_000),
+        ava1::gen::ERR_IO as i32,
+        "{}",
+        job.events()
+    );
+}

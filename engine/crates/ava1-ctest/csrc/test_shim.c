@@ -878,7 +878,13 @@ static uint64_t g_dup_off;
 
 static void ev_add(const char *s, int done);
 
+static int g_arm_point = -1, g_arm_n, g_arm_errno;
 static void t_hook(ava1_job_t *j, int point, uint32_t id) {
+    if (point == __atomic_load_n(&g_arm_point, __ATOMIC_SEQ_CST)) { /* fsync fault, armed for this point */
+        ava1_fsync_test_errno = g_arm_errno;
+        __atomic_store_n(&ava1_fsync_test_fail_n, g_arm_n, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_arm_point, -1, __ATOMIC_SEQ_CST);
+    }
     if (__atomic_load_n(&g_trace, __ATOMIC_SEQ_CST)) {
         char line[64];
         snprintf(line, sizeof line, "hook %d %u\n", point, id);
@@ -903,6 +909,21 @@ static void t_hook(ava1_job_t *j, int point, uint32_t id) {
         pthread_mutex_unlock(&j->mu);
     }
 }
+
+/* Fails the next `n` fsync tries with `err`: now (point < 0) or the next time the apply engine reaches the
+ * hook `point` (so a test can aim at the journal's fsync, which follows hook 7). */
+void ava1_test_fsync_fault(int point, int n, int err) {
+    if (point < 0) {
+        ava1_fsync_test_errno = err;
+        __atomic_store_n(&ava1_fsync_test_fail_n, n, __ATOMIC_SEQ_CST);
+    } else {
+        g_arm_n = n;
+        g_arm_errno = err;
+        __atomic_store_n(&g_arm_point, point, __ATOMIC_SEQ_CST);
+    }
+}
+unsigned ava1_test_fsync_retries(void) { return __atomic_load_n(&ava1_fsync_retries_total, __ATOMIC_RELAXED); }
+int ava1_test_fsync_pending_faults(void) { return __atomic_load_n(&ava1_fsync_test_fail_n, __ATOMIC_SEQ_CST); }
 
 void ava1_test_apply_trace(int on) { __atomic_store_n(&g_trace, on, __ATOMIC_SEQ_CST); }
 
@@ -1035,6 +1056,8 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
     uint32_t i;
     int rc = 0;
     ava1_test_set_same_device(1); /* a test that died mid-way must not leak its override */
+    __atomic_store_n(&ava1_fsync_test_fail_n, 0, __ATOMIC_SEQ_CST); /* ... or its fsync fault */
+    __atomic_store_n(&g_arm_point, -1, __ATOMIC_SEQ_CST);
     memset(&cfg, 0, sizeof cfg);
     snprintf(cfg.jobs_dir, sizeof cfg.jobs_dir, "%s", jobs_dir);
     cfg.may_write = t_allow;
@@ -1208,6 +1231,8 @@ void ava1_test_apply_end(void) {
     ava1_apply_fault = NULL;
     ava1_test_apply_fail_dir_sync(UINT32_MAX - 1);
     ava1_test_apply_hold(0);
+    __atomic_store_n(&ava1_fsync_test_fail_n, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_arm_point, -1, __ATOMIC_SEQ_CST);
     g_kind = AVA1_JOB_UPLOAD;
     g_owner = 1;
     __atomic_store_n(&g_deny_write, 0, __ATOMIC_SEQ_CST);
