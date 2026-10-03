@@ -11420,6 +11420,27 @@ static int handle_fan_curve_get(runtime_state_t *state, int client_fd,
                       trace_id, buf, strlen(buf));
 }
 
+/* The save / screenshot / video lists are built in one heap buffer of LIST_JSON_CAP bytes and
+ * cut at an entry when it fills (the walkers stop at cap-2300/-2800). Over AVA1 the dispatcher
+ * pages the array (`more`), so the buffer only bounds one walk. A walk that reached the limit
+ * says so, with `"truncated":true`, instead of looking complete: 512 KiB is ~3,000 entries. */
+#define LIST_JSON_CAP (512 * 1024)
+#define LIST_JSON_TRUNC_MARGIN 2900
+
+static int list_json_close(char *resp, int n, int cap) {
+    if (n >= cap - LIST_JSON_TRUNC_MARGIN) {
+        static const char t[] = "],\"truncated\":true}";
+        if (n + (int)sizeof t <= cap) {
+            memcpy(resp + n, t, sizeof t - 1);
+            n += (int)sizeof t - 1;
+        }
+    } else if (n < cap - 2) {
+        resp[n++] = ']';
+        resp[n++] = '}';
+    }
+    return n;
+}
+
 /* ── Save-data listing ───────────────────────────────────────────────── */
 
 /* Walk a savedata root for one user, appending JSON entries to `body`.
@@ -11525,13 +11546,13 @@ static int handle_list_saves(runtime_state_t *state, int client_fd,
     /* Response body is large — saves can number in the hundreds. 64 KB
      * is comfortable; the ~100-byte-per-entry budget gives room for
      * ~600 entries before truncation. */
-    char *resp = malloc(64 * 1024);
+    char *resp = malloc(LIST_JSON_CAP);
     if (!resp) {
         const char *err = "{\"err\":\"oom\"}";
         return send_frame(client_fd, FTX2_FRAME_LIST_SAVES_ACK, 0,
                           trace_id, err, strlen(err));
     }
-    int cap = 64 * 1024;
+    int cap = LIST_JSON_CAP;
     int n = 0;
     n += snprintf(resp + n, cap - n, "{\"saves\":[");
     int wrote_one = 0;
@@ -11572,10 +11593,7 @@ static int handle_list_saves(runtime_state_t *state, int client_fd,
         }
         closedir(home);
     }
-    if (n < cap - 2) {
-        resp[n++] = ']';
-        resp[n++] = '}';
-    }
+    n = list_json_close(resp, n, cap);
     int rc = send_frame(client_fd, FTX2_FRAME_LIST_SAVES_ACK, 0, trace_id,
                         resp, (uint64_t)n);
     free(resp);
@@ -12070,6 +12088,7 @@ static int handle_search_index(runtime_state_t *state, int client_fd,
     n += snprintf(resp + n, cap - n, "{\"results\":[");
     int wrote_one = 0;
     int matched = 0;
+    int cut = 0;
     pthread_mutex_lock(&g_index_lock);
     for (size_t i = 0; i < g_index_count && matched < limit; i++) {
         const char *path = g_index_entries[i].path;
@@ -12082,7 +12101,10 @@ static int handle_search_index(runtime_state_t *state, int client_fd,
         if (size_max > 0 && sz > size_max) continue;
         char esc_path[2048];
         json_escape_into(path, esc_path, sizeof(esc_path));
-        if (n >= cap - 2300) break;
+        if (n >= cap - 2300) {
+            cut = 1; /* the reply buffer is full: say so below, never look complete */
+            break;
+        }
         if (wrote_one) resp[n++] = ',';
         wrote_one = 1;
         n += snprintf(resp + n, cap - n,
@@ -12091,7 +12113,9 @@ static int handle_search_index(runtime_state_t *state, int client_fd,
         matched++;
     }
     pthread_mutex_unlock(&g_index_lock);
-    if (n < cap - 2) {
+    if (cut) {
+        n += snprintf(resp + n, cap - n, "],\"truncated\":true}");
+    } else if (n < cap - 2) {
         resp[n++] = ']';
         resp[n++] = '}';
     }
@@ -12167,9 +12191,15 @@ static int handle_app_lifecycle(runtime_state_t *state, int client_fd,
         }
         int count = 0;
         int rc = -1;
+        /* sceApplication* is Sony code: serialised like every other Sony call
+         * (P3 Task 6: AVA1 runs up to eight management calls at once, FTX2 ran one
+         * thread per connection, and an unserialised Sony call can take the host
+         * process down, CE-108262-9). */
+        pthread_mutex_lock(&sony_api_lock);
         if (resolve_sce_syscore() == 0 && p_sceApplicationGetProcs) {
             rc = p_sceApplicationGetProcs(buf, APP_PROCS_MAX_COUNT, &count);
         }
+        pthread_mutex_unlock(&sony_api_lock);
         if (rc != 0 || count < 0) count = 0;
         if (count > APP_PROCS_MAX_COUNT) count = APP_PROCS_MAX_COUNT;
         int n = 0;
@@ -12202,7 +12232,12 @@ static int handle_app_lifecycle(runtime_state_t *state, int client_fd,
         return send_frame(client_fd, FTX2_FRAME_APP_LIFECYCLE_ACK, 0,
                           trace_id, err, strlen(err));
     }
+    /* The suspend / resume / kill calls below are Sony APIs: hold sony_api_lock across
+     * the whole action (the kill ladder is up to four calls, run back to back as before)
+     * and release it on every exit. */
+    pthread_mutex_lock(&sony_api_lock);
     if (resolve_sce_syscore() != 0) {
+        pthread_mutex_unlock(&sony_api_lock);
         const char *err = "{\"ok\":false,\"err\":\"libSceSysCore_unavailable\"}";
         return send_frame(client_fd, FTX2_FRAME_APP_LIFECYCLE_ACK, 0,
                           trace_id, err, strlen(err));
@@ -12246,10 +12281,12 @@ static int handle_app_lifecycle(runtime_state_t *state, int client_fd,
             rc = rc4;
         }
     } else {
+        pthread_mutex_unlock(&sony_api_lock);
         const char *err = "{\"ok\":false,\"err\":\"unknown_action\"}";
         return send_frame(client_fd, FTX2_FRAME_APP_LIFECYCLE_ACK, 0,
                           trace_id, err, strlen(err));
     }
+    pthread_mutex_unlock(&sony_api_lock);
     pthread_mutex_lock(&state->state_mtx);
     state->command_count += 1;
     pthread_mutex_unlock(&state->state_mtx);
@@ -13724,13 +13761,13 @@ static int handle_index_cancel(runtime_state_t *state, int client_fd,
 static int handle_list_screenshots(runtime_state_t *state, int client_fd,
                                     uint64_t trace_id) {
     if (!state) return -1;
-    char *resp = malloc(64 * 1024);
+    char *resp = malloc(LIST_JSON_CAP);
     if (!resp) {
         const char *err = "{\"err\":\"oom\"}";
         return send_frame(client_fd, FTX2_FRAME_LIST_SCREENSHOTS_ACK, 0,
                           trace_id, err, strlen(err));
     }
-    int cap = 64 * 1024;
+    int cap = LIST_JSON_CAP;
     int n = 0;
     n += snprintf(resp + n, cap - n, "{\"items\":[");
     int wrote_one = 0;
@@ -13748,10 +13785,7 @@ static int handle_list_screenshots(runtime_state_t *state, int client_fd,
     walk_screenshots("/user/av_contents/thumbnails/photo", 5,
                      resp, &n, cap, &wrote_one, &seen, 1);
     free(seen.names);
-    if (n < cap - 2) {
-        resp[n++] = ']';
-        resp[n++] = '}';
-    }
+    n = list_json_close(resp, n, cap);
     int rc = send_frame(client_fd, FTX2_FRAME_LIST_SCREENSHOTS_ACK, 0,
                         trace_id, resp, (uint64_t)n);
     free(resp);
@@ -13766,21 +13800,18 @@ static int handle_list_screenshots(runtime_state_t *state, int client_fd,
 static int handle_list_videos(runtime_state_t *state, int client_fd,
                               uint64_t trace_id) {
     if (!state) return -1;
-    char *resp = malloc(64 * 1024);
+    char *resp = malloc(LIST_JSON_CAP);
     if (!resp) {
         const char *err = "{\"err\":\"oom\"}";
         return send_frame(client_fd, FTX2_FRAME_LIST_VIDEOS_ACK, 0,
                           trace_id, err, strlen(err));
     }
-    int cap = 64 * 1024;
+    int cap = LIST_JSON_CAP;
     int n = 0;
     n += snprintf(resp + n, cap - n, "{\"items\":[");
     int wrote_one = 0;
     walk_videos("/user/av_contents/video", 5, resp, &n, cap, &wrote_one);
-    if (n < cap - 2) {
-        resp[n++] = ']';
-        resp[n++] = '}';
-    }
+    n = list_json_close(resp, n, cap);
     int rc = send_frame(client_fd, FTX2_FRAME_LIST_VIDEOS_ACK, 0,
                         trace_id, resp, (uint64_t)n);
     free(resp);
@@ -13985,7 +14016,9 @@ static int handle_focus_probe(runtime_state_t *state, int client_fd,
  * guards self/kernel/init; the UI is responsible for warning before a
  * "system" kill. Ack {"ok":bool,"pid":N[,"err":"..."]}. */
 static int handle_process_kill(runtime_state_t *state, int client_fd,
-                               uint64_t trace_id, const char *body) {
+                               uint64_t trace_id, const char *body,
+                               uint64_t body_len) {
+    (void)body_len;
     int pid = (int)extract_json_uint64_field(body ? body : "", "pid");
     int rc = proc_kill(pid);
     int err_no = errno; /* capture immediately — proc_kill set it on failure */
@@ -16175,7 +16208,7 @@ static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
     }
     if (hdr.frame_type == FTX2_FRAME_PROCESS_KILL) {
         return handle_process_kill(state, client_fd, hdr.trace_id,
-                                   request_body);
+                                   request_body, hdr.body_len);
     }
     if (hdr.frame_type == FTX2_FRAME_SYSLOG_TAIL) {
         return handle_syslog_tail(state, client_fd, hdr.trace_id);

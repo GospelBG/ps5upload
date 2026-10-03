@@ -29,6 +29,8 @@
 
 /* The cause a handler returns when its answer did not fit (SPEC.md §7.3). */
 #define MGMT_ERR_TRUNCATED "reply truncated"
+/* The longest error cause (a kept failure body longer than this travels as its token only). */
+#define MGMT_CAUSE_MAX 200u
 
 struct mgmt_ctx;
 
@@ -106,7 +108,8 @@ int mgmt_reply_error(mgmt_ctx_t *cx, int status, const char *cause);
  * ERR_EXISTS, ERR_CROSS_DEVICE, ERR_BUSY, ERR_IO, ERR_UNKNOWN_JOB, ERR_CANCELLED,
  * ERR_PROTOCOL for malformed requests, else ERR_INTERNAL. */
 int mgmt_status_for_token(const char *token);
-/* 1 when `body` is a legacy failure ({"ok":false,...}); *token receives its "err" value. */
+/* 1 when `body` is a legacy failure: a JSON object whose TOP-LEVEL "ok" is false, wherever that key sits (an
+ * "ok" inside a nested object or a string does not count). *token receives its top-level err/error/reason. */
 int mgmt_legacy_failure(const char *body, size_t len, char *token, size_t token_cap);
 
 /* Runner helpers the table (mgmt_table.def) names: (request, length, ctx, legacy handler). */

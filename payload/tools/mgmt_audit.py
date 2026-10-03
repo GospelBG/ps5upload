@@ -7,6 +7,9 @@
                          (the capture path calls handlers with fd = -1)
   mgmt_audit.py sony     every entry whose handler can reach register/profile/registry/Remote
                          Play/notification code or a Sony API carries MGMT_SONY
+  mgmt_audit.py lock     every MGMT_SONY entry of a "P3 Task N" block of mgmt_table.def (and app.launch) reaches a
+                         `pthread_mutex_lock(&sony_api_lock)`, and no handler in runtime.c calls a p_sce* Sony
+                         function without taking it (the dispatcher adds no lock of its own)
   mgmt_audit.py stack    no stack array of 16 KiB or more is reachable from a table handler
                          (AVA1 workers have 512 KiB, the rule is the SPEC.md section 7.3 one)
   mgmt_audit.py report   every array of 2 KiB or more reachable from each handler in
@@ -93,6 +96,11 @@ for f in sorted(glob.glob("src/*.c")):
                 if m:
                     cur, buf, hdr = m.group(1), [l], "{" not in l
                     if l.rstrip().endswith(";"):
+                        cur = None
+                    elif "{" in l and l.rstrip().endswith("}"):
+                        # a one-line function (`static inline int f(int x) { return x; }`): without this
+                        # it swallowed the next function's header and body (launch_title went missing)
+                        FUNCS.setdefault(cur, (l, f))
                         cur = None
         else:
             buf.append(l)
@@ -260,7 +268,7 @@ def check_recv():
 # The FTX2 transfer-port handlers and the dispatcher read their own bodies; none is a table entry.
 TRANSFER_HANDLERS = {"handle_stream_shard", "handle_begin_tx_frame", "handle_binary_frame_impl", "handle_packed_shard"}
 
-SONY_RE = re.compile(r"\b(sceUserService\w*|sceRegMgr\w*|sceAppInstUtil\w*|sceLncUtil\w*|sceSystemService\w*|sony_api_lock\w*)\b")
+SONY_RE = re.compile(r"\b(p_?sce(?:Application|LncUtil|SystemService|AppInstUtil|UserService|RegMgr)\w*|sceUserService\w*|sceRegMgr\w*|sceAppInstUtil\w*|sceLncUtil\w*|sceSystemService\w*|sony_api_lock\w*)\b")
 
 
 def sony_api_names():
@@ -285,6 +293,45 @@ def check_sony():
         hit = sorted(n for n in names if n in api or n == "sony-call")
         if hit and "MGMT_SONY" not in e["flags"]:
             bad.append("%s (%s) reaches %s but lacks MGMT_SONY" % (e["method"], e["handler"], ", ".join(hit[:4])))
+    return bad
+
+
+# MGMT_SONY entries that take no Sony lock because they call no Sony API (handler -> why).
+LOCK_EXEMPT = {
+    "handle_app_list_registered": "readdir over /user/app only (flagged MGMT_SONY because its code lives in register.c)",
+}
+# A direct call of a dlsym'd Sony function (runtime.c keeps them as p_sce* pointers).
+SONY_PTR_RE = re.compile(r"\bp_sce(?:Application|LncUtil|SystemService|AppInstUtil|UserService|RegMgr)\w*\s*\(")
+LOCK_RE = re.compile(r"pthread_mutex_lock\s*\(\s*&\s*sony_api_lock\s*\)")
+
+
+def locked_entries():
+    """Entries of the `P3 Task N` blocks of mgmt_table.def, plus app.launch (Task 2's), that carry MGMT_SONY."""
+    out, in_block = [], False
+    for l in open("src/mgmt_table.def"):
+        if l.startswith("/* ---- P3 Task"):
+            in_block = True
+            continue
+        m = re.match(r"MGMT_H([01])\((.*)\)\s*$", l)
+        if m:
+            f = [x.strip() for x in m.group(2).split(",")]
+            if "MGMT_SONY" in f[3] and (in_block or f[0] == "AVA1_METHOD_APP_LAUNCH"):
+                out.append(dict(method=f[0], handler=f[4]))
+    return out
+
+
+def check_lock():
+    bad = []
+    for e in locked_entries():
+        if e["handler"] in LOCK_EXEMPT:
+            continue
+        r = reach(e["handler"])
+        if not any(LOCK_RE.search(strip(FUNCS[fn][0])) for fn in r):
+            bad.append("%s (%s) is MGMT_SONY but reaches no pthread_mutex_lock(&sony_api_lock)" % (e["method"], e["handler"]))
+        for fn in sorted(r):
+            body = strip(FUNCS[fn][0])
+            if FUNCS[fn][1] == "src/runtime.c" and SONY_PTR_RE.search(body) and not LOCK_RE.search(body):
+                bad.append("%s: %s calls a p_sce* Sony function without taking sony_api_lock" % (e["method"], fn))
     return bad
 
 
@@ -347,8 +394,8 @@ def report():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
-    checks = dict(table=check_table, recv=check_recv, sony=check_sony, stack=check_stack, report=report, selftest=selftest)
-    todo = ["table", "recv", "sony", "stack"] if cmd == "all" else [cmd]
+    checks = dict(table=check_table, recv=check_recv, sony=check_sony, lock=check_lock, stack=check_stack, report=report, selftest=selftest)
+    todo = ["table", "recv", "sony", "lock", "stack"] if cmd == "all" else [cmd]
     failed = 0
     for c in todo:
         for line in checks[c]():

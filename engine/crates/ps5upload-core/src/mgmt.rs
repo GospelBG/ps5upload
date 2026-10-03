@@ -297,9 +297,57 @@ pub fn call_legacy_ok(addr: &str, method: Method, label: &str, body: &[u8]) -> R
 pub fn legacy_ok(r: Result<Vec<u8>>) -> Result<Vec<u8>> {
     match r {
         Err(e) => match e.downcast_ref::<MgmtError>() {
-            Some(m) if m.status != 0 => Ok(serde_json::to_vec(
-                &serde_json::json!({ "ok": false, "err": m.cause }),
-            )?),
+            // The payload keeps the whole `{"ok":false,...}` body as the cause when it fits one: that is the
+            // legacy body, byte for byte. A bare token (an ERROR frame, or a body too long for a cause) is
+            // wrapped as the old `{"ok":false,"err":token}`.
+            Some(m) if m.status != 0 => {
+                if serde_json::from_str::<serde_json::Value>(&m.cause).is_ok_and(|v| v.is_object())
+                {
+                    Ok(m.cause.clone().into_bytes())
+                } else {
+                    Ok(serde_json::to_vec(
+                        &serde_json::json!({ "ok": false, "err": m.cause }),
+                    )?)
+                }
+            }
+            _ => Err(e),
+        },
+        ok => ok,
+    }
+}
+
+/// For the handlers whose `{"ok":false,...}` body carries data the caller reads (the Sony return
+/// code of `app.lifecycle`, the errno and reason of `proc.kill`, the `error` text of `app.info_*`).
+/// The AVA1 payload answers such a failure with an error status whose cause is the whole body
+/// (`mgmt_call_text_keep`); this returns that body, so the caller parses the same bytes an FTX2
+/// payload sent. A cause that is not a JSON object (a bare token, or a body too long for a cause
+/// and cut to its token) and every transport failure stay errors.
+pub fn call_legacy_body(addr: &str, method: Method, label: &str, body: &[u8]) -> Result<Vec<u8>> {
+    legacy_body(call_as(addr, method, label, body))
+}
+
+/// [`call_legacy_body`] with a caller-chosen deadline.
+pub fn call_legacy_body_with(
+    addr: &str,
+    method: Method,
+    label: &str,
+    body: &[u8],
+    timeout: Option<Duration>,
+) -> Result<Vec<u8>> {
+    legacy_body(call_with(addr, method, label, body, timeout))
+}
+
+/// [`call_legacy_body`]'s conversion, separately testable.
+pub fn legacy_body(r: Result<Vec<u8>>) -> Result<Vec<u8>> {
+    match r {
+        Err(e) => match e.downcast_ref::<MgmtError>() {
+            Some(m)
+                if m.status != 0
+                    && serde_json::from_str::<serde_json::Value>(&m.cause)
+                        .is_ok_and(|v| v.is_object()) =>
+            {
+                Ok(m.cause.clone().into_bytes())
+            }
             _ => Err(e),
         },
         ok => ok,
@@ -469,6 +517,29 @@ mod tests {
         assert_eq!(v["err"], "exists");
         assert!(legacy_ok(Err(anyhow::anyhow!("network: reset"))).is_err());
         assert_eq!(legacy_ok(Ok(b"x".to_vec())).unwrap(), b"x");
+    }
+
+    #[test]
+    fn legacy_body_returns_a_failure_body_kept_whole_but_not_a_bare_token_or_a_transport_error() {
+        let refused = |cause: &str, status: u16| -> Result<Vec<u8>> {
+            Err(MgmtError {
+                label: "PROCESS_KILL".into(),
+                status,
+                cause: cause.into(),
+            }
+            .into())
+        };
+        let body =
+            br#"{"ok":false,"pid":9,"err":"kill_failed","errno":3,"reason":"No such process"}"#;
+        let kept = legacy_body(refused(std::str::from_utf8(body).unwrap(), 7)).unwrap();
+        assert_eq!(kept, body, "the legacy bytes, not a rebuilt body");
+        // a bare token (an ERROR frame's cause, or a too-long body cut to its token) stays an error
+        let e = legacy_body(refused("kill_failed", 7)).unwrap_err();
+        assert_eq!(e.to_string(), "payload rejected PROCESS_KILL: kill_failed");
+        // an FTX2 Error frame (status 0) stays an error even when its text happens to be JSON
+        assert!(legacy_body(refused("{\"a\":1}", 0)).is_err());
+        assert!(legacy_body(Err(anyhow::anyhow!("network: reset"))).is_err());
+        assert_eq!(legacy_body(Ok(b"x".to_vec())).unwrap(), b"x");
     }
 
     #[test]

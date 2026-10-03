@@ -936,29 +936,27 @@ pub struct RegisterResult {
 /// `"PSN"` or `"disc"` and the launcher rejects it. Invasive:
 /// modifies the user's source file in place, so it's opt-in.
 pub fn app_register(addr: &str, src_path: &str, patch_drm_type: bool) -> Result<RegisterResult> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::to_vec(&serde_json::json!({
         "src_path": src_path,
         "patch_drm_type": if patch_drm_type { 1 } else { 0 },
     }))
     .context("serialize app_register body")?;
-    c.send_frame(FrameType::AppRegister, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APP_REGISTER({}): {}",
-            src_path,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppRegisterAck {
-        bail!("expected APP_REGISTER_ACK, got {:?}", ft);
-    }
+    // A register can run 10 s or more (copy of the metadata, the nullfs mount, Sony's installer
+    // under its lock), so it gets the 60 s deadline a launch has.
+    let resp = mgmt::call_with(
+        addr,
+        m::APP_REGISTER,
+        &format!("APP_REGISTER({src_path})"),
+        &body,
+        Some(SONY_CALL_TIMEOUT),
+    )?;
     let parsed: RegisterResult =
         serde_json::from_slice(&resp).context("decode APP_REGISTER_ACK body as JSON")?;
     Ok(parsed)
 }
+
+/// The deadline of the Sony-lock calls that can queue behind one another or run long.
+const SONY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Reverse of `app_register`. Unmounts the nullfs at
 /// `/system_ex/app/<title_id>/`, removes tracking link files, and
@@ -995,19 +993,14 @@ impl UnregisterOutcome {
 pub fn app_unregister(addr: &str, title_id: &str) -> Result<UnregisterOutcome> {
     let body = serde_json::to_vec(&serde_json::json!({ "title_id": title_id }))
         .context("serialize app_unregister body")?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppUnregister, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APP_UNREGISTER: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppUnregisterAck {
-        bail!("expected APP_UNREGISTER_ACK, got {ft:?}");
-    }
+    // On FW 13.60 the unregister repeats for two records and can run 10 s or more: 60 s deadline.
+    let resp = mgmt::call_with(
+        addr,
+        m::APP_UNREGISTER,
+        "APP_UNREGISTER",
+        &body,
+        Some(SONY_CALL_TIMEOUT),
+    )?;
     // Older payloads answer with an empty body — treat that as "Sony's
     // result unknown", i.e. 0, rather than failing the call.
     let rc = serde_json::from_slice::<serde_json::Value>(&resp)
@@ -1031,14 +1024,14 @@ pub fn app_unregister(addr: &str, title_id: &str) -> Result<UnregisterOutcome> {
 pub fn app_launch(addr: &str, title_id: &str) -> Result<()> {
     let body = serde_json::to_vec(&serde_json::json!({ "title_id": title_id }))
         .context("serialize app_launch body")?;
-    send_empty_ack_op_with_timeout(
+    mgmt::call_with(
         addr,
-        FrameType::AppLaunch,
-        &body,
-        FrameType::AppLaunchAck,
+        m::APP_LAUNCH,
         "APP_LAUNCH",
-        Some(std::time::Duration::from_secs(60)),
-    )
+        &body,
+        Some(SONY_CALL_TIMEOUT),
+    )?;
+    Ok(())
 }
 
 /// One entry returned by `app_list_registered`.
@@ -1071,19 +1064,8 @@ pub struct RegisteredApps {
 /// old `list_sqlite_unavailable` failure is no longer reachable — callers
 /// that still map it are harmless, and older payloads can still send it.
 pub fn app_list_registered(addr: &str) -> Result<RegisteredApps> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppListRegistered, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APP_LIST_REGISTERED: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppListRegisteredAck {
-        bail!("expected APP_LIST_REGISTERED_ACK, got {:?}", ft);
-    }
+    // Over AVA1 the transport pages the list (a reply holds ~1,700 entries) and returns one document.
+    let resp = mgmt::call(addr, m::APP_LIST, &[])?;
     let parsed: RegisteredApps =
         serde_json::from_slice(&resp).context("decode APP_LIST_REGISTERED_ACK body as JSON")?;
     Ok(parsed)

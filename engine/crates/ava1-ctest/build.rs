@@ -79,6 +79,51 @@ fn main() {
         .extra_warnings(true)
         .warnings_into_errors(true)
         .compile("ava1c");
+    // P3 Task 6: the real "P3 Task 6" rows of payload/src/mgmt_table.def over stub handlers
+    // (csrc/mgmt_t6_shim.c), so the tests drive the real table's methods, flags and runners.
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let def = std::fs::read_to_string(p.join("src/mgmt_table.def")).unwrap();
+    let mut block = String::new();
+    let mut inside = false;
+    for l in def.lines() {
+        if l.starts_with("/* ---- P3 Task") {
+            inside = l.starts_with("/* ---- P3 Task 6");
+        } else if inside
+            || [
+                "AVA1_METHOD_APP_LAUNCH,",
+                "AVA1_METHOD_APP_LIST,",
+                "AVA1_METHOD_PROC_PROCESS_LIST,",
+            ]
+            .iter()
+            .any(|m| l.contains(m))
+        {
+            block.push_str(l);
+            block.push('\n');
+        }
+    }
+    assert!(!block.is_empty(), "no `P3 Task 6` block in mgmt_table.def");
+    std::fs::write(out.join("mgmt_t6.def"), block).unwrap();
+    cc::Build::new()
+        .files([
+            here.join("csrc/mgmt_t6_shim.c"),
+            p.join("src/sony_api_lock.c"),
+        ])
+        .include(&ava1)
+        .include(ava1.join("gen"))
+        .include(p.join("include"))
+        .include(&out)
+        .warnings(true)
+        .extra_warnings(true)
+        .warnings_into_errors(true)
+        .compile("ava1t6");
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("src/mgmt_table.def").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("src/sony_api_lock.c").display()
+    );
     // The AVX2 ChaCha20 is its own unit, built with -mavx2 only on x86-64 (where the
     // run-time CPUID check picks it); elsewhere it compiles to nothing.
     let mut avx2 = cc::Build::new();

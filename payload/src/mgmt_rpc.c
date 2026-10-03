@@ -10,7 +10,6 @@
 
 /* The FTX2 error frame's number (runtime.c asserts its FTX2_FRAME_ERROR is the same). */
 #define MGMT_FRAME_ERROR 3u
-#define MGMT_CAUSE_MAX 200u
 /* The sink's room for a paged method's whole (unpaged) answer. */
 #define MGMT_PAGED_CAPTURE_MAX (1024u * 1024u)
 /* MgmtText overhead: u32 length + u16 ext count, plus a `more` ext (tag, length, value). */
@@ -105,6 +104,7 @@ int mgmt_status_for_token(const char *t) {
     if (has(t, "cross_mount") || has(t, "cross_device")) return AVA1_ERR_CROSS_DEVICE;
     /* A path the node's policy refuses (the allowlist) is ERR_PATH; an OS permission refusal is not
      * a path problem. The schema has no permission code, so it is ERR_IO ("the filesystem refused"). */
+    if (has(t, "missing")) return AVA1_ERR_PROTOCOL; /* an absent argument (register_src_path_missing) is the peer's, not a refused path */
     if (has(t, "path") || has(t, "not_allowed")) return AVA1_ERR_PATH;
     if (has(t, "denied") || has(t, "permission") || has(t, "eacces") || has(t, "eperm")) return AVA1_ERR_IO;
     if (has(t, "no_space") || has(t, "enospc") || has(t, "disk_full")) return AVA1_ERR_NO_SPACE;
@@ -112,6 +112,7 @@ int mgmt_status_for_token(const char *t) {
     if (has(t, "exists") || has(t, "eexist") || has(t, "already")) return AVA1_ERR_EXISTS;
     if (has(t, "unknown_job") || has(t, "no_such_job") || has(t, "job_not_found")) return AVA1_ERR_UNKNOWN_JOB;
     if (has(t, "cancel")) return AVA1_ERR_CANCELLED;
+    if (has(t, "required") || has(t, "bad_action") || has(t, "unknown_action")) return AVA1_ERR_PROTOCOL;
     if (has(t, "missing") || has(t, "invalid") || has(t, "malformed") || has(t, "too_large") || has(t, "bad_request") ||
         has(t, "body_too"))
         return AVA1_ERR_PROTOCOL;
@@ -126,36 +127,75 @@ static const char *skip_ws(const char *p, const char *end) {
     return p;
 }
 
-/* Copies the string value of `"key":"..."` (first occurrence) into out; 1 when found. */
+/* Skips one JSON value starting at p (string, object, array or scalar); returns the byte after it, or NULL
+ * when the text ends first. Strings honour backslash escapes; nesting is counted. */
+static const char *skip_value(const char *p, const char *end) {
+    int depth = 0;
+    while (p < end) {
+        char c = *p;
+        if (c == '"') {
+            for (p++; p < end && *p != '"'; p++)
+                if (*p == '\\' && p + 1 < end) p++;
+            if (p >= end) return NULL;
+            p++;
+            if (depth == 0) return p;
+            continue;
+        }
+        if (c == '{' || c == '[') depth++;
+        else if (c == '}' || c == ']') {
+            if (depth == 0) return p; /* the enclosing container's end: a scalar ended before it */
+            if (--depth == 0) return p + 1;
+        } else if (depth == 0 && (c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r')) {
+            return p;
+        }
+        p++;
+    }
+    return depth == 0 ? p : NULL;
+}
+
+/* The value of the TOP-LEVEL key `key` of the JSON object `json` (keys inside nested objects and text
+ * inside strings never match): a pointer to its first byte, or NULL. */
+static const char *top_value(const char *json, size_t len, const char *key) {
+    const char *end = json + len, *p = skip_ws(json, end);
+    size_t kl = strlen(key);
+    if (p >= end || *p != '{') return NULL;
+    p++;
+    for (;;) {
+        const char *ks, *ke;
+        p = skip_ws(p, end);
+        if (p >= end || *p != '"') return NULL; /* '}' (no more keys) or malformed */
+        ks = p + 1;
+        ke = skip_value(p, end);
+        if (!ke) return NULL;
+        p = skip_ws(ke, end);
+        if (p >= end || *p != ':') return NULL;
+        p = skip_ws(p + 1, end);
+        if (p >= end) return NULL;
+        if ((size_t)(ke - 1 - ks) == kl && memcmp(ks, key, kl) == 0) return p;
+        p = skip_value(p, end);
+        if (!p) return NULL;
+        p = skip_ws(p, end);
+        if (p < end && *p == ',') p++;
+    }
+}
+
+/* Copies a top-level string value into out; 1 when found. */
 static int json_string_value(const char *json, size_t len, const char *key, char *out, size_t cap) {
-    char needle[40];
-    const char *end = json + len, *p, *q;
+    const char *end = json + len, *p = top_value(json, len, key), *q;
     size_t n = 0;
-    if (snprintf(needle, sizeof needle, "\"%s\"", key) >= (int)sizeof needle) return 0;
-    p = strstr(json, needle);
-    if (!p) return 0;
-    p = skip_ws(p + strlen(needle), end);
-    if (p >= end || *p != ':') return 0;
-    p = skip_ws(p + 1, end);
-    if (p >= end || *p != '"') return 0;
+    if (!p || *p != '"') return 0;
     for (q = p + 1; q < end && *q != '"'; q++) {
         if (*q == '\\' && q + 1 < end) q++;
         if (n + 1 < cap) out[n++] = *q;
     }
-    out[n] = '\0';
+    if (cap) out[n] = '\0';
     return 1;
 }
 
 int mgmt_legacy_failure(const char *body, size_t len, char *token, size_t token_cap) {
-    const char *end = body + len, *p = skip_ws(body, end);
+    const char *end = body + len, *v = top_value(body, len, "ok");
     if (token_cap) token[0] = '\0';
-    if (p >= end || *p != '{') return 0;
-    p = skip_ws(p + 1, end);
-    if (end - p < 4 || strncmp(p, "\"ok\"", 4) != 0) return 0;
-    p = skip_ws(p + 4, end);
-    if (p >= end || *p != ':') return 0;
-    p = skip_ws(p + 1, end);
-    if (end - p < 5 || strncmp(p, "false", 5) != 0) return 0;
+    if (!v || end - v < 5 || strncmp(v, "false", 5) != 0) return 0;
     if (token_cap &&
         !json_string_value(body, len, "err", token, token_cap) &&
         !json_string_value(body, len, "error", token, token_cap) &&
@@ -174,6 +214,8 @@ int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t 
     memset(&c, 0, sizeof c);
     rep->body = NULL;
     rep->len = 0;
+    /* The handler reads its request as a C string: an embedded NUL would silently cut it short. */
+    if (req_len && memchr(req, '\0', req_len)) return mgmt_reply_error(cx, AVA1_ERR_PROTOCOL, "request contains NUL");
     rq = malloc(req_len + 1);
     c.buf = malloc(capture_cap + 1);
     if (!rq || !c.buf) {
@@ -204,7 +246,8 @@ int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t 
     }
     if (mgmt_legacy_failure((const char *)c.buf, c.len, token, sizeof token)) {
         int st = mgmt_status_for_token(token);
-        mgmt_reply_error(cx, st, token);
+        /* the whole body (err, errno, reason, codes) when it fits a cause, else its token */
+        mgmt_reply_error(cx, st, c.len <= MGMT_CAUSE_MAX ? (const char *)c.buf : token);
         free(c.buf);
         return st;
     }
