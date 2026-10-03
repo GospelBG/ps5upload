@@ -18,6 +18,22 @@
 #define MAX_DEPTH 64
 
 uint32_t fsj_test_file_delay_us;
+const char *fsj_test_cross_name;
+
+/* The device of an entry, with the test hook's "this one is a mount" applied. */
+static dev_t dev_of(const struct stat *st, const char *path) {
+    const char *name = fsj_test_cross_name;
+    if (name) {
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        if (strcmp(base, name) == 0) return st->st_dev + 1;
+    }
+    return st->st_dev;
+}
+
+static void failed(const fsj_hooks_t *h, const char *path, const char *what) {
+    if (h && h->failed) h->failed(h->arg, path, what);
+}
 
 static void test_delay(void) {
     uint32_t us = __atomic_load_n(&fsj_test_file_delay_us, __ATOMIC_RELAXED);
@@ -160,19 +176,26 @@ static void fsync_parent_dir(const char *path) {
     }
 }
 
-int fsj_rm_rf(const char *path, int depth, const fsj_hooks_t *h) {
+static int rm_rf_in(const char *path, int depth, const fsj_hooks_t *h, dev_t root_dev) {
     struct stat st;
     DIR *d;
     struct dirent *e;
     char sub[1024];
-    int rc = 0;
+    int rc = 0, child_failed = 0;
 
     if (depth > MAX_DEPTH) return -1;
     if (cancelled(h)) return -2;
     if (lstat(path, &st) != 0) {
         /* Already gone is success: a concurrent sweep, or the caller's own earlier delete, may
          * have removed it. */
-        return errno == ENOENT ? 0 : -1;
+        if (errno == ENOENT) return 0;
+        failed(h, path, "lstat");
+        return -1;
+    }
+    /* Never cross into another device than the root's: a mount below the tree is not ours to empty. */
+    if (dev_of(&st, path) != root_dev) {
+        failed(h, path, "mount");
+        return -1;
     }
     if (!S_ISDIR(st.st_mode)) {
         if (unlink(path) != 0) {
@@ -189,8 +212,12 @@ int fsj_rm_rf(const char *path, int depth, const fsj_hooks_t *h) {
                     }
                     if (errno != EBUSY) break;
                 }
-                if (!freed) return -1;
+                if (!freed) {
+                    failed(h, path, "unlink");
+                    return -1;
+                }
             } else {
+                failed(h, path, "unlink");
                 return -1;
             }
         }
@@ -199,7 +226,10 @@ int fsj_rm_rf(const char *path, int depth, const fsj_hooks_t *h) {
         return 0;
     }
     d = opendir(path);
-    if (!d) return -1;
+    if (!d) {
+        failed(h, path, "opendir");
+        return -1;
+    }
     while ((e = readdir(d)) != NULL) {
         int n, sub_rc;
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
@@ -209,25 +239,39 @@ int fsj_rm_rf(const char *path, int depth, const fsj_hooks_t *h) {
         }
         n = snprintf(sub, sizeof sub, "%s/%s", path, e->d_name);
         if (n < 0 || (size_t)n >= sizeof sub) {
+            failed(h, path, "path too long");
             rc = -1;
+            child_failed = 1;
             break;
         }
-        sub_rc = fsj_rm_rf(sub, depth + 1, h);
+        sub_rc = rm_rf_in(sub, depth + 1, h, root_dev);
         if (sub_rc == -2) {
             rc = -2;
             break;
         }
-        if (sub_rc != 0) rc = -1; /* keep going; best effort */
+        if (sub_rc != 0) {
+            rc = -1; /* keep going; best effort */
+            child_failed = 1;
+        }
     }
     closedir(d);
     /* A cancelled delete leaves the directory the user clicked Stop on, so they can see what
      * is left. ENOENT on rmdir means it is already gone: success. */
-    if (rc != -2 && rmdir(path) != 0 && errno != ENOENT) rc = -1;
+    if (rc != -2 && rmdir(path) != 0 && errno != ENOENT) {
+        if (!child_failed) failed(h, path, "rmdir"); /* a folder kept only by a failed child is not a new failure */
+        rc = -1;
+    }
     if (rc == 0) fsync_parent_dir(path);
     return rc;
 }
 
-int fsj_chmod_rf(const char *path, unsigned mode, int depth, const fsj_hooks_t *h) {
+int fsj_rm_rf(const char *path, int depth, const fsj_hooks_t *h) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return errno == ENOENT ? 0 : -1;
+    return rm_rf_in(path, depth, h, dev_of(&st, path));
+}
+
+static int chmod_rf_in(const char *path, unsigned mode, int depth, const fsj_hooks_t *h, dev_t root_dev) {
     struct stat st;
     DIR *d;
     struct dirent *e;
@@ -236,24 +280,38 @@ int fsj_chmod_rf(const char *path, unsigned mode, int depth, const fsj_hooks_t *
 
     if (depth > MAX_DEPTH) return -1;
     if (cancelled(h)) return -2;
-    if (lstat(path, &st) != 0) return -1;
+    if (lstat(path, &st) != 0) {
+        failed(h, path, "lstat");
+        return -1;
+    }
+    if (dev_of(&st, path) != root_dev) {
+        failed(h, path, "mount");
+        return -1;
+    }
     /* chmod first, then descend: a partial failure still updated the top. */
-    if (chmod(path, (mode_t)mode) != 0) rc = -1;
+    if (chmod(path, (mode_t)mode) != 0) {
+        failed(h, path, "chmod");
+        rc = -1;
+    }
     if (!S_ISDIR(st.st_mode)) {
         visited(h, 0); /* progress counts what the size walk counted: non-directories */
         return rc;
     }
     d = opendir(path);
-    if (!d) return -1;
+    if (!d) {
+        failed(h, path, "opendir");
+        return -1;
+    }
     while ((e = readdir(d)) != NULL) {
         int n, sub_rc;
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
         n = snprintf(sub, sizeof sub, "%s/%s", path, e->d_name);
         if (n < 0 || (size_t)n >= sizeof sub) {
+            failed(h, path, "path too long");
             rc = -1;
             break;
         }
-        sub_rc = fsj_chmod_rf(sub, mode, depth + 1, h);
+        sub_rc = chmod_rf_in(sub, mode, depth + 1, h, root_dev);
         if (sub_rc == -2) {
             rc = -2;
             break;
@@ -264,7 +322,14 @@ int fsj_chmod_rf(const char *path, unsigned mode, int depth, const fsj_hooks_t *
     return rc;
 }
 
-int fsj_tree_size(const char *path, uint64_t *bytes, uint64_t *files, int depth, const fsj_hooks_t *h) {
+int fsj_chmod_rf(const char *path, unsigned mode, int depth, const fsj_hooks_t *h) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return -1;
+    return chmod_rf_in(path, mode, depth, h, dev_of(&st, path));
+}
+
+static int tree_size_in(const char *path, uint64_t *bytes, uint64_t *files, int depth, const fsj_hooks_t *h,
+                        dev_t root_dev) {
     struct stat st;
     DIR *d;
     struct dirent *e;
@@ -272,6 +337,8 @@ int fsj_tree_size(const char *path, uint64_t *bytes, uint64_t *files, int depth,
     if (depth > MAX_DEPTH) return -1;
     if (cancelled(h)) return -2;
     if (lstat(path, &st) != 0) return -1;
+    /* A nested mount is not counted (the removal and the chmod skip it and report it). */
+    if (dev_of(&st, path) != root_dev) return 0;
     if (!S_ISDIR(st.st_mode)) {
         if (S_ISREG(st.st_mode)) *bytes += (uint64_t)st.st_size;
         if (files) (*files)++;
@@ -289,7 +356,7 @@ int fsj_tree_size(const char *path, uint64_t *bytes, uint64_t *files, int depth,
             rc = -1;
             break;
         }
-        sub_rc = fsj_tree_size(sub, bytes, files, depth + 1, h);
+        sub_rc = tree_size_in(sub, bytes, files, depth + 1, h, root_dev);
         if (sub_rc != 0) {
             rc = sub_rc;
             break;
@@ -299,17 +366,120 @@ int fsj_tree_size(const char *path, uint64_t *bytes, uint64_t *files, int depth,
     return rc;
 }
 
-/* ---- the operations ---- */
-
-static int op_cancelled(void *arg) { return ava1_op_cancelled(arg); }
-static void op_file(void *arg, uint64_t bytes) { ava1_op_add(arg, 1, bytes); }
-static const fsj_hooks_t k_op_hooks_tmpl = { op_cancelled, op_file, NULL };
-
-static fsj_hooks_t op_hooks(ava1_op_ctx_t *c) {
-    fsj_hooks_t h = k_op_hooks_tmpl;
-    h.arg = c;
-    return h;
+int fsj_tree_size(const char *path, uint64_t *bytes, uint64_t *files, int depth, const fsj_hooks_t *h) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return -1;
+    return tree_size_in(path, bytes, files, depth, h, dev_of(&st, path));
 }
+
+/* ---- paths ---- */
+
+int fsj_normalize_path(char *path) {
+    char *out = path, *p = path;
+    if (path[0] != '/') return -1;
+    while (*p) {
+        char *start;
+        size_t n;
+        while (*p == '/') p++;
+        if (!*p) break;
+        start = p;
+        while (*p && *p != '/') p++;
+        n = (size_t)(p - start);
+        if (n == 1 && start[0] == '.') continue;
+        if (n == 2 && start[0] == '.' && start[1] == '.') return -1;
+        *out++ = '/';
+        memmove(out, start, n); /* out never passes start: components only shrink */
+        out += n;
+    }
+    if (out == path) *out++ = '/';
+    *out = '\0';
+    return 0;
+}
+
+int fsj_path_is_root(const char *path) {
+    int comps = 0;
+    const char *p = path;
+    int mnt = strncmp(path, "/mnt", 4) == 0 && (path[4] == '/' || path[4] == '\0');
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        comps++;
+        while (*p && *p != '/') p++;
+    }
+    return mnt ? comps < 3 : comps < 2;
+}
+
+int fsj_copy_atomic(const char *src, const char *dst, const fsj_hooks_t *h) {
+    static unsigned g_seq;
+    enum { BLK = 64 * 1024 };
+    char tmp[1100];
+    struct stat st;
+    struct timespec times[2];
+    char *buf;
+    int sfd, dfd, rc = 0;
+    ssize_t n;
+    unsigned seq = __atomic_add_fetch(&g_seq, 1, __ATOMIC_RELAXED);
+    /* Next to dst: the final rename stays in one folder, so it can never cross a device. */
+    if (snprintf(tmp, sizeof tmp, "%s.part%u", dst, seq) >= (int)sizeof tmp) return -1;
+    sfd = open(src, O_RDONLY);
+    if (sfd < 0) return -1;
+    if (fstat(sfd, &st) != 0) {
+        close(sfd);
+        return -1;
+    }
+    dfd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    buf = malloc(BLK);
+    if (dfd < 0 || !buf) {
+        if (dfd >= 0) {
+            close(dfd);
+            unlink(tmp);
+        }
+        close(sfd);
+        free(buf);
+        return -1;
+    }
+    for (;;) {
+        ssize_t off = 0;
+        n = read(sfd, buf, BLK);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            rc = -1;
+            break;
+        }
+        if (n == 0) break;
+        if (cancelled(h)) {
+            rc = -2;
+            break;
+        }
+        while (off < n) {
+            ssize_t w = write(dfd, buf + off, (size_t)(n - off));
+            if (w <= 0) {
+                rc = -1;
+                break;
+            }
+            off += w;
+        }
+        if (rc) break;
+        if (h && h->file) h->file(h->arg, (uint64_t)n);
+        test_delay();
+    }
+    free(buf);
+    close(sfd);
+    if (rc == 0 && fsync(dfd) != 0) rc = -1;
+    if (close(dfd) != 0 && rc == 0) rc = -1;
+    if (rc == 0) {
+        times[0].tv_sec = st.st_atime;
+        times[0].tv_nsec = 0;
+        times[1].tv_sec = st.st_mtime;
+        times[1].tv_nsec = 0;
+        (void)utimensat(AT_FDCWD, tmp, times, 0);
+        if (rename(tmp, dst) != 0) rc = -1; /* same folder: never a cross-device rename */
+    }
+    if (rc != 0) unlink(tmp); /* only the temporary file; dst was never touched */
+    return rc;
+}
+
+/* ---- the operations ---- */
 
 static int may_write(const char *p) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
@@ -330,33 +500,79 @@ static void parent_of(const char *path, char *out, size_t cap) {
     out[n] = '\0';
 }
 
-/* DELETE {"path"}. Refuses a path outside the writable roots and a mount point (a path on a
- * different device than its parent: deleting it would reach into the mounted volume), counts
- * the tree first so progress has a total, then removes it. */
+/* Collects what a walk could not do: the first path and how many entries. */
+typedef struct {
+    ava1_op_ctx_t *c;
+    char first[600];
+    char what[16];
+    uint64_t n;
+} fail_t;
+
+static int fail_cancelled(void *arg) { return ava1_op_cancelled(((fail_t *)arg)->c); }
+static void fail_file(void *arg, uint64_t bytes) { ava1_op_add(((fail_t *)arg)->c, 1, bytes); }
+static void fail_note(void *arg, const char *path, const char *what) {
+    fail_t *f = arg;
+    if (f->n++ == 0) {
+        snprintf(f->first, sizeof f->first, "%s", path);
+        snprintf(f->what, sizeof f->what, "%s", what);
+    }
+}
+
+/* The cause of a partly failed walk: `<token>: <what> <first path> (<n> left)`, cut to the
+ * status line, keeping the END of a long path (the part that tells folders apart). */
+static void fail_message(const fail_t *f, const char *token, const char *unit) {
+    char shown[110];
+    size_t l = strlen(f->first), keep = sizeof shown - 1;
+    if (l > keep) {
+        memcpy(shown, "...", 3);
+        memcpy(shown + 3, f->first + l - (keep - 3), keep - 3);
+        shown[keep] = '\0';
+    } else {
+        memcpy(shown, f->first, l + 1);
+    }
+    ava1_op_message((ava1_op_ctx_t *)f->c, "%s: %s %s (%llu %s)", token, f->what, shown, (unsigned long long)f->n, unit);
+}
+
+/* DELETE {"path"}. The path is normalised first (trailing slashes, `//`, `/./` all spell the
+ * same folder, and the guards below must see that folder, not its spelling). It refuses a root
+ * or a top folder (`/data`, `/mnt/usb0`), anything outside the writable roots, and a mount point:
+ * a path on another device than its parent, or a device that cannot be told (fail closed). The
+ * tree is counted first so progress has a total, then removed; the walk never enters a nested
+ * mount and a partial failure names its first path and how many entries are left. */
 static int op_delete(void *arg, ava1_op_ctx_t *c, const uint8_t *args, size_t n) {
     char path[1024], parent[1024];
     uint64_t bytes = 0, files = 0;
     struct stat st;
-    fsj_hooks_t h = op_hooks(c), walk = h;
-    int rc;
+    fail_t f;
+    fsj_hooks_t h, walk;
+    int rc, dev;
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
     (void)arg;
     (void)n;
+    memset(&f, 0, sizeof f);
+    f.c = c;
+    h.cancelled = fail_cancelled;
+    h.file = fail_file;
+    h.failed = fail_note;
+    h.arg = &f;
+    walk = h;
+    walk.file = NULL;
+    walk.failed = NULL;
     if (!fsj_json_str((const char *)args, "path", path, sizeof path) || !path[0]) {
         ava1_op_message(c, "fs_delete_missing_path");
         return AVA1_ERR_PROTOCOL;
     }
-    if (path[0] != '/' || !may_write(path)) {
+    if (fsj_normalize_path(path) != 0 || fsj_path_is_root(path) || !may_write(path)) {
         ava1_op_message(c, "fs_delete_path_not_allowed");
         return AVA1_ERR_PATH;
     }
     parent_of(path, parent, sizeof parent);
-    if (cfg->same_device && cfg->same_device(path, parent) == 0) {
-        ava1_op_message(c, "fs_delete_path_is_mount_point");
+    dev = cfg->same_device ? cfg->same_device(path, parent) : -1;
+    if (dev != 1) { /* 0: a mount point; -1: cannot tell, which is not "safe" */
+        ava1_op_message(c, dev == 0 ? "fs_delete_path_is_mount_point" : "fs_delete_device_unknown");
         return AVA1_ERR_PATH;
     }
     if (lstat(path, &st) != 0 && errno == ENOENT) return AVA1_STATUS_OK; /* nothing to do */
-    walk.file = NULL; /* the walk counts; only the removal reports progress */
     ava1_op_message(c, "counting");
     rc = fsj_tree_size(path, &bytes, &files, 0, &walk);
     if (rc == -2) {
@@ -375,26 +591,38 @@ static int op_delete(void *arg, ava1_op_ctx_t *c, const uint8_t *args, size_t n)
         return AVA1_ERR_CANCELLED;
     }
     if (rc != 0) {
-        ava1_op_message(c, "fs_delete_failed");
+        if (f.n) fail_message(&f, "fs_delete_failed", "left");
+        else ava1_op_message(c, "fs_delete_failed");
         return AVA1_ERR_IO;
     }
     ava1_op_message(c, "%s", "");
     return AVA1_STATUS_OK;
 }
 
-/* CHMOD_R {"path","mode":"0755"}: the recursive form of fs.chmod. */
+/* CHMOD_R {"path","mode":"0755"}: the recursive form of fs.chmod. The path is normalised; the
+ * walk stays on the root's device and names its first failure. */
 static int op_chmod_r(void *arg, ava1_op_ctx_t *c, const uint8_t *args, size_t n) {
     char path[1024], mode_s[16];
     uint64_t bytes = 0, files = 0, mode;
-    fsj_hooks_t h = op_hooks(c), walk = h;
+    fail_t f;
+    fsj_hooks_t h, walk;
     int rc;
     (void)arg;
     (void)n;
+    memset(&f, 0, sizeof f);
+    f.c = c;
+    h.cancelled = fail_cancelled;
+    h.file = fail_file;
+    h.failed = fail_note;
+    h.arg = &f;
+    walk = h;
+    walk.file = NULL;
+    walk.failed = NULL;
     if (!fsj_json_str((const char *)args, "path", path, sizeof path) || !path[0]) {
         ava1_op_message(c, "fs_chmod_missing_path");
         return AVA1_ERR_PROTOCOL;
     }
-    if (path[0] != '/' || !may_write(path)) {
+    if (fsj_normalize_path(path) != 0 || !may_write(path)) {
         ava1_op_message(c, "fs_chmod_path_not_allowed");
         return AVA1_ERR_PATH;
     }
@@ -404,7 +632,6 @@ static int op_chmod_r(void *arg, ava1_op_ctx_t *c, const uint8_t *args, size_t n
     }
     mode = strtoull(mode_s, NULL, 8); /* octal text, as the legacy handler read it */
     if (mode > 07777) mode = 07777;
-    walk.file = NULL;
     if ((rc = fsj_tree_size(path, &bytes, &files, 0, &walk)) == 0) ava1_op_set_total(c, files, bytes);
     else if (rc == -2) {
         ava1_op_message(c, "fs_chmod_cancelled");
@@ -418,7 +645,8 @@ static int op_chmod_r(void *arg, ava1_op_ctx_t *c, const uint8_t *args, size_t n
         return AVA1_ERR_CANCELLED;
     }
     if (rc != 0) {
-        ava1_op_message(c, "fs_chmod_failed");
+        if (f.n) fail_message(&f, "fs_chmod_failed", "failed");
+        else ava1_op_message(c, "fs_chmod_failed");
         return AVA1_ERR_IO;
     }
     return AVA1_STATUS_OK;

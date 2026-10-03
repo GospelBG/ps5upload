@@ -1601,11 +1601,7 @@ pub fn reconcile(
                     // 30 s socket timeout would multiply N files × 30 s
                     // on a crashed payload — at hundreds of files the
                     // user would think the app is dead.
-                    match fs_hash_with_timeout(
-                        addr,
-                        &remote_path,
-                        Some(std::time::Duration::from_secs(10)),
-                    ) {
+                    match hash_remote_waiting_out_busy(addr, &remote_path)? {
                         Ok(r) => local_hash != r.hash,
                         Err(e) => {
                             crate::core_log!(
@@ -1640,6 +1636,31 @@ pub fn reconcile(
         already_present,
         bytes_already_present,
     })
+}
+
+/// `ERR_BUSY` (AVA1 status 8): the console has no free job slot or operation worker right now.
+const STATUS_BUSY: u16 = 8;
+
+/// Hashes one remote file for the reconcile. A busy console is not an answer about the file:
+/// waiting it out (up to ~15 s) is right, and giving up is an error of the whole reconcile, never a
+/// silent "unverified, must re-send" (which would re-upload everything while the console is merely
+/// working). Any other failure is the inner `Err`, which the caller treats as unverified.
+fn hash_remote_waiting_out_busy(addr: &str, remote_path: &str) -> Result<Result<HashResult>> {
+    for attempt in 0..60 {
+        match fs_hash_with_timeout(addr, remote_path, Some(std::time::Duration::from_secs(10))) {
+            Err(e)
+                if e.downcast_ref::<mgmt::MgmtError>()
+                    .is_some_and(|m| m.status == STATUS_BUSY) =>
+            {
+                if attempt == 59 {
+                    return Err(e.context("reconcile: the console stayed busy"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            r => return Ok(r),
+        }
+    }
+    unreachable!("the loop returns on its last attempt")
 }
 
 /// Stream a local file through BLAKE3 in 64 KiB chunks. Mirrors the
@@ -2029,5 +2050,58 @@ mod tests {
         assert!(!inv.contains_key(".git/HEAD"));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A console that answers `ERR_BUSY` to the first `busy` hash jobs, then hashes.
+    struct BusyThenOk {
+        busy: std::sync::atomic::AtomicUsize,
+    }
+
+    impl mgmt::MgmtTransport for BusyThenOk {
+        fn call(
+            &self,
+            _: &str,
+            _: mgmt::Method,
+            _: &str,
+            _: &[u8],
+            _: std::time::Duration,
+        ) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn run_job(
+            &self,
+            _: &str,
+            _: mgmt::JobOp,
+            label: &str,
+            _: &[u8],
+            _: &mgmt::JobCall<'_>,
+        ) -> Result<Option<Vec<u8>>> {
+            use std::sync::atomic::Ordering;
+            if self
+                .busy
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(mgmt::MgmtError {
+                    label: label.into(),
+                    status: STATUS_BUSY,
+                    cause: "the job table is full".into(),
+                }
+                .into());
+            }
+            Ok(Some(br#"{"path":"/p","size":1,"hash":"ab"}"#.to_vec()))
+        }
+    }
+
+    #[test]
+    fn a_busy_console_is_waited_out_never_read_as_must_resend() {
+        let _g = mgmt::scoped_transport(std::sync::Arc::new(BusyThenOk { busy: 3.into() }));
+        let r = hash_remote_waiting_out_busy("c:1", "/p").unwrap().unwrap();
+        assert_eq!(r.hash, "ab");
+        // Busy for good is an error of the whole reconcile, not an `Ok(Err(..))` the caller would
+        // turn into "unverified".
+        let _g = mgmt::scoped_transport(std::sync::Arc::new(BusyThenOk { busy: 1000.into() }));
+        assert!(hash_remote_waiting_out_busy("c:1", "/p").is_err());
     }
 }

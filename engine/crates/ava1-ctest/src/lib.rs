@@ -298,6 +298,12 @@ pub mod ffi {
         pub fn ava1_test_data_clamp(start: u8, min: u8, max: u8, out: *mut c_int);
         pub fn ava1_test_set_same_device(v: c_int);
         pub fn ava1_test_fsj_delay_us(us: u32);
+        pub fn ava1_test_fsj_cross_name(name: *const c_char);
+        pub fn ava1_test_copy_atomic(
+            src: *const c_char,
+            dst: *const c_char,
+            blocks: c_int,
+        ) -> c_int;
         pub fn ava1_test_reap_far();
         pub fn ava1_test_mgmt_install() -> c_int;
         pub fn ava1_test_mgmt_install_duplicate() -> c_int;
@@ -1166,6 +1172,21 @@ pub fn c_data_clamp(start: u8, min: u8, max: u8) -> ([i32; 3], i32, i32) {
 thread_local! {
     /// The same_device answer the next `CApplyJob::begin` on this thread installs.
     static SAME_DEVICE: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
+}
+
+/// A folder or file with this base name reports another device than its parent (a mount point)
+/// to the walkers' device guard; "" turns it off (every data start does).
+pub fn c_set_cross_name(name: &str) {
+    let c = std::ffi::CString::new(name).unwrap();
+    unsafe { ffi::ava1_test_fsj_cross_name(c.as_ptr()) }
+}
+
+/// `fsj_copy_atomic(src, dst)` with a cancel after `blocks` 64 KiB blocks (negative: never):
+/// 0, -1 or -2 (cancelled).
+pub fn c_copy_atomic(src: &std::path::Path, dst: &std::path::Path, blocks: i32) -> i32 {
+    let s = std::ffi::CString::new(src.to_str().unwrap()).unwrap();
+    let d = std::ffi::CString::new(dst.to_str().unwrap()).unwrap();
+    unsafe { ffi::ava1_test_copy_atomic(s.as_ptr(), d.as_ptr(), blocks) }
 }
 
 /// Runs the payload's reaper as if an hour had passed: finished jobs are collected, running

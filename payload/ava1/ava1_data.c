@@ -1018,8 +1018,10 @@ int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *o
             ava1_job_put(j);
             return AVA1_ERR_UNKNOWN_JOB;
         }
-        if (method == AVA1_METHOD_JOB_STATUS) st = encode_status(j, out, cap, out_len);
-        else if (j->kind == AVA1_JOB_OPKIND) ava1_op_cancel(j); /* an operation: stays listed, finished */
+        if (method == AVA1_METHOD_JOB_STATUS) {
+            st = encode_status(j, out, cap, out_len);
+            if (st == AVA1_STATUS_OK && j->kind == AVA1_JOB_OPKIND) ava1_op_status_delivered(j);
+        } else if (j->kind == AVA1_JOB_OPKIND) ava1_op_cancel(j); /* an operation: stays listed, finished */
         else ava1_recv_cancel(j); /* stops it and unlists it: the journal stays */
         ava1_job_put(j);
         return st;

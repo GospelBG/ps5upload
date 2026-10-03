@@ -35,8 +35,16 @@ use crate::upload::hex;
 
 /// Between two status polls.
 pub const POLL: Duration = Duration::from_millis(500);
-/// The first poll comes sooner: a delete of one file is done by then.
-const FIRST_POLL: Duration = Duration::from_millis(100);
+/// The first polls come sooner (a hash of one small file is done in milliseconds): 20, 50, 100,
+/// 250 ms, then [`POLL`].
+const EARLY_POLLS: [Duration; 4] = [
+    Duration::from_millis(20),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+];
+/// How long a progress query waits for the console to list the job (the run reply not yet in).
+const LISTED_WAIT: Duration = Duration::from_secs(3);
 /// Consecutive times the console may forget a job we started before the call gives up.
 const REISSUE_LIMIT: u32 = 3;
 /// One status or cancel call may take this long (they answer in milliseconds).
@@ -56,12 +64,18 @@ pub fn op_id_of(job: &[u8; 16]) -> u64 {
     u64::from_le_bytes(job[8..].try_into().expect("8 bytes"))
 }
 
+/// What the polling loop last saw of the job (`listed` is false until the console answered `job.run`).
+#[derive(Default)]
+struct Shared {
+    listed: bool,
+    last: JobProgress,
+}
+
 struct Entry {
     host: String,
     job_id: [u8; 16],
-    kind: &'static str,
-    subject: String,
     cancel: Arc<AtomicBool>,
+    shared: Arc<Mutex<Shared>>,
 }
 
 fn registry() -> &'static Mutex<HashMap<u64, Entry>> {
@@ -141,14 +155,21 @@ impl AvaTransport {
         let nonce = ava1::keys::random_bytes::<8>()?;
         let job_id = op_job_id(call.op_id, nonce);
         let cancel = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Mutex::new(Shared {
+            listed: false,
+            last: JobProgress {
+                kind: op.kind.to_string(),
+                subject: call.subject.to_string(),
+                ..JobProgress::default()
+            },
+        }));
         let _registered = register(
             call.op_id,
             Entry {
                 host: host_of(console),
                 job_id,
-                kind: op.kind,
-                subject: call.subject.to_string(),
-                cancel,
+                cancel: cancel.clone(),
+                shared: shared.clone(),
             },
         )?;
         let run = JobRun {
@@ -164,6 +185,13 @@ impl AvaTransport {
         loop {
             let now = Instant::now();
             if now >= deadline {
+                // Give up cleanly: the console would otherwise keep deleting or hashing for
+                // nobody. Best effort; a job it no longer has is fine.
+                if issued {
+                    let _ = self
+                        .rpc(console, gen::METHOD_JOB_CANCEL, label, &by_id, RPC_TIMEOUT)
+                        .await;
+                }
                 return Err(anyhow!(
                     "{label}: no result after {:?}; the operation may still be running on the console (job {})",
                     call.deadline,
@@ -182,6 +210,19 @@ impl AvaTransport {
                     issued = true;
                     backoff = Duration::from_millis(250);
                     polls += 1;
+                    {
+                        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        sh.listed = true;
+                        sh.last = JobProgress {
+                            kind: op.kind.to_string(),
+                            subject: call.subject.to_string(),
+                            files_done: st.files_done as u64,
+                            files_total: st.files_total as u64,
+                            bytes_done: st.bytes_durable,
+                            bytes_total: st.bytes_total,
+                            cancel_requested: cancel.load(Ordering::Relaxed),
+                        };
+                    }
                     match st.state {
                         Some(1) => return Ok(Some(st.result.unwrap_or_default())),
                         Some(0) | None => {}
@@ -219,69 +260,41 @@ impl AvaTransport {
                     }
                 },
             }
-            let pause = if polls <= 1 { FIRST_POLL } else { POLL };
+            let pause = EARLY_POLLS
+                .get(polls.saturating_sub(1) as usize)
+                .copied()
+                .unwrap_or(POLL);
             tokio::time::sleep(pause.min(deadline.saturating_duration_since(Instant::now()))).await;
         }
     }
 
     /// The progress of the operation running under `op_id`; `None` when this process runs none.
+    /// It is what the polling loop last saw (no extra call, so it never takes a slot or races the
+    /// job's release). A query that arrives before the console answered `job.run` waits for it
+    /// rather than reporting zero progress for a job that is simply not listed yet.
     pub(crate) async fn job_progress_async(
         &self,
         console: &str,
         op_id: u64,
     ) -> Result<Option<JobProgress>> {
-        let (host, job_id, kind, subject, cancel) = {
+        let (shared, cancel) = {
             let r = registry().lock().unwrap_or_else(|e| e.into_inner());
             match r.get(&op_id) {
-                Some(e) => (
-                    e.host.clone(),
-                    e.job_id,
-                    e.kind,
-                    e.subject.clone(),
-                    e.cancel.load(Ordering::Relaxed),
-                ),
-                None => return Ok(None),
+                Some(e) if e.host == host_of(console) => (e.shared.clone(), e.cancel.clone()),
+                _ => return Ok(None),
             }
         };
-        if host != host_of(console) {
-            return Ok(None);
-        }
-        let by_id = JobRef { job_id }.to_bytes()?;
-        match self
-            .rpc(
-                console,
-                gen::METHOD_JOB_STATUS,
-                "FS_OP_STATUS",
-                &by_id,
-                RPC_TIMEOUT,
-            )
-            .await
-        {
-            Ok(reply) => {
-                let st = Status::decode(&reply)?;
-                Ok(Some(JobProgress {
-                    kind: kind.to_string(),
-                    subject,
-                    files_done: st.files_done as u64,
-                    files_total: st.files_total as u64,
-                    bytes_done: st.bytes_durable,
-                    bytes_total: st.bytes_total,
-                    cancel_requested: cancel,
-                }))
-            }
-            // Not started yet (the poll raced `job.run`) or already collected: nothing to show.
-            Err(e)
-                if e.downcast_ref::<MgmtError>()
-                    .is_some_and(|m| m.status == gen::ERR_UNKNOWN_JOB) =>
+        let until = Instant::now() + LISTED_WAIT;
+        loop {
             {
-                Ok(Some(JobProgress {
-                    kind: kind.to_string(),
-                    subject,
-                    cancel_requested: cancel,
-                    ..JobProgress::default()
-                }))
+                let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                if sh.listed || Instant::now() >= until {
+                    let mut p = sh.last.clone();
+                    p.cancel_requested = cancel.load(Ordering::Relaxed);
+                    return Ok(Some(p));
+                }
             }
-            Err(e) => Err(e),
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -347,9 +360,8 @@ mod tests {
             Entry {
                 host: "10.0.0.1".into(),
                 job_id: op_job_id(424_242, [1; 8]),
-                kind: "fs_delete",
-                subject: "/data/x".into(),
                 cancel: Arc::default(),
+                shared: Arc::default(),
             },
         )
         .unwrap();
@@ -360,9 +372,8 @@ mod tests {
             Entry {
                 host: "x".into(),
                 job_id: [0; 16],
-                kind: "k",
-                subject: String::new(),
-                cancel: Arc::default()
+                cancel: Arc::default(),
+                shared: Arc::default()
             }
         )
         .is_err());
@@ -374,9 +385,8 @@ mod tests {
             Entry {
                 host: "x".into(),
                 job_id: [0; 16],
-                kind: "k",
-                subject: String::new(),
                 cancel: Arc::default(),
+                shared: Arc::default(),
             },
         )
         .unwrap();

@@ -1197,9 +1197,13 @@ int ava1_test_apply_dup_on_commit(uint32_t id, uint64_t off, const uint8_t *d, s
 /* Read by the data layer's same_device hook from the job's threads. */
 void ava1_test_set_same_device(int v) { __atomic_store_n(&g_same_device, v, __ATOMIC_SEQ_CST); }
 static int t_same_device(const char *a, const char *b) {
-    (void)a;
-    (void)b;
-    return __atomic_load_n(&g_same_device, __ATOMIC_SEQ_CST);
+    int v = __atomic_load_n(&g_same_device, __ATOMIC_SEQ_CST);
+    if (v == 2) { /* "a mount": the path is on another device than any different folder */
+        char ra[1024], rb[1024];
+        if (!realpath(a, ra) || !realpath(b, rb)) return -1;
+        return strcmp(ra, rb) == 0 ? 1 : 0;
+    }
+    return v;
 }
 static int g_deny_write;
 static uint8_t g_kind = AVA1_JOB_UPLOAD, g_owner = 1; /* the receiver driver's JobOpen */
@@ -1705,10 +1709,35 @@ static void install_ops(void) {
     fsj_register_ops();
     (void)mgmt_rpc_install_ops(k_stub_ops, sizeof k_stub_ops / sizeof k_stub_ops[0]);
     __atomic_store_n(&fsj_test_file_delay_us, 0, __ATOMIC_SEQ_CST);
+    fsj_test_cross_name = NULL;
 }
 
 /* Runs the reaper as if an hour had passed: finished jobs go, running ones stay. */
 void ava1_test_reap_far(void) { ava1_job_reap(ava1_mono_ms() + 3600u * 1000u); }
+
+static char g_cross_name[64];
+/* A folder with this base name reports another device (a mount point); NULL or "" = off. */
+void ava1_test_fsj_cross_name(const char *name) {
+    if (!name || !name[0]) {
+        fsj_test_cross_name = NULL;
+        return;
+    }
+    snprintf(g_cross_name, sizeof g_cross_name, "%s", name);
+    fsj_test_cross_name = g_cross_name;
+}
+
+static int g_cab_left;
+static int cab_cancelled(void *arg) {
+    (void)arg;
+    return --g_cab_left < 0;
+}
+
+/* fsj_copy_atomic with a cancel after `blocks` blocks (negative: never). */
+int ava1_test_copy_atomic(const char *src, const char *dst, int blocks) {
+    fsj_hooks_t h = { cab_cancelled, NULL, NULL, NULL };
+    g_cab_left = blocks < 0 ? 1 << 30 : blocks;
+    return fsj_copy_atomic(src, dst, &h);
+}
 
 void ava1_test_fsj_delay_us(uint32_t us) { __atomic_store_n(&fsj_test_file_delay_us, us, __ATOMIC_SEQ_CST); }
 

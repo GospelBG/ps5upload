@@ -59,6 +59,8 @@ struct Script {
     forget_at: Option<u32>,
     /// `job.run` answers this status instead (busy, unknown method).
     run_refused: Option<u16>,
+    /// `job.run` takes this long to answer (the job is not listed until it does).
+    run_delay_ms: u64,
 }
 
 #[derive(Default)]
@@ -99,6 +101,12 @@ fn status(job_id: [u8; 16], state: u8, polls: u32, current: Option<&str>) -> Sta
 }
 
 fn handle(c: &Mutex<Console>, method: u16, body: &[u8]) -> RpcReply {
+    if method == gen::METHOD_JOB_RUN {
+        let delay = c.lock().unwrap().script.run_delay_ms;
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay)); // not listed until it answers
+        }
+    }
     let mut c = c.lock().unwrap();
     match method {
         gen::METHOD_JOB_RUN => {
@@ -106,6 +114,7 @@ fn handle(c: &Mutex<Console>, method: u16, body: &[u8]) -> RpcReply {
             if let Some(s) = c.script.run_refused {
                 return err(s, "refused");
             }
+
             c.runs.push((r.op, r.args.clone()));
             let j = c.jobs.entry(r.job_id).or_insert_with(|| Job {
                 op: r.op,
@@ -491,7 +500,7 @@ async fn a_job_the_console_forgot_is_started_again_except_a_snapshot() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_wait_ends_at_the_callers_deadline_and_says_the_job_may_still_run() {
-    let (t, _p, c, _st) = console("deadline", Script::default()).await;
+    let (t, _p, c, st) = console("deadline", Script::default()).await;
     let started = Instant::now();
     let e = run_op(
         &t,
@@ -510,6 +519,57 @@ async fn the_wait_ends_at_the_callers_deadline_and_says_the_job_may_still_run() 
         "{msg}"
     );
     assert!(started.elapsed() < Duration::from_secs(4));
+    // Giving up cancels the job on the console: nobody is waiting for it any more.
+    assert_eq!(st.lock().unwrap().cancels, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_progress_query_before_the_job_is_listed_waits_instead_of_reading_zero() {
+    let (t, _p, c, _st) = console(
+        "unlisted",
+        Script {
+            finish_at: 1_000,
+            run_delay_ms: 500,
+            ..Script::default()
+        },
+    )
+    .await;
+    let (t2, c2) = (t.clone(), c.clone());
+    let runner = tokio::spawn(async move {
+        run_op(
+            &t2,
+            &c2,
+            ops::DELETE,
+            "{}",
+            9_300,
+            "/data/g",
+            Duration::from_secs(3),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await; // the run call is in flight, unanswered
+    let started = Instant::now();
+    let (t3, c3) = (t.clone(), c.clone());
+    let p = tokio::task::spawn_blocking(move || t3.job_progress(&c3, 9_300))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .expect("the op is registered");
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "waited for the listing: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        p.files_total, 100,
+        "the console's own numbers, not a zeroed placeholder"
+    );
+    assert_eq!(
+        (p.kind.as_str(), p.subject.as_str()),
+        ("fs_delete", "/data/g")
+    );
+    let _ = runner.await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

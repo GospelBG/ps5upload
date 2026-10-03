@@ -212,15 +212,28 @@ int ava1_op_encode_status(ava1_job_t *j, uint8_t *out, size_t cap, size_t *out_l
     return rc == 0 ? AVA1_STATUS_OK : AVA1_ERR_INTERNAL;
 }
 
+/* Signals and returns: this runs on a session's reader or an RPC worker, which must not
+ * wait on a worker thread. The engine polls job.status, which reports `state 2 / ERR_CANCELLED`
+ * as soon as the operation stops (a delete, chmod, hash, crc32 or backup within one entry or
+ * block; fsck, cleanup and sdk.scan are one system call and only honour a cancel before they start). */
 void ava1_op_cancel(ava1_job_t *j) {
     op_t *o = op_of(j);
-    int i;
     if (!o) return;
     __atomic_store_n(&o->ctx.cancel, 1, __ATOMIC_RELEASE);
-    /* Most operations stop within a directory entry or a read block: give the worker a
-     * moment so the caller's next job.status already says how it ended. One stuck in a
-     * system call just keeps running; the flag is read when it returns. */
-    for (i = 0; i < 200 && !__atomic_load_n(&j->finished, __ATOMIC_ACQUIRE); i++) ava1_platform_sleep_ms(10);
+}
+
+/* The operations whose repeat gives the same outcome: their finished job is released as soon as
+ * its terminal status was read (the engine has the answer; keeping 8 or 32 of them would let a
+ * loop of hashes fill the job table). A backup snapshot or restore is kept for the done-age
+ * instead, because a re-run after a lost reply would take a second snapshot. */
+static int releasable(const op_t *o) { return o->op != AVA1_JOB_OP_BACKUP_SNAPSHOT && o->op != AVA1_JOB_OP_BACKUP_RESTORE; }
+
+void ava1_op_status_delivered(ava1_job_t *j) {
+    op_t *o = op_of(j);
+    uint8_t id[16];
+    if (!o || !__atomic_load_n(&j->finished, __ATOMIC_ACQUIRE) || !releasable(o)) return;
+    memcpy(id, j->id, 16);
+    ava1_job_free_one(id); /* unlists; the caller's reference still holds it until it returns */
 }
 
 int ava1_op_run_rpc(const uint8_t *body, uint32_t len, const uint8_t owner[32], uint8_t *out, size_t cap,
@@ -248,6 +261,7 @@ int ava1_op_run_rpc(const uint8_t *body, uint32_t len, const uint8_t owner[32], 
             rc = AVA1_ERR_PROTOCOL;
         } else {
             rc = ava1_op_encode_status(j, out, cap, out_len);
+            if (rc == AVA1_STATUS_OK) ava1_op_status_delivered(j);
         }
         ava1_job_put(j);
         pthread_mutex_unlock(&g_run_mu);
@@ -307,6 +321,7 @@ int ava1_op_run_rpc(const uint8_t *body, uint32_t len, const uint8_t owner[32], 
     }
     o->started = 1;
     rc = ava1_op_encode_status(j, out, cap, out_len);
+    if (rc == AVA1_STATUS_OK) ava1_op_status_delivered(j); /* an op that already finished */
     ava1_job_put(j);
     pthread_mutex_unlock(&g_run_mu);
     return rc;

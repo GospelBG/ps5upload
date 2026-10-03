@@ -147,23 +147,22 @@ async fn delete_tree_returns_immediately_and_reports_progress() {
     );
     assert_eq!(st.unwrap().state, Some(0), "still running");
     let (mut seen, mut last) = (Vec::new(), 0);
-    loop {
+    let done = loop {
         let s = status(&r.me, id(1)).await;
         if s.state.unwrap_or(0) != 0 {
-            break;
+            break s; // read once: a delete is released when its terminal status was read
         }
         if s.files_done > last {
             seen.push(s.files_done);
             last = s.files_done;
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
-    }
+    };
     assert!(
         seen.len() >= 3,
         "progress should rise across polls: {seen:?}"
     );
     assert!(seen.windows(2).all(|w| w[0] < w[1]));
-    let done = status(&r.me, id(1)).await;
     assert_eq!(done.state, Some(1));
     assert_eq!(done.files_total, 5000);
     assert_eq!(done.files_done, 5000);
@@ -191,9 +190,15 @@ async fn cancel_stops_a_delete_midway_and_the_job_is_collected_after() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let t0 = Instant::now();
     assert_eq!(cancel(&r.me, id(2)).await, gen::STATUS_OK);
-    let st = status(&r.me, id(2)).await;
-    assert_eq!(st.state, Some(2), "cancel returns once the worker stopped");
+    assert!(
+        t0.elapsed() < Duration::from_millis(100),
+        "cancel signals and returns: {:?}",
+        t0.elapsed()
+    );
+    let st = finished(&r.me, id(2)).await;
+    assert_eq!(st.state, Some(2), "the worker stops at its next entry");
     assert_eq!(st.code, Some(gen::ERR_CANCELLED));
     assert!(st.files_done < 3000);
     let left = count_files(&tree);
@@ -272,10 +277,10 @@ async fn repeat_job_run_is_idempotent() {
     );
     let done = finished(&r.me, id(5)).await;
     assert_eq!(done.state, Some(1));
-    // After it finished, a repeat still answers with that finished job (no second delete).
-    let (code, st) = run(&r.me, id(5), gen::JOB_OP_DELETE, &a).await;
+    // Released once read: a repeat is simply a new run (the tree is gone, so it is a no-op success).
+    let (code, _) = run(&r.me, id(5), gen::JOB_OP_DELETE, &a).await;
     assert_eq!(code, gen::STATUS_OK);
-    assert_eq!(st.unwrap().state, Some(1));
+    assert_eq!(finished(&r.me, id(5)).await.state, Some(1));
     drop(r.srv);
 }
 
@@ -337,7 +342,11 @@ async fn a_failure_midway_is_state_2_with_the_cause_and_the_rest_deleted() {
     std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(st.state, Some(2));
     assert_eq!(st.code, Some(gen::ERR_IO));
-    assert_eq!(st.current.as_deref(), Some("fs_delete_failed"));
+    assert!(st
+        .current
+        .as_deref()
+        .unwrap()
+        .starts_with("fs_delete_failed"));
     assert_eq!(
         count_files(&tree),
         n_stuck,
@@ -451,8 +460,8 @@ async fn hash_result_rides_in_status_ext() {
     assert_eq!(v["size"], 300_000);
     assert_eq!(v["path"], f.to_str().unwrap());
     assert_eq!(st.bytes_total, 300_000);
-    // The result is still there on a later poll.
-    assert!(status(&r.me, id(30)).await.result.is_some());
+    // A hash is repeatable, so its job was released when the terminal status was read.
+    assert_eq!(status_code(&r.me, id(30)).await, gen::ERR_UNKNOWN_JOB);
     // A folder is not hashable, a missing file fails with a cause.
     run(&r.me, id(31), gen::JOB_OP_HASH, &delete_args(&r.d)).await;
     let st = finished(&r.me, id(31)).await;
@@ -517,7 +526,7 @@ async fn crc32_of_a_large_file_is_a_job_that_can_be_cancelled() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(cancel(&r.me, id(41)).await, gen::STATUS_OK);
-    let st = status(&r.me, id(41)).await;
+    let st = finished(&r.me, id(41)).await;
     assert_eq!((st.state, st.code), (Some(2), Some(gen::ERR_CANCELLED)));
     assert!(st.bytes_durable < 1_000_000);
     assert!(st.result.is_none());
@@ -597,7 +606,7 @@ async fn backup_snapshot_reports_progress_and_cancel_stops_it() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(cancel(&r.me, id(61)).await, gen::STATUS_OK);
-    let st = status(&r.me, id(61)).await;
+    let st = finished(&r.me, id(61)).await;
     assert_eq!((st.state, st.code), (Some(2), Some(gen::ERR_CANCELLED)));
     assert_eq!(st.current.as_deref(), Some("backup_cancelled"));
     assert!(st.files_done < 500);
@@ -703,6 +712,12 @@ async fn at_most_eight_operations_run_at_once_and_an_unknown_op_is_refused() {
     for n in 0..8u8 {
         assert_eq!(cancel(&r.me, id(100 + n)).await, gen::STATUS_OK);
     }
+    for n in 0..8u8 {
+        assert_eq!(
+            finished(&r.me, id(100 + n)).await.code,
+            Some(gen::ERR_CANCELLED)
+        );
+    }
     // Slots free up as they end.
     assert_eq!(
         run(&r.me, id(121), gen::JOB_OP_FSCK, r#"{"device":"/dev/md1"}"#)
@@ -725,5 +740,220 @@ async fn a_job_run_with_an_oversize_or_malformed_body_is_a_protocol_error() {
     let s = r.me.rpc(gen::METHOD_JOB_RUN, &[1, 2, 3]).await.unwrap();
     assert_eq!(s.status, gen::ERR_PROTOCOL);
     assert!(list(&r.me).await.is_empty());
+    drop(r.srv);
+}
+
+// ---- fix round 1 ----
+
+/// Starts a delete and returns how it ended.
+async fn delete_outcome(r: &Rig, n: u8, path: &str) -> Status {
+    run(
+        &r.me,
+        id(n),
+        gen::JOB_OP_DELETE,
+        &serde_json::json!({ "path": path }).to_string(),
+    )
+    .await;
+    finished(&r.me, id(n)).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn roots_and_trailing_slash_spellings_are_refused_and_nothing_is_deleted() {
+    let r = rig("jr-roots").await;
+    // The usual spellings of a drive or a writable root, none of which may be emptied.
+    let mut n = 200u8;
+    for p in [
+        "/mnt/usb0/",
+        "/data/",
+        "/user/",
+        "/mnt/usb0//",
+        "/mnt/usb0/.",
+        "/data/./",
+        "/data",
+        "/mnt/ext1",
+        "//data//",
+        "/",
+        "/mnt",
+        "/mnt/usb0/./",
+    ] {
+        n += 1;
+        let st = delete_outcome(&r, n, p).await;
+        assert_eq!((st.state, st.code), (Some(2), Some(gen::ERR_PATH)), "{p}");
+    }
+    // A mount point named with a trailing slash or a dot is still a mount point: the parent is the
+    // folder above it, not the path itself.
+    let m = r.d.join("m");
+    write_tree(&m, 3, |_| 4);
+    unsafe { ava1_ctest::ffi::ava1_test_set_same_device(2) };
+    for (i, spelling) in [
+        format!("{}/", m.display()),
+        format!("{}//", m.display()),
+        format!("{}/.", m.display()),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let st = delete_outcome(&r, 230 + i as u8, spelling).await;
+        assert_eq!(
+            (st.state, st.code),
+            (Some(2), Some(gen::ERR_PATH)),
+            "{spelling}"
+        );
+        assert_eq!(count_files(&m), 3, "{spelling}");
+    }
+    unsafe { ava1_ctest::ffi::ava1_test_set_same_device(1) };
+    drop(r.srv);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_device_answer_refuses_the_delete() {
+    let r = rig("jr-unknown-dev").await;
+    let t = r.d.join("t");
+    write_tree(&t, 3, |_| 4);
+    unsafe { ava1_ctest::ffi::ava1_test_set_same_device(-1) };
+    let st = delete_outcome(&r, 240, t.to_str().unwrap()).await;
+    unsafe { ava1_ctest::ffi::ava1_test_set_same_device(1) };
+    assert_eq!((st.state, st.code), (Some(2), Some(gen::ERR_PATH)));
+    assert_eq!(count_files(&t), 3);
+    drop(r.srv);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn finished_hash_ops_release_their_slots_when_read() {
+    let r = rig("jr-slots").await;
+    let f = r.d.join("h.bin");
+    std::fs::write(&f, b"hello").unwrap();
+    let a = serde_json::json!({ "path": f.to_str().unwrap() }).to_string();
+    for n in 0..200u32 {
+        let mut job = [0u8; 16];
+        job[..4].copy_from_slice(&n.to_le_bytes());
+        job[15] = 0x77;
+        let (code, st) = run(&r.me, job, gen::JOB_OP_HASH, &a).await;
+        assert_eq!(code, gen::STATUS_OK, "op {n}: the table must never fill");
+        let st = match st.filter(|s| s.state.unwrap_or(0) != 0) {
+            Some(s) => s,
+            None => finished(&r.me, job).await,
+        };
+        assert_eq!(st.state, Some(1), "op {n}");
+    }
+    assert!(
+        list(&r.me).await.is_empty(),
+        "every finished op was released once read"
+    );
+    // A backup is not repeatable, so its result is kept for the short done-age instead.
+    run(
+        &r.me,
+        id(250),
+        gen::JOB_OP_BACKUP_SNAPSHOT,
+        r#"{"tag":"t","path":"/data/x"}"#,
+    )
+    .await;
+    finished(&r.me, id(250)).await;
+    assert_eq!(
+        status(&r.me, id(250)).await.state,
+        Some(1),
+        "still readable"
+    );
+    drop(r.srv);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_delete_failure_names_the_first_path_and_the_entries_left() {
+    let r = rig("jr-firstfail").await;
+    if unsafe { libc_geteuid() } == 0 {
+        return;
+    }
+    let tree = r.d.join("g");
+    write_tree(&tree, 120, |_| 8);
+    let stuck = tree.join("d05");
+    let n_stuck = count_files(&stuck);
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let st = delete_outcome(&r, 241, tree.to_str().unwrap()).await;
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cur = st.current.unwrap();
+    assert!(cur.starts_with("fs_delete_failed"), "{cur}");
+    assert!(
+        cur.contains("d05/f"),
+        "names a path inside the stuck folder: {cur}"
+    );
+    assert!(
+        cur.contains(&format!("{n_stuck} left")),
+        "counts the entries left: {cur}"
+    );
+    drop(r.srv);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_walkers_never_enter_a_nested_mount() {
+    let r = rig("jr-nested").await;
+    let tree = r.d.join("g");
+    write_tree(&tree, 30, |_| 4);
+    let inner = tree.join("mnt");
+    write_tree(&inner, 5, |_| 4);
+    c_set_cross_name("mnt"); // the folder named mnt reports another device
+    let st = delete_outcome(&r, 242, tree.to_str().unwrap()).await;
+    assert_eq!((st.state, st.code), (Some(2), Some(gen::ERR_IO)));
+    let cur = st.current.unwrap();
+    assert!(cur.starts_with("fs_delete_failed: mount "), "{cur}");
+    assert!(cur.contains("g/mnt (1 left)"), "{cur}");
+    assert_eq!(
+        count_files(&inner),
+        5,
+        "nothing below the mount was touched"
+    );
+    assert_eq!(count_files(&tree), 5, "the rest of the tree is gone");
+    // chmod -R skips it too.
+    let a = serde_json::json!({ "path": tree.to_str().unwrap(), "mode": "0700" }).to_string();
+    run(&r.me, id(243), gen::JOB_OP_CHMOD_R, &a).await;
+    let st = finished(&r.me, id(243)).await;
+    assert_eq!(st.state, Some(2));
+    assert!(st.current.unwrap().contains("mount"));
+    let f = std::fs::read_dir(&inner).unwrap().flatten().next().unwrap();
+    assert_ne!(
+        f.metadata().unwrap().permissions().mode() & 0o7777,
+        0o700,
+        "not chmod'd inside the mount"
+    );
+    c_set_cross_name("");
+    drop(r.srv);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_atomic_copy_never_truncates_the_destination_and_a_cancel_removes_only_its_temp() {
+    let r = rig("jr-atomic").await;
+    let src = r.d.join("backup.bin");
+    let dst = r.d.join("live.bin");
+    let new: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&src, &new).unwrap();
+    std::fs::write(&dst, b"the user's live file").unwrap();
+    // Cancelled after two 64 KiB blocks: the live file is exactly as it was, no temp is left.
+    c_set_fsj_delay_us(1000);
+    assert_eq!(c_copy_atomic(&src, &dst, 2), -2);
+    assert_eq!(std::fs::read(&dst).unwrap(), b"the user's live file");
+    let leftovers = |d: &Path| {
+        std::fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".part"))
+            .count()
+    };
+    assert_eq!(leftovers(&r.d), 0);
+    // A missing source fails the same way.
+    assert_eq!(c_copy_atomic(&r.d.join("nope"), &dst, -1), -1);
+    assert_eq!(std::fs::read(&dst).unwrap(), b"the user's live file");
+    // Complete: the new bytes land in one rename, the mtime is the source's, no temp remains.
+    assert_eq!(c_copy_atomic(&src, &dst, -1), 0);
+    assert_eq!(std::fs::read(&dst).unwrap(), new);
+    assert_eq!(leftovers(&r.d), 0);
+    let secs = |p: &Path| {
+        std::fs::metadata(p)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    assert_eq!(secs(&dst), secs(&src));
     drop(r.srv);
 }

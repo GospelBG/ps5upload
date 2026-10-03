@@ -54,8 +54,13 @@ int ava1_op_run_rpc(const uint8_t *body, uint32_t len, const uint8_t owner[32], 
 int ava1_op_list_rpc(const uint8_t owner[32], uint8_t *out, size_t cap, size_t *out_len);
 /* Encodes the Status of an operation job (job.status / job.run reply). */
 int ava1_op_encode_status(ava1_job_t *j, uint8_t *out, size_t cap, size_t *out_len);
-/* job.cancel on an operation job: raises the flag and waits a moment for the worker; the job
- * stays listed (finished, ERR_CANCELLED) so a poller reads how it ended. */
+/* job.cancel on an operation job: raises the flag and returns (never waits); the worker stops at
+ * its next check and the job stays listed (finished, ERR_CANCELLED) so a poller reads how it ended. */
 void ava1_op_cancel(ava1_job_t *j);
+/* A status reply was produced for `j`: when it was terminal and the operation is repeatable, the job
+ * is released (unlisted) now instead of holding a table slot until the reaper. */
+void ava1_op_status_delivered(ava1_job_t *j);
+/* How long a finished operation that is not released on read stays listed (ms). */
+#define AVA1_OP_DONE_AGE_MS 30000u
 
 #endif

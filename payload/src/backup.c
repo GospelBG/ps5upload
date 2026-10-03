@@ -6,6 +6,7 @@
  * and copies each file back to its original path. */
 
 #include "backup.h"
+#include "fs_jobs.h"
 #include "mgmt_rpc.h" /* mgmt_op_cancelled / mgmt_op_progress: no-ops outside a job.run operation */
 #include "runtime.h"
 
@@ -49,20 +50,25 @@ static int mkpath_p(const char *path) {
     return mkdir(tmp, 0755);
 }
 
-static int copy_file(const char *src, const char *dst) { /* 0, -1, or BACKUP_CANCELLED */
+static int bk_cancelled(void *arg) {
+    (void)arg;
+    return mgmt_op_cancelled();
+}
+static void bk_block(void *arg, uint64_t bytes) {
+    (void)arg;
+    mgmt_op_progress(0, bytes);
+}
+
+/* 0, -1, or BACKUP_CANCELLED. The destination is written through a temporary file in its own
+ * folder and renamed into place only when complete (fsjobs.c fsj_copy_atomic): a restore that
+ * fails or is cancelled halfway leaves the user's live file as it was, never truncated. */
+static int copy_file(const char *src, const char *dst) {
     /* Defense-in-depth: every write destination must be inside the
      * writable-roots allowlist. The restore path already validates the
      * manifest's "original" field before calling us, but this catches
      * any future caller that forgets. Backup snapshot dirs are always
      * under /data/ps5upload/backups/ which passes is_path_allowed. */
     if (!is_path_allowed(dst)) return -1;
-    int sfd = open(src, O_RDONLY);
-    if (sfd < 0) return -1;
-    struct stat st;
-    if (fstat(sfd, &st) != 0) {
-        close(sfd);
-        return -1;
-    }
     char parent[1024];
     snprintf(parent, sizeof(parent), "%s", dst);
     char *slash = strrchr(parent, '/');
@@ -70,55 +76,9 @@ static int copy_file(const char *src, const char *dst) { /* 0, -1, or BACKUP_CAN
         *slash = 0;
         mkpath_p(parent);
     }
-    int dfd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (dfd < 0) {
-        close(sfd);
-        return -1;
-    }
-    /* Heap, not stack: this runs on a management thread (mgmt_audit.py refuses 64 KiB arrays). */
-    enum { COPY_BUF = 64 * 1024 };
-    char *buf = (char *)malloc(COPY_BUF);
-    if (!buf) {
-        close(sfd);
-        close(dfd);
-        unlink(dst);
-        return -1;
-    }
-    ssize_t n;
-    while ((n = read(sfd, buf, COPY_BUF)) > 0) {
-        ssize_t off = 0;
-        /* A cancelled job.run stops between blocks and removes the half-written copy. */
-        if (mgmt_op_cancelled()) {
-            free(buf);
-            close(sfd);
-            close(dfd);
-            unlink(dst);
-            return BACKUP_CANCELLED;
-        }
-        while (off < n) {
-            ssize_t w = write(dfd, buf + off, n - off);
-            if (w <= 0) {
-                free(buf);
-                close(sfd);
-                close(dfd);
-                unlink(dst);
-                return -1;
-            }
-            off += w;
-        }
-        mgmt_op_progress(0, (uint64_t)n);
-    }
-    free(buf);
-    fsync(dfd);
-    close(sfd);
-    close(dfd);
-    struct timespec times[2];
-    times[0].tv_sec = st.st_atime;
-    times[0].tv_nsec = 0;
-    times[1].tv_sec = st.st_mtime;
-    times[1].tv_nsec = 0;
-    utimensat(AT_FDCWD, dst, times, 0);
-    return 0;
+    fsj_hooks_t h = { bk_cancelled, bk_block, NULL, NULL };
+    int rc = fsj_copy_atomic(src, dst, &h);
+    return rc == -2 ? BACKUP_CANCELLED : rc;
 }
 
 static const char *snapshot_dir_for(const char *tag) {
