@@ -1,7 +1,7 @@
 //! A TCP proxy that misbehaves on purpose: latency, bandwidth caps, blackholes
 //! (half-open links) and killed connections. For AVA1 tests and the lab tool.
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +22,8 @@ pub struct ChaosConfig {
 
 struct Ctl {
     blackhole: AtomicBool,
+    /// `kill_all` calls that actually aborted a live connection.
+    kills: AtomicU64,
     conns: Mutex<Vec<[AbortHandle; 2]>>,
 }
 
@@ -54,6 +56,7 @@ impl ChaosProxy {
         let addr = listener.local_addr()?;
         let ctl = Arc::new(Ctl {
             blackhole: AtomicBool::new(false),
+            kills: AtomicU64::new(0),
             conns: Mutex::default(),
         });
         let mut tasks = Vec::new();
@@ -125,6 +128,12 @@ impl ChaosProxy {
         }
     }
 
+    /// How many times every connection was killed (the periodic killer and manual
+    /// `kill_all` calls alike); a kill that found nothing open is not counted.
+    pub fn kills(&self) -> u64 {
+        self.ctl.kills.load(Ordering::SeqCst)
+    }
+
     pub fn connections(&self) -> usize {
         self.ctl
             .conns
@@ -137,10 +146,15 @@ impl ChaosProxy {
 }
 
 fn kill_all(ctl: &Ctl) {
+    let mut killed = false;
     for hs in ctl.conns.lock().unwrap().drain(..) {
+        killed |= !hs.iter().all(|h| h.is_finished());
         for h in hs {
             h.abort();
         }
+    }
+    if killed {
+        ctl.kills.fetch_add(1, Ordering::SeqCst);
     }
 }
 

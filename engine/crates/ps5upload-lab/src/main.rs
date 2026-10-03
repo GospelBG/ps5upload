@@ -510,7 +510,7 @@ mod ava1_cmds {
     }
 
     /// Same files the engine uses (`<data dir>/ava/`), so a lab-stamped payload trusts the engine.
-    fn ava_dir() -> PathBuf {
+    pub(crate) fn ava_dir() -> PathBuf {
         if let Ok(p) = std::env::var("AVA1_DIR") {
             return PathBuf::from(p);
         }
@@ -526,7 +526,7 @@ mod ava1_cmds {
         data_dir().join("bench-results.jsonl")
     }
 
-    fn identity() -> Result<Arc<Identity>> {
+    pub(crate) fn identity() -> Result<Arc<Identity>> {
         let p = ava_dir().join("identity");
         Ok(Arc::new(
             Identity::load_or_create(&p).with_context(|| format!("identity {}", p.display()))?,
@@ -997,6 +997,8 @@ fn usage() -> ! {
         "                                ratio (single-threaded; a 223k-file corpus takes minutes)"
     );
     eprintln!("  ava1-calibrate CONSOLE DIR [FILES=2000] [SIZE=4096] [--out FILE]");
+    eprintln!("  bench CONSOLE SCENARIO --proto ava1|ftx2 --src P [--dest P] [--runs N] [--elf F]");
+    eprintln!("        [--to CONSOLE2] [--out FILE] [--kill-every-s N]   (see `bench --help`)");
     eprintln!(
         "  ava1-relay FROM SRC TO DEST [TX_ID_HEX]   relay a console tree through this computer"
     );
@@ -1413,6 +1415,23 @@ fn main() -> Result<()> {
         "ava1-calibrate" => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(do_ava1_calibrate(&rest[1..]))
+        }
+        // C2: `bench` parses its own console, never the lab's global ADDR (a bare
+        // `bench` reaches here with `addr == DEFAULT_ADDR`, which it must not use).
+        "bench" => {
+            let tail = &rest[1..];
+            if tail.iter().any(|a| a == "--help" || a == "-h") {
+                println!("{}", bench::HELP);
+                return Ok(());
+            }
+            let parsed = bench::BenchArgs::parse(tail)?;
+            let rt = tokio::runtime::Runtime::new()?;
+            let rows = rt.block_on(bench::run_bench(&parsed))?;
+            let failed = rows.iter().filter(|r| !r.ok).count();
+            if failed > 0 {
+                bail!("{failed} of {} bench run(s) failed", rows.len());
+            }
+            Ok(())
         }
         "ava1-relay" => {
             if rest.len() < 5 || rest.len() > 6 {

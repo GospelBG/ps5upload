@@ -522,6 +522,1591 @@ pub fn record(out: &Path, line: &serde_json::Value) -> io::Result<()> {
     f.write_all(bytes.as_bytes())
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Task 27 — the scenario runner: AVA1 vs FTX2 on identical inputs.
+// ════════════════════════════════════════════════════════════════════════════
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, bail, Context};
+use ps5upload_core::download::{
+    download_to_local_multistream_ex, enumerate_download_set, DownloadKind, DownloadPlan,
+};
+use ps5upload_core::transfer::{
+    transfer_file_list_multistream, transfer_file_path_resumable, FileListEntry, TransferConfig,
+    TransferResult, DEFAULT_RESUME_RETRIES,
+};
+use serde_json::{json, Map, Value};
+
+/// `bench --help`.
+pub const HELP: &str = "\
+Usage: ps5upload-lab bench CONSOLE SCENARIO --proto ava1|ftx2 --src PATH [options]
+
+CONSOLE is a bare host or host:port; every address is derived from the host:
+  FTX2 transfer HOST:9113, FTX2 management HOST:9114, AVA1 HOST:9120 (AVA1_PORT overrides).
+
+Scenarios:
+  upload-file   --src local FILE        --dest console FILE path
+  upload-dir    --src local DIR         --dest console DIR path
+  download      --src console path      --dest local directory (default: a temp directory)
+  copy          --src console path      --dest console path (same console)
+  drop60        --src local file/dir    --dest console DIR   AVA1 only: connections killed
+                every --kill-every-s (default 60) seconds through an in-process proxy;
+                passes only with drops > 0 and resent <= drops x 64 MiB
+  resume        --src local file/dir    --dest console path  payload stopped at 50 % durable
+                and re-sent (needs --elf); passes only if no durable byte went twice
+  relay         --src console path      --dest path on --to  console to console
+
+Options:
+  --proto ava1|ftx2     required: the protocol under test (never read from the environment)
+  --src PATH            required (see the scenarios)
+  --dest PATH           console path (local directory for download); recursive deletes happen
+                        here between runs, so a path component must contain 'bench'
+                        (PS5UPLOAD_BENCH_ALLOW_ANY_DEST=1 lifts that)
+  --runs N              repetitions, N >= 1 (default 1)
+  --elf FILE            payload for `resume` (default: --elf, then PS5UPLOAD_ELF, then
+                        payload/ps5upload.elf or ../payload/ps5upload.elf)
+  --to CONSOLE2         second console for `relay`
+  --out FILE            results file (default: <data dir>/bench-results.jsonl)
+  --kill-every-s N      drop60 only: seconds between kills (default 60)
+
+Every run appends one JSON line to the results file; a summary per drive follows. Run from
+the engine/ directory. Nothing prompts: a console that needs a pairing code is an error.";
+
+pub const SCENARIOS: [&str; 7] = [
+    "upload-file",
+    "upload-dir",
+    "download",
+    "copy",
+    "drop60",
+    "resume",
+    "relay",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proto {
+    Ava1,
+    Ftx2,
+}
+
+impl Proto {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Proto::Ava1 => "ava1",
+            Proto::Ftx2 => "ftx2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scenario {
+    UploadFile,
+    UploadDir,
+    Download,
+    Copy,
+    Drop60,
+    Resume,
+    Relay,
+}
+
+impl Scenario {
+    pub fn name(self) -> &'static str {
+        SCENARIOS[self as usize]
+    }
+    fn parse(s: &str) -> Option<Scenario> {
+        Some(match s {
+            "upload-file" => Scenario::UploadFile,
+            "upload-dir" => Scenario::UploadDir,
+            "download" => Scenario::Download,
+            "copy" => Scenario::Copy,
+            "drop60" => Scenario::Drop60,
+            "resume" => Scenario::Resume,
+            "relay" => Scenario::Relay,
+            _ => return None,
+        })
+    }
+}
+
+/// The parsed `bench` command line (C2: the console comes from `bench`'s own positional
+/// list; the lab's global ADDR is never consulted).
+#[derive(Debug, Clone)]
+pub struct BenchArgs {
+    pub host: String,
+    /// `host:9113` — FTX2 transfer.
+    pub transfer: String,
+    /// `host:9114` — FTX2 management.
+    pub mgmt: String,
+    /// `host:9120` (`AVA1_PORT` honoured) — AVA1.
+    pub ava1: String,
+    pub scenario: Scenario,
+    pub proto: Proto,
+    pub src: String,
+    pub dest: Option<String>,
+    pub runs: u32,
+    pub elf: Option<PathBuf>,
+    pub to: Option<String>,
+    pub out: Option<PathBuf>,
+    pub kill_every_s: u64,
+}
+
+fn host_of(console: &str) -> String {
+    console
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(console)
+        .to_string()
+}
+
+impl BenchArgs {
+    pub fn parse<S: AsRef<str>>(args: &[S]) -> anyhow::Result<BenchArgs> {
+        let a: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
+        let mut pos: Vec<&str> = Vec::new();
+        let (mut proto, mut src, mut dest, mut elf, mut to, mut out) =
+            (None, None, None, None, None, None);
+        let (mut runs, mut kill_every_s) = (1u32, 60u64);
+        let mut i = 0;
+        while i < a.len() {
+            let Some(flag) = a[i].strip_prefix("--") else {
+                pos.push(a[i]);
+                i += 1;
+                continue;
+            };
+            let v = *a
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("--{flag} needs a value"))?;
+            i += 2;
+            match flag {
+                "proto" => proto = Some(v),
+                "src" => src = Some(v.to_string()),
+                "dest" => dest = Some(v.to_string()),
+                "elf" => elf = Some(PathBuf::from(v)),
+                "to" => to = Some(v.to_string()),
+                "out" => out = Some(PathBuf::from(v)),
+                "runs" => {
+                    runs = v
+                        .parse()
+                        .map_err(|_| anyhow!("--runs needs a whole number, got {v:?}"))?;
+                    if runs == 0 {
+                        bail!("--runs must be at least 1 (0 is an error, not \"once\")");
+                    }
+                }
+                "kill-every-s" => {
+                    kill_every_s = v
+                        .parse()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| anyhow!("--kill-every-s needs a positive number"))?;
+                }
+                _ => bail!("unknown option --{flag} (see `bench --help`)"),
+            }
+        }
+        let [console, scenario] = pos[..] else {
+            bail!("bench needs CONSOLE and SCENARIO (see `bench --help`)");
+        };
+        let scenario = Scenario::parse(scenario).ok_or_else(|| {
+            anyhow!(
+                "unknown scenario {scenario:?}; valid scenarios: {}",
+                SCENARIOS.join(", ")
+            )
+        })?;
+        let proto = match proto {
+            Some("ava1") => Proto::Ava1,
+            Some("ftx2") => Proto::Ftx2,
+            Some(p) => bail!("unknown protocol {p:?}; valid protocols: ava1, ftx2"),
+            None => bail!("--proto is required; valid protocols: ava1, ftx2"),
+        };
+        let host = host_of(console);
+        let transfer = format!("{host}:9113");
+        let parsed = BenchArgs {
+            mgmt: crate::to_mgmt_addr(&transfer),
+            ava1: crate::ava1_cmds::ava1_addr(&host),
+            transfer,
+            host,
+            scenario,
+            proto,
+            src: src.ok_or_else(|| anyhow!("--src is required"))?,
+            dest,
+            runs,
+            elf,
+            to,
+            out,
+            kill_every_s,
+        };
+        if parsed.scenario != Scenario::Download && parsed.dest.is_none() {
+            bail!("--dest is required for {}", parsed.scenario.name());
+        }
+        if parsed.scenario == Scenario::Relay && parsed.to.is_none() {
+            bail!("relay needs --to CONSOLE2");
+        }
+        if parsed.scenario == Scenario::Drop60 && parsed.proto != Proto::Ava1 {
+            bail!("drop60 is AVA1 only: FTX2 has no credit-window resend to measure");
+        }
+        Ok(parsed)
+    }
+}
+
+/// A destination the bench may delete recursively between runs (C8). Absolute, no `..`,
+/// strictly below a drive root (`/data`, `/mnt/<drive>`, `/user`), and — so a typo can
+/// never point the cleanup at real data — some component says `bench`.
+pub fn check_console_dest(path: &str) -> anyhow::Result<()> {
+    if !path.starts_with('/') || path.contains("//") || path.contains('\\') {
+        bail!("{path:?}: the destination must be an absolute console path");
+    }
+    let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    if comps.iter().any(|c| *c == ".." || *c == ".") {
+        bail!("{path:?}: the destination must not contain . or ..");
+    }
+    let below = match comps.first().copied() {
+        Some("mnt") => comps.len().saturating_sub(2),
+        Some("data") | Some("user") => comps.len().saturating_sub(1),
+        _ => bail!("{path:?}: the destination must be under /data, /mnt/<drive> or /user"),
+    };
+    if below == 0 {
+        bail!("{path:?}: refusing a drive root; use a directory below it");
+    }
+    let allow_any = std::env::var("PS5UPLOAD_BENCH_ALLOW_ANY_DEST").is_ok_and(|v| v == "1");
+    if !allow_any
+        && !comps
+            .iter()
+            .any(|c| c.to_ascii_lowercase().contains("bench"))
+    {
+        bail!(
+            "{path:?}: the bench deletes its destination between runs, so a component of the \
+             path must contain \"bench\" (or set PS5UPLOAD_BENCH_ALLOW_ANY_DEST=1)"
+        );
+    }
+    Ok(())
+}
+
+/// `/mnt/usb0/x` → `/mnt/usb0`, `/data/x` → `/data`: the unit a calibration describes.
+pub fn drive_of(path: &str) -> String {
+    let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    match comps.as_slice() {
+        ["mnt", d, ..] => format!("/mnt/{d}"),
+        [first, ..] => format!("/{first}"),
+        [] => "/".into(),
+    }
+}
+
+/// One result line (the plan's shape; every key always present).
+#[derive(Debug, Clone)]
+pub struct BenchRun {
+    pub console: String,
+    pub scenario: String,
+    pub proto: String,
+    pub run: u32,
+    pub files: u64,
+    pub bytes: u64,
+    pub seconds: f64,
+    pub resent: u64,
+    pub max_lanes: u64,
+    pub bottleneck: String,
+    pub sequential: bool,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+impl BenchRun {
+    pub fn json(&self) -> Value {
+        let date = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        // A run that took no time has no rate; 0 keeps the JSON finite (no NaN/inf/null).
+        let rate = |n: u64| {
+            if self.seconds > 0.0 && self.seconds.is_finite() {
+                n as f64 / self.seconds
+            } else {
+                0.0
+            }
+        };
+        json!({
+            "kind": "bench", "date": date, "console": self.console, "scenario": self.scenario,
+            "proto": self.proto, "run": self.run, "files": self.files, "bytes": self.bytes,
+            "seconds": self.seconds,
+            "mb_s": rate(self.bytes) / 1e6,
+            "files_s": rate(self.files),
+            "resent": self.resent, "max_lanes": self.max_lanes, "bottleneck": self.bottleneck,
+            "sequential": self.sequential, "ok": self.ok, "error": self.error,
+        })
+    }
+}
+
+/// C12: a drop60 run passes only if the fault fired and cost at most one 64 MiB credit
+/// window of resent bytes per drop.
+pub fn drop60_verdict(resent: u64, drops: u64) -> Result<(), String> {
+    if drops == 0 {
+        return Err("no drops".into());
+    }
+    let allowed = drops.saturating_mul(64 << 20);
+    if resent > allowed {
+        return Err(format!(
+            "resent {resent} bytes over {drops} drop(s); at most {allowed} (64 MiB per drop) allowed"
+        ));
+    }
+    Ok(())
+}
+
+/// C14: the middle value, or the mean of the two middle values of an even count; `None`
+/// for no values (printed as `n/a`).
+pub fn median(v: &[f64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.total_cmp(b));
+    let n = s.len();
+    Some(if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        (s[n / 2 - 1] + s[n / 2]) / 2.0
+    })
+}
+
+/// C13: the protocol an upload's commit acknowledgement shows. AVA1 says
+/// `"protocol":"ava1"`; FTX2 has no such field and carries a transfer id.
+pub fn observe_upload(tx_id_hex: &str, commit_ack_body: &str) -> String {
+    let body: Option<Value> = serde_json::from_str(commit_ack_body).ok();
+    let protocol = body
+        .as_ref()
+        .and_then(|b| b.get("protocol"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match protocol {
+        "ava1" => "ava1".into(),
+        "" if !tx_id_hex.is_empty() => "ftx2".into(),
+        other => format!("unrecognised(protocol={other:?}, tx_id={tx_id_hex:?})"),
+    }
+}
+
+pub fn verify_protocol(asked: Proto, observed: &str) -> Result<(), String> {
+    if observed == asked.as_str() {
+        Ok(())
+    } else {
+        Err(format!(
+            "protocol mismatch: asked {}, saw {observed}",
+            asked.as_str()
+        ))
+    }
+}
+
+// ─── Results, ceilings, summary ─────────────────────────────────────────────────
+
+/// One recorded run plus what the summary needs.
+#[derive(Debug, Clone)]
+pub struct Row {
+    pub run: BenchRun,
+    pub drive: String,
+    pub verified: bool,
+    /// The drive's calibrated create ceiling (files/s), when a calibrate record exists.
+    pub ceiling: Option<u64>,
+    pub extra: Map<String, Value>,
+}
+
+impl Row {
+    fn json(&self, started_at: u64, corpus: &str) -> Value {
+        let mut v = record_envelope("bench", Some(corpus), None, &self.run.proto);
+        let o = v.as_object_mut().expect("envelope is an object");
+        if let Value::Object(run) = self.run.json() {
+            o.extend(run);
+        }
+        o.insert("started_at".into(), started_at.into());
+        o.insert("drive".into(), self.drive.clone().into());
+        o.insert("verified".into(), self.verified.into());
+        o.insert("ceiling_files_s".into(), self.ceiling.into());
+        o.extend(self.extra.clone());
+        v
+    }
+}
+
+/// The newest calibrate record for this console's drive: (max files/s over its worker
+/// points, the directory it measured). Read from the results file before the runs add to
+/// it. A calibration is 4 KiB files, so it bounds tiny-file create rates, nothing else.
+pub fn calibrated_ceiling(results: &Path, host: &str, drive: &str) -> Option<(u64, String)> {
+    let text = std::fs::read_to_string(results).ok()?;
+    let mut best: Option<(u64, u64, String)> = None;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["kind"] != "calibrate" {
+            continue;
+        }
+        let (Some(console), Some(dir)) = (v["console"].as_str(), v["dir"].as_str()) else {
+            continue;
+        };
+        if host_of(console) != host && console != host {
+            continue;
+        }
+        if drive_of(dir) != drive {
+            continue;
+        }
+        let top = v["points"]
+            .as_array()
+            .map(|p| {
+                p.iter()
+                    .filter_map(|x| x["files_per_s"].as_u64())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let at = v["started_at"].as_u64().unwrap_or(0);
+        if top > 0 && best.as_ref().is_none_or(|b| at >= b.0) {
+            best = Some((at, top, dir.to_string()));
+        }
+    }
+    best.map(|(_, top, dir)| (top, dir))
+}
+
+fn fmt1(v: Option<f64>) -> String {
+    v.map_or("n/a".into(), |x| format!("{x:.1}"))
+}
+
+/// The end-of-run table (C14): per scenario and drive, per protocol — successful runs,
+/// median MB/s and files/s, the drive's calibrated ceiling beside them — then the
+/// AVA1/FTX2 ratio, then the pass/fail counts and the results path (C15).
+pub fn summary(rows: &[Row], out: &Path) -> String {
+    let mut groups: BTreeMap<(String, String), Vec<&Row>> = BTreeMap::new();
+    for r in rows {
+        groups
+            .entry((r.run.scenario.clone(), r.drive.clone()))
+            .or_default()
+            .push(r);
+    }
+    let mut s = String::new();
+    for ((scenario, drive), rs) in &groups {
+        let ceiling = rs.iter().find_map(|r| r.ceiling);
+        s += &format!("\n{scenario} on {drive}");
+        match ceiling {
+            Some(c) => s += &format!("  (calibrated create ceiling: {c} files/s, 4 KiB files)\n"),
+            None => s += "  (no calibrate record for this drive)\n",
+        }
+        s += "  proto  ok/runs   median MB/s   median files/s   files/s vs ceiling\n";
+        let mut med: BTreeMap<&str, (Option<f64>, Option<f64>)> = BTreeMap::new();
+        for proto in ["ava1", "ftx2"] {
+            let mine: Vec<&&Row> = rs.iter().filter(|r| r.run.proto == proto).collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let good: Vec<&&Row> = mine.iter().copied().filter(|r| r.run.ok).collect();
+            let col = |f: fn(&BenchRun) -> f64| {
+                median(&good.iter().map(|r| f(&r.run)).collect::<Vec<_>>())
+            };
+            let mb = col(|r| r.json()["mb_s"].as_f64().unwrap_or(0.0));
+            let fs = col(|r| r.json()["files_s"].as_f64().unwrap_or(0.0));
+            let pct = match (fs, ceiling) {
+                (Some(f), Some(c)) if c > 0 => format!("{:.0} %", f / c as f64 * 100.0),
+                _ => "n/a".into(),
+            };
+            s += &format!(
+                "  {proto:<5}  {:>2}/{:<4}    {:>11}   {:>14}   {pct:>18}\n",
+                good.len(),
+                mine.len(),
+                fmt1(mb),
+                fmt1(fs)
+            );
+            med.insert(proto, (mb, fs));
+        }
+        if let (Some(a), Some(f)) = (med.get("ava1"), med.get("ftx2")) {
+            let ratio = |x: Option<f64>, y: Option<f64>| match (x, y) {
+                (Some(x), Some(y)) if y > 0.0 => format!("{:.2}x", x / y),
+                _ => "n/a".into(),
+            };
+            s += &format!(
+                "  AVA1/FTX2: MB/s {}  files/s {}\n",
+                ratio(a.0, f.0),
+                ratio(a.1, f.1)
+            );
+            if !matches!(scenario.as_str(), "download" | "copy") {
+                s += "  note: AVA1 makes every file durable (fsync) before it counts as done; \
+FTX2 may not, so a ratio below 1.0 on small files can be that durability cost, not a defect.\n";
+            }
+        }
+    }
+    let ok = rows.iter().filter(|r| r.run.ok).count();
+    s += &format!(
+        "\n{} run(s): {ok} passed, {} failed\nresults: {}\n",
+        rows.len(),
+        rows.len() - ok,
+        std::path::absolute(out)
+            .unwrap_or_else(|_| out.to_path_buf())
+            .display()
+    );
+    s
+}
+
+// ─── The runner ─────────────────────────────────────────────────────────────────
+
+/// Which AVA1 pool the AVA1 calls use: the process's own (the engine's pool — same
+/// identity and pins) or an injected one (the lab's proxy override; tests, C11).
+#[derive(Clone)]
+pub enum PoolRef {
+    Global,
+    Owned(Arc<ps5upload_ava1::Pool>),
+}
+
+impl PoolRef {
+    fn get(&self) -> &ps5upload_ava1::Pool {
+        match self {
+            PoolRef::Global => ps5upload_ava1::pool(),
+            PoolRef::Owned(p) => p,
+        }
+    }
+}
+
+/// Everything environmental, so tests can run the same scenarios against a loopback
+/// host: no console cleanup, no idle wait.
+pub struct Env {
+    pub pool: PoolRef,
+    pub ava_dir: PathBuf,
+    pub idle: Duration,
+    pub clean: bool,
+    pub out: PathBuf,
+}
+
+impl Env {
+    /// C11: the AVA1 address is overridden through a per-pool address (`Pool::with_addr`)
+    /// only when `AVA1_PORT` moves it off the default; otherwise the engine's own pool.
+    pub fn production(args: &BenchArgs) -> Env {
+        let ava_dir = crate::ava1_cmds::ava_dir();
+        let default = ps5upload_ava1::pool::ava1_addr(&args.host);
+        let pool = if args.ava1 == default {
+            PoolRef::Global
+        } else {
+            PoolRef::Owned(Arc::new(
+                ps5upload_ava1::Pool::new(ava_dir.clone()).with_addr(args.ava1.clone()),
+            ))
+        };
+        Env {
+            pool,
+            ava_dir,
+            idle: Duration::from_secs(5),
+            clean: true,
+            out: args
+                .out
+                .clone()
+                .unwrap_or_else(crate::ava1_cmds::bench_results_default),
+        }
+    }
+}
+
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(f)
+        .await
+        .expect("a blocking bench task panicked")
+}
+
+/// What a finished attempt measured. `seconds` times the transfer call only.
+struct Measured {
+    seconds: f64,
+    resent: u64,
+    max_lanes: u64,
+    bottleneck: String,
+    sequential: bool,
+    /// The protocol the evidence shows (C13).
+    observed: String,
+    verified_by: &'static str,
+    /// Overrides the corpus byte count (resume counts bytes sent across attempts).
+    bytes: Option<u64>,
+    /// An error the scenario's own pass rule found in an otherwise finished run.
+    verdict: Option<String>,
+    extra: Map<String, Value>,
+}
+
+impl Measured {
+    fn new(seconds: f64, observed: String, verified_by: &'static str) -> Measured {
+        Measured {
+            seconds,
+            resent: 0,
+            max_lanes: 0,
+            bottleneck: "n/a".into(),
+            sequential: false,
+            observed,
+            verified_by,
+            bytes: None,
+            verdict: None,
+            extra: Map::new(),
+        }
+    }
+}
+
+/// A failed attempt: how long it ran, and why.
+type Attempt = Result<Measured, (f64, String)>;
+
+struct ElfInfo {
+    path: PathBuf,
+    size: u64,
+    mtime: u64,
+    hash12: String,
+    stamped: Arc<Vec<u8>>,
+}
+
+struct Prep {
+    files: u64,
+    bytes: u64,
+    src_is_dir: bool,
+    /// (relative path, absolute path), sorted — the FTX2 file list for a local source.
+    local: Arc<Vec<(String, PathBuf)>>,
+    kind: Option<DownloadKind>,
+    corpus: String,
+    drive: String,
+    ceiling: Option<(u64, String)>,
+    elf: Option<ElfInfo>,
+    setup_ms: Option<u64>,
+}
+
+fn walk_local(root: &Path) -> std::io::Result<Vec<(String, PathBuf, u64)>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d)? {
+            let p = e?.path();
+            let m = std::fs::symlink_metadata(&p)?;
+            if m.is_dir() {
+                stack.push(p);
+            } else if m.is_file() {
+                let rel = p
+                    .strip_prefix(root)
+                    .expect("walked below the root")
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.push((rel, p, m.len()));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// The FTX2 file list for a local directory, built the way the engine's folder upload
+/// does (`dest_root/rel`, absolute sources). Called inside the timed region, like
+/// AVA1's own manifest walk.
+fn ftx2_entries(dest_root: &str, root: &Path) -> anyhow::Result<Vec<FileListEntry>> {
+    let base = dest_root.trim_end_matches('/');
+    Ok(walk_local(root)?
+        .into_iter()
+        .map(|(rel, abs, _)| FileListEntry {
+            src: abs.to_string_lossy().into_owned(),
+            dest: format!("{base}/{rel}"),
+        })
+        .collect())
+}
+
+/// A console source: a file first, else a folder (the listing error of the wrong guess
+/// is discarded; both failing reports both).
+fn console_plan(mgmt: &str, src: &str) -> anyhow::Result<(DownloadKind, DownloadPlan)> {
+    match enumerate_download_set(mgmt, src, DownloadKind::File) {
+        Ok(p) => Ok((DownloadKind::File, p)),
+        Err(file_err) => enumerate_download_set(mgmt, src, DownloadKind::Folder)
+            .map(|p| (DownloadKind::Folder, p))
+            .map_err(|e| anyhow!("{src}: not a readable file ({file_err:#}) or folder ({e:#})")),
+    }
+}
+
+fn basename(p: &str) -> String {
+    p.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(p)
+        .to_string()
+}
+
+/// `--elf`, then `PS5UPLOAD_ELF`, then the repo's built payload (A4). The lab normally
+/// runs from `engine/`, so the parent directory is searched too.
+fn resolve_elf(flag: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let mut tried: Vec<PathBuf> = Vec::new();
+    if let Some(f) = flag {
+        tried.push(f.to_path_buf());
+    } else {
+        if let Some(e) = std::env::var_os("PS5UPLOAD_ELF").filter(|v| !v.is_empty()) {
+            tried.push(e.into());
+        }
+        tried.push("payload/ps5upload.elf".into());
+        tried.push("../payload/ps5upload.elf".into());
+    }
+    for t in &tried {
+        if t.is_file() {
+            return Ok(t.clone());
+        }
+        if flag.is_some() {
+            break;
+        }
+    }
+    bail!(
+        "no payload ELF for `resume`; tried: {} (pass --elf FILE)",
+        tried
+            .iter()
+            .map(|t| t.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Reads the ELF, stamps a copy with the pool identity and a fresh launch token (so the
+/// restarted console trusts us without a pairing code), and describes it (A4).
+fn load_elf(path: &Path) -> anyhow::Result<ElfInfo> {
+    let raw = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let meta = std::fs::metadata(path)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let hash12 = ava1::hex::encode(&blake3::hash(&raw).as_bytes()[..6]);
+    let key = crate::ava1_cmds::identity()?.public();
+    let tokens = ava1::launch::LaunchTokens::at(&crate::ava1_cmds::ava_dir().join("launch_tokens"));
+    let mut stamped = raw;
+    ava1::trust::stamp_helper(&mut stamped, Some(&key), || tokens.issue().ok())
+        .map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    Ok(ElfInfo {
+        path: path.to_path_buf(),
+        size: meta.len(),
+        mtime,
+        hash12,
+        stamped: Arc::new(stamped),
+    })
+}
+
+/// The knobs mirrored from the engine's `make_transfer_config` (C3), plus the progress
+/// counters the runs read. Excludes stay empty on both protocols.
+struct Counters4 {
+    bytes: Arc<AtomicU64>,
+    bytes_finalized: Arc<AtomicU64>,
+}
+
+fn make_cfg(args: &BenchArgs, proto: Proto) -> (TransferConfig, Counters4, String) {
+    let mut cfg = TransferConfig::new(args.transfer.clone());
+    let mut knobs: Vec<String> = Vec::new();
+    if proto == Proto::Ftx2 {
+        let env = |k: &str| std::env::var(k).ok();
+        if let Some(n) = env("FTX2_INFLIGHT_SHARDS").and_then(|v| v.parse::<usize>().ok()) {
+            if n >= 1 {
+                cfg.inflight_shards = n;
+                knobs.push(format!("FTX2_INFLIGHT_SHARDS={n}"));
+            }
+        }
+        if let Some(n) = env("FTX2_INFLIGHT_BYTES").and_then(|v| v.parse::<usize>().ok()) {
+            if n >= 1 {
+                cfg.inflight_bytes = n;
+                knobs.push(format!("FTX2_INFLIGHT_BYTES={n}"));
+            }
+        }
+        if let Some(n) = env("FTX2_PACK_SIZE").and_then(|v| v.parse::<usize>().ok()) {
+            cfg.pack_size = n;
+            knobs.push(format!("FTX2_PACK_SIZE={n}"));
+        }
+        if let Some(n) = env("FTX2_PACK_FILE_MAX").and_then(|v| v.parse::<usize>().ok()) {
+            cfg.pack_file_max = n;
+            knobs.push(format!("FTX2_PACK_FILE_MAX={n}"));
+        }
+    }
+    let c = Counters4 {
+        bytes: Arc::new(AtomicU64::new(0)),
+        bytes_finalized: Arc::new(AtomicU64::new(0)),
+    };
+    cfg.progress_bytes = Some(c.bytes.clone());
+    cfg.progress_files = Some(Arc::new(AtomicU64::new(0)));
+    cfg.progress_files_finalized = Some(Arc::new(AtomicU64::new(0)));
+    cfg.progress_bytes_finalized = Some(c.bytes_finalized.clone());
+    cfg.excludes = Vec::new();
+    let note = if knobs.is_empty() {
+        "engine-default".to_string()
+    } else {
+        format!("engine-default+{}", knobs.join(","))
+    };
+    (cfg, c, note)
+}
+
+fn new_id() -> [u8; 16] {
+    *uuid::Uuid::new_v4().as_bytes()
+}
+
+fn new_op_id() -> u64 {
+    (u64::from_le_bytes(new_id()[..8].try_into().unwrap()) >> 1).max(1)
+}
+
+/// The upload itself, on a blocking thread: AVA1 through the adapter the engine uses,
+/// FTX2 through 4-stream file lists for a folder (what the app uses for game folders)
+/// and the resumable single-file path for a file (C4, C5).
+fn spawn_upload(
+    pool: PoolRef,
+    args: &BenchArgs,
+    prep: &Prep,
+    cfg: TransferConfig,
+    id: [u8; 16],
+) -> tokio::task::JoinHandle<(f64, anyhow::Result<TransferResult>)> {
+    let (proto, dest, src) = (
+        args.proto,
+        args.dest.clone().expect("validated"),
+        PathBuf::from(&args.src),
+    );
+    let is_dir = prep.src_is_dir;
+    tokio::task::spawn_blocking(move || {
+        let t = Instant::now();
+        let r = match (proto, is_dir) {
+            (Proto::Ava1, true) => {
+                ps5upload_ava1::upload::upload_dir_in(pool.get(), &cfg, id, &dest, &src)
+            }
+            (Proto::Ava1, false) => {
+                ps5upload_ava1::upload::upload_file_in(pool.get(), &cfg, id, &dest, &src)
+            }
+            (Proto::Ftx2, true) => ftx2_entries(&dest, &src).and_then(|entries| {
+                transfer_file_list_multistream(
+                    &cfg,
+                    id,
+                    &dest,
+                    &entries,
+                    4,
+                    DEFAULT_RESUME_RETRIES,
+                    0,
+                )
+            }),
+            (Proto::Ftx2, false) => {
+                transfer_file_path_resumable(&cfg, id, &dest, &src, DEFAULT_RESUME_RETRIES, 0)
+            }
+        };
+        (t.elapsed().as_secs_f64(), r)
+    })
+}
+
+fn measured_from_transfer(proto: Proto, tr: &TransferResult, seconds: f64) -> Measured {
+    let mut m = Measured::new(
+        seconds,
+        observe_upload(&tr.tx_id_hex, &tr.commit_ack_body),
+        "commit_ack",
+    );
+    if proto == Proto::Ava1 {
+        if let Ok(b) = serde_json::from_str::<Value>(&tr.commit_ack_body) {
+            m.resent = b["resent"].as_u64().unwrap_or(0);
+            m.max_lanes = b["max_lanes"].as_u64().unwrap_or(0);
+            m.bottleneck = b["bottleneck"].as_str().unwrap_or("n/a").to_string();
+            m.sequential = b["sequential"].as_bool().unwrap_or(false);
+        }
+    }
+    m.extra.insert("bytes_sent".into(), tr.bytes_sent.into());
+    m
+}
+
+async fn run_upload(env: &Env, args: &BenchArgs, prep: &Prep) -> Attempt {
+    let (cfg, _c, _note) = make_cfg(args, args.proto);
+    let (secs, r) = spawn_upload(env.pool.clone(), args, prep, cfg, new_id())
+        .await
+        .map_err(|e| (0.0, format!("upload task: {e}")))?;
+    match r {
+        Ok(tr) => Ok(measured_from_transfer(args.proto, &tr, secs)),
+        Err(e) => Err((secs, format!("{e:#}"))),
+    }
+}
+
+/// drop60 (C12): the upload goes through the killing proxy; `drops` is how many times it
+/// really killed live connections during this run.
+async fn run_drop60(
+    env: &Env,
+    args: &BenchArgs,
+    prep: &Prep,
+    proxy: &ava1_chaos::ChaosProxy,
+) -> Attempt {
+    let before = proxy.kills();
+    let mut m = run_upload(env, args, prep).await?;
+    let drops = proxy.kills() - before;
+    m.extra.insert("drops".into(), drops.into());
+    m.verdict = drop60_verdict(m.resent, drops).err();
+    Ok(m)
+}
+
+/// resume: stop the payload at 50 % durable, re-send the stamped ELF (C16), and let the
+/// adapter's reconnect loop carry on. AVA1 reads durable bytes, FTX2 sent bytes (it has
+/// no durable counter).
+async fn run_resume(env: &Env, args: &BenchArgs, prep: &Prep) -> Attempt {
+    let elf = prep.elf.as_ref().expect("resume loads its ELF first");
+    let (mut cfg, c, _note) = make_cfg(args, args.proto);
+    let cancel = Arc::new(AtomicBool::new(false));
+    cfg.cancel = Some(cancel.clone());
+    let counter = match args.proto {
+        Proto::Ava1 => c.bytes_finalized.clone(),
+        Proto::Ftx2 => c.bytes.clone(),
+    };
+    let size = prep.bytes;
+    let target = (size / 2).max(1);
+    let handle = spawn_upload(env.pool.clone(), args, prep, cfg, new_id());
+    let mut fired: Option<(u64, f64)> = None;
+    let mut fault_error: Option<String> = None;
+    while !handle.is_finished() {
+        let at = counter.load(Ordering::Relaxed);
+        if at >= target {
+            let t0 = Instant::now();
+            let mgmt = args.mgmt.clone();
+            let _ = blocking(move || {
+                ps5upload_core::payload_lifecycle::shutdown_running_payload(&mgmt)
+            })
+            .await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let (host, bytes) = (args.host.clone(), elf.stamped.clone());
+            let sent = blocking(move || {
+                ps5upload_core::payload_lifecycle::send_elf_to_loader(
+                    &host,
+                    9021,
+                    &bytes,
+                    ps5upload_core::payload_lifecycle::LoaderImage::Ps5Upload,
+                )
+            })
+            .await;
+            if let Err(e) = sent {
+                cancel.store(true, Ordering::Relaxed);
+                fault_error = Some(format!("re-sending the payload failed: {e}"));
+            }
+            fired = Some((at, t0.elapsed().as_secs_f64()));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (secs, r) = handle
+        .await
+        .map_err(|e| (0.0, format!("upload task: {e}")))?;
+    let tr = match r {
+        Ok(tr) => tr,
+        Err(e) => {
+            let why = fault_error.map_or(String::new(), |f| format!("{f}; "));
+            return Err((secs, format!("{why}{e:#}")));
+        }
+    };
+    let mut m = measured_from_transfer(args.proto, &tr, secs);
+    let sent = match args.proto {
+        Proto::Ava1 => tr.bytes_sent,
+        Proto::Ftx2 => tr.bytes_sent.max(c.bytes.load(Ordering::Relaxed)),
+    };
+    m.bytes = Some(sent);
+    m.extra.insert("payload_size".into(), size.into());
+    match fired {
+        None => {
+            m.verdict = Some(
+                "the transfer finished before reaching 50 %: the fault never fired \
+                 (use a larger --src)"
+                    .into(),
+            )
+        }
+        Some((at, restart_s)) => {
+            m.extra.insert("fault_at_bytes".into(), at.into());
+            m.extra.insert("restart_s".into(), restart_s.into());
+            if args.proto == Proto::Ava1 {
+                // The pass rule: no durable byte went twice (one credit window of slack).
+                if sent > size + (64 << 20) {
+                    m.verdict = Some(format!(
+                        "sent {sent} bytes for {size}: more than one 64 MiB window was re-sent"
+                    ));
+                }
+            } else {
+                m.resent = sent.saturating_sub(size);
+            }
+        }
+    }
+    Ok(m)
+}
+
+async fn session_evidence(env: &Env, console: &str) -> String {
+    match env.pool.get().session(console).await {
+        Ok(s) if s.peer_caps() & ava1::gen::CAP_DATA_PLANE != 0 => "ava1".into(),
+        Ok(s) => format!("ava1-session-without-data-plane(caps={:#x})", s.peer_caps()),
+        Err(e) => format!("no-ava1-session({e})"),
+    }
+}
+
+async fn run_download(env: &Env, args: &BenchArgs, prep: &Prep, dir: &Path) -> Attempt {
+    let kind = prep.kind.expect("download resolves its kind first");
+    let (dest, src) = (dir.to_path_buf(), args.src.clone());
+    let (secs, r) = match args.proto {
+        Proto::Ava1 => {
+            let (pool, console) = (env.pool.clone(), args.transfer.clone());
+            blocking(move || {
+                let t = Instant::now();
+                let r = ps5upload_ava1::download::to_local_in(
+                    pool.get(),
+                    &console,
+                    &src,
+                    kind,
+                    &dest,
+                    false,
+                    new_id(),
+                    &ps5upload_ava1::download::Counters::default(),
+                    None,
+                );
+                (t.elapsed().as_secs_f64(), r)
+            })
+            .await
+        }
+        Proto::Ftx2 => {
+            let mgmt = args.mgmt.clone();
+            blocking(move || {
+                let t = Instant::now();
+                let progress = Arc::new(AtomicU64::new(0));
+                // Enumeration is part of what a FTX2 download costs, so it is timed.
+                let r = enumerate_download_set(&mgmt, &src, kind).and_then(|plan| {
+                    download_to_local_multistream_ex(
+                        &mgmt,
+                        &dest,
+                        &plan.manifest,
+                        4,
+                        Some(&progress),
+                        false,
+                    )
+                });
+                (t.elapsed().as_secs_f64(), r)
+            })
+            .await
+        }
+    };
+    match r {
+        Ok(n) => {
+            let (observed, by) = match args.proto {
+                Proto::Ava1 => (
+                    session_evidence(env, &args.transfer).await,
+                    "session+call-path",
+                ),
+                Proto::Ftx2 => ("ftx2".into(), "call-path"),
+            };
+            let mut m = Measured::new(secs, observed, by);
+            m.extra.insert("bytes_reported".into(), n.into());
+            Ok(m)
+        }
+        Err(e) => Err((secs, format!("{e:#}"))),
+    }
+}
+
+async fn run_copy(env: &Env, args: &BenchArgs) -> Attempt {
+    let (src, dest, op) = (args.src.clone(), args.dest.clone().unwrap(), new_op_id());
+    let (secs, r) = match args.proto {
+        Proto::Ava1 => {
+            let (pool, console) = (env.pool.clone(), args.transfer.clone());
+            blocking(move || {
+                let t = Instant::now();
+                // Overwrite off: the destination was cleaned, so it never decides the run.
+                let r = ps5upload_ava1::copy::console_copy_in(
+                    pool.get(),
+                    &console,
+                    &src,
+                    &dest,
+                    op,
+                    false,
+                    false,
+                );
+                (t.elapsed().as_secs_f64(), r)
+            })
+            .await
+        }
+        Proto::Ftx2 => {
+            let mgmt = args.mgmt.clone();
+            blocking(move || {
+                let t = Instant::now();
+                let r = ps5upload_core::fs_ops::fs_copy_robust(
+                    &mgmt,
+                    &src,
+                    &dest,
+                    op,
+                    Duration::from_secs(180),
+                    false,
+                );
+                (t.elapsed().as_secs_f64(), r)
+            })
+            .await
+        }
+    };
+    match r {
+        Ok(()) => {
+            let (observed, by) = match args.proto {
+                Proto::Ava1 => (
+                    session_evidence(env, &args.transfer).await,
+                    "session+call-path",
+                ),
+                Proto::Ftx2 => ("ftx2".into(), "call-path"),
+            };
+            let mut m = Measured::new(secs, observed, by);
+            m.extra.insert("overwrite".into(), false.into());
+            Ok(m)
+        }
+        Err(e) => Err((secs, format!("{e:#}"))),
+    }
+}
+
+/// relay: AVA1 streams console to console; FTX2 is download-then-upload through this
+/// computer's disk (the app's current behaviour), timed end to end (C18).
+async fn run_relay(env: &Env, args: &BenchArgs, prep: &Prep, scratch: &Path) -> Attempt {
+    let to = args.to.clone().expect("validated");
+    let to_transfer = format!("{}:9113", host_of(&to));
+    let dest = args.dest.clone().unwrap();
+    let kind = prep.kind.expect("relay resolves its kind first");
+    let src = args.src.clone();
+    match args.proto {
+        Proto::Ava1 => {
+            let (pool, from) = (env.pool.clone(), args.transfer.clone());
+            let progress = Arc::new(ava1::send::Progress::default());
+            let (secs, r) = blocking(move || {
+                let t = Instant::now();
+                let r = ps5upload_ava1::relay::ps5_to_ps5_between(
+                    pool.get(),
+                    &from,
+                    &src,
+                    pool.get(),
+                    &to_transfer,
+                    &dest,
+                    new_id(),
+                    progress,
+                    Arc::new(AtomicBool::new(false)),
+                );
+                (t.elapsed().as_secs_f64(), r)
+            })
+            .await;
+            match r {
+                Ok(rep) => {
+                    let mut observed = session_evidence(env, &args.transfer).await;
+                    if observed == "ava1" {
+                        observed = session_evidence(env, &to_session_name(&to)).await;
+                    }
+                    let mut m = Measured::new(secs, observed, "session+call-path");
+                    m.resent = rep.resent;
+                    m.max_lanes = u64::from(rep.max_lanes);
+                    m.bottleneck = ps5upload_ava1::progress::bottleneck_name(rep.bottleneck).into();
+                    m.sequential = rep.sequential;
+                    Ok(m)
+                }
+                Err(e) => Err((secs, format!("{e:#}"))),
+            }
+        }
+        Proto::Ftx2 => {
+            let (mgmt, scratch_dir) = (args.mgmt.clone(), scratch.to_path_buf());
+            let to_cfg = make_cfg_for(&to_transfer);
+            let (secs, r) = blocking(move || {
+                let t = Instant::now();
+                let r = (|| -> anyhow::Result<()> {
+                    let plan = enumerate_download_set(&mgmt, &src, kind)?;
+                    let progress = Arc::new(AtomicU64::new(0));
+                    download_to_local_multistream_ex(
+                        &mgmt,
+                        &scratch_dir,
+                        &plan.manifest,
+                        4,
+                        Some(&progress),
+                        false,
+                    )?;
+                    let local = scratch_dir.join(basename(&src));
+                    match kind {
+                        DownloadKind::File => {
+                            transfer_file_path_resumable(
+                                &to_cfg,
+                                new_id(),
+                                &dest,
+                                &local,
+                                DEFAULT_RESUME_RETRIES,
+                                0,
+                            )?;
+                        }
+                        DownloadKind::Folder => {
+                            let entries = ftx2_entries(&dest, &local)?;
+                            transfer_file_list_multistream(
+                                &to_cfg,
+                                new_id(),
+                                &dest,
+                                &entries,
+                                4,
+                                DEFAULT_RESUME_RETRIES,
+                                0,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })();
+                (t.elapsed().as_secs_f64(), r)
+            })
+            .await;
+            let _ = std::fs::remove_dir_all(scratch);
+            match r {
+                Ok(()) => Ok(Measured::new(secs, "ftx2".into(), "call-path")),
+                Err(e) => Err((secs, format!("{e:#}"))),
+            }
+        }
+    }
+}
+
+fn to_session_name(to: &str) -> String {
+    format!("{}:9113", host_of(to))
+}
+
+/// A FTX2 config for a console other than `--console` (relay's destination).
+fn make_cfg_for(transfer: &str) -> TransferConfig {
+    let mut cfg = TransferConfig::new(transfer.to_string());
+    cfg.excludes = Vec::new();
+    cfg
+}
+
+/// Deletes the destination between runs (C8). Missing is fine; anything else fails the
+/// run rather than measuring over leftovers.
+fn clean_console(mgmt: &str, path: &str) -> Result<(), String> {
+    match ps5upload_core::cleanup::cleanup_path(mgmt, path) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let m = format!("{e:#}");
+            let l = m.to_ascii_lowercase();
+            if ["not found", "no such", "enoent", "does not exist"]
+                .iter()
+                .any(|k| l.contains(k))
+            {
+                Ok(())
+            } else {
+                Err(format!("cleaning {path} failed: {m}"))
+            }
+        }
+    }
+}
+
+async fn clean_between(env: &Env, args: &BenchArgs, local: &Path) -> Result<(), String> {
+    if !env.clean {
+        return Ok(());
+    }
+    match args.scenario {
+        Scenario::Download => {
+            let target = local.join(basename(&args.src));
+            let r = if target.is_dir() {
+                std::fs::remove_dir_all(&target)
+            } else if target.exists() {
+                std::fs::remove_file(&target)
+            } else {
+                Ok(())
+            };
+            r.map_err(|e| format!("cleaning {}: {e}", target.display()))
+        }
+        Scenario::Relay => {
+            let (mgmt, dest) = (
+                crate::to_mgmt_addr(&to_session_name(args.to.as_deref().unwrap_or(""))),
+                args.dest.clone().unwrap(),
+            );
+            blocking(move || clean_console(&mgmt, &dest)).await
+        }
+        _ => {
+            let (mgmt, dest) = (args.mgmt.clone(), args.dest.clone().unwrap());
+            blocking(move || clean_console(&mgmt, &dest)).await
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// An unattended AVA1 session before any run: a console that wants a pairing code is an
+/// error here, never a prompt.
+async fn ava1_preflight(env: &Env, console: &str) -> anyhow::Result<u64> {
+    let pool = env.pool.get();
+    pool.forget(console).await;
+    let t = Instant::now();
+    let s = pool.session(console).await.map_err(|e| match e {
+        ava1::Ava1Error::NotPaired => anyhow!(
+            "{console}: AVA1 needs a pairing code on the console, and bench never prompts. \
+             Send a payload stamped with this machine's key (`ps5upload-lab ava1-stamp`, then \
+             `send-elf`) so the console trusts it without a code"
+        ),
+        other => anyhow!("{console}: no AVA1 session: {other}"),
+    })?;
+    if s.peer_caps() & ava1::gen::CAP_DATA_PLANE == 0 {
+        bail!("{console}: the console's helper does not advertise the AVA1 data plane");
+    }
+    Ok(t.elapsed().as_millis() as u64)
+}
+
+/// Gathers everything the runs need before the first (untimed) call.
+async fn prepare(env: &Env, args: &BenchArgs) -> anyhow::Result<Prep> {
+    let mut prep = Prep {
+        files: 0,
+        bytes: 0,
+        src_is_dir: false,
+        local: Arc::new(Vec::new()),
+        kind: None,
+        corpus: basename(&args.src),
+        drive: String::new(),
+        ceiling: None,
+        elf: None,
+        setup_ms: None,
+    };
+    let (ceil_host, drive) = match args.scenario {
+        Scenario::Download => (args.host.clone(), drive_of(&args.src)),
+        Scenario::Relay => (
+            host_of(args.to.as_deref().unwrap_or("")),
+            drive_of(args.dest.as_deref().unwrap_or("/")),
+        ),
+        _ => (
+            args.host.clone(),
+            drive_of(args.dest.as_deref().unwrap_or("/")),
+        ),
+    };
+    prep.drive = drive.clone();
+    prep.ceiling = calibrated_ceiling(&env.out, &ceil_host, &drive);
+    match args.scenario {
+        Scenario::UploadFile | Scenario::UploadDir | Scenario::Drop60 | Scenario::Resume => {
+            let src = PathBuf::from(&args.src);
+            let meta = std::fs::metadata(&src)
+                .with_context(|| format!("--src {} is not readable", src.display()))?;
+            prep.src_is_dir = meta.is_dir();
+            match (args.scenario, prep.src_is_dir) {
+                (Scenario::UploadFile, true) => bail!("upload-file needs a file, not a directory"),
+                (Scenario::UploadDir, false) => bail!("upload-dir needs a directory, not a file"),
+                _ => {}
+            }
+            let s2 = src.clone();
+            let set = if prep.src_is_dir {
+                blocking(move || walk_local(&s2)).await?
+            } else {
+                vec![(basename(&args.src), src, meta.len())]
+            };
+            prep.files = set.len() as u64;
+            prep.bytes = set.iter().map(|x| x.2).sum();
+            prep.local = Arc::new(set.into_iter().map(|(r, p, _)| (r, p)).collect());
+            if prep.files == 0 {
+                bail!("--src holds no files");
+            }
+        }
+        Scenario::Download | Scenario::Copy | Scenario::Relay => {
+            let (mgmt, src) = (args.mgmt.clone(), args.src.clone());
+            let (kind, plan) = blocking(move || console_plan(&mgmt, &src)).await?;
+            prep.kind = Some(kind);
+            prep.files = plan.manifest.len() as u64;
+            prep.bytes = plan.manifest.iter().map(|e| e.size).sum();
+            if prep.files == 0 {
+                bail!("--src holds no files");
+            }
+        }
+    }
+    if args.scenario == Scenario::Resume {
+        let path = resolve_elf(args.elf.as_deref())?;
+        let p2 = path.clone();
+        let elf = blocking(move || load_elf(&p2)).await?;
+        println!(
+            "payload: {} ({} bytes, mtime {}, blake3 {}…) — stamped copy is sent, the file is untouched",
+            elf.path.display(),
+            elf.size,
+            elf.mtime,
+            elf.hash12
+        );
+        prep.elf = Some(elf);
+    }
+    if args.proto == Proto::Ava1 {
+        prep.setup_ms = Some(ava1_preflight(env, &args.transfer).await?);
+        if args.scenario == Scenario::Relay {
+            ava1_preflight(env, &to_session_name(args.to.as_deref().unwrap())).await?;
+        }
+    }
+    Ok(prep)
+}
+
+/// `PS5UPLOAD_TRANSFER` must not contradict `--proto` (C17): an ambiguous measurement is
+/// refused, not made.
+fn check_mode(proto: Proto) -> anyhow::Result<()> {
+    use ps5upload_ava1::route::{mode, Mode};
+    match (mode(), proto) {
+        (Mode::Ftx2, Proto::Ava1) | (Mode::Ava1, Proto::Ftx2) => bail!(
+            "PS5UPLOAD_TRANSFER is set to {:?}, which contradicts --proto {}; unset it \
+             (bench calls each protocol directly and never reads it)",
+            std::env::var("PS5UPLOAD_TRANSFER").unwrap_or_default(),
+            proto.as_str()
+        ),
+        _ => Ok(()),
+    }
+}
+
+pub async fn run_bench(args: &BenchArgs) -> anyhow::Result<Vec<BenchRun>> {
+    check_mode(args.proto)?;
+    let env = Env::production(args);
+    run_bench_in(&env, args).await
+}
+
+/// The scenario loop. A failed run is data too: it is recorded and the loop goes on.
+pub async fn run_bench_in(env: &Env, args: &BenchArgs) -> anyhow::Result<Vec<BenchRun>> {
+    if env.clean {
+        if let Some(d) = args
+            .dest
+            .as_deref()
+            .filter(|_| args.scenario != Scenario::Download)
+        {
+            check_console_dest(d)?;
+        }
+    }
+    if args.scenario == Scenario::Relay && !matches!(env.pool, PoolRef::Global) {
+        bail!("relay cannot run with AVA1_PORT moved: one address cannot serve two consoles");
+    }
+    let mut env_owned: Option<Env> = None;
+    let mut proxy: Option<ava1_chaos::ChaosProxy> = None;
+    if args.scenario == Scenario::Drop60 {
+        let upstream = tokio::net::lookup_host(&args.ava1)
+            .await
+            .with_context(|| format!("resolving {}", args.ava1))?
+            .next()
+            .ok_or_else(|| anyhow!("{} resolves to nothing", args.ava1))?;
+        let p = ava1_chaos::ChaosProxy::start(
+            upstream,
+            ava1_chaos::ChaosConfig {
+                kill_every: Some(Duration::from_secs(args.kill_every_s)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        println!(
+            "drop60: killing every connection each {} s through {} -> {upstream}",
+            args.kill_every_s, p.addr
+        );
+        env_owned = Some(Env {
+            pool: PoolRef::Owned(Arc::new(
+                ps5upload_ava1::Pool::new(env.ava_dir.clone()).with_addr(p.addr.to_string()),
+            )),
+            ava_dir: env.ava_dir.clone(),
+            idle: env.idle,
+            clean: env.clean,
+            out: env.out.clone(),
+        });
+        proxy = Some(p);
+    }
+    let env = env_owned.as_ref().unwrap_or(env);
+
+    let prep = prepare(env, args).await?;
+    let local_dir = args
+        .dest
+        .as_deref()
+        .filter(|_| args.scenario == Scenario::Download);
+    let local_dir = PathBuf::from(local_dir.map(String::from).unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join(format!("ps5upload-bench-download-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }));
+    let scratch = crate::ava1_cmds::data_dir().join(format!("bench-relay-{}", std::process::id()));
+    println!(
+        "bench {} {} on {} ({} files, {} bytes), {} run(s), results -> {}",
+        args.scenario.name(),
+        args.proto.as_str(),
+        args.host,
+        prep.files,
+        prep.bytes,
+        args.runs,
+        env.out.display()
+    );
+
+    let mut rows: Vec<Row> = Vec::new();
+    for run_no in 1..=args.runs {
+        let cleaned = clean_between(env, args, &local_dir).await;
+        if env.clean {
+            tokio::time::sleep(env.idle).await;
+        }
+        let started = unix_now();
+        let attempt: Attempt = match cleaned {
+            Err(e) => Err((0.0, e)),
+            Ok(()) => match args.scenario {
+                Scenario::UploadFile | Scenario::UploadDir => run_upload(env, args, &prep).await,
+                Scenario::Drop60 => {
+                    run_drop60(env, args, &prep, proxy.as_ref().expect("started above")).await
+                }
+                Scenario::Resume => run_resume(env, args, &prep).await,
+                Scenario::Download => run_download(env, args, &prep, &local_dir).await,
+                Scenario::Copy => run_copy(env, args).await,
+                Scenario::Relay => run_relay(env, args, &prep, &scratch).await,
+            },
+        };
+        let row = finish(args, &prep, run_no, attempt);
+        record(&env.out, &row.json(started, &prep.corpus))?;
+        println!(
+            "run {run_no}/{}: {} {:.2}s {:.1} MB/s {:.1} files/s{}",
+            args.runs,
+            if row.run.ok { "ok" } else { "FAILED" },
+            row.run.seconds,
+            row.run.json()["mb_s"].as_f64().unwrap_or(0.0),
+            row.run.json()["files_s"].as_f64().unwrap_or(0.0),
+            row.run
+                .error
+                .as_deref()
+                .map_or(String::new(), |e| format!(" — {e}"))
+        );
+        rows.push(row);
+    }
+    // Leave the console tidy; the run records are already written.
+    if let Err(e) = clean_between(env, args, &local_dir).await {
+        eprintln!("final cleanup: {e}");
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+    print!("{}", summary(&rows, &env.out));
+    Ok(rows.into_iter().map(|r| r.run).collect())
+}
+
+fn finish(args: &BenchArgs, prep: &Prep, run_no: u32, attempt: Attempt) -> Row {
+    let base = |ok: bool, seconds: f64, error: Option<String>| BenchRun {
+        console: args.host.clone(),
+        scenario: args.scenario.name().into(),
+        proto: args.proto.as_str().into(),
+        run: run_no,
+        files: if ok { prep.files } else { 0 },
+        bytes: if ok { prep.bytes } else { 0 },
+        seconds,
+        resent: 0,
+        max_lanes: 0,
+        bottleneck: "n/a".into(),
+        sequential: false,
+        ok,
+        error,
+    };
+    let mut extra = Map::new();
+    extra.insert("config".into(), "engine-default+FTX2 knobs as named".into());
+    extra.insert("bytes_planned".into(), prep.bytes.into());
+    extra.insert("files_planned".into(), prep.files.into());
+    if let Some((c, dir)) = &prep.ceiling {
+        extra.insert("ceiling_dir".into(), dir.clone().into());
+        extra.insert("ceiling_files_s_calibrated".into(), (*c).into());
+    }
+    if let Some(ms) = prep.setup_ms.filter(|_| run_no == 1) {
+        extra.insert("session_setup_ms".into(), ms.into());
+    }
+    if let Some(e) = &prep.elf {
+        extra.insert("elf_path".into(), e.path.display().to_string().into());
+        extra.insert("elf_size".into(), e.size.into());
+        extra.insert("elf_mtime".into(), e.mtime.into());
+        extra.insert("elf_blake3_12".into(), e.hash12.clone().into());
+    }
+    let ceiling = prep.ceiling.as_ref().map(|c| c.0);
+    match attempt {
+        Err((seconds, why)) => {
+            extra.insert("observed".into(), Value::Null);
+            Row {
+                run: base(false, seconds, Some(why)),
+                drive: prep.drive.clone(),
+                verified: false,
+                ceiling,
+                extra,
+            }
+        }
+        Ok(m) => {
+            let verification = verify_protocol(args.proto, &m.observed);
+            let error = verification.clone().err().or_else(|| m.verdict.clone());
+            let mut run = base(error.is_none(), m.seconds, error);
+            run.resent = m.resent;
+            run.max_lanes = m.max_lanes;
+            run.bottleneck = m.bottleneck.clone();
+            run.sequential = m.sequential;
+            if let Some(b) = m.bytes {
+                run.bytes = b;
+            }
+            extra.extend(m.extra);
+            extra.insert("observed".into(), m.observed.into());
+            extra.insert("verified_by".into(), m.verified_by.into());
+            Row {
+                run,
+                drive: prep.drive.clone(),
+                verified: verification.is_ok(),
+                ceiling,
+                extra,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,5 +2495,408 @@ mod tests {
             "{}",
             st.compressible_fraction
         );
+    }
+
+    // ─── Task 27 ────────────────────────────────────────────────────────────────
+
+    fn run(seconds: f64) -> BenchRun {
+        BenchRun {
+            console: "1.2.3.4".into(),
+            scenario: "upload-dir".into(),
+            proto: "ava1".into(),
+            run: 1,
+            files: 10,
+            bytes: 1 << 20,
+            seconds,
+            resent: 0,
+            max_lanes: 3,
+            bottleneck: "network".into(),
+            sequential: false,
+            ok: true,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn a_result_line_has_every_field() {
+        let r = BenchRun {
+            console: "1.2.3.4".into(),
+            scenario: "upload-dir".into(),
+            proto: "ava1".into(),
+            run: 1,
+            files: 10,
+            bytes: 1 << 20,
+            seconds: 0.5,
+            resent: 0,
+            max_lanes: 3,
+            bottleneck: "network".into(),
+            sequential: false,
+            ok: true,
+            error: None,
+        };
+        let v = r.json();
+        for k in [
+            "date",
+            "console",
+            "scenario",
+            "proto",
+            "run",
+            "files",
+            "bytes",
+            "seconds",
+            "mb_s",
+            "files_s",
+            "resent",
+            "max_lanes",
+            "bottleneck",
+            "sequential",
+            "ok",
+        ] {
+            assert!(v.get(k).is_some(), "{k}");
+        }
+        assert!((v["mb_s"].as_f64().unwrap() - 2.097152).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_zero_second_run_is_finite() {
+        let v = run(0.0).json();
+        assert!(v["mb_s"].as_f64().unwrap().is_finite());
+        assert!(v["files_s"].as_f64().unwrap().is_finite());
+        let text = v.to_string();
+        assert!(!text.contains("NaN") && !text.contains("inf"), "{text}");
+        assert!(v["mb_s"].is_number() && v["files_s"].is_number());
+    }
+
+    #[test]
+    fn bench_args_parse_the_console_and_derive_three_ports() {
+        let a = BenchArgs::parse(&[
+            "10.0.0.5",
+            "upload-dir",
+            "--proto",
+            "ava1",
+            "--src",
+            "/x",
+            "--dest",
+            "/y",
+            "--runs",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(a.host, "10.0.0.5");
+        assert_eq!(a.transfer, "10.0.0.5:9113");
+        assert_eq!(a.mgmt, "10.0.0.5:9114");
+        assert!(a.ava1.starts_with("10.0.0.5:"), "{}", a.ava1);
+        assert_eq!(a.scenario, Scenario::UploadDir);
+        assert_eq!(a.proto, Proto::Ava1);
+        assert_eq!(
+            (a.runs, a.src.as_str(), a.dest.as_deref()),
+            (3, "/x", Some("/y"))
+        );
+        let b = BenchArgs::parse(&[
+            "10.0.0.5:9113",
+            "copy",
+            "--proto",
+            "ftx2",
+            "--src",
+            "/a",
+            "--dest",
+            "/b",
+        ])
+        .unwrap();
+        assert_eq!(
+            (b.host.as_str(), b.mgmt.as_str()),
+            ("10.0.0.5", "10.0.0.5:9114")
+        );
+        assert_eq!(b.runs, 1, "--runs defaults to 1");
+    }
+
+    #[test]
+    fn an_unknown_scenario_or_proto_is_an_error_listing_the_valid_values() {
+        let base = |sc: &str, proto: &str, runs: &str| {
+            BenchArgs::parse(&[
+                "h", sc, "--proto", proto, "--src", "/x", "--dest", "/y", "--runs", runs,
+            ])
+        };
+        let e = base("sideways", "ava1", "1").unwrap_err().to_string();
+        for s in SCENARIOS {
+            assert!(e.contains(s), "{e}");
+        }
+        let e = base("copy", "ftp", "1").unwrap_err().to_string();
+        assert!(e.contains("ava1") && e.contains("ftx2"), "{e}");
+        let e = base("copy", "ava1", "0").unwrap_err().to_string();
+        assert!(e.contains("at least 1"), "{e}");
+        assert!(base("copy", "ava1", "x").is_err());
+        assert!(
+            BenchArgs::parse(&["h", "drop60", "--proto", "ftx2", "--src", "/x", "--dest", "/y"])
+                .is_err(),
+            "drop60 is AVA1-only"
+        );
+        assert!(BenchArgs::parse(&[
+            "h", "relay", "--proto", "ava1", "--src", "/x", "--dest", "/y"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn drop60_refuses_to_pass_without_drops() {
+        assert_eq!(drop60_verdict(0, 0), Err("no drops".to_string()));
+        assert!(drop60_verdict(64 << 20, 1).is_ok());
+        assert!(drop60_verdict((64 << 20) + 1, 1).is_err());
+        assert!(drop60_verdict(128 << 20, 2).is_ok());
+    }
+
+    #[test]
+    fn the_median_is_the_middle_or_the_mean_of_the_two_middle() {
+        assert_eq!(median(&[1.0]), Some(1.0));
+        assert_eq!(median(&[1.0, 3.0]), Some(2.0));
+        assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
+        assert_eq!(median(&[]), None);
+        assert_eq!(fmt1(median(&[])), "n/a");
+    }
+
+    #[test]
+    fn the_protocol_evidence_must_match_what_was_asked() {
+        assert_eq!(
+            observe_upload("ab", r#"{"protocol":"ava1","files":1}"#),
+            "ava1"
+        );
+        assert_eq!(observe_upload("ab", r#"{"ok":true}"#), "ftx2");
+        assert!(observe_upload("", r#"{"ok":true}"#).starts_with("unrecognised"));
+        assert!(observe_upload("ab", r#"{"protocol":"zzz"}"#).starts_with("unrecognised"));
+        assert!(verify_protocol(Proto::Ava1, "ava1").is_ok());
+        let e = verify_protocol(Proto::Ava1, "ftx2").unwrap_err();
+        assert_eq!(e, "protocol mismatch: asked ava1, saw ftx2");
+    }
+
+    #[test]
+    fn a_recursive_delete_target_must_be_below_a_drive_and_say_bench() {
+        for ok in ["/data/bench", "/mnt/usb0/bench-run/x", "/mnt/ext1/my-bench"] {
+            check_console_dest(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [
+            "/",
+            "/data",
+            "/mnt",
+            "/mnt/usb0",
+            "/data/ps5upload",
+            "/data/bench/../x",
+            "data/bench",
+            "/system/bench",
+            "/data//bench",
+        ] {
+            assert!(check_console_dest(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_drive_is_the_mount_or_the_top_directory() {
+        assert_eq!(drive_of("/mnt/usb0/bench/x"), "/mnt/usb0");
+        assert_eq!(drive_of("/mnt/ext1"), "/mnt/ext1");
+        assert_eq!(drive_of("/data/bench"), "/data");
+        assert_eq!(drive_of("/user/home"), "/user");
+    }
+
+    #[test]
+    fn the_ceiling_is_the_newest_calibration_of_this_consoles_drive() {
+        let d = TempDir::new("bench-ceiling");
+        let f = d.path().join("r.jsonl");
+        let cal = |console: &str, dir: &str, at: u64, tops: &[u64]| {
+            let mut v = record_envelope("calibrate", None, None, "ava1");
+            let o = v.as_object_mut().unwrap();
+            o.insert("console".into(), console.into());
+            o.insert("dir".into(), dir.into());
+            o.insert("started_at".into(), at.into());
+            o.insert(
+                "points".into(),
+                tops.iter()
+                    .map(|t| json!({"files_per_s": t}))
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+            v
+        };
+        record(&f, &cal("1.1.1.1", "/data/cal", 1, &[188, 298])).unwrap();
+        record(&f, &cal("1.1.1.1:9113", "/data/cal2", 2, &[200, 310, 300])).unwrap();
+        record(&f, &cal("1.1.1.1", "/mnt/usb0/cal", 3, &[575])).unwrap();
+        record(&f, &cal("2.2.2.2", "/data/cal", 4, &[999])).unwrap();
+        assert_eq!(
+            calibrated_ceiling(&f, "1.1.1.1", "/data"),
+            Some((310, "/data/cal2".into()))
+        );
+        assert_eq!(
+            calibrated_ceiling(&f, "1.1.1.1", "/mnt/usb0").map(|c| c.0),
+            Some(575)
+        );
+        assert_eq!(calibrated_ceiling(&f, "1.1.1.1", "/mnt/ext1"), None);
+        assert_eq!(
+            calibrated_ceiling(&d.path().join("none"), "1.1.1.1", "/data"),
+            None
+        );
+    }
+
+    fn row(proto: &str, ok: bool, seconds: f64, ceiling: Option<u64>) -> Row {
+        let mut r = run(seconds);
+        r.proto = proto.into();
+        r.ok = ok;
+        Row {
+            run: r,
+            drive: "/data".into(),
+            verified: ok,
+            ceiling,
+            extra: Map::new(),
+        }
+    }
+
+    #[test]
+    fn the_summary_compares_per_drive_next_to_the_ceiling() {
+        let rows = vec![
+            row("ava1", true, 0.5, Some(300)),
+            row("ava1", true, 1.5, Some(300)),
+            row("ava1", false, 9.0, Some(300)),
+            row("ftx2", true, 1.0, Some(300)),
+        ];
+        let s = summary(&rows, Path::new("results.jsonl"));
+        assert!(s.contains("upload-dir on /data"), "{s}");
+        assert!(s.contains("300 files/s"), "{s}");
+        assert!(
+            s.contains("2/3"),
+            "failed runs are counted, not averaged: {s}"
+        );
+        assert!(s.contains("1/1"), "{s}");
+        // ava1 median of 0.5 s and 1.5 s runs: files/s 20 and 6.67 -> 13.3; ftx2 10.
+        assert!(s.contains("AVA1/FTX2: MB/s 1.33x"), "{s}");
+        assert!(s.contains("durability"), "{s}");
+        assert!(
+            s.contains("2 passed, 1 failed") || s.contains("3 passed, 1 failed"),
+            "{s}"
+        );
+        assert!(s.contains("results:") && s.contains("results.jsonl"), "{s}");
+    }
+
+    /// A whole AVA1 upload scenario against a loopback host: records one verified line
+    /// per run, the file lands, and the line carries the drive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ava1_upload_dir_scenario_runs_end_to_end_on_loopback() {
+        use ava1::host::FolderHost;
+        use ava1::keys::Identity;
+        use ava1::peers::PeerStore;
+        use ava1::server::{self, ServerCtx};
+        use ava1::session::RpcReply;
+        use ava1::wire::Message;
+        let d = TempDir::new("bench-e2e");
+        let ava = d.path().join("ava");
+        let me = Identity::load_or_create(&ava.join("identity")).unwrap();
+        let mut peers = PeerStore::in_memory();
+        peers.add(me.public(), "bench").unwrap();
+        let rpc: ava1::server::RpcHandler = Box::new(|method, _| {
+            if method == ava1::gen::METHOD_NODE_INFO {
+                let info = ava1::gen::NodeInfo {
+                    version: "t".into(),
+                    platform: "rust".into(),
+                    name: "h".into(),
+                    firmware: None,
+                };
+                RpcReply {
+                    status: ava1::gen::STATUS_OK,
+                    body: info.to_bytes().unwrap(),
+                }
+            } else {
+                RpcReply {
+                    status: ava1::gen::ERR_UNKNOWN_METHOD,
+                    body: Vec::new(),
+                }
+            }
+        });
+        let ctx = ServerCtx::new(Identity::generate().unwrap(), "host", peers, rpc).with_jobs(
+            Arc::new(FolderHost {
+                root: d.path().join("share"),
+                jobs_dir: d.path().join("jobs"),
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(server::serve(l, Arc::new(ctx)));
+
+        let src = d.path().join("src");
+        corpus_tiny(&src, 40).unwrap();
+        let want = stats(&src).unwrap();
+        let out = d.path().join("out.jsonl");
+        let env = Env {
+            pool: PoolRef::Owned(Arc::new(
+                ps5upload_ava1::Pool::new(ava.clone()).with_addr(addr),
+            )),
+            ava_dir: ava,
+            idle: Duration::ZERO,
+            clean: false,
+            out: out.clone(),
+        };
+        let args = BenchArgs::parse(&[
+            "127.0.0.1",
+            "upload-dir",
+            "--proto",
+            "ava1",
+            "--src",
+            src.to_str().unwrap(),
+            "--dest",
+            "in",
+            "--runs",
+            "2",
+        ])
+        .unwrap();
+        let runs = tokio::time::timeout(Duration::from_secs(60), run_bench_in(&env, &args))
+            .await
+            .expect("bench timed out")
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|r| r.ok), "{runs:?}");
+        assert_eq!((runs[0].files, runs[0].bytes), (want.files, want.bytes));
+        let lines: Vec<Value> = std::fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["verified"], true);
+        assert_eq!(lines[0]["observed"], "ava1");
+        assert_eq!(lines[0]["drive"], "/in");
+        assert_eq!(lines[0]["kind"], "bench");
+        assert_eq!(lines[0]["schema"], 1);
+        assert!(lines[0]["session_setup_ms"].is_number());
+        assert!(
+            lines[1].get("session_setup_ms").is_none(),
+            "setup is recorded once"
+        );
+        assert!(d.path().join("share/in").is_dir());
+    }
+
+    /// C10: `kills()` counts kills that took down a live connection, and only those.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_chaos_proxy_counts_only_kills_that_hit_something() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((c, _)) = l.accept().await else { break };
+                tokio::spawn(async move {
+                    let _keep = c;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        let p = ava1_chaos::ChaosProxy::start(up, Default::default())
+            .await
+            .unwrap();
+        p.kill_all();
+        assert_eq!(p.kills(), 0, "nothing was open");
+        let _c = tokio::net::TcpStream::connect(p.addr).await.unwrap();
+        for _ in 0..100 {
+            if p.connections() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(p.connections(), 1);
+        p.kill_all();
+        assert_eq!(p.kills(), 1);
     }
 }
