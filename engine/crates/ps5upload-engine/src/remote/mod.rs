@@ -64,12 +64,14 @@ pub enum RemoteError {
     HostKey { fingerprint: String, changed: bool },
 }
 
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use future
 #[async_trait::async_trait]
 pub trait RemoteFile: Send + Sync {
     fn size(&self) -> u64;
     async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, RemoteError>;
 }
 
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use future
 #[async_trait::async_trait]
 pub trait RemoteFs: Send + Sync {
     async fn list(&self, path: &str, cursor: Option<String>) -> Result<Page, RemoteError>;
@@ -120,6 +122,7 @@ impl MemFs {
         self.fail_lists.store(n, Ordering::SeqCst);
     }
 
+    #[allow(deprecated)] // fetch_update is the pre-1.99 spelling of try_update
     fn list_fails(&self) -> bool {
         self.fail_lists
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -192,6 +195,7 @@ impl RemoteFile for MemFile {
     fn size(&self) -> u64 {
         self.bytes.len() as u64
     }
+    #[allow(deprecated)] // fetch_update is the pre-1.99 spelling of try_update
     async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, RemoteError> {
         if self
             .fail_reads

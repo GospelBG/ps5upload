@@ -35,6 +35,7 @@ pub fn global() -> Result<Arc<Remote>, RemoteError> {
         .map_err(RemoteError::Io)
 }
 
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use future
 #[async_trait::async_trait]
 pub trait Connector: Send + Sync {
     async fn connect(

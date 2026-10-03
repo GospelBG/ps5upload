@@ -1776,6 +1776,7 @@ pub(crate) mod origin_tests {
                             if !saw {
                                 return;
                             }
+                            #[allow(deprecated)] // pre-1.99 spelling of try_update
                             let refuse = refusals
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                                     if n > 0 {
