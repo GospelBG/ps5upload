@@ -492,12 +492,36 @@ async fn apply_chunk(
 
 /// From here on both sides are identical: journal, map, apply, sync, commit, finish
 /// (SPEC.md §12.6, §13, §14).
+///
+/// The loop runs in `run_loop`; this wrapper joins the sync batch on every exit path.
+/// A dropped handle detaches the task, and a detached batch keeps appending to the
+/// job's journal after the job is gone — two writers against the journal's
+/// single-writer directory if the peer reopens the same job id (ruling 19). Joining
+/// cannot deadlock: the batch awaits only its own `spawn_blocking` I/O and the
+/// control outbox, whose sends fail as soon as the session's writer task ends
+/// (bounded by `dead_after`), never anything the run loop holds.
 async fn run(
     link: &mut JobLink,
     m: Arc<Manifest>,
     need_hint: Option<Need>,
     sink: Arc<dyn Sink>,
     o: RecvOptions,
+) -> Result<RecvReport, SendError> {
+    let mut batch_handle: Option<tokio::task::JoinHandle<Result<BatchDone, SendError>>> = None;
+    let outcome = run_loop(link, m, need_hint, sink, o, &mut batch_handle).await;
+    if let Some(h) = batch_handle.take() {
+        let _ = h.await;
+    }
+    outcome
+}
+
+async fn run_loop(
+    link: &mut JobLink,
+    m: Arc<Manifest>,
+    need_hint: Option<Need>,
+    sink: Arc<dyn Sink>,
+    o: RecvOptions,
+    batch_handle: &mut Option<tokio::task::JoinHandle<Result<BatchDone, SendError>>>,
 ) -> Result<RecvReport, SendError> {
     let job_id = link.job_id;
     let dir = journal::job_dir(&o.jobs_dir, &job_id);
@@ -554,7 +578,15 @@ async fn run(
     // against the sink and the outboard; a mismatch resets the file before the map.
     let mut large: HashMap<u32, Large> = HashMap::new();
     for (id, r) in st.ranges.clone() {
-        let size = m.entry(id).expect("an id from the journal").size;
+        let Some(e) = m.entry(id) else {
+            // A journal id the manifest does not carry (corrupt state, or a hash
+            // collision): an error ends the job, never a panic on the job task (ruling
+            // 3 covers wire ids; this is the journal's).
+            return Err(SendError::Protocol(format!(
+                "the journal names file {id}, which this manifest has none of"
+            )));
+        };
+        let size = e.size;
         let mut ob = Outboard::open(&dir.join(format!("{id}.ob")), verify::groups(size)).ok();
         let mut good = RangeSet::new();
         for (s, e) in r.iter() {
@@ -617,21 +649,54 @@ async fn run(
     pg.files_total.store(m.files() as u64, Ordering::Relaxed);
     pg.files_durable
         .store(st.done.len() as u64, Ordering::Relaxed);
+    let mut durable_bytes = 0u64;
+    for id in &st.done {
+        let Some(e) = m.entry(*id) else {
+            return Err(SendError::Protocol(format!(
+                "the journal names file {id}, which this manifest has none of"
+            )));
+        };
+        durable_bytes += e.size;
+    }
     pg.bytes_durable.store(
-        st.done
-            .iter()
-            .map(|id| m.entry(*id).expect("an id from the journal").size)
-            .sum::<u64>()
-            + st.ranges.values().map(|r| r.covered()).sum::<u64>(),
+        durable_bytes + st.ranges.values().map(|r| r.covered()).sum::<u64>(),
         Ordering::Relaxed,
     );
 
     let total_files = m.files() as usize;
     let mut done: BTreeSet<u32> = st.done.clone();
     let mut pending_small: Vec<u32> = Vec::new();
+    // A zero-byte file is already complete: its zero range yields no chunks and, in an
+    // ordered download, no bundle either (the ordered sender sends every file as chunks),
+    // so no frame will ever arrive to mark it done — and the ordered cursor would stall
+    // on it forever, holding every later file up. Create the empty file up front and let
+    // the first batch journal it durable (SPEC.md §12.6: done always follows Durable), so
+    // it completes on its own whether or not anything arrives for it.
+    let zero: BTreeSet<u32> = m
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == gen::ENTRY_FILE && e.size == 0)
+        .map(|(i, _)| i as u32)
+        .collect();
+    for id in &zero {
+        if done.contains(id) {
+            continue; // a resume: the journal already made it durable
+        }
+        let (s2, id) = (sink.clone(), *id);
+        tokio::task::spawn_blocking(move || s2.write_whole(id, &[]))
+            .await
+            .map_err(proto)??;
+        pending_small.push(id);
+    }
     let granted = o.credit;
-    let mut returned = 0u64;
     let mut credit_back = 0u64;
+    // The credit still outstanding, exactly as the C receiver counts it (w_avail):
+    // the grant, minus every frame received, plus every Credit frame sent back — the
+    // sender's in-flight mirror. A job receiving more than `granted` in total is fine
+    // (every returned Credit re-opens the window); only more than `granted` at once is
+    // not (SPEC.md §12.4, ledger row 19).
+    let mut outstanding = granted;
     let mut last_batch = Instant::now();
     // Out-of-order frames are bounded by the credit granted in JobOpen: the sender cannot
     // have more than one window in flight (SPEC.md §12.4). `whole` says the entry is a
@@ -645,7 +710,6 @@ async fn run(
     // when no batch is in flight.
     let mut jnl = Some(jnl);
     let mut st = Some(st);
-    let mut batch_handle: Option<tokio::task::JoinHandle<Result<BatchDone, SendError>>> = None;
     loop {
         if o.cancel.load(Ordering::Relaxed) {
             let _ = link
@@ -665,9 +729,9 @@ async fn run(
         let ev = tokio::select! {
             ev = next(link) => Some(ev?),
             _ = tick.tick() => None,
-            joined = join_batch(&mut batch_handle), if batch_handle.is_some() => {
+            joined = join_batch(batch_handle), if batch_handle.is_some() => {
                 let b = joined.expect("guarded by `is_some`");
-                batch_handle = None;
+                *batch_handle = None;
                 match b {
                     Ok(out) => {
                         fold_batch(&mut done, &mut large, &pg, &m, &out);
@@ -686,16 +750,13 @@ async fn run(
                 let len = frame.body.len() as u64;
                 // SPEC.md §12.4 (ledger row 19): a frame that exceeds the credit this job
                 // still has outstanding is refused with ERR_CREDIT on that lane; nothing of
-                // it is buffered or acknowledged. `granted` = o.credit; `returned` = credit
-                // already sent back in Credit frames (incremented where they are sent).
-                if len > granted.saturating_sub(returned) {
+                // it is buffered or acknowledged. `outstanding` = granted − received +
+                // returned, the sender's in-flight mirror (the C receiver's w_avail).
+                if len > outstanding {
                     if let Some(l) = link.lane(lane) {
-                        // The peer's link closes the lane when it reads this sealed Error
-                        // (link.rs), which the sender observes exactly as the C receiver's
-                        // explicit close: its lane dies. The responder side has no lane-close
-                        // API (LaneOpener is dial-only), so it returns the error after the
-                        // send and the session's own lifecycle ends the lane — a deliberate
-                        // divergence from the C receiver, which closes the lane itself (Q2).
+                        // The sealed Error on the offending lane (SPEC.md §12.4): the peer's
+                        // link closes that lane when it reads it, which the sender observes
+                        // exactly as the C receiver's explicit close: its lane dies.
                         let _ =
                             l.tx.send(&gen::Error {
                                 code: gen::ERR_CREDIT,
@@ -703,6 +764,20 @@ async fn run(
                             })
                             .await;
                     }
+                    // Ruling Q2: a credit overrun is a peer protocol violation and ends the
+                    // whole session, not just the job — a transport without a server-side
+                    // session-end API closes it through the peer: the sealed Error also goes
+                    // on the control connection, where the peer's link reader ends the
+                    // session (and this side follows when the peer's sockets close). The
+                    // sender then learns ERR_CREDIT immediately instead of stalling on credit
+                    // it will never get.
+                    let _ = link
+                        .control
+                        .send(&gen::Error {
+                            code: gen::ERR_CREDIT,
+                            message: "a frame larger than the credit granted".into(),
+                        })
+                        .await;
                     if let Some(op) = link.opener() {
                         op.close(lane); // dial side only (ruling Q2)
                     }
@@ -719,6 +794,7 @@ async fn run(
                     })
                     .await
                     .map_err(|e| SendError::Disconnected(e.to_string()))?;
+                outstanding -= len;
 
                 match frame.ty {
                     Chunk::TYPE => {
@@ -795,7 +871,9 @@ async fn run(
                 }
                 credit_back += len;
                 if o.ordered {
-                    // Feed the sink strictly in (file, offset) order; skip files already done.
+                    // Feed the sink strictly in (file, offset) order; skip files already
+                    // done — and zero-byte files, which no frame will ever describe: the
+                    // cursor must not wait for a chunk that cannot arrive.
                     loop {
                         while (cursor.0 as usize) < m.entries.len()
                             && (m
@@ -803,7 +881,8 @@ async fn run(
                                 .expect("the cursor is inside the manifest")
                                 .kind
                                 != gen::ENTRY_FILE
-                                || done.contains(&cursor.0))
+                                || done.contains(&cursor.0)
+                                || zero.contains(&cursor.0))
                         {
                             cursor = (cursor.0 + 1, 0);
                         }
@@ -875,7 +954,7 @@ async fn run(
                 })
                 .await
                 .map_err(|e| SendError::Disconnected(e.to_string()))?;
-            returned += credit_back;
+            outstanding += credit_back;
             credit_back = 0;
         }
         if batch_handle.is_none() {
@@ -943,8 +1022,8 @@ async fn run(
                     &pg,
                     &mut pending_small,
                     &mut large,
-                );
-                batch_handle = Some(tokio::task::spawn(batch_task(snap)));
+                )?;
+                *batch_handle = Some(tokio::task::spawn(batch_task(snap)));
             }
         }
     }
@@ -1016,7 +1095,7 @@ fn snapshot_batch(
     pg: &Arc<Progress>,
     small: &mut Vec<u32>,
     large: &mut HashMap<u32, Large>,
-) -> BatchJob {
+) -> Result<BatchJob, SendError> {
     let mut ranges = Vec::new();
     let mut roots = Vec::new();
     let mut entries = Vec::new();
@@ -1027,7 +1106,14 @@ fn snapshot_batch(
         if l.written.covered() == 0 {
             continue;
         }
-        let size = m.entry(*id).expect("an id from the manifest").size;
+        let Some(e) = m.entry(*id) else {
+            // `large` holds ids the journal replayed; a bad one is an error, not a panic
+            // on the job task.
+            return Err(SendError::Protocol(format!(
+                "file {id} has written data but this manifest has none of it"
+            )));
+        };
+        let size = e.size;
         for (s, e) in l.written.iter() {
             ranges.push(FileRange {
                 file_id: *id,
@@ -1043,7 +1129,7 @@ fn snapshot_batch(
             ob: l.hasher_cvs.clone(),
         });
     }
-    BatchJob {
+    Ok(BatchJob {
         job_id,
         control,
         sink: sink.clone(),
@@ -1055,7 +1141,7 @@ fn snapshot_batch(
         ranges,
         roots,
         large: entries,
-    }
+    })
 }
 
 /// Sync → journal → Durable, then commit the complete large files (SPEC.md §12.6). The
@@ -1474,7 +1560,8 @@ mod tests {
             &pg,
             &mut Vec::new(),
             &mut large,
-        );
+        )
+        .unwrap();
         let out = batch_task(snap).await.unwrap();
         fold_batch(&mut done, &mut large, &pg, &m, &out);
         let (jnl, st) = (out.jnl, out.st);

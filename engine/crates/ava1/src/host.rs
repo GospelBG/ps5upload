@@ -26,6 +26,13 @@ fn inside(root: &Path, rel: &str) -> Option<PathBuf> {
     if rel.is_empty() {
         return Some(root.to_path_buf()); // check_path's documented exception: the root itself
     }
+    // `check_path` splits on '/', but Windows treats '\\' as a separator too, so
+    // "a\\..\\..\\x" would pass the check and `root.join` would let it escape the share
+    // on a Windows host. A JobOpen.root is a peer-chosen console/engine path — a
+    // backslash is never a legitimate component of one — so refuse it outright.
+    if rel.contains('\\') {
+        return None;
+    }
     if manifest::check_path(rel).is_err() {
         return None;
     }
