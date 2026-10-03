@@ -862,7 +862,7 @@ int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *o
         return st;
     }
     case AVA1_METHOD_DISK_CALIBRATE:
-        return AVA1_ERR_UNKNOWN_METHOD; /* Task 20 */
+        return ava1_calibrate(body, len, out, cap, out_len);
     default:
         return -1; /* not ours: the embedder's handler runs (ava1_glue.c, Task 21) */
     }

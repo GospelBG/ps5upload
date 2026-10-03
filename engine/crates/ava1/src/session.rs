@@ -301,6 +301,29 @@ impl Session {
         Ok(gen::NodeInfo::decode(&r.body)?)
     }
 
+    /// Measures file creation and sync cost at 1, 2, 4, 8 and 16 workers.
+    pub async fn calibrate(
+        &self,
+        dir: &str,
+        files: u32,
+        size: u32,
+    ) -> Result<Vec<gen::CalPoint>, Ava1Error> {
+        let body = gen::DiskCalibrate {
+            dir: dir.into(),
+            files,
+            size,
+        }
+        .to_bytes()?;
+        let reply = self.rpc(gen::METHOD_DISK_CALIBRATE, &body).await?;
+        if reply.status != gen::STATUS_OK {
+            return Err(Ava1Error::Refused {
+                code: reply.status,
+                message: "disk.calibrate failed".into(),
+            });
+        }
+        Ok(gen::DiskCalibrateResult::decode(&reply.body)?.points)
+    }
+
     /// Asks the other device (which must already trust us) to accept new pairings for
     /// `seconds` — the app's "Pair another device".
     pub async fn open_pairing(&self, seconds: u16) -> Result<(), Ava1Error> {

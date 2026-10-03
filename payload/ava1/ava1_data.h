@@ -44,6 +44,8 @@ const ava1_data_hooks_t *ava1_data_hooks(void);
  * data layer's, so an embedder's own handler runs (ava1_glue.c, Task 21). */
 int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *out, size_t cap,
                   size_t *out_len);
+/* Five file-create/fsync measurements used to choose an initial worker count. */
+int ava1_calibrate(const uint8_t *body, uint32_t len, uint8_t *out, size_t cap, size_t *out_len);
 /* Attaches a job to session `sid`: its messages go there (waiting sends), its lanes are
  * counted, frames held for an earlier session are dropped and lane frames wait for the
  * new session's map. `credit` nonzero is this attach's grant (JobOpenAck.credit): the

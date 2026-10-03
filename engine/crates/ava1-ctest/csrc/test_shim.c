@@ -1542,6 +1542,11 @@ int ava1_test_data_knob(const char *name, uint32_t v) {
     else if (!strcmp(name, "lane_alloc_fail")) ava1_data_test_lane_alloc_fail = (int)v;
     else if (!strcmp(name, "fb_force")) ava1_data_test_fb_force = (int)v;
     else if (!strcmp(name, "park_ms")) __atomic_store_n(&c->park_ms, v, __ATOMIC_SEQ_CST);
+    else if (!strcmp(name, "deny_write")) __atomic_store_n(&g_deny_write, (int)v, __ATOMIC_SEQ_CST);
+    else if (!strcmp(name, "budget_free")) {
+        (void)ava1_budget_take(UINT64_MAX, 0);
+        ava1_budget_give(v);
+    }
     else if (!strcmp(name, "copy_walk_delay_ms")) __atomic_store_n(&ava1_copy_test_walk_delay_ms, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "copy_delete_delay_ms")) __atomic_store_n(&ava1_copy_test_delete_delay_ms, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "ctl_cap")) __atomic_store_n(&c->ctl_cap, v, __ATOMIC_SEQ_CST);
