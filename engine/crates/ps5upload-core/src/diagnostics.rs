@@ -21,19 +21,8 @@ use crate::mgmt::{self, m};
 pub fn klog_read(addr: &str, max_bytes: u32) -> Result<String> {
     let body = serde_json::json!({ "max_bytes": max_bytes });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::KlogRead, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected KLOG_READ: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::KlogReadAck {
-        bail!("expected KLOG_READ_ACK, got {ft:?}");
-    }
+    // One reply carries at most the newest ~56 KiB; a console that had more says so in the text.
+    let resp = mgmt::call(addr, m::LOG_KLOG, &body)?;
     Ok(String::from_utf8_lossy(&resp).into_owned())
 }
 
@@ -57,19 +46,7 @@ pub struct NetInterfaceList {
 }
 
 pub fn net_interfaces(addr: &str) -> Result<NetInterfaceList> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::NetInterfaces, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected NET_INTERFACES: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::NetInterfacesAck {
-        bail!("expected NET_INTERFACES_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::NET_INTERFACES, &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -564,16 +541,10 @@ pub fn ufs_fsck(addr: &str, device: &str, repair: bool) -> Result<UfsFsckResult>
 pub fn net_speed_test(addr: &str, round_trips: u32) -> Result<NetSpeedTestResult> {
     let n = round_trips.clamp(1, 2048);
     let mut latencies_us: Vec<u64> = Vec::with_capacity(n as usize);
-    let mut c = Connection::connect(addr)?;
     let started = std::time::Instant::now();
     for _ in 0..n {
         let t0 = std::time::Instant::now();
-        c.send_frame(FrameType::NetSpeedTest, &[])?;
-        let (hdr, _resp) = c.recv_frame()?;
-        let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-        if ft != FrameType::NetSpeedTestAck {
-            bail!("expected NET_SPEED_TEST_ACK, got {ft:?}");
-        }
+        mgmt::call(addr, m::NET_SPEEDTEST, &[])?;
         latencies_us.push(t0.elapsed().as_micros() as u64);
     }
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -617,32 +588,23 @@ pub fn net_reach(addr: &str, host: &str, port: u16, timeout_ms: u32) -> Result<N
         "timeout_ms": timeout_ms.to_string(),
     })
     .to_string();
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::NetReach, body.as_bytes())?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft != FrameType::NetReachAck {
-        bail!("expected NET_REACH_ACK, got {ft:?}");
-    }
+    // The probe may wait `timeout_ms` for the connect; the call's own deadline is longer.
+    let deadline =
+        std::time::Duration::from_millis(u64::from(timeout_ms.clamp(100, 15_000)) + 5_000);
+    let resp = mgmt::call_with(
+        addr,
+        m::NET_REACH,
+        m::NET_REACH.label,
+        body.as_bytes(),
+        Some(deadline),
+    )?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
 pub fn proc_modules(addr: &str, pid: i32) -> Result<ModuleList> {
     let body = serde_json::json!({ "pid": pid });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::ProcModules, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected PROC_MODULES: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::ProcModulesAck {
-        bail!("expected PROC_MODULES_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::PROC_MODULES, &body)?;
     Ok(serde_json::from_slice(&resp)?)
 }
 

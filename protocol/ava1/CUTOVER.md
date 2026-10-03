@@ -89,6 +89,11 @@ kept.
       FTX2 (`ZipTooLarge`); they need a streaming entry reader.
 - [ ] Management RPCs: every :9114 FTX2 frame the engine core sends (list above) needs an AVA1
       method. `SPEC.md` §7.1 defines only 1–3 and 16–19. This is project 3's main work.
+- [ ] Task 9 leftovers: `net.speedtest` now measures round trips on the shared AVA1 session (gate and
+      pool included), so its numbers are not comparable with the FTX2 one-connection figures; the AVA1
+      event log has no line for a `job.copy` ending (only upload/download receivers and peer-ended
+      senders log); a clamped `log.syslog` tail is a note plus the newest 256 KiB, the older kernel text
+      is not reachable (FTX2 sent up to 1 MiB).
 - [ ] A failed multi-chunk `fs.write` (`ps5upload-ava1/src/mgmt.rs`, `write_chunks`) leaves `<path>.ps5upload.tmp` behind until the next
   write of that path (offset 0 truncates it). Needs `job.run` DELETE (Task 5) for a best-effort cleanup; `TODO(Task 5)` marks the spot.
 - [ ] `ps5_fs_move`'s same-drive rename moves to an AVA1 RPC with the `st_dev` guard (never an

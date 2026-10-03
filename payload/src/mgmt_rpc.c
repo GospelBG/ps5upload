@@ -112,7 +112,7 @@ int mgmt_status_for_token(const char *t) {
     if (has(t, "exists") || has(t, "eexist") || has(t, "already")) return AVA1_ERR_EXISTS;
     if (has(t, "unknown_job") || has(t, "no_such_job") || has(t, "job_not_found")) return AVA1_ERR_UNKNOWN_JOB;
     if (has(t, "cancel")) return AVA1_ERR_CANCELLED;
-    if (has(t, "missing") || has(t, "invalid") || has(t, "malformed") || has(t, "too_large") || has(t, "bad_request") ||
+    if (has(t, "missing") || has(t, "invalid") || has(t, "malformed") || has(t, "too_large") || has(t, "bad_request") || has(t, "bad_address") ||
         has(t, "body_too"))
         return AVA1_ERR_PROTOCOL;
     if (has(t, "read_failed") || has(t, "write_failed") || has(t, "open_failed") || has(t, "mkdir") || has(t, "_io_") ||
@@ -166,8 +166,8 @@ int mgmt_legacy_failure(const char *body, size_t len, char *token, size_t token_
 
 /* ---- calling a legacy handler ---- */
 
-int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
-                     mgmt_reply_t *rep) {
+static int legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
+                       mgmt_reply_t *rep, int keep_failures) {
     capture_t c;
     char *rq, token[MGMT_CAUSE_MAX + 1];
     int rc;
@@ -202,7 +202,8 @@ int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t 
         free(c.buf);
         return st;
     }
-    if (mgmt_legacy_failure((const char *)c.buf, c.len, token, sizeof token)) {
+    if (mgmt_legacy_failure((const char *)c.buf, c.len, token, sizeof token) &&
+        !(keep_failures && strstr(token, "bad_") == NULL)) {
         int st = mgmt_status_for_token(token);
         mgmt_reply_error(cx, st, token);
         free(c.buf);
@@ -211,6 +212,11 @@ int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t 
     rep->body = c.buf;
     rep->len = c.len;
     return AVA1_STATUS_OK;
+}
+
+int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
+                     mgmt_reply_t *rep) {
+    return legacy_call(cx, fn, req, req_len, capture_cap, rep, 0);
 }
 
 /* The text capacity this call can carry: the reply buffer minus the MgmtText encoding. */
@@ -249,6 +255,62 @@ int mgmt_text_call(mgmt_ctx_t *cx, const uint8_t *req, uint32_t req_len, mgmt_le
 
 int mgmt_call_text(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn) {
     return mgmt_text_call(cx, req, n, fn, 1);
+}
+
+/* A clamped tail (log.klog, log.syslog; SPEC.md section 7.3): the handler may answer far more
+ * text than one reply carries (kern.msgbuf: up to 1 MiB). The reply is the LAST text_cap bytes
+ * (the newest lines are the ones a bug report needs), starting at a line boundary when the first
+ * line in the window is cut, never in the middle of a UTF-8 sequence, with `more` = 1 when older
+ * text was left out. A short answer is returned whole with `more` = 0. */
+int mgmt_tail_window(const char *text, size_t len, size_t cap, size_t *start) {
+    size_t s, i, scan;
+    if (len <= cap) {
+        *start = 0;
+        return 0;
+    }
+    s = len - cap;
+    scan = cap < 4096 ? cap : 4096;
+    for (i = s + 1; i <= s + scan; i++)
+        if (text[i - 1] == '\n') {
+            s = i;
+            goto aligned;
+        }
+    /* no line break near the cut: at least do not start inside a UTF-8 sequence */
+    while (s < len && ((unsigned char)text[s] & 0xC0u) == 0x80u) s++;
+aligned:
+    *start = s;
+    return 1;
+}
+
+int mgmt_call_tail(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn) {
+    const char *b;
+    uint32_t bl;
+    mgmt_reply_t rep;
+    size_t start = 0;
+    int rc, clipped;
+    if ((rc = text_request(cx, req, n, &b, &bl)) != AVA1_STATUS_OK) return rc;
+    rc = mgmt_legacy_call(cx, fn, b, bl, MGMT_PAGED_CAPTURE_MAX, &rep);
+    if (rc != AVA1_STATUS_OK) return rc;
+    clipped = mgmt_tail_window((const char *)rep.body, rep.len, text_cap(cx), &start);
+    rc = mgmt_reply_text(cx, (const char *)rep.body + start, rep.len - start, clipped);
+    mgmt_reply_free(&rep);
+    return rc;
+}
+
+/* A probe (net.reach): its negative answers are the measurement, so {"ok":false,...} with
+ * the timeout, errno and elapsed time travels as a successful MgmtText. Only a malformed
+ * request ("bad_request", "bad_address") is an error status. */
+int mgmt_call_probe(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn) {
+    const char *b;
+    uint32_t bl;
+    mgmt_reply_t rep;
+    int rc;
+    if ((rc = text_request(cx, req, n, &b, &bl)) != AVA1_STATUS_OK) return rc;
+    rc = legacy_call(cx, fn, b, bl, text_cap(cx), &rep, 1);
+    if (rc != AVA1_STATUS_OK) return rc;
+    rc = mgmt_reply_text(cx, (const char *)rep.body, rep.len, -1);
+    mgmt_reply_free(&rep);
+    return rc;
 }
 
 /* A paged text method: the request body is {"offset":N,"limit":M} (both optional); the reply

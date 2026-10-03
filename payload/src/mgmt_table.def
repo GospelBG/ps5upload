@@ -21,3 +21,15 @@ MGMT_H1(AVA1_METHOD_APP_LAUNCH, FTX2_FRAME_APP_LAUNCH, FTX2_FRAME_APP_LAUNCH_ACK
 MGMT_H1(AVA1_METHOD_APP_LIST, FTX2_FRAME_APP_LIST_REGISTERED, FTX2_FRAME_APP_LIST_REGISTERED_ACK, MGMT_SONY, handle_app_list_registered, mgmt_call_paged)
 MGMT_H0(AVA1_METHOD_PROC_PROCESS_LIST, FTX2_FRAME_PROCESS_LIST, FTX2_FRAME_PROCESS_LIST_ACK, 0, handle_process_list, mgmt_call_text)
 MGMT_HS(AVA1_METHOD_NODE_STATUS, FTX2_FRAME_STATUS, FTX2_FRAME_STATUS_ACK, 0, handle_status_frame, mgmt_call_node_status)
+
+/* ---- P3 Task 9: bug-report log reads and diagnostics probes (log.*, net.*, proc.modules) ----
+ * log.klog and log.syslog answer a clamped tail (mgmt_call_tail: the newest bytes that fit one reply, `more` = 1
+ * when older text was left out); net.reach is a probe whose negative answer is data (mgmt_call_probe). The files
+ * a bug report also reads (stderr.log, stderr.log.old, crash.log, ava/events.log) go through fs.list + fs.read. */
+MGMT_H1(AVA1_METHOD_LOG_KLOG, FTX2_FRAME_KLOG_READ, FTX2_FRAME_KLOG_READ_ACK, 0, handle_klog_read, mgmt_call_tail)
+MGMT_H0(AVA1_METHOD_LOG_SYSLOG, FTX2_FRAME_SYSLOG_TAIL, FTX2_FRAME_SYSLOG_TAIL_ACK, 0, handle_syslog_tail, mgmt_call_tail)
+MGMT_H0(AVA1_METHOD_NET_INTERFACES, FTX2_FRAME_NET_INTERFACES, FTX2_FRAME_NET_INTERFACES_ACK, 0, handle_net_interfaces, mgmt_call_text)
+MGMT_H1(AVA1_METHOD_NET_REACH, FTX2_FRAME_NET_REACH, FTX2_FRAME_NET_REACH_ACK, 0, handle_net_reach, mgmt_call_probe)
+MGMT_H1(AVA1_METHOD_NET_SPEEDTEST, FTX2_FRAME_NET_SPEED_TEST, FTX2_FRAME_NET_SPEED_TEST_ACK, 0, handle_net_speed_test, mgmt_call_text)
+MGMT_H1(AVA1_METHOD_PROC_MODULES, FTX2_FRAME_PROC_MODULES, FTX2_FRAME_PROC_MODULES_ACK, 0, handle_proc_modules, mgmt_call_text)
+/* ---- end Task 9 ---- */

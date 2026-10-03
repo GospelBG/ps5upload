@@ -119,6 +119,10 @@ enum PoolRef {
     Fixed(&'static Pool),
 }
 
+/// First line of a `log.klog` / `log.syslog` reply the console had to clamp (SPEC.md section 7.3).
+pub const TAIL_CLIPPED: &str =
+    "[earlier log text omitted: the console returned only the newest part of this log]\n";
+
 pub struct AvaTransport {
     pool: PoolRef,
     gates: Mutex<HashMap<String, Arc<MgmtGate>>>,
@@ -269,6 +273,13 @@ impl AvaTransport {
                 cause: "reply_paged".into(),
             }
             .into());
+        }
+        if tail && t.more.unwrap_or(0) != 0 {
+            // Say so in the text itself: a bug report that quietly starts mid-log reads as if
+            // the console had nothing older (the legacy FTX2 reply had no such limit).
+            let mut v = TAIL_CLIPPED.as_bytes().to_vec();
+            v.extend_from_slice(&t.body);
+            return Ok(v);
         }
         Ok(t.body)
     }

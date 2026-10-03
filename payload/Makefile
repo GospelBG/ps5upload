@@ -51,7 +51,7 @@ AVA1_SRCS := ava1/ava1_wire.c ava1/ava1_frame.c ava1/ava1_keys.c ava1/ava1_noise
              ava1/ava1_aead.c ava1/ava1_chacha_avx2.c ava1/ava1_b3.c ava1/ava1_ranges.c \
              ava1/ava1_journal.c ava1/ava1_tune.c ava1/ava1_thread.c ava1/ava1_manifest.c \
              ava1/ava1_job.c ava1/ava1_data.c ava1/ava1_apply.c ava1/ava1_recv.c ava1/ava1_send.c \
-             ava1/ava1_copy.c ava1/ava1_calibrate.c \
+             ava1/ava1_copy.c ava1/ava1_calibrate.c ava1/ava1_events.c \
              ava1/gen/ava1_gen.c src/ava1_glue.c
 # AVA1 is built as objects at -O2: it seals every byte of a transfer, and the rest of the
 # payload is compiled without -O (i.e. -O0). The AVX2 ChaCha20 alone gets -mavx2;
@@ -157,7 +157,7 @@ SRCS := src/main.c src/runtime.c src/shell_builtin.c src/takeover.c src/register
         src/backup.c src/remoteplay.c src/fan_curve.c src/notif.c \
         src/wake_watchdog.c src/cheats.c src/xml_encoding.c src/activity.c src/sdk_changer.c src/fakelib_overlay.c \
         src/tmdb.c src/fw_spoof.c src/ftp_server.c src/focus_probe.c \
-        src/content_db.c src/mgmt_rpc.c \
+        src/content_db.c src/mgmt_rpc.c src/net_probe.c \
         third_party/tiny_aes/aes.c \
         $(BLAKE3_SRCS)
 

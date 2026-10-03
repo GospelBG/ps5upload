@@ -2991,11 +2991,14 @@ export async function fsReadPreview(
   addr: string,
   path: string,
   maxBytes?: number,
+  /** Start here instead of the beginning: a log's TAIL (the newest lines). */
+  offset?: number,
 ): Promise<FsReadPreviewResult> {
   return invoke<FsReadPreviewResult>("fs_read_preview", {
     addr,
     path,
     maxBytes: maxBytes ?? null,
+    offset: offset ?? null,
   });
 }
 

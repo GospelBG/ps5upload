@@ -56,6 +56,7 @@
 #include "sys_registry.h"
 #include "profile.h"
 #include "sony_api_lock.h"
+#include "net_probe.h"
 #include "focus_probe.h"
 #include "proc_list.h"
 #include "proc_identity.h"
@@ -13515,70 +13516,12 @@ static int handle_net_reach(runtime_state_t *state, int client_fd,
                             uint64_t trace_id, const char *body,
                             uint64_t body_len) {
     if (!state) return -1;
-    char host[64] = {0}, port_s[16] = {0}, timeout_s[16] = {0};
-    if (parse_json_string_field_local(body, body_len, "host", host, sizeof(host)) != 0 ||
-        parse_json_string_field_local(body, body_len, "port", port_s, sizeof(port_s)) != 0) {
-        const char *err = "{\"ok\":false,\"err\":\"bad_request\"}";
-        return send_frame(client_fd, FTX2_FRAME_NET_REACH_ACK, 0, trace_id, err, strlen(err));
-    }
-    (void)parse_json_string_field_local(body, body_len, "timeout_ms", timeout_s, sizeof(timeout_s));
-    long port = strtol(port_s, NULL, 10);
-    long timeout_ms = timeout_s[0] ? strtol(timeout_s, NULL, 10) : 3000;
-    if (timeout_ms < 100) timeout_ms = 100;
-    if (timeout_ms > 15000) timeout_ms = 15000;
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t)port);
-    if (port <= 0 || port > 65535 || inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
-        const char *err = "{\"ok\":false,\"err\":\"bad_address\"}";
-        return send_frame(client_fd, FTX2_FRAME_NET_REACH_ACK, 0, trace_id, err, strlen(err));
-    }
+    char resp[320];
     pthread_mutex_lock(&state->state_mtx);
     state->command_count += 1;
     pthread_mutex_unlock(&state->state_mtx);
-
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    int err_no = 0, timed_out = 0;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        err_no = errno;
-    } else {
-        int fl = fcntl(fd, F_GETFL, 0);
-        (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-        if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-            if (errno == EINPROGRESS) {
-                struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
-                int pr = poll(&pfd, 1, (int)timeout_ms);
-                if (pr == 0) {
-                    timed_out = 1;
-                } else if (pr < 0) {
-                    err_no = errno;
-                } else {
-                    int soerr = 0;
-                    socklen_t sl = sizeof(soerr);
-                    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0) soerr = errno;
-                    err_no = soerr;
-                }
-            } else {
-                err_no = errno;
-            }
-        }
-        close(fd);
-    }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    long ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
-    char resp[256];
-    int n;
-    if (!timed_out && err_no == 0) {
-        n = snprintf(resp, sizeof(resp), "{\"ok\":true,\"ms\":%ld}", ms);
-    } else {
-        n = snprintf(resp, sizeof(resp),
-                     "{\"ok\":false,\"timed_out\":%s,\"errno\":%d,\"err\":\"%s\",\"ms\":%ld}",
-                     timed_out ? "true" : "false", err_no,
-                     timed_out ? "timed out" : strerror(err_no), ms);
-    }
+    /* The probe itself lives in net_probe.c so the host tests run the real code. */
+    size_t n = net_probe_reach(body, (size_t)body_len, resp, sizeof(resp));
     return send_frame(client_fd, FTX2_FRAME_NET_REACH_ACK, 0, trace_id, resp, (uint64_t)n);
 }
 

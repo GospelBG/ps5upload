@@ -481,6 +481,7 @@ export async function browserInvoke<T>(
         addr: args["addr"],
         path: args["path"],
         max_bytes: args["maxBytes"] ?? args["max_bytes"],
+        offset: args["offset"] ?? undefined,
       });
 
     // App lifecycle (suspend / resume / kill / list). Without these the
