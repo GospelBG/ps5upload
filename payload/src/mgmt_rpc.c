@@ -166,8 +166,10 @@ int mgmt_legacy_failure(const char *body, size_t len, char *token, size_t token_
 
 /* ---- calling a legacy handler ---- */
 
-int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
-                     mgmt_reply_t *rep) {
+/* convert_failure: a normal frame whose body is {"ok":false,...} becomes an error (a method's
+ * contract); off for an operation, whose body is its answer either way. */
+static int legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
+                       mgmt_reply_t *rep, int convert_failure) {
     capture_t c;
     char *rq, token[MGMT_CAUSE_MAX + 1];
     int rc;
@@ -202,7 +204,7 @@ int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t 
         free(c.buf);
         return st;
     }
-    if (mgmt_legacy_failure((const char *)c.buf, c.len, token, sizeof token)) {
+    if (convert_failure && mgmt_legacy_failure((const char *)c.buf, c.len, token, sizeof token)) {
         int st = mgmt_status_for_token(token);
         mgmt_reply_error(cx, st, token);
         free(c.buf);
@@ -211,6 +213,61 @@ int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t 
     rep->body = c.buf;
     rep->len = c.len;
     return AVA1_STATUS_OK;
+}
+
+int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
+                     mgmt_reply_t *rep) {
+    return legacy_call(cx, fn, req, req_len, capture_cap, rep, 1);
+}
+
+/* ---- job.run operations ---- */
+
+static __thread ava1_op_ctx_t *g_op_cur;
+
+int mgmt_op_cancelled(void) { return g_op_cur && ava1_op_cancelled(g_op_cur); }
+void mgmt_op_progress(uint64_t files, uint64_t bytes) {
+    if (g_op_cur) ava1_op_add(g_op_cur, files, bytes);
+}
+void mgmt_op_total(uint64_t files, uint64_t bytes) {
+    if (g_op_cur) ava1_op_set_total(g_op_cur, files, bytes);
+}
+
+static int op_entry_run(void *arg, ava1_op_ctx_t *c, const uint8_t *args, size_t n) {
+    const mgmt_op_entry_t *e = arg;
+    mgmt_ctx_t cx;
+    mgmt_reply_t rep;
+    uint8_t cause[MGMT_CAUSE_MAX + 1];
+    int rc;
+    memset(&cx, 0, sizeof cx);
+    cx.state = G.state;
+    cx.out = cause;
+    cx.cap = MGMT_CAUSE_MAX;
+    if (G.enter) G.enter(e->legacy_frame);
+    g_op_cur = c;
+    rc = legacy_call(&cx, e->fn, (const char *)args, n, AVA1_OP_RESULT_MAX, &rep, 0);
+    g_op_cur = NULL;
+    if (G.leave) G.leave();
+    if (rc != AVA1_STATUS_OK) {
+        cause[cx.out_len] = '\0';
+        ava1_op_message(c, "%s", (const char *)cause);
+        return rc;
+    }
+    rc = ava1_op_set_result(c, rep.body, rep.len);
+    mgmt_reply_free(&rep);
+    if (rc != 0) {
+        ava1_op_message(c, "%s", MGMT_ERR_TRUNCATED);
+        return AVA1_ERR_INTERNAL;
+    }
+    return AVA1_STATUS_OK;
+}
+
+int mgmt_rpc_install_ops(const mgmt_op_entry_t *table, size_t n) {
+    size_t i;
+    if (!table) return -1;
+    for (i = 0; i < n; i++)
+        if (table[i].op == 0 || !table[i].fn || ava1_op_register(table[i].op, op_entry_run, (void *)&table[i]) != 0)
+            return -1;
+    return 0;
 }
 
 /* The text capacity this call can carry: the reply buffer minus the MgmtText encoding. */

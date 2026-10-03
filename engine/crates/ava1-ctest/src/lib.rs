@@ -297,6 +297,8 @@ pub mod ffi {
         pub fn ava1_test_page_next(out: *mut i64);
         pub fn ava1_test_data_clamp(start: u8, min: u8, max: u8, out: *mut c_int);
         pub fn ava1_test_set_same_device(v: c_int);
+        pub fn ava1_test_fsj_delay_us(us: u32);
+        pub fn ava1_test_reap_far();
         pub fn ava1_test_mgmt_install() -> c_int;
         pub fn ava1_test_mgmt_install_duplicate() -> c_int;
         pub fn ava1_test_mgmt_uninstall();
@@ -1164,6 +1166,17 @@ pub fn c_data_clamp(start: u8, min: u8, max: u8) -> ([i32; 3], i32, i32) {
 thread_local! {
     /// The same_device answer the next `CApplyJob::begin` on this thread installs.
     static SAME_DEVICE: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
+}
+
+/// Runs the payload's reaper as if an hour had passed: finished jobs are collected, running
+/// ones stay.
+pub fn c_reap_far() {
+    unsafe { ffi::ava1_test_reap_far() }
+}
+
+/// Every file a job.run operation visits waits this long (0 = off; reset at each data start).
+pub fn c_set_fsj_delay_us(us: u32) {
+    unsafe { ffi::ava1_test_fsj_delay_us(us) }
 }
 
 /// What the data layer's same_device hook answers for the next apply job begun on this

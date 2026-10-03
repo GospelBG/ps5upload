@@ -22,7 +22,7 @@ Generated from the tree at the Task 1 commit; line numbers drift, re-find with
 | Status 20 | 4 `node.status` | empty -> `NodeStatus` | todo | `src/runtime.c:15049` `handle_status_frame`; dispatch `runtime.c:15994` | `ps5upload-core/src/health.rs:246`, `ps5upload-engine/src/lib.rs:4757`; lab `ps5upload-lab/src/main.rs:151`; +3 test/bench |
 | Shutdown 22 | 5 `node.shutdown` | empty -> empty | todo | inline in dispatch (runtime.c:16023); dispatch `runtime.c:16023` | `ps5upload-core/src/payload_lifecycle.rs:101`; lab `ps5upload-lab/src/main.rs:171` |
 | StreamShard 30 | (none) | deleted: transfer pipeline | n/a | `src/runtime.c:5040` `handle_stream_shard`; dispatch `runtime.c:15876` | `ps5upload-core/src/transfer.rs:742`, `ps5upload-core/src/transfer.rs:977`, `ps5upload-core/src/transfer.rs:981`; lab `ps5upload-lab/src/main.rs:456`; +3 test/bench |
-| Cleanup 32 | 6 `node.cleanup` | `MgmtText` (job if > 2 s: `job.run` CLEANUP) | todo | `src/runtime.c:5543` `handle_cleanup`; dispatch `runtime.c:16031` | `ps5upload-core/src/cleanup.rs:56` |
+| Cleanup 32 | 6 `node.cleanup` | `MgmtText`; a long tree runs as `job.run (op CLEANUP)` (payload op, Task 5) | todo | `src/runtime.c:5543` `handle_cleanup`; dispatch `runtime.c:16031` | `ps5upload-core/src/cleanup.rs:56` |
 | FsListVolumes 34 | 32 `fs.volumes` | `MgmtText` | todo | `src/runtime.c:5901` `handle_fs_list_volumes`; dispatch `runtime.c:16037` | `ps5upload-core/src/volumes.rs:211`; +1 test/bench |
 | FsListDir 36 | 33 `fs.list` | `FsList` -> `FsListResult` (<= 256 entries per call, `more`) | todo | `src/runtime.c:6110` `handle_fs_list_dir`; dispatch `runtime.c:16042` | `ps5upload-core/src/fs_ops.rs:105` |
 | FsHash 38 | 20 `job.run (op HASH)` | `JobRun` -> `Status` (ext `state`, `result`, `code`) | todo | `src/runtime.c:6319` `handle_fs_hash`; dispatch `runtime.c:16048` | `ps5upload-core/src/fs_ops.rs:159` |
@@ -109,7 +109,7 @@ Generated from the tree at the Task 1 commit; line numbers drift, re-find with
 | CheatsReload 208 | 108 `cheats.reload` | `MgmtText` | todo | `src/runtime.c:11080` `handle_cheats_reload`; dispatch `runtime.c:16303` | `ps5upload-core/src/cheats.rs:180` |
 | CheatsStatus 210 | 109 `cheats.status` | `MgmtText` | todo | `src/runtime.c:11091` `handle_cheats_status`; dispatch `runtime.c:16306` | `ps5upload-core/src/cheats.rs:191` |
 | CheatsEngineSet 212 | 110 `cheats.engine_set` | `MgmtText` | todo | `src/runtime.c:11102` `handle_cheats_engine_set`; dispatch `runtime.c:16309` | `ps5upload-core/src/cheats.rs:202` |
-| SdkScan 214 | 114 `sdk.scan` | `MgmtText` | todo | `src/runtime.c:11171` `handle_sdk_scan`; dispatch `runtime.c:16320` | `ps5upload-core/src/sdk_changer.rs:151` |
+| SdkScan 214 | 114 `sdk.scan` | `MgmtText`; also `job.run (op SDK_SCAN)` (payload op, Task 5) | todo | `src/runtime.c:11171` `handle_sdk_scan`; dispatch `runtime.c:16320` | `ps5upload-core/src/sdk_changer.rs:151` |
 | SdkPatch 216 | 115 `sdk.patch` | `MgmtText` | todo | `src/runtime.c:11189` `handle_sdk_patch`; dispatch `runtime.c:16323` | `ps5upload-core/src/sdk_changer.rs:168` |
 | SdkRestore 218 | 116 `sdk.restore` | `MgmtText` | todo | `src/runtime.c:11240` `handle_sdk_restore`; dispatch `runtime.c:16326` | `ps5upload-core/src/sdk_changer.rs:198` |
 | TmdbFetch 222 | 117 `tmdb.fetch` | `MgmtText` | todo | `src/runtime.c:11284` `handle_tmdb_fetch`; dispatch `runtime.c:16330` | `ps5upload-core/src/tmdb.rs:364` |

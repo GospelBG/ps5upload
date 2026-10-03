@@ -6,6 +6,7 @@
  * and copies each file back to its original path. */
 
 #include "backup.h"
+#include "mgmt_rpc.h" /* mgmt_op_cancelled / mgmt_op_progress: no-ops outside a job.run operation */
 #include "runtime.h"
 
 #include <ctype.h>
@@ -48,7 +49,7 @@ static int mkpath_p(const char *path) {
     return mkdir(tmp, 0755);
 }
 
-static int copy_file(const char *src, const char *dst) {
+static int copy_file(const char *src, const char *dst) { /* 0, -1, or BACKUP_CANCELLED */
     /* Defense-in-depth: every write destination must be inside the
      * writable-roots allowlist. The restore path already validates the
      * manifest's "original" field before calling us, but this catches
@@ -74,13 +75,30 @@ static int copy_file(const char *src, const char *dst) {
         close(sfd);
         return -1;
     }
-    char buf[64 * 1024];
+    /* Heap, not stack: this runs on a management thread (mgmt_audit.py refuses 64 KiB arrays). */
+    enum { COPY_BUF = 64 * 1024 };
+    char *buf = (char *)malloc(COPY_BUF);
+    if (!buf) {
+        close(sfd);
+        close(dfd);
+        unlink(dst);
+        return -1;
+    }
     ssize_t n;
-    while ((n = read(sfd, buf, sizeof(buf))) > 0) {
+    while ((n = read(sfd, buf, COPY_BUF)) > 0) {
         ssize_t off = 0;
+        /* A cancelled job.run stops between blocks and removes the half-written copy. */
+        if (mgmt_op_cancelled()) {
+            free(buf);
+            close(sfd);
+            close(dfd);
+            unlink(dst);
+            return BACKUP_CANCELLED;
+        }
         while (off < n) {
             ssize_t w = write(dfd, buf + off, n - off);
             if (w <= 0) {
+                free(buf);
                 close(sfd);
                 close(dfd);
                 unlink(dst);
@@ -88,7 +106,9 @@ static int copy_file(const char *src, const char *dst) {
             }
             off += w;
         }
+        mgmt_op_progress(0, (uint64_t)n);
     }
+    free(buf);
     fsync(dfd);
     close(sfd);
     close(dfd);
@@ -143,6 +163,7 @@ static int snapshot_tree_inner(const char *snap_dir, const char *src,
     if (!d) return -1;
     struct dirent *e;
     while ((e = readdir(d))) {
+        if (mgmt_op_cancelled()) break;
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
             continue;
         char child[1024];
@@ -162,6 +183,7 @@ static int snapshot_tree_inner(const char *snap_dir, const char *src,
             if (copy_file(child, dst) == 0) {
                 manifest_append(snap_dir, flat, child);
                 (*file_count)++;
+                mgmt_op_progress(1, 0);
             }
         }
     }
@@ -206,7 +228,19 @@ int backup_snapshot(const char *tag, const char *src_path,
         if (copy_file(src_path, dst) == 0) {
             manifest_append(snap, flat, src_path);
             file_count = 1;
+            mgmt_op_progress(1, 0);
         }
+    }
+
+    /* job.cancel arrived: a half snapshot is worse than none, so it goes, and the caller
+     * answers "cancelled" rather than "nothing to back up". */
+    if (mgmt_op_cancelled()) {
+        char tagdir[640];
+        rm_rf(snap);
+        snprintf(tagdir, sizeof(tagdir), "%s/%s", BACKUPS_ROOT, tag);
+        rmdir(tagdir);
+        pthread_mutex_unlock(&g_backup_lock);
+        return BACKUP_CANCELLED;
     }
 
     /* Compute total bytes of the snapshot dir. */
@@ -354,7 +388,15 @@ static int restore_from_manifest(const char *snap_dir, int *restored) {
         if (!is_path_allowed(original)) continue;
         char src[1024];
         snprintf(src, sizeof(src), "%s/%s", snap_dir, snap_basename);
-        if (copy_file(src, original) == 0) n++;
+        int c = copy_file(src, original);
+        if (c == 0) {
+            n++;
+            mgmt_op_progress(1, 0);
+        } else if (c == BACKUP_CANCELLED) {
+            fclose(f);
+            if (restored) *restored = n;
+            return BACKUP_CANCELLED; /* the files restored so far stay restored */
+        }
     }
     fclose(f);
     if (restored) *restored = n;

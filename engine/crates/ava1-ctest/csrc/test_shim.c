@@ -28,6 +28,8 @@
 #include "ava1_server.h"
 #include "ava1_thread.h"
 #include "mgmt_rpc.h"
+#include "ava1_op.h"
+#include "fs_jobs.h"
 
 static uint32_t g_pair_requests, g_last_code, g_logs;
 
@@ -1202,7 +1204,7 @@ static int t_same_device(const char *a, const char *b) {
 static int g_deny_write;
 static uint8_t g_kind = AVA1_JOB_UPLOAD, g_owner = 1; /* the receiver driver's JobOpen */
 static int t_allow(const char *p) {
-    (void)p;
+    if (strstr(p, "/ps5-denied/")) return 0; /* the path-policy tests (job.run delete/chmod) */
     return !__atomic_load_n(&g_deny_write, __ATOMIC_SEQ_CST);
 }
 /* The data layer's may_read hook (downloads): a test flips it through the FFI setter. */
@@ -1615,6 +1617,101 @@ int ava1_test_apply_reserve(size_t n, int take) {
     return ava1_apply_reserve(g_job, n);
 }
 
+/* ---- P3 Task 5: job.run operations wrapped around stub FTX2 handlers -------------------- */
+
+/* A slow stub: `loops` rounds of 20 ms, each reporting one unit of progress and honouring
+ * job.cancel the way backup.c does (mgmt_op_cancelled / mgmt_op_progress). */
+static int stub_slow(const char *b, const char *cancel_token, int cancel_frame_type) {
+    uint32_t i, loops = 0;
+    const char *p = strstr(b, "\"loops\":");
+    if (p) loops = (uint32_t)strtoul(p + 8, NULL, 10);
+    mgmt_op_total(loops, (uint64_t)loops * 100u);
+    for (i = 0; i < loops; i++) {
+        if (mgmt_op_cancelled()) return stub_send_frame((uint16_t)cancel_frame_type, cancel_token, strlen(cancel_token));
+        usleep(20 * 1000);
+        mgmt_op_progress(1, 100);
+    }
+    return 0;
+}
+
+static int stub_op_fsck(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st; (void)fd; (void)t; (void)l;
+    if (strstr(b, "\"error\"")) return stub_send_frame(STUB_FRAME_ERROR, "libSceFsInternalForVsh_unavailable", strlen("libSceFsInternalForVsh_unavailable"));
+    if (stub_slow(b, "fsck_cancelled", STUB_FRAME_ERROR) != 0) return 0;
+    if (strstr(b, "dirty")) /* a normal frame whose body says ok:false: the operation's answer, not a failure */
+        return stub_send_frame(127, "{\"ok\":false,\"code\":3,\"device\":\"/dev/md1\",\"repair\":false}", strlen("{\"ok\":false,\"code\":3,\"device\":\"/dev/md1\",\"repair\":false}"));
+    return stub_send_frame(127, "{\"ok\":true,\"code\":0,\"device\":\"/dev/md1\",\"repair\":false}", strlen("{\"ok\":true,\"code\":0,\"device\":\"/dev/md1\",\"repair\":false}"));
+}
+
+static int stub_op_snapshot(void *st, int fd, uint64_t t, const char *b) {
+    (void)st; (void)fd; (void)t;
+    if (strstr(b, "\"fail\"")) return stub_send_frame(STUB_FRAME_ERROR, "backup_snapshot_io_error", strlen("backup_snapshot_io_error"));
+    if (stub_slow(b, "backup_cancelled", STUB_FRAME_ERROR) != 0) return 0;
+    {
+        static const char r[] = "{\"ok\":true,\"tag\":\"t\",\"timestamp\":1,\"files\":2,\"bytes\":3,\"err\":\"\"}";
+        return stub_send_frame(177, r, sizeof r - 1);
+    }
+}
+
+static int stub_op_restore(void *st, int fd, uint64_t t, const char *b) {
+    (void)st; (void)fd; (void)t; (void)b;
+    {
+        static const char r[] = "{\"ok\":false,\"tag\":\"t\",\"restored\":0,\"err\":\"snapshot not found or restore failed\"}";
+        return stub_send_frame(181, r, sizeof r - 1);
+    }
+}
+
+static int stub_op_cleanup(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    {
+        static const char r[] = "{\"ok\":true,\"removed_files\":4,\"removed_dirs\":1}";
+        return stub_send_frame(33, r, sizeof r - 1);
+    }
+}
+
+/* sdk.scan: a 100 KiB reply (a result the status poll must carry whole). */
+static int stub_op_sdk_scan(void *st, int fd, uint64_t t) {
+    size_t n = 100 * 1024;
+    char *buf = malloc(n + 1);
+    int rc;
+    (void)st; (void)fd; (void)t;
+    if (!buf) return -1;
+    memset(buf, 'a', n);
+    memcpy(buf, "{\"titles\":\"", 11);
+    memcpy(buf + n - 2, "\"}", 2);
+    buf[n] = '\0';
+    rc = stub_send_frame(215, buf, n);
+    free(buf);
+    return rc;
+}
+
+static int stub_lo_fsck(void *st, int fd, uint64_t t, const char *b, uint64_t l) { return stub_op_fsck(st, fd, t, b, l); }
+static int stub_lo_snapshot(void *st, int fd, uint64_t t, const char *b, uint64_t l) { (void)l; return stub_op_snapshot(st, fd, t, b); }
+static int stub_lo_restore(void *st, int fd, uint64_t t, const char *b, uint64_t l) { (void)l; return stub_op_restore(st, fd, t, b); }
+static int stub_lo_cleanup(void *st, int fd, uint64_t t, const char *b, uint64_t l) { return stub_op_cleanup(st, fd, t, b, l); }
+static int stub_lo_sdk(void *st, int fd, uint64_t t, const char *b, uint64_t l) { (void)b; (void)l; return stub_op_sdk_scan(st, fd, t); }
+
+static const mgmt_op_entry_t k_stub_ops[] = {
+    {AVA1_JOB_OP_FSCK, 126, 127, 0, stub_lo_fsck},
+    {AVA1_JOB_OP_BACKUP_SNAPSHOT, 176, 177, 0, stub_lo_snapshot},
+    {AVA1_JOB_OP_BACKUP_RESTORE, 180, 181, 0, stub_lo_restore},
+    {AVA1_JOB_OP_CLEANUP, 32, 33, 0, stub_lo_cleanup},
+    {AVA1_JOB_OP_SDK_SCAN, 214, 215, 0, stub_lo_sdk},
+};
+
+/* The operations a data-layer test server serves: the real fs_jobs.c ones and the stubs. */
+static void install_ops(void) {
+    ava1_op_unregister_all();
+    fsj_register_ops();
+    (void)mgmt_rpc_install_ops(k_stub_ops, sizeof k_stub_ops / sizeof k_stub_ops[0]);
+    __atomic_store_n(&fsj_test_file_delay_us, 0, __ATOMIC_SEQ_CST);
+}
+
+/* Runs the reaper as if an hour had passed: finished jobs go, running ones stay. */
+void ava1_test_reap_far(void) { ava1_job_reap(ava1_mono_ms() + 3600u * 1000u); }
+
+void ava1_test_fsj_delay_us(uint32_t us) { __atomic_store_n(&fsj_test_file_delay_us, us, __ATOMIC_SEQ_CST); }
+
 /* ---- the data layer on the wire (Task 14) ----------------------------------------- */
 
 /* The data server's hook: the data plane's own methods first (Task 19), then node.info. */
@@ -1648,6 +1745,7 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     __atomic_store_n(&ava1_copy_test_delete_delay_ms, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&ava1_copy_test_delete_active, 0, __ATOMIC_SEQ_CST);
     if (ava1_data_start(&dc) != 0) return -100;
+    install_ops();
     ava1_apply_fault = t_fault;
     memset(&cfg, 0, sizeof cfg);
     ava1_identity_from_secret(&cfg.identity, secret);

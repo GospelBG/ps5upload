@@ -12,6 +12,7 @@
 
 #include "ava1_apply.h"
 #include "ava1_copy.h"
+#include "ava1_op.h"
 #include "ava1_job.h"
 #include "ava1_platform.h"
 #include "ava1_recv.h"
@@ -920,6 +921,7 @@ static int encode_status(ava1_job_t *j, uint8_t *out, size_t cap, size_t *out_le
     ava1_status_t st;
     ava1_w_t w;
     int rc;
+    if (j->kind == AVA1_JOB_OPKIND) return ava1_op_encode_status(j, out, cap, out_len);
     memset(&st, 0, sizeof st);
     pthread_mutex_lock(&j->mu);
     memcpy(st.job_id, j->id, 16);
@@ -1017,10 +1019,15 @@ int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *o
             return AVA1_ERR_UNKNOWN_JOB;
         }
         if (method == AVA1_METHOD_JOB_STATUS) st = encode_status(j, out, cap, out_len);
+        else if (j->kind == AVA1_JOB_OPKIND) ava1_op_cancel(j); /* an operation: stays listed, finished */
         else ava1_recv_cancel(j); /* stops it and unlists it: the journal stays */
         ava1_job_put(j);
         return st;
     }
+    case AVA1_METHOD_JOB_RUN:
+        return ava1_op_run_rpc(body, len, peer, out, cap, out_len);
+    case AVA1_METHOD_JOB_LIST:
+        return ava1_op_list_rpc(peer, out, cap, out_len);
     case AVA1_METHOD_DISK_CALIBRATE:
         return ava1_calibrate(body, len, out, cap, out_len);
     default:
