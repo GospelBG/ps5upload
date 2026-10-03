@@ -742,14 +742,25 @@ fn directories_interleaved_in_a_solid_block_are_refused_not_misread() {
         &[Some(0), None, Some(1), None, Some(2), Some(3)],
     );
     // The crate's block walk covers fewer entries than such a block spans (it would
-    // silently drop the last files), so the source refuses it up front as unsupported.
+    // silently drop the last files), so the source refuses it up front, with its own
+    // reason: no FTX2 fallback, which would drop them too.
     let e = SevenzSource::open(&d.join("a.7z"), &[])
         .err()
         .expect("refused at open");
-    assert!(matches!(
+    assert_eq!(
         ps5upload_ava1::seq::fault_of(&e),
-        Some(ps5upload_ava1::seq::SevenzFault::Unsupported(_))
-    ));
+        Some(&ps5upload_ava1::seq::SevenzFault::UnsupportedLayout)
+    );
+    let p = Pool::new(d.join("ava")).with_addr("127.0.0.1:1");
+    let e = upload::upload_7z_in(&p, &cfg(), [1; 16], "out", &d.join("a.7z")).unwrap_err();
+    assert!(
+        e.downcast_ref::<upload::SevenzUnsupported>().is_none(),
+        "must not take the FTX2 fallback"
+    );
+    let f = failure(&e);
+    assert_eq!(f.reason, "ava1_7z_unsupported_layout");
+    assert!(f.detail.contains("layout is not supported"), "{}", f.detail);
+    assert_eq!(p.attempts(), 0);
     // Directories after the last file: the walk is complete and every path is right.
     craft_interleaved(
         &d.join("b.7z"),

@@ -90,6 +90,7 @@ fn sevenz_failure(e: &anyhow::Error) -> Option<UploadFailure> {
         SevenzFault::Encrypted(_) => "ava1_7z_encrypted",
         SevenzFault::UnsafePath(_) => "ava1_7z_unsafe_path",
         SevenzFault::Unsupported(_) => "ava1_7z_unsupported",
+        SevenzFault::UnsupportedLayout => "ava1_7z_unsupported_layout",
     };
     Some(UploadFailure {
         reason: reason.into(),

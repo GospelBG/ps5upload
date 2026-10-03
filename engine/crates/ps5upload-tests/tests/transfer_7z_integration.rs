@@ -241,3 +241,130 @@ fn sevenz_plan_preview_total_and_sorted_with_excludes() {
     let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, vec!["a.bin", "z.bin"]); // sorted, no junk
 }
+
+// ---- stream-less entries inside a solid block ---------------------------------------
+//
+// The sevenz-rust2 per-block walk covers fewer entries than such a block spans and
+// would silently drop the last files; the FTX2 path refuses the archive instead.
+
+/// 7z variable-length number.
+fn num(v: u64) -> Vec<u8> {
+    let mut n = 0;
+    while n < 8 && v >= 1u64 << (7 * (n + 1)) {
+        n += 1;
+    }
+    let mut first = if n == 8 { 0xFFu8 } else { !(0xFFu8 >> n) };
+    if n < 8 {
+        first |= (v >> (8 * n)) as u8;
+    }
+    let mut out = vec![first];
+    out.extend_from_slice(&v.to_le_bytes()[..n]);
+    out
+}
+
+/// A hand-built 7z (COPY, uncompressed header, no CRCs) holding one solid folder whose
+/// file list interleaves stream-less directories among the streamed files: the
+/// `sevenz-rust2` writer cannot produce this valid shape, 7z the format allows it.
+/// `layout` lists `Some(file index)` for a streamed file and `None` for a directory.
+fn craft_interleaved(
+    path: &std::path::Path,
+    files: &[(String, Vec<u8>)],
+    layout: &[Option<usize>],
+) {
+    let data: Vec<u8> = files.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+    let mut h = vec![0x01, 0x04];
+    h.extend([0x06]);
+    h.extend(num(0));
+    h.extend(num(1));
+    h.push(0x09);
+    h.extend(num(data.len() as u64));
+    h.push(0x00);
+    h.push(0x07);
+    h.push(0x0B);
+    h.extend(num(1));
+    h.push(0x00); // not external
+    h.extend(num(1)); // one coder
+    h.extend([0x01, 0x00]); // simple coder, id size 1, COPY
+    h.push(0x0C);
+    h.extend(num(data.len() as u64));
+    h.push(0x00);
+    h.push(0x08);
+    h.push(0x0D);
+    h.extend(num(files.len() as u64));
+    h.push(0x09);
+    for (_, d) in &files[..files.len() - 1] {
+        h.extend(num(d.len() as u64));
+    }
+    h.push(0x00);
+    h.push(0x00); // end of streams info
+    h.push(0x05);
+    h.extend(num(layout.len() as u64));
+    let mut bits = vec![0u8; layout.len().div_ceil(8)];
+    for (i, l) in layout.iter().enumerate() {
+        if l.is_none() {
+            bits[i / 8] |= 0x80 >> (i % 8);
+        }
+    }
+    h.push(0x0E);
+    h.extend(num(bits.len() as u64));
+    h.extend(&bits);
+    let mut names = vec![0u8]; // not external
+    for l in layout {
+        let n = match l {
+            Some(i) => files[*i].0.clone(),
+            None => format!("sub{}", names.len()),
+        };
+        for u in n.encode_utf16().chain([0]) {
+            names.extend(u.to_le_bytes());
+        }
+    }
+    h.push(0x11);
+    h.extend(num(names.len() as u64));
+    h.extend(&names);
+    h.push(0x00);
+    h.push(0x00);
+    let mut start = Vec::new();
+    start.extend((data.len() as u64).to_le_bytes());
+    start.extend((h.len() as u64).to_le_bytes());
+    start.extend(crc32fast::hash(&h).to_le_bytes());
+    let mut out = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4];
+    out.extend(crc32fast::hash(&start).to_le_bytes());
+    out.extend(start);
+    out.extend(data);
+    out.extend(h);
+    std::fs::write(path, out).unwrap();
+}
+
+#[test]
+fn transfer_7z_refuses_a_block_with_directories_between_its_files() {
+    let files: Vec<(String, Vec<u8>)> = (0..4)
+        .map(|i| (format!("f{i}"), vec![i as u8 + 1; 1_000]))
+        .collect();
+    let p = std::env::temp_dir().join(format!("ps5upload_7zlayout_{}.7z", std::process::id()));
+    craft_interleaved(
+        &p,
+        &files,
+        &[Some(0), None, Some(1), None, Some(2), Some(3)],
+    );
+    let srv = MockServer::start();
+    let cfg = TransferConfig::new(&srv.addr);
+    let err = transfer_7z_with_opts(&cfg, random_tx_id(), "/data/dest", &p, 0).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("layout is not supported"),
+        "{err:#}"
+    );
+    assert!(
+        sevenz_plan_preview(&p, &[]).is_err(),
+        "the preview refuses it too"
+    );
+    // Nothing was begun on the console.
+    assert!(srv.state.lock().unwrap().txs.is_empty());
+    // The same files with the directories last are fine.
+    craft_interleaved(
+        &p,
+        &files,
+        &[Some(0), Some(1), Some(2), Some(3), None, None],
+    );
+    transfer_7z_with_opts(&cfg, random_tx_id(), "/data/dest", &p, 0).unwrap();
+    let _ = std::fs::remove_file(&p);
+}

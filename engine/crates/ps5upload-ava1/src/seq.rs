@@ -35,6 +35,10 @@ pub enum SevenzFault {
     /// An entry name that would escape the destination (or the manifest refuses).
     #[error("the 7z archive has an unsafe entry path: {0}")]
     UnsafePath(String),
+    /// A solid block with stream-less entries between its files (the crate's walk would
+    /// drop files); never falls back to FTX2, which would drop them too.
+    #[error("{}", ps5upload_core::transfer::SEVENZ_LAYOUT_UNSUPPORTED)]
+    UnsupportedLayout,
     /// A feature this source does not handle (the engine may fall back to FTX2).
     #[error("the 7z archive is not usable as an AVA1 source: {0}")]
     Unsupported(String),
@@ -178,10 +182,7 @@ impl SevenzSource {
                 // A directory or empty file between the streamed files of one block: the
                 // crate's per-block walk covers fewer entries than the block spans and
                 // would skip the last files, so refuse before sending anything.
-                return Err(fault(SevenzFault::Unsupported(format!(
-                    "{:?} is a stream-less entry inside a solid block",
-                    e.name()
-                ))));
+                return Err(fault(SevenzFault::UnsupportedLayout));
             }
             if e.is_directory() {
                 // An unsafe directory name is ignored: its files are refused by name.
@@ -440,10 +441,7 @@ impl SeqSource for SevenzSource {
                 return Err(map_pass_error(e));
             }
             if !reached_last {
-                return Err(fault(SevenzFault::Unsupported(format!(
-                    "folder {b} yielded {j} entries, the header lists {} (stream-less entries inside a block?)",
-                    members.len()
-                ))));
+                return Err(fault(SevenzFault::UnsupportedLayout));
             }
         }
         for p in &self.empties {
