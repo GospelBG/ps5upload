@@ -44,14 +44,18 @@ impl Source for FsSource {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "a name is not UTF-8"))?
                 .to_string();
             let len = if is_dir { 0 } else { self.fs.metadata(&p)?.len };
-            // `SourceFs::SourceMeta` has no mtime: report 0. That is legal — the
-            // console applies mtime as information, and POLICY_REPLACE is the
-            // engine's policy — but a remote source's mtimes are silently lost.
+            // 0 = the backend reports no mtime (SPEC.md §11.4: skip-existing then
+            // falls back to a content check, see `upload::apply_existing_policy`).
+            let mtime = if is_dir {
+                0
+            } else {
+                self.fs.mtime(&p).unwrap_or(0)
+            };
             out.push((
                 name,
                 SourceMeta {
                     size: len,
-                    mtime: 0,
+                    mtime,
                     mode: if is_dir { 0o755 } else { 0o644 },
                     is_dir,
                 },
@@ -64,7 +68,11 @@ impl Source for FsSource {
         let m = self.fs.metadata(&self.path(rel))?;
         Ok(SourceMeta {
             size: m.len,
-            mtime: 0,
+            mtime: if m.is_dir {
+                0
+            } else {
+                self.fs.mtime(&self.path(rel)).unwrap_or(0)
+            },
             mode: if m.is_dir { 0o755 } else { 0o644 },
             is_dir: m.is_dir,
         })

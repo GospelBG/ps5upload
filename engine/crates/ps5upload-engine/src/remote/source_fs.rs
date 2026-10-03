@@ -19,6 +19,9 @@ use super::{RemoteError, RemoteFile, RemoteFs};
 /// How far ahead each server read goes.
 const READ_AHEAD: u64 = 8 * 1024 * 1024;
 
+/// A listing's word on one path: (size, is_dir, mtime).
+type Known = (u64, bool, Option<i64>);
+
 pub struct RemoteSourceFs {
     handle: tokio::runtime::Handle,
     fs: Arc<dyn RemoteFs>,
@@ -27,7 +30,7 @@ pub struct RemoteSourceFs {
     id: String,
     /// What listings already said about each path, so the per-file stats that follow a walk
     /// cost no round trip.
-    known: std::sync::Mutex<std::collections::HashMap<String, (u64, bool)>>,
+    known: std::sync::Mutex<std::collections::HashMap<String, Known>>,
 }
 
 impl std::fmt::Debug for RemoteSourceFs {
@@ -114,7 +117,7 @@ impl SourceFs for RemoteSourceFs {
             .unwrap_or_else(|e| e.into_inner())
             .get(&path)
             .copied();
-        if let Some((len, is_dir)) = seen {
+        if let Some((len, is_dir, _)) = seen {
             return Ok(SourceMeta {
                 len,
                 is_dir,
@@ -133,6 +136,31 @@ impl SourceFs for RemoteSourceFs {
             is_dir: e.is_dir,
             is_file: !e.is_dir,
         })
+    }
+
+    /// The server's modification time: from the listing that named the path, else one stat.
+    /// `None` when the protocol reports none (then AVA1 compares content instead).
+    fn mtime(&self, p: &Path) -> Option<u64> {
+        let path = server_path(p);
+        let seen = self
+            .known
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&path)
+            .copied();
+        let t = match seen {
+            Some((_, _, t)) => t,
+            None => {
+                self.handle
+                    .block_on(self.pool.with_fs(&self.store, &self.id, |fs| {
+                        let path = path.clone();
+                        async move { fs.stat(&path).await }
+                    }))
+                    .ok()?
+                    .mtime
+            }
+        };
+        t.filter(|t| *t > 0).map(|t| t as u64)
     }
 
     fn read_dir(&self, p: &Path) -> std::io::Result<Vec<(PathBuf, bool)>> {
@@ -154,7 +182,7 @@ impl SourceFs for RemoteSourceFs {
                 self.known
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(child.clone(), (e.size, e.is_dir));
+                    .insert(child.clone(), (e.size, e.is_dir, e.mtime));
                 out.push((PathBuf::from(child), e.is_dir));
             }
             match page.next_cursor {
@@ -245,7 +273,11 @@ mod tests {
     use crate::remote::MemFs;
 
     async fn setup(files: &[(&str, &[u8])]) -> RemoteSourceFs {
-        let r = remote_with_shared(Arc::new(MemFs::new(files)), None);
+        setup_with(MemFs::new(files)).await
+    }
+
+    async fn setup_with(mem: MemFs) -> RemoteSourceFs {
+        let r = remote_with_shared(Arc::new(mem), None);
         let id = r
             .store
             .add(conn("NAS", Protocol::Smb), Secret::None)
@@ -255,6 +287,24 @@ mod tests {
         RemoteSourceFs::new(Arc::clone(&r.pool), Arc::clone(&r.store), &id)
             .await
             .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_backend_with_mtimes_reports_them_and_one_without_reports_none() {
+        let mem = MemFs::new(&[("/g/a.bin", b"aa"), ("/g/b.bin", b"bb")]);
+        mem.set_mtime("/g/a.bin", 1_700_000_123);
+        let fs = setup_with(mem).await;
+        tokio::task::spawn_blocking(move || {
+            // Before any listing: one stat.
+            assert_eq!(fs.mtime(Path::new("/g/a.bin")), Some(1_700_000_123));
+            assert_eq!(fs.mtime(Path::new("/g/b.bin")), None, "unknown, not 0");
+            // After a listing: answered from what it said.
+            fs.read_dir(Path::new("/g")).unwrap();
+            assert_eq!(fs.mtime(Path::new("/g/a.bin")), Some(1_700_000_123));
+            assert_eq!(fs.mtime(Path::new("/g/b.bin")), None);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

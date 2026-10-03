@@ -84,6 +84,8 @@ pub trait RemoteFs: Send + Sync {
 /// An in-memory tree standing in for a server in tests. Directories are implied by file paths.
 pub(crate) struct MemFs {
     files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    /// Modification times by path; a path with none reports `None`, like a protocol that has none.
+    mtimes: Arc<Mutex<BTreeMap<String, i64>>>,
     fail_reads: Arc<AtomicUsize>,
     fail_lists: AtomicUsize,
 }
@@ -93,6 +95,7 @@ impl MemFs {
         let map = files.iter().map(|(p, b)| (normal(p), b.to_vec())).collect();
         Self {
             files: Arc::new(Mutex::new(map)),
+            mtimes: Arc::default(),
             fail_reads: Arc::new(AtomicUsize::new(0)),
             fail_lists: AtomicUsize::new(0),
         }
@@ -107,11 +110,22 @@ impl MemFs {
         }
     }
 
+    /// Gives `path` a modification time (seconds since the epoch).
+    #[cfg(test)]
+    pub fn set_mtime(&self, path: &str, t: i64) {
+        self.mtimes.lock().unwrap().insert(normal(path), t);
+    }
+
+    fn mtime_of(&self, p: &str) -> Option<i64> {
+        self.mtimes.lock().unwrap().get(p).copied()
+    }
+
     /// A handle on the same tree, for adding files once this one is owned elsewhere.
     #[cfg(test)]
     pub fn share(&self) -> Self {
         Self {
             files: Arc::clone(&self.files),
+            mtimes: Arc::clone(&self.mtimes),
             fail_reads: Arc::new(AtomicUsize::new(0)),
             fail_lists: AtomicUsize::new(0),
         }
@@ -163,7 +177,7 @@ impl MemFs {
                             name: rest.to_string(),
                             is_dir: false,
                             size: b.len() as u64,
-                            mtime: None,
+                            mtime: self.mtime_of(p),
                         },
                     );
                 }
@@ -237,7 +251,7 @@ impl RemoteFs for MemFs {
                 name,
                 is_dir: false,
                 size: b.len() as u64,
-                mtime: None,
+                mtime: self.mtime_of(&p),
             });
         }
         if self.is_dir(&p) {

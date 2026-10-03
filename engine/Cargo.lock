@@ -199,6 +199,8 @@ dependencies = [
  "ava1-chaos",
  "blake3",
  "cc",
+ "ps5upload-ava1",
+ "ps5upload-core",
  "serde_json",
  "tokio",
 ]

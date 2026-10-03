@@ -90,8 +90,10 @@ kept.
       method. `SPEC.md` §7.1 defines only 1–3 and 16–19. This is project 3's main work.
 - [ ] `ps5_fs_move`'s same-drive rename moves to an AVA1 RPC with the `st_dev` guard (never an
       unguarded `rename()` across mounts: that panics the console's kernel).
-- [ ] NAS sources: the engine's `SourceFs` carries no mtime, so `skip-existing` cannot be used for a
-      saved-server upload (`SPEC.md` §11.4).
+- [x] NAS sources: `SourceFs` now has an `mtime` (SMB, FTP and SFTP report one; a backend that does
+      not reports unknown), carried into the manifest. `upload::apply_existing_policy` picks
+      `skip-existing` when every file has an mtime and `verify` (roots in the manifest) otherwise
+      (`SPEC.md` §11.4). The engine does not expose a skip-existing option yet; call it when it does.
 - [ ] Zip downloads restart the archive from zero on a reconnect (a fresh job per attempt; the
       reported progress stays monotonic). FTX2 resumes mid-entry, so this is a measured regression:
       implement an in-run resume, or accept it explicitly in the release notes.

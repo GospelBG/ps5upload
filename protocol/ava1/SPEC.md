@@ -287,9 +287,7 @@ Not in version 1, each with its reason:
   for them; they stay on FTX2 until project 3.
 - Full re-verification of durable groups on resume: §13.4 re-hashes only the last durable
   batch of each partial file and trusts older groups to the journal.
-- Sources of unknown length, and skip-existing for NAS sources: every file's size must be known
-  when the manifest is built, and the engine's remote source file system (NAS) reports no mtime,
-  which `skip-existing` needs (§11.4).
+- Sources of unknown length: every file's size must be known when the manifest is built.
 - Auto-tuning of the small/large cutoff (the design spec's 64 KiB–4 MiB range): the cutoff
   is the protocol constant `LARGE_CUTOFF`, §12.2.
 - Resuming a zip download within a run: a dropped zip download restarts the archive with a
@@ -325,6 +323,14 @@ Entries are numbered 0.. in manifest order (`file_id`); directories are entries 
 marks a file done when a file of the same size and mtime seconds exists), `verify` (the
 sender puts each file's root in `ext root`; the receiver marks a file done when an
 existing file of the same size hashes to it).
+
+A sender that wants "skip files the console already has" picks the policy from its source:
+when every file reports a real mtime (local disk; SMB, FTP and SFTP servers) it uses
+`skip-existing`; when any file's mtime is unknown (`mtime = 0` in the manifest — a backend
+that reports none) it uses `verify` for the whole job, computing each file's root before
+the manifest is sent. `verify` costs one read of the source plus a hash of each existing
+console file of the right size, but is correct without an mtime; the sender never guesses
+an mtime. A directory's mtime is always 0 and is ignored by both policies.
 
 11.5 A `JobOpen` for a job the receiver already knows is a resume: the receiver matches
 the new manifest against its stored one by path, keeps the progress of entries whose

@@ -2,7 +2,7 @@
 //! call them from `spawn_blocking` or a non-async thread (C15), exactly like the
 //! FTX2 functions they replace; calling them from inside an async task panics.
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -223,6 +223,63 @@ pub(crate) const STALL_LIMIT: Duration = Duration::from_secs(600);
 
 pub(crate) fn hex(b: &[u8; 16]) -> String {
     ava1::hex::encode(b)
+}
+
+/// SPEC.md §11.4: chooses the policy for "skip files the console already has".
+/// When every file carries a real mtime the receiver compares size and mtime
+/// (`skip-existing`, free). A source that reports no mtime (some NAS backends) cannot
+/// use that, so the job runs under `verify` instead: this reads each file once to put
+/// its root in the manifest, and the console skips a file whose size and hash match.
+/// Costlier than an mtime compare, but correct, and the console only hashes files that
+/// already exist. Returns the policy it set on `opts`.
+pub fn apply_existing_policy(
+    source: &dyn Source,
+    manifest: &mut Manifest,
+    opts: &mut SendOptions,
+) -> io::Result<u8> {
+    let files = |m: &Manifest| {
+        m.entries
+            .iter()
+            .filter(|e| e.kind == gen::ENTRY_FILE)
+            .count()
+    };
+    let missing = manifest
+        .entries
+        .iter()
+        .any(|e| e.kind == gen::ENTRY_FILE && e.mtime == 0);
+    if !missing || files(manifest) == 0 {
+        opts.policy = gen::POLICY_SKIP_EXISTING;
+        return Ok(opts.policy);
+    }
+    for e in manifest
+        .entries
+        .iter_mut()
+        .filter(|e| e.kind == gen::ENTRY_FILE)
+    {
+        e.root = Some(hash_file(source, &e.path, e.size)?);
+    }
+    opts.policy = gen::POLICY_VERIFY;
+    Ok(opts.policy)
+}
+
+/// BLAKE3 of a source file (equal to the root the receiver computes, `ava1::verify`).
+fn hash_file(source: &dyn Source, rel: &str, size: u64) -> io::Result<[u8; 32]> {
+    let mut r = source.open(rel)?;
+    let mut h = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut off = 0u64;
+    while off < size {
+        let n = ava1::source::read_full_at(r.as_mut(), off, &mut buf)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{rel} is shorter than its listed size"),
+            ));
+        }
+        h.update(&buf[..n]);
+        off += n as u64;
+    }
+    Ok(*h.finalize().as_bytes())
 }
 
 fn source_for(cfg: &TransferConfig, root: &Path) -> Arc<dyn Source> {
