@@ -138,6 +138,7 @@ impl RarSource {
         let mut folded: HashMap<String, String> = HashMap::new();
         let mut ordinal = HashMap::new();
         let mut order = Vec::new();
+        let mut mtimes: HashMap<String, u64> = HashMap::new();
         for (i, (p, size)) in layout.files.iter().enumerate() {
             manifest::check_path(p).map_err(|e| RarOpenError::Unsupported(format!("{p}: {e}")))?;
             if let Some(other) = folded.insert(p.to_lowercase(), p.clone()) {
@@ -153,6 +154,9 @@ impl RarSource {
                 )));
             }
             ordinal.insert(p.clone(), i as u64);
+            if let Some(t) = layout.mtimes.get(i) {
+                mtimes.insert(p.clone(), *t);
+            }
             order.push(p.clone());
         }
         let mut dirs: BTreeSet<String> = BTreeSet::new();
@@ -192,7 +196,7 @@ impl RarSource {
                 kind: gen::ENTRY_FILE,
                 mode: 0o644,
                 size: *size,
-                mtime: 0,
+                mtime: mtimes.get(p).copied().unwrap_or(0),
                 path: p.clone(),
                 root: None,
             });
@@ -242,10 +246,16 @@ struct Adapter<'a> {
     sink: &'a mut dyn EntrySink,
     /// Set when the walk's order disagrees with the listing.
     reordered: Option<String>,
+    /// Only a non-solid resume (`start > 0`) skips entries by ordinal; any other
+    /// pass binds by path, so a listing/extraction disagreement is harmless.
+    enforce_order: bool,
 }
 
 impl RarWalkSink for Adapter<'_> {
     fn visit(&mut self, ordinal: u64, path: &str) -> bool {
+        if !self.enforce_order {
+            return true;
+        }
         match self.src.order.get(ordinal as usize) {
             Some(p) if p == path => true,
             _ => {
@@ -293,6 +303,7 @@ impl SeqSource for RarSource {
             want,
             sink,
             reordered: None,
+            enforce_order: !self.solid && start > 0,
         };
         let r = rar_walk(
             &self.path,

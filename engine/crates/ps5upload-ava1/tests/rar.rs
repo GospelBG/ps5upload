@@ -58,6 +58,8 @@ pub enum Ent<'a> {
     /// A file whose header says "unpacked size unknown" (flag 0x8).
     Unknown(&'a str, &'a [u8]),
     Dir(&'a str),
+    /// A file with a Unix-seconds modification time in its header.
+    Dated(&'a str, &'a [u8], u32),
 }
 
 fn rar5(entries: &[Ent], solid: bool) -> Vec<u8> {
@@ -70,7 +72,7 @@ fn rar5(entries: &[Ent], solid: bool) -> Vec<u8> {
     out.extend(block(&main));
     for (i, e) in entries.iter().enumerate() {
         let (name, data, is_dir, unknown) = match e {
-            Ent::File(n, d) => (*n, *d, false, false),
+            Ent::File(n, d) | Ent::Dated(n, d, _) => (*n, *d, false, false),
             Ent::Unknown(n, d) => (*n, *d, false, true),
             Ent::Dir(n) => (*n, &[][..], true, false),
         };
@@ -86,6 +88,8 @@ fn rar5(entries: &[Ent], solid: bool) -> Vec<u8> {
                 1
             } else if unknown {
                 4 | 8
+            } else if matches!(e, Ent::Dated(..)) {
+                4 | 2
             } else {
                 4
             },
@@ -93,6 +97,9 @@ fn rar5(entries: &[Ent], solid: bool) -> Vec<u8> {
         );
         vint(if unknown { 0 } else { data.len() as u64 }, &mut h); // unpacked size
         vint(0o644, &mut h); // attributes
+        if let Ent::Dated(_, _, t) = e {
+            h.extend_from_slice(&t.to_le_bytes()); // mtime (Unix seconds)
+        }
         if !is_dir {
             h.extend_from_slice(&crc32(data).to_le_bytes());
         }
@@ -354,7 +361,7 @@ fn rar_solid_resume_still_correct() {
 }
 
 #[test]
-fn rar_reordered_listing_is_refused_on_resume() {
+fn rar_reordered_listing_only_matters_when_entries_are_skipped_by_ordinal() {
     let d = temp("rar-reordered");
     let f = sample(6);
     write(&d.join("a.rar"), &archive_of(&f, false, &[]));
@@ -363,7 +370,13 @@ fn rar_reordered_listing_is_refused_on_resume() {
     let mut order: Vec<String> = f.0.iter().map(|(n, _)| n.clone()).collect();
     order.swap(2, 3);
     let src = src.with_listing_order_for_test(order);
+    // A fresh pass binds by path: nothing is skipped by ordinal, so it uploads whole.
     let mut want = |_: &str, _: u64| Keep::All;
+    let mut rec = Rec::default();
+    src.pass(Restart(0), &mut want, &mut rec, &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(rec.got, f.0.to_vec());
+    // A resume from ordinal 3 trusts positions: refused, typed.
     let mut rec = Rec::default();
     let e = src
         .pass(Restart(3), &mut want, &mut rec, &AtomicBool::new(false))
@@ -531,11 +544,7 @@ fn an_unsafe_entry_path_fails_before_connecting() {
     let pool = Pool::new(d.join("ava")).with_addr("127.0.0.1:1");
     let e =
         upload::upload_rar_in(&pool, &cfg(), [11; 16], "dst", &d.join("a.rar"), None).unwrap_err();
-    assert!(
-        e.downcast_ref::<UploadFailure>().is_some()
-            || e.downcast_ref::<upload::RarUnsupported>().is_some(),
-        "{e:#}"
-    );
+    assert!(e.downcast_ref::<UploadFailure>().is_some(), "{e:#}");
     assert_eq!(pool.attempts(), 0);
 }
 
@@ -668,4 +677,63 @@ fn a_cancelled_job_does_not_open_the_archive() {
         )
         .unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "{e}");
+}
+
+#[test]
+fn an_entrys_own_mtime_is_carried_into_the_manifest() {
+    let d = temp("rar-mtime");
+    let ents = [
+        Ent::Dated("dated", b"hello", 1_709_209_840),
+        Ent::File("undated", b"x"),
+    ];
+    write(&d.join("a.rar"), &rar5(&ents, false));
+    let (m, _src) = RarSource::open(&d.join("a.rar"), None, &[]).unwrap();
+    let t = |n: &str| m.entries.iter().find(|e| e.path == n).unwrap().mtime;
+    // UnRAR rounds to 2 s in the host's zone; an even second round-trips exactly.
+    if cfg!(unix) {
+        assert_eq!(t("dated"), 1_709_209_840);
+    }
+    assert_eq!(t("undated"), 0);
+}
+
+#[test]
+fn duplicates_and_case_clashes_are_terminal_not_an_ftx2_fallback() {
+    let d = temp("rar-terminal");
+    let pool = Pool::new(d.join("ava")).with_addr("127.0.0.1:1");
+    for (name, ents, what) in [
+        (
+            "dup",
+            vec![Ent::File("a", b"1"), Ent::File("a", b"2")],
+            "more than once",
+        ),
+        (
+            "case",
+            vec![Ent::File("A", b"1"), Ent::File("a", b"2")],
+            "differ only in case",
+        ),
+        (
+            "filedir",
+            vec![Ent::File("x", b"1"), Ent::File("x/y", b"2")],
+            "both a file and a directory",
+        ),
+    ] {
+        write(&d.join(format!("{name}.rar")), &rar5(&ents, false));
+        let e = upload::upload_rar_in(
+            &pool,
+            &cfg(),
+            [12; 16],
+            "dst",
+            &d.join(format!("{name}.rar")),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            e.downcast_ref::<upload::RarUnsupported>().is_none(),
+            "{name}"
+        );
+        let f = e.downcast_ref::<UploadFailure>().expect(name);
+        assert_eq!(f.reason, "ava1_rar_unsupported", "{name}");
+        assert!(f.detail.contains(what), "{name}: {}", f.detail);
+    }
+    assert_eq!(pool.attempts(), 0);
 }

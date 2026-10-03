@@ -7,6 +7,7 @@
 //! async task panics (`block_on` has tokio's "Cannot start a runtime from within a
 //! runtime" behaviour — C15).
 
+mod archive_time;
 pub mod copy;
 pub mod download;
 pub mod mgmt;

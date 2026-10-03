@@ -113,7 +113,19 @@ impl ZipSource {
                         },
                         SourceMeta {
                             size: entry.size(),
-                            mtime: 0,
+                            mtime: entry
+                                .last_modified()
+                                .map(|t| {
+                                    crate::archive_time::civil_to_unix(
+                                        t.year().into(),
+                                        t.month().into(),
+                                        t.day().into(),
+                                        t.hour().into(),
+                                        t.minute().into(),
+                                        t.second().into(),
+                                    )
+                                })
+                                .unwrap_or(0),
                             mode: entry.unix_mode().unwrap_or(0o644) & 0o7777,
                             is_dir: false,
                         },
@@ -143,7 +155,7 @@ impl ZipSource {
                 kind: gen::ENTRY_FILE,
                 mode: m.mode,
                 size: m.size,
-                mtime: 0,
+                mtime: m.mtime,
                 path: p.clone(),
                 root: None,
             });

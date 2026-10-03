@@ -828,4 +828,18 @@ than the manifest fails the job (the archive changed between listing and sending
 protocol or receiver failure) and must poll it at least every 1 MiB of input, including while
 skipping, and every `EntrySink` call fails
 once the job is ending; `SeqSource::close` is called at teardown before the decode thread is
-joined. The bottleneck is `BN_SOURCE` while the decode thread is what the lanes wait on.
+joined. The sender attributes the bottleneck itself: it is `BN_SOURCE` when lanes find nothing queued, except
+in a tick in which the decode thread parked on its read-ahead budget (the budget is held by frames in flight,
+so the lanes, not the source, are the limit then).
+
+17.5 Entry metadata. The manifest carries each entry's own last-modified time as `mtime` (it is content, not
+container metadata) where the format exposes it: 7z (the entry's FILETIME), zip (its DOS time, read as UTC) and
+RAR (UnRAR's DOS time in the host's zone and 2 s resolution; a stamp in the future is read as absent, and
+non-Unix hosts carry none). 0 means the archive has none. Directory mtimes are 0, and modes stay `0644` for files
+and `0755` for directories: archives' Unix permission bits are not carried (zip's `unix_mode` excepted).
+
+17.6 Refusals. A duplicate name, a path that is both a file and a directory (and, for RAR, two names that differ
+only in case) fail the job terminally (`ava1_7z_unsupported`, `ava1_rar_unsupported`); only an unsupported 7z
+coder method falls back to FTX2, since FTX2 has the same problem with the others (it writes both duplicates, or
+hits the same decoder memory limit). A RAR's listing order is compared with its extraction order only when a
+non-solid resume skips entries by position; any other pass binds entries by path.
