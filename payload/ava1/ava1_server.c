@@ -557,6 +557,9 @@ static void *rpc_worker(void *arg) {
         out_len = 0;
         status = AVA1_ERR_INTERNAL;
     }
+    if (status != AVA1_STATUS_OK)
+        fprintf(stderr, "[ava1] rpc method %u -> status %d, %zu byte cause: %.*s\n", (unsigned)j->method, status, out_len,
+                (int)(out_len > 200 ? 200 : out_len), out ? (const char *)out : "");
     (void)send_status(&j->k->io, j->ch, (uint16_t)status, out, out_len); /* an error carries its cause as UTF-8 text */
     pthread_mutex_lock(&mu);
     if (sess_is_locked(j->idx, j->sid)) S.sessions[j->idx].rpc_inflight--;

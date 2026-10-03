@@ -2,7 +2,9 @@
 
 #include <errno.h>
 #include <stdarg.h>
+#include <fcntl.h>
 #include <sys/resource.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,6 +115,27 @@ static uint32_t g_fd_budget = 512 - 128;
 static uint32_t g_pend_open, g_pend_peak;
 static int g_fd_logged;
 
+/* RLIMIT_NOFILE is not always the real ceiling (a console's kernel tables can stop
+ * earlier): open /dev/null until something refuses. Returns how many opened. */
+#define FD_PROBE_MAX 4096
+static uint32_t fd_probe(int *stop_errno) {
+    int *fds = malloc(FD_PROBE_MAX * sizeof *fds);
+    uint32_t n = 0;
+    *stop_errno = 0;
+    if (!fds) { *stop_errno = ENOMEM; return 0; }
+    while (n < FD_PROBE_MAX) {
+        int fd = open("/dev/null", O_RDONLY);
+        if (fd < 0) { *stop_errno = errno; break; }
+        fds[n++] = fd;
+    }
+    {
+        uint32_t i;
+        for (i = 0; i < n; i++) close(fds[i]);
+    }
+    free(fds);
+    return n;
+}
+
 static void fd_limit_init(void) {
     struct rlimit rl;
     uint64_t soft = 512;
@@ -139,6 +162,16 @@ static void fd_limit_init(void) {
         fprintf(stderr, "[ava1] getrlimit(RLIMIT_NOFILE) failed: %s; assuming 512\n", strerror(errno));
     }
     g_fd_budget = soft > 144 ? (uint32_t)(soft - 128) : 16;
+    {
+        int e;
+        uint32_t got = fd_probe(&e);
+        uint32_t cap = got > 144 ? got - 128 : 16;
+        if (!g_fd_logged)
+            fprintf(stderr, "[ava1] fd probe: %u opened, stopped by %s%s\n", got, e ? strerror(e) : "the probe bound",
+                    e ? "" : " (4096)");
+        if (e && cap < g_fd_budget) g_fd_budget = cap;
+        else if (!e && got == FD_PROBE_MAX && g_fd_budget > FD_PROBE_MAX - 128) g_fd_budget = FD_PROBE_MAX - 128;
+    }
     if (!g_fd_logged) fprintf(stderr, "[ava1] open-file budget %u\n", g_fd_budget);
     g_fd_logged = 1;
 }

@@ -5,6 +5,7 @@ mod common;
 
 use ava1::gen;
 use ava1::session::connect;
+use ava1::wire::Message;
 use ava1_ctest::CServer;
 use common::*;
 
@@ -82,6 +83,40 @@ async fn a_failing_calibrate_names_the_step() {
                 "{message}"
             );
             assert!(message.contains("exist"), "{message}");
+        }
+        e => panic!("{e:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_calibrate_on_a_missing_dir_carries_its_cause_to_the_session() {
+    let d = dir("fd-cal-missing");
+    let peers = d.join("peers");
+    let (me, mine) = paired_client(&peers);
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 4000, 4000, 0);
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let missing = d.join("nope/deeper");
+    // The raw reply: a non-OK status still carries the console's text.
+    let body = gen::DiskCalibrate {
+        dir: missing.to_str().unwrap().into(),
+        files: 8,
+        size: 4096,
+    }
+    .to_bytes()
+    .unwrap();
+    let reply = s.rpc(gen::METHOD_DISK_CALIBRATE, &body).await.unwrap();
+    assert_ne!(reply.status, gen::STATUS_OK);
+    assert!(!reply.body.is_empty(), "the error reply dropped its body");
+    let err = s
+        .calibrate(missing.to_str().unwrap(), 8, 4096)
+        .await
+        .unwrap_err();
+    match err {
+        ava1::Ava1Error::Refused { message, .. } => {
+            assert!(message.starts_with("disk.calibrate: "), "{message}");
+            assert!(message.len() > "disk.calibrate failed".len(), "{message}");
         }
         e => panic!("{e:?}"),
     }

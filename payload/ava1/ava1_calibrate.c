@@ -100,11 +100,12 @@ int ava1_calibrate(const uint8_t *body, uint32_t len, uint8_t *out, size_t cap, 
     ava1_w_t points, encoded;
     uint8_t *data = NULL;
     int *fds = NULL;
-    uint32_t chunk;
+    uint32_t chunk = 0;
     char why[1536] = "";
     int status = AVA1_STATUS_OK;
     unsigned k;
     *out_len = 0;
+    memset(&q, 0, sizeof q);
     if (ava1_disk_calibrate_decode(body, len, &q) != 0 || !q.dir_len || q.dir_len > AVA1_MAX_PATH ||
         !q.files || q.files > CAL_MAX_FILES || q.size > CAL_MAX_SIZE) {
         ava1_rpc_msg(out, cap, out_len, "disk.calibrate: files must be 1..%u and size at most %u bytes", CAL_MAX_FILES,
@@ -207,6 +208,9 @@ int ava1_calibrate(const uint8_t *body, uint32_t len, uint8_t *out, size_t cap, 
         else status = AVA1_ERR_INTERNAL;
     }
 done:
+    if (status != AVA1_STATUS_OK)
+        fprintf(stderr, "[ava1] disk.calibrate failed (status %d, files=%u size=%u chunk=%u): %s\n", status, q.files,
+                q.size, chunk, why[0] ? why : "no detail");
     if (status != AVA1_STATUS_OK && why[0]) ava1_rpc_msg(out, cap, out_len, "%s", why);
     else if (status == AVA1_ERR_INTERNAL && !why[0]) ava1_rpc_msg(out, cap, out_len, "disk.calibrate: out of memory");
     free(data);
