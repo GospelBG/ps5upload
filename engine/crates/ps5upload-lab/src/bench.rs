@@ -830,18 +830,38 @@ pub fn check_local_dest(dir: &Path, src: &str) -> anyhow::Result<()> {
             dir.display()
         );
     }
-    let named = dir
-        .components()
-        .any(|c| bench_named(&c.as_os_str().to_string_lossy()));
-    let empty_or_absent = match std::fs::read_dir(dir) {
-        Ok(mut rd) => rd.next().is_none(),
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    if dir.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        bail!(
+            "{}: the download directory must not contain . or ..",
+            dir.display()
+        );
+    }
+    // What gets deleted is `<real dir>/<base>`, so the *resolved* directory decides: a
+    // `bench-*` ancestor or a symlink named `bench-*` that points elsewhere is not enough.
+    let (resolved, exists) = match std::fs::canonicalize(dir) {
+        Ok(c) => (c, true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (dir.to_path_buf(), false),
+        Err(e) => bail!("{}: {e}", dir.display()),
     };
+    let named = resolved
+        .file_name()
+        .is_some_and(|n| bench_named(&n.to_string_lossy()));
+    let empty_or_absent = !exists
+        || std::fs::read_dir(&resolved)
+            .map(|mut rd| rd.next().is_none())
+            .unwrap_or(false);
     if !named && !empty_or_absent {
         bail!(
-            "{}: the download directory holds files and is not bench-named; use an absent, \
-             empty or bench-* directory (the bench deletes <dir>/{base} between runs)",
-            dir.display()
+            "{} (resolves to {}): the download directory holds files and its final component \
+             is not bench-named; use an absent, empty or bench-* directory (the bench deletes \
+             <dir>/{base} between runs)",
+            dir.display(),
+            resolved.display()
         );
     }
     Ok(())
@@ -2113,6 +2133,7 @@ pub async fn run_bench_in(env: &Env, args: &BenchArgs) -> anyhow::Result<Vec<Ben
     let mut rows: Vec<Row> = Vec::new();
     let limit = attempt_timeout(prep.bytes, prep.files);
     let first = if args.warmup { 0 } else { 1 };
+    let mut abandoned = false;
     for run_no in first..=args.runs {
         let kind = match (run_no, args.warmup) {
             (0, _) => "warmup",
@@ -2183,6 +2204,7 @@ pub async fn run_bench_in(env: &Env, args: &BenchArgs) -> anyhow::Result<Vec<Ben
         );
         rows.push(row);
         if timed_out {
+            abandoned = true;
             eprintln!(
                 "stopping: the timed-out transfer may still be running on a blocking thread, \
                  and further runs would measure on top of it"
@@ -2191,7 +2213,12 @@ pub async fn run_bench_in(env: &Env, args: &BenchArgs) -> anyhow::Result<Vec<Ben
         }
     }
     // Leave the console tidy; the run records are already written.
-    if let Err(e) = clean_between(env, args, &local_dir).await {
+    if abandoned {
+        eprintln!(
+            "final cleanup skipped: the abandoned transfer may still be running and writing to \
+             the destination; clean it by hand once it has stopped"
+        );
+    } else if let Err(e) = clean_between(env, args, &local_dir).await {
         eprintln!("final cleanup: {e}");
     }
     let _ = std::fs::remove_dir_all(&scratch);
@@ -2974,6 +3001,26 @@ mod tests {
         for src in ["/", "", "/a/..", "/a/."] {
             assert!(check_local_dest(&named, src).is_err(), "{src:?}");
         }
+        // A bench-named ancestor does not make `..` safe.
+        let up = named.join("..");
+        assert!(check_local_dest(&up, "/a/tiny").is_err());
+        assert!(check_local_dest(Path::new("bench-x/../y"), "/a/tiny").is_err());
+        assert!(check_local_dest(Path::new("./bench-x"), "/a/tiny").is_err());
+        // A `bench-*` ancestor over a plain directory: the final component decides.
+        let inner = named.join("plain");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("keep"), b"x").unwrap();
+        assert!(check_local_dest(&inner, "/a/tiny").is_err());
+        #[cfg(unix)]
+        {
+            // A symlink named bench-link that points at a directory with real files.
+            let outside = d.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("precious"), b"x").unwrap();
+            let link = d.path().join("bench-link");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(check_local_dest(&link, "/a/tiny").is_err());
+        }
         assert!(check_local_dest(Path::new("/"), "/a/tiny").is_err());
         assert!(check_local_dest(Path::new(""), "/a/tiny").is_err());
     }
@@ -3007,7 +3054,6 @@ mod tests {
         let consoles = ["192.168.86.100", "192.168.86.99"];
         let drives = ["/data", "/mnt/usb0", "/mnt/ext1"];
         let (mut stage, mut bench) = (Vec::new(), Vec::new());
-        let mut n = 0u32;
         for c in consoles {
             let other = if c == consoles[0] {
                 consoles[1]
@@ -3016,12 +3062,9 @@ mod tests {
             };
             for d in drives {
                 let t = format!("{d}/ps5upload/tests");
-                for (name, dir) in [("tiny", "/tmp/b/tiny"), ("ppsa", "/tmp/b/ppsa")] {
-                    n += 1;
-                    stage.push(format!(
-                        "{c}:9113 transfer-dir {n:032x} {t}/bench-src/{name} {dir}"
-                    ));
-                }
+                stage.push(format!(
+                    "{c}:9113 transfer-dir $(tx) {t}/bench-src/tiny /tmp/b/tiny"
+                ));
                 for proto in ["ava1", "ftx2"] {
                     let b = |sc: &str, rest: String| {
                         format!("bench {c} {sc} --proto {proto} {rest} --runs 3 --warmup --out $O")
@@ -3033,10 +3076,6 @@ mod tests {
                     bench.push(b(
                         "upload-dir",
                         format!("--src /tmp/b/tiny --dest {t}/bench/tiny"),
-                    ));
-                    bench.push(b(
-                        "upload-dir",
-                        format!("--src /tmp/b/ppsa --dest {t}/bench/ppsa"),
                     ));
                     bench.push(b(
                         "download",
@@ -3051,6 +3090,14 @@ mod tests {
                         "relay",
                         format!("--src {t}/bench-src/tiny --dest {t}/bench/relayed --to {other}"),
                     ));
+                }
+                if d == "/data" {
+                    // The 223 000-file corpus: one drive, one run, no warm-up.
+                    for proto in ["ava1", "ftx2"] {
+                        bench.push(format!(
+                            "bench {c} upload-dir --proto {proto} --src /tmp/b/ppsa --dest {t}/bench/ppsa --runs 1 --out $O"
+                        ));
+                    }
                 }
                 bench.push(format!(
                     "bench {c} drop60 --proto ava1 --src /tmp/b/large/large-4g.bin --dest {t}/bench/drop.bin --runs 1 --kill-every-s 60 --out $O"
@@ -3073,12 +3120,26 @@ mod tests {
                 check_console_dest(a.dest.as_deref().unwrap())
                     .unwrap_or_else(|e| panic!("{l}: {e}"));
             }
-            assert_eq!(a.warmup, a.scenario != Scenario::Drop60, "{l}");
+            if l.contains("/tmp/b/ppsa") {
+                assert!(
+                    !a.warmup && a.runs == 1 && a.dest.as_deref().unwrap().starts_with("/data/"),
+                    "ppsa runs on /data only, once, without warm-up: {l}"
+                );
+            } else {
+                assert_eq!(a.warmup, a.scenario != Scenario::Drop60, "{l}");
+            }
         }
         for l in &stage {
-            // Staging is a plain FTX2 upload (transfer-dir), never a bench command.
-            assert!(l.contains(" transfer-dir "), "{l}");
-            let dest = l.split_whitespace().nth(3).unwrap();
+            // Staging is a plain FTX2 upload (transfer-dir), never a bench command, with a
+            // fresh transfer id from the report's `tx` helper.
+            let w: Vec<&str> = l.split_whitespace().collect();
+            assert_eq!(w.len(), 5, "{l}");
+            assert!(
+                w[0].ends_with(":9113") && w[1] == "transfer-dir" && w[2] == "$(tx)",
+                "{l}"
+            );
+            assert!(w[4].starts_with("/tmp/b/tiny"), "{l}");
+            let dest = w[3];
             assert!(
                 check_console_dest(dest).is_err(),
                 "{dest} must not be bench-deletable"
