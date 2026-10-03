@@ -526,7 +526,7 @@ async fn resume_restarts_the_folder_and_sends_only_missing_files() {
     let (m, src) = SevenzSource::open(&d.join("a.7z"), &[]).unwrap();
     let src = Arc::new(src);
     let src2 = src.clone();
-    within(
+    let r = within(
         120,
         tokio::task::spawn_blocking(move || {
             upload::upload_7z_source_in(&pool, &c, [3; 16], "out", m, src2)
@@ -536,10 +536,10 @@ async fn resume_restarts_the_folder_and_sends_only_missing_files() {
     .unwrap()
     .unwrap();
     same(&expected(&spec), &read_tree(&d.join("share/out")));
+    let on_wire = wire_bytes(&r, &sent);
     assert!(
-        sent.load(Ordering::Relaxed) <= total - fin1,
-        "sent {} but only {} were missing",
-        sent.load(Ordering::Relaxed),
+        on_wire <= total - fin1,
+        "sent {on_wire} but only {} were missing",
         total - fin1
     );
     assert!(
@@ -811,12 +811,26 @@ async fn a_touched_copy_of_the_archive_keeps_its_resume() {
         "the caller's id is reported"
     );
     same(&expected(&spec), &read_tree(&d.join("share/out")));
+    let on_wire = wire_bytes(&r, &sent);
     assert!(
-        sent.load(Ordering::Relaxed) <= total - fin1,
-        "the copy resumed: sent {} of {} missing",
-        sent.load(Ordering::Relaxed),
+        on_wire <= total - fin1,
+        "the copy resumed: sent {on_wire} of {} missing",
         total - fin1
     );
+}
+
+/// Bytes that actually crossed the wire: the progress counter also counts files the
+/// receiver already had (skipped bytes, so the bar reaches 100%), which the commit ack
+/// reports separately.
+fn wire_bytes(
+    r: &ps5upload_core::transfer::TransferResult,
+    progress: &std::sync::atomic::AtomicU64,
+) -> u64 {
+    let skipped = serde_json::from_str::<serde_json::Value>(&r.commit_ack_body)
+        .ok()
+        .and_then(|v| v["skipped_bytes"].as_u64())
+        .unwrap_or(0);
+    progress.load(Ordering::Relaxed).saturating_sub(skipped)
 }
 
 // ---- memory ------------------------------------------------------------------------

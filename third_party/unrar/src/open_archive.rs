@@ -416,6 +416,32 @@ impl OpenArchive<Process, CursorBeforeFile> {
         ))
     }
 
+    /// ps5upload local addition: decompress this entry through `f`, called with
+    /// consecutive pieces on the calling thread. `f` returns false to stop: UnRAR
+    /// is told to abort at once (not after the rest of the entry) and the call
+    /// returns an error. A stop leaves the archive unusable; drop it.
+    pub fn read_to_fn(
+        self,
+        f: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> UnrarResult<OpenArchive<Process, CursorBeforeHeader>> {
+        let _ = Internal::<ReadToFn<'_>>::process_file_raw_seeded(
+            &self.handle,
+            None,
+            None,
+            FnSink {
+                f: Some(f),
+                stopped: false,
+            },
+        )?;
+        Ok(OpenArchive {
+            extra: CursorBeforeHeader,
+            damaged: self.damaged,
+            handle: self.handle,
+            flags: self.flags,
+            marker: std::marker::PhantomData,
+        })
+    }
+
     /// Test the file without extracting it
     pub fn test(self) -> UnrarResult<OpenArchive<Process, CursorBeforeHeader>> {
         Ok(self.process_file::<Test>(None, None)?)
@@ -499,6 +525,12 @@ trait ProcessMode: core::fmt::Debug {
     type Output: core::fmt::Debug + std::default::Default;
 
     fn process_data(data: &mut Self::Output, other: &[u8]);
+
+    /// ps5upload local addition: true makes the callback answer -1, which
+    /// stops UnRAR mid-entry (the call then returns an error).
+    fn abort(_: &Self::Output) -> bool {
+        false
+    }
 }
 impl ProcessMode for Skip {
     const OPERATION: private::Operation = private::Operation::Skip;
@@ -582,6 +614,54 @@ impl ProcessMode for ReadToSink {
     }
 }
 
+/// ps5upload local addition: the output type of [`OpenArchive::read_to_fn`].
+struct FnSink<'a> {
+    f: Option<&'a mut dyn FnMut(&[u8]) -> bool>,
+    stopped: bool,
+}
+
+impl core::fmt::Debug for FnSink<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FnSink")
+            .field("stopped", &self.stopped)
+            .finish()
+    }
+}
+
+impl Default for FnSink<'_> {
+    fn default() -> Self {
+        Self {
+            f: None,
+            stopped: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReadToFn<'a>(std::marker::PhantomData<&'a ()>);
+
+impl<'a> ProcessMode for ReadToFn<'a> {
+    const OPERATION: private::Operation = private::Operation::Test;
+    type Output = FnSink<'a>;
+
+    fn process_data(sink: &mut Self::Output, data: &[u8]) {
+        if sink.stopped {
+            return;
+        }
+        let keep_going = match sink.f.as_mut() {
+            Some(f) => f(data),
+            None => false,
+        };
+        if !keep_going {
+            sink.stopped = true;
+        }
+    }
+
+    fn abort(sink: &Self::Output) -> bool {
+        sink.stopped
+    }
+}
+
 impl ProcessMode for Extract {
     const OPERATION: private::Operation = private::Operation::Extract;
     type Output = ();
@@ -660,7 +740,11 @@ impl<M: ProcessMode> Internal<M> {
             native::UCM_PROCESSDATA => {
                 let raw_slice = std::ptr::slice_from_raw_parts(p1 as *const u8, p2 as _);
                 M::process_data(&mut user_data.0, unsafe { &*raw_slice as &_ });
-                0
+                if M::abort(&user_data.0) {
+                    -1
+                } else {
+                    0
+                }
             }
             _ => 0,
         }

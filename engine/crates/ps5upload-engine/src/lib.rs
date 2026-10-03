@@ -7799,15 +7799,41 @@ async fn transfer_rar_handler(
         // blip, or the payload's serial accept loop still draining the dropped
         // connection) burned both retries inside the first 1.5 s of backoff
         // and surfaced as "transfer_zip gave up after 2 retries".
-        let result = ps5upload_core::transfer::transfer_rar_resumable(
-            &cfg,
-            tx_id,
-            &req.dest_root,
-            std::path::Path::new(&req.archive_path),
-            req.password.as_deref(),
-            DEFAULT_RESUME_RETRIES,
-            initial_flags,
-        );
+        // The password stays in this request for the job's lifetime and is never
+        // logged; AVA1's resume passes reuse it from the RarSource.
+        let ftx2 = |reason: Option<&str>| {
+            let mut r = ps5upload_core::transfer::transfer_rar_resumable(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                std::path::Path::new(&req.archive_path),
+                req.password.as_deref(),
+                DEFAULT_RESUME_RETRIES,
+                initial_flags,
+            )?;
+            r.commit_ack_body = tag_ack_body(&r.commit_ack_body, "ftx2", reason);
+            Ok::<_, anyhow::Error>(r)
+        };
+        let result = if ps5upload_ava1::route::use_ava1(&addr) {
+            match ps5upload_ava1::upload::upload_rar(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                std::path::Path::new(&req.archive_path),
+                req.password.as_deref(),
+            ) {
+                Err(e)
+                    if e.downcast_ref::<ps5upload_ava1::upload::RarUnsupported>()
+                        .is_some() =>
+                {
+                    crate::log_info!("transfer_rar: AVA1 fallback to FTX2: {e}");
+                    ftx2(Some("rar_unsupported_by_ava1"))
+                }
+                other => other,
+            }
+        } else {
+            ftx2(Some("ava1_unavailable"))
+        };
         match result {
             Ok(r) => {
                 let completed_at_ms = now_ms();

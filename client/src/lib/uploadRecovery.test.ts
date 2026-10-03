@@ -64,6 +64,20 @@ describe("isAutoRecoverable", () => {
   });
 
   it.each([
+    "ava1_rar_password_required",
+    "ava1_rar_password_wrong",
+    "ava1_rar_corrupt",
+    "ava1_rar_missing_volume",
+    "ava1_rar_reordered",
+    "ava1_rar_failed",
+    "ava1_rar_some_future_reason",
+    "rar_password_required",
+    "rar_password_wrong",
+  ])("does NOT recover RAR failure %s (same archive and password fail again)", (r) => {
+    expect(isAutoRecoverable(r, "")).toBe(false);
+  });
+
+  it.each([
     "ava1_refused_7", // internal
     "ava1_refused_8", // busy
     "ava1_refused_11", // unknown job (console restarted)

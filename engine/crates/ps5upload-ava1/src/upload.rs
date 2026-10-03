@@ -174,6 +174,77 @@ pub fn upload_zip(
     upload_zip_in(pool(), cfg, job_id, dest_root, zip_path)
 }
 
+/// The archive cannot be an AVA1 source because its entries cannot be carried by the
+/// manifest as listed: a duplicate path, or two paths that differ only in case
+/// (console filesystems may fold case). The engine falls back to FTX2 for these
+/// (`rar_unsupported_by_ava1`). An *unsafe* path (`../x`, absolute) is different: it
+/// fails planning with the terminal reason `ava1_rar_failed` and does not fall back,
+/// because FTX2 refuses the same archive with the same zip-slip rule.
+#[cfg(not(target_os = "android"))]
+#[derive(Debug, thiserror::Error)]
+#[error("rar is not usable as an AVA1 source: {0}")]
+pub struct RarUnsupported(pub String);
+
+/// A RAR upload over AVA1: the archive is decoded forward on one thread
+/// ([`crate::rar_source::RarSource`]). `password` is held only in memory for this job;
+/// it is never logged. Failures that retrying cannot fix are [`UploadFailure`]s with
+/// the `ava1_rar_*` reasons in [`crate::rar_source::RarReason`].
+#[cfg(not(target_os = "android"))]
+pub fn upload_rar_in(
+    pool: &Pool,
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    dest_root: &str,
+    archive: &Path,
+    password: Option<&str>,
+) -> Result<TransferResult> {
+    use crate::rar_source::{rar_failure, RarOpenError, RarSource};
+    let (manifest, source) = match RarSource::open(archive, password, &cfg.excludes) {
+        Ok(v) => v,
+        Err(RarOpenError::Plan(f)) => return Err(rar_upload_failure(f.reason, f.message).into()),
+        Err(RarOpenError::Unsupported(m)) => return Err(RarUnsupported(m).into()),
+    };
+    let source = Arc::new(source);
+    let mut opts = SendOptions::upload(dest_root);
+    opts.seq = Some(source.clone());
+    upload_with_in(pool, &cfg.addr, job_id, manifest, source, opts, cfg).map_err(|e| {
+        match e.chain().find_map(|c| rar_failure(c)) {
+            Some(f) => rar_upload_failure(f.reason, f.message.clone()).into(),
+            None => e,
+        }
+    })
+}
+
+#[cfg(not(target_os = "android"))]
+fn rar_upload_failure(reason: crate::rar_source::RarReason, message: String) -> UploadFailure {
+    use crate::rar_source::RarReason::*;
+    let detail = match reason {
+        PasswordRequired => {
+            "the RAR is password protected and no password is available (a restarted engine \
+             forgets it); enter the password again"
+                .to_string()
+        }
+        PasswordWrong => "the RAR password is wrong".to_string(),
+        Corrupt => format!("the RAR archive is corrupt: {message}"),
+        MissingVolume | Reordered | Other => message,
+    };
+    UploadFailure {
+        reason: reason.as_str().into(),
+        detail,
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn upload_rar(
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    dest_root: &str,
+    archive: &Path,
+    password: Option<&str>,
+) -> Result<TransferResult> {
+    upload_rar_in(pool(), cfg, job_id, dest_root, archive, password)
+}
+
 /// Why the console refused a transfer whose data it had already received (a
 /// post-commit failure). The upload must never be retried: the destination is taken
 /// and resuming would re-send every byte.
@@ -546,7 +617,8 @@ pub fn upload_with_seq_in(
                 // The shared flag, not a copy (C18): flipping cfg.cancel ends the job.
                 cancel: cancel.clone(),
                 bandwidth_cap: cfg.bandwidth_cap_bps,
-                seq: seq.clone(),
+                // 7z passes its source as `seq`; RAR sets it on `opts`.
+                seq: seq.clone().or_else(|| opts.seq.clone()),
             };
             match send_job(&mut link, manifest.clone(), source.clone(), o).await {
                 Ok(r) if r.status == gen::STATUS_OK => {

@@ -67,6 +67,12 @@ const AVA1_FATAL_REASON_PREFIXES = [
   "ava1_not_paired",
   "ava1_wrong_console",
   "ava1_no_identity",
+  // RAR source failures (engine rar_source.rs RarReason): the same archive with
+  // the same password fails the same way. The password ones mean "ask for the
+  // password again" (UI prompt: Task 20); until then they are terminal.
+  "ava1_rar_",
+  "rar_password_required",
+  "rar_password_wrong",
 ] as const;
 
 /** Local (no payload `reason`) error-message substrings that are FATAL. These
