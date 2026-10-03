@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use ava1::gen::{self, FsEntry, FsList, FsListResult, FsPath, FsRead, FsReadResult, FsStat, FsWrite, MgmtText};
+use ava1::gen::{
+    self, FsEntry, FsList, FsListResult, FsPath, FsRead, FsReadResult, FsStat, FsWrite, MgmtText,
+};
 use ava1::keys::Identity;
 use ava1::peers::PeerStore;
 use ava1::session::{connect, Session, Timing};
@@ -37,6 +39,8 @@ fn fast() -> Timing {
     }
 }
 
+// The process-wide lock is held for the whole test on purpose (the installed table is global).
+#[allow(clippy::await_holding_lock)]
 async fn rig(tag: &str) -> Rig {
     let one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     let base = std::env::temp_dir().join(format!("ava1-mfs-{tag}-{}", std::process::id()));
@@ -56,9 +60,15 @@ async fn rig(tag: &str) -> Rig {
     mine.add(Identity::from_secret(SECRET).public(), "C test server")
         .unwrap();
     let srv = CServer::start(SECRET, &base.join("peers"), 0, 100, 3000, 800);
-    let s = connect(&srv.addr(), me, Arc::new(Mutex::new(mine)), "laptop", fast())
-        .await
-        .unwrap();
+    let s = connect(
+        &srv.addr(),
+        me,
+        Arc::new(Mutex::new(mine)),
+        "laptop",
+        fast(),
+    )
+    .await
+    .unwrap();
     Rig {
         _one: one,
         _srv: srv,
@@ -96,7 +106,14 @@ impl Rig {
         assert_eq!(st, OK, "{}", String::from_utf8_lossy(&b));
         FsListResult::decode(&b).unwrap()
     }
-    async fn write(&self, rel: &str, offset: u64, flags: u32, data: &[u8], mode: Option<u32>) -> (u16, Vec<u8>) {
+    async fn write(
+        &self,
+        rel: &str,
+        offset: u64,
+        flags: u32,
+        data: &[u8],
+        mode: Option<u32>,
+    ) -> (u16, Vec<u8>) {
         self.rpc(
             gen::METHOD_FS_WRITE,
             &FsWrite {
@@ -157,7 +174,10 @@ async fn list_dir_pages_cover_a_20k_entry_directory() {
         }
         offset += page.entries.len() as u32;
         if page.more == 0 {
-            assert_eq!(page.total_scanned, 20_000, "the last page counts everything");
+            assert_eq!(
+                page.total_scanned, 20_000,
+                "the last page counts everything"
+            );
             break;
         }
         assert_eq!(page.entries.len(), 256, "a page that says more is full");
@@ -197,11 +217,20 @@ async fn list_refuses_what_the_ftx2_handler_refused() {
         limit: 10,
     };
     let (st, b) = r.rpc(gen::METHOD_FS_LIST, &ask("relative/path")).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_PATH, "fs_list_dir_bad_path"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PATH, "fs_list_dir_bad_path")
+    );
     let (st, b) = r.rpc(gen::METHOD_FS_LIST, &ask("/a/../b")).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_PATH, "fs_list_dir_path_denied"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PATH, "fs_list_dir_path_denied")
+    );
     let (st, b) = r.rpc(gen::METHOD_FS_LIST, &ask(&r.p("missing"))).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_IO, "fs_list_dir_opendir_errno_2"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_IO, "fs_list_dir_opendir_errno_2")
+    );
     // a name that merely contains ".." is fine
     std::fs::create_dir_all(r.path("..cache/x..bak")).unwrap();
     assert_eq!(r.list(&r.p("..cache"), 0, 10).await.entries.len(), 1);
@@ -232,13 +261,21 @@ async fn fs_stat_reports_dev() {
     assert_eq!(FsStat::decode(&b).unwrap().kind, gen::ENTRY_LINK);
     // a missing path is an error, not an empty OK: that is what the 1-byte FsRead probe was
     let (st, b) = r.rpc(gen::METHOD_FS_STAT, &stat("nope")).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_IO, "fs_stat_failed_errno_2"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_IO, "fs_stat_failed_errno_2")
+    );
     let (st, _) = r
         .rpc(gen::METHOD_FS_STAT, &FsPath { path: "rel".into() })
         .await;
     assert_eq!(st, gen::ERR_PATH);
     let (st, _) = r
-        .rpc(gen::METHOD_FS_STAT, &FsPath { path: "/a/../b".into() })
+        .rpc(
+            gen::METHOD_FS_STAT,
+            &FsPath {
+                path: "/a/../b".into(),
+            },
+        )
         .await;
     assert_eq!(st, gen::ERR_PATH);
 }
@@ -267,10 +304,16 @@ async fn mkdir_honours_mode_and_parents() {
     // an existing directory is fine (mkdir -p) and keeps its mode; a file in the way is not
     let (st, _) = r.rpc(gen::METHOD_FS_MKDIR, &mk("a/b/c", 0o700, 1)).await;
     assert_eq!(st, OK);
-    assert_eq!(std::fs::metadata(r.path("a/b/c")).unwrap().mode() & 0o7777, 0o750);
+    assert_eq!(
+        std::fs::metadata(r.path("a/b/c")).unwrap().mode() & 0o7777,
+        0o750
+    );
     std::fs::write(r.path("file"), b"").unwrap();
     let (st, b) = r.rpc(gen::METHOD_FS_MKDIR, &mk("file", 0o755, 1)).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_EXISTS, "fs_mkdir_exists_not_dir"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_EXISTS, "fs_mkdir_exists_not_dir")
+    );
     // outside the policy
     let (st, b) = r
         .rpc(
@@ -282,7 +325,10 @@ async fn mkdir_honours_mode_and_parents() {
             },
         )
         .await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_PATH, "fs_mkdir_path_not_allowed"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PATH, "fs_mkdir_path_not_allowed")
+    );
 }
 
 // ---- fs.rename ----
@@ -327,14 +373,13 @@ async fn fs_rename_overwrite_and_policy() {
     let r = rig("rename").await;
     std::fs::write(r.path("a"), b"A").unwrap();
     std::fs::write(r.path("b"), b"B").unwrap();
-    let (st, b) = r
-        .rpc(gen::METHOD_FS_RENAME, &rename(&r, "a", "b", 0))
-        .await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_EXISTS, "fs_move_exists"));
+    let (st, b) = r.rpc(gen::METHOD_FS_RENAME, &rename(&r, "a", "b", 0)).await;
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_EXISTS, "fs_move_exists")
+    );
     assert_eq!(std::fs::read(r.path("b")).unwrap(), b"B");
-    let (st, _) = r
-        .rpc(gen::METHOD_FS_RENAME, &rename(&r, "a", "b", 1))
-        .await;
+    let (st, _) = r.rpc(gen::METHOD_FS_RENAME, &rename(&r, "a", "b", 1)).await;
     assert_eq!(st, OK);
     assert_eq!(std::fs::read(r.path("b")).unwrap(), b"A");
     let (st, b) = r
@@ -347,7 +392,10 @@ async fn fs_rename_overwrite_and_policy() {
             },
         )
         .await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_PATH, "fs_move_path_not_allowed"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PATH, "fs_move_path_not_allowed")
+    );
 }
 
 // ---- fs.chmod ----
@@ -366,7 +414,10 @@ async fn fs_chmod_sets_the_bits_and_obeys_the_policy() {
         )
         .await;
     assert_eq!((st, b.len()), (OK, 0));
-    assert_eq!(std::fs::metadata(r.path("f")).unwrap().mode() & 0o7777, 0o600);
+    assert_eq!(
+        std::fs::metadata(r.path("f")).unwrap().mode() & 0o7777,
+        0o600
+    );
     let (st, b) = r
         .rpc(
             gen::METHOD_FS_CHMOD,
@@ -386,7 +437,10 @@ async fn fs_chmod_sets_the_bits_and_obeys_the_policy() {
             },
         )
         .await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_PATH, "fs_chmod_path_not_allowed"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PATH, "fs_chmod_path_not_allowed")
+    );
 }
 
 // ---- fs.read ----
@@ -420,19 +474,31 @@ async fn fs_read_windows_eof_and_the_unsafe_flag() {
     }
     // errors keep the legacy tokens
     let (st, b) = r.read("nope", 0, 10, 0).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_IO, "fs_read_stat_failed"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_IO, "fs_read_stat_failed")
+    );
     std::fs::create_dir_all(r.path("dir")).unwrap();
     let (st, b) = r.read("dir", 0, 10, 0).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_IO, "fs_read_not_regular_file"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_IO, "fs_read_not_regular_file")
+    );
     // the system tree is readable only with FSR_UNSAFE (the policy sees the flag)
     std::fs::create_dir_all(r.path("sys")).unwrap();
     std::fs::write(r.path("sys/lib"), b"elf").unwrap();
     let (st, b) = r.read("sys/lib", 0, 10, 0).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_PATH, "fs_read_path_not_allowed"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PATH, "fs_read_path_not_allowed")
+    );
     let (st, b) = r.read("sys/lib", 0, 10, gen::FSR_UNSAFE).await;
     assert_eq!(st, OK);
     assert_eq!(FsReadResult::decode(&b).unwrap().data, b"elf");
-    assert!(mgmt_fs::stats().2 >= 1, "the unsafe flag reached the policy");
+    assert!(
+        mgmt_fs::stats().2 >= 1,
+        "the unsafe flag reached the policy"
+    );
     let (st, _) = r
         .rpc(
             gen::METHOD_FS_READ,
@@ -460,13 +526,22 @@ async fn fs_write_whole_file_is_atomic_and_honours_create_and_mode() {
     let (st, b) = r.write("w", 0, OVERWRITE, b"hello", None).await;
     assert_eq!((st, b.len()), (OK, 0));
     assert_eq!(std::fs::read(r.path("w")).unwrap(), b"hello");
-    assert_eq!(std::fs::metadata(r.path("w")).unwrap().mode() & 0o7777, 0o644);
-    assert!(!r.path("w.ps5upload.tmp").exists(), "committed in the same call");
+    assert_eq!(
+        std::fs::metadata(r.path("w")).unwrap().mode() & 0o7777,
+        0o644
+    );
+    assert!(
+        !r.path("w.ps5upload.tmp").exists(),
+        "committed in the same call"
+    );
     // default (neither flag) overwrites; CREATE refuses an existing file and writes nothing
     let (st, _) = r.write("w", 0, 0, b"v2", Some(0o600)).await;
     assert_eq!(st, OK);
     assert_eq!(std::fs::read(r.path("w")).unwrap(), b"v2");
-    assert_eq!(std::fs::metadata(r.path("w")).unwrap().mode() & 0o7777, 0o600);
+    assert_eq!(
+        std::fs::metadata(r.path("w")).unwrap().mode() & 0o7777,
+        0o600
+    );
     let (st, b) = r.write("w", 0, CREATE, b"v3", None).await;
     assert_eq!((st, cause(&b).as_str()), (gen::ERR_EXISTS, "exists"));
     assert_eq!(std::fs::read(r.path("w")).unwrap(), b"v2");
@@ -477,7 +552,10 @@ async fn fs_write_whole_file_is_atomic_and_honours_create_and_mode() {
     let (st, _) = r.write("empty", 0, 0, b"", None).await;
     assert_eq!(st, OK);
     assert_eq!(std::fs::read(r.path("empty")).unwrap(), b"");
-    assert!(mgmt_fs::stats().0 >= 4, "successful writes are counted as commands");
+    assert!(
+        mgmt_fs::stats().0 >= 4,
+        "successful writes are counted as commands"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -488,23 +566,34 @@ async fn fs_write_chunks_commit_on_the_last_and_a_retry_starts_clean() {
     let (st, _) = r.write("c", 0, OVERWRITE | AT, &part(0), None).await;
     assert_eq!(st, OK);
     assert!(!r.path("c").exists(), "not committed yet");
-    assert_eq!(std::fs::metadata(r.path("c.ps5upload.tmp")).unwrap().len(), 1000);
+    assert_eq!(
+        std::fs::metadata(r.path("c.ps5upload.tmp")).unwrap().len(),
+        1000
+    );
     let (st, _) = r.write("c", 1000, OVERWRITE | AT, &part(1), None).await;
     assert_eq!(st, OK);
     // an abandoned attempt: a new chunk at offset 0 truncates the tmp file first
     let (st, _) = r.write("c", 0, OVERWRITE | AT, &part(0), None).await;
     assert_eq!(st, OK);
-    assert_eq!(std::fs::metadata(r.path("c.ps5upload.tmp")).unwrap().len(), 1000);
+    assert_eq!(
+        std::fs::metadata(r.path("c.ps5upload.tmp")).unwrap().len(),
+        1000
+    );
     let (st, _) = r.write("c", 1000, OVERWRITE | AT, &part(1), None).await;
     assert_eq!(st, OK);
-    let (st, _) = r.write("c", 2000, OVERWRITE | AT | COMMIT, &part(2), Some(0o640)).await;
+    let (st, _) = r
+        .write("c", 2000, OVERWRITE | AT | COMMIT, &part(2), Some(0o640))
+        .await;
     assert_eq!(st, OK);
     let mut want = part(0);
     want.extend(part(1));
     want.extend(part(2));
     assert_eq!(std::fs::read(r.path("c")).unwrap(), want);
     assert!(!r.path("c.ps5upload.tmp").exists());
-    assert_eq!(std::fs::metadata(r.path("c")).unwrap().mode() & 0o7777, 0o640);
+    assert_eq!(
+        std::fs::metadata(r.path("c")).unwrap().mode() & 0o7777,
+        0o640
+    );
     // CREATE is checked at commit: the target appeared while chunks were sent
     let (st, _) = r.write("d", 0, CREATE | AT, b"zz", None).await;
     assert_eq!(st, OK);
@@ -512,9 +601,14 @@ async fn fs_write_chunks_commit_on_the_last_and_a_retry_starts_clean() {
     let (st, b) = r.write("d", 2, CREATE | AT | COMMIT, b"yy", None).await;
     assert_eq!((st, cause(&b).as_str()), (gen::ERR_EXISTS, "exists"));
     assert_eq!(std::fs::read(r.path("d")).unwrap(), b"someone else");
-    assert!(!r.path("d.ps5upload.tmp").exists(), "a refused commit leaves no tmp");
+    assert!(
+        !r.path("d.ps5upload.tmp").exists(),
+        "a refused commit leaves no tmp"
+    );
     // APPEND adds to the end whatever offset says
-    let (st, _) = r.write("e", 0, OVERWRITE | gen::FSW_APPEND, b"12", None).await;
+    let (st, _) = r
+        .write("e", 0, OVERWRITE | gen::FSW_APPEND, b"12", None)
+        .await;
     assert_eq!(st, OK);
     let (st, _) = r
         .write("e", 0, OVERWRITE | gen::FSW_APPEND | COMMIT, b"34", None)
@@ -534,18 +628,27 @@ async fn fs_write_over_48k_is_refused_not_truncated() {
     let ok = vec![7u8; gen::FSW_CHUNK_MAX as usize];
     let (st, _) = r.write("big", 0, 0, &ok, None).await;
     assert_eq!(st, OK);
-    assert_eq!(std::fs::metadata(r.path("big")).unwrap().len(), ok.len() as u64);
+    assert_eq!(
+        std::fs::metadata(r.path("big")).unwrap().len(),
+        ok.len() as u64
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fs_write_validates_flags_and_paths() {
     let r = rig("write4").await;
     let (st, b) = r.write("f", 0, CREATE | OVERWRITE, b"x", None).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_PROTOCOL, "fs_write_flags_conflict"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PROTOCOL, "fs_write_flags_conflict")
+    );
     let (st, _) = r.write("f", 0, AT | gen::FSW_APPEND, b"x", None).await;
     assert_eq!(st, gen::ERR_PROTOCOL);
     let (st, b) = r.write("f", 5, 0, b"x", None).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_PROTOCOL, "fs_write_offset_without_chunk"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PROTOCOL, "fs_write_offset_without_chunk")
+    );
     let (st, b) = r
         .rpc(
             gen::METHOD_FS_WRITE,
@@ -571,7 +674,10 @@ async fn fs_write_validates_flags_and_paths() {
             },
         )
         .await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_PROTOCOL, "path_required"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PROTOCOL, "path_required")
+    );
     // a directory in the way: the rename fails and leaves no tmp
     std::fs::create_dir_all(r.path("dir/inner")).unwrap();
     let (st, b) = r.write("dir", 0, 0, b"x", None).await;
@@ -611,13 +717,17 @@ async fn klog_read_marks_more() {
     // an open failure is an error with its token
     mgmt_fs::set(false, u32::MAX, 0);
     let (st, b) = r.raw(gen::METHOD_LOG_KLOG, &ask(None)).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_INTERNAL, "open_klog_failed"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_INTERNAL, "open_klog_failed")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn syslog_returns_the_tail_and_says_older_text_was_cut() {
     let r = rig("syslog").await;
-    let expect = |from: usize, to: usize| -> Vec<u8> { (from..to).map(|i| b'a' + (i % 26) as u8).collect() };
+    let expect =
+        |from: usize, to: usize| -> Vec<u8> { (from..to).map(|i| b'a' + (i % 26) as u8).collect() };
     // 1 MiB (the handler's cap) does not fit a reply: the LAST RPC_TEXT_MAX bytes are returned
     let total = 1024 * 1024;
     mgmt_fs::set(false, 0, total as u32);
@@ -626,7 +736,11 @@ async fn syslog_returns_the_tail_and_says_older_text_was_cut() {
     let t = MgmtText::decode(&b).unwrap();
     let keep = gen::RPC_TEXT_MAX as usize;
     assert_eq!((t.body.len(), t.more), (keep, Some(1)));
-    assert_eq!(t.body, expect(total - keep, total), "the newest text, not the oldest");
+    assert_eq!(
+        t.body,
+        expect(total - keep, total),
+        "the newest text, not the oldest"
+    );
     // a smaller buffer comes whole
     mgmt_fs::set(false, 0, 5000);
     let (_, b) = r.raw(gen::METHOD_LOG_SYSLOG, &text("")).await;
@@ -644,7 +758,10 @@ async fn syslog_returns_the_tail_and_says_older_text_was_cut() {
     assert_eq!((st, MgmtText::decode(&b).unwrap().body.len()), (OK, 0));
     mgmt_fs::set(false, 0, u32::MAX);
     let (st, b) = r.raw(gen::METHOD_LOG_SYSLOG, &text("")).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_IO, "syslog_tail_sysctl_errno_5"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_IO, "syslog_tail_sysctl_errno_5")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -656,8 +773,17 @@ async fn failures_that_carry_data_keep_it_in_the_cause() {
         .await;
     assert_eq!(st, gen::ERR_INTERNAL);
     let v: serde_json::Value = serde_json::from_slice(&b).expect("the cause is the failure body");
-    assert_eq!((v["ok"].as_bool(), v["timed_out"].as_bool(), v["ms"].as_u64()), (Some(false), Some(true), Some(3000)));
-    let (st, b) = r.raw(gen::METHOD_NET_REACH, &text(r#"{"host":"10.0.0.1"}"#)).await;
+    assert_eq!(
+        (
+            v["ok"].as_bool(),
+            v["timed_out"].as_bool(),
+            v["ms"].as_u64()
+        ),
+        (Some(false), Some(true), Some(3000))
+    );
+    let (st, b) = r
+        .raw(gen::METHOD_NET_REACH, &text(r#"{"host":"10.0.0.1"}"#))
+        .await;
     assert_eq!(st, OK);
     assert_eq!(MgmtText::decode(&b).unwrap().body, br#"{"ok":true,"ms":4}"#);
     // a failure with only a token keeps the token
@@ -688,9 +814,15 @@ async fn node_and_net_methods_answer_and_map_their_errors() {
     let (st, b) = r
         .raw(gen::METHOD_NODE_CLEANUP, &text(r#"{"path":"/denied"}"#))
         .await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_PATH, "cleanup_path_denied"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PATH, "cleanup_path_denied")
+    );
     let (st, b) = r.raw(gen::METHOD_NODE_CLEANUP, &text("{}")).await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_PROTOCOL, "cleanup_missing_path"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PROTOCOL, "cleanup_missing_path")
+    );
     // net.interfaces and net.speedtest are text methods
     let (st, b) = r.raw(gen::METHOD_NET_INTERFACES, &text("")).await;
     assert_eq!(st, OK);
@@ -702,3 +834,244 @@ async fn node_and_net_methods_answer_and_map_their_errors() {
 
 #[allow(dead_code)]
 fn _unused(_: &Path) {}
+
+// ---- the Rust transport against the C payload (core call sites, end to end) ----
+
+mod transport {
+    use super::*;
+    use ps5upload_ava1::mgmt::AvaTransport;
+    use ps5upload_ava1::Pool;
+    use ps5upload_core::mgmt::{self, MgmtError};
+
+    pub struct T {
+        _one: MutexGuard<'static, ()>,
+        _srv: CServer,
+        _scope: mgmt::ScopedTransport,
+        pub transport: Arc<AvaTransport>,
+        pub console: String,
+        pub root: PathBuf,
+    }
+
+    /// `install`: the server's management table is installed (CAP_MGMT is advertised).
+    pub fn rig(tag: &str, install: bool) -> T {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| std::env::set_var("PS5UPLOAD_TRANSFER", "auto"));
+        let one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("ava1-mfst-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        if install {
+            assert_eq!(mgmt_fs::install(&root), 0);
+        } else {
+            mgmt_fs::uninstall();
+        }
+        mgmt_fs::set(false, 0, 0);
+        let ava = base.join("ava");
+        std::fs::create_dir_all(&ava).unwrap();
+        let me = Identity::load_or_create(&ava.join("identity")).unwrap();
+        PeerStore::load(&base.join("srv-peers"))
+            .unwrap()
+            .add(me.public(), "engine")
+            .unwrap();
+        PeerStore::load(&ava.join("peers"))
+            .unwrap()
+            .add(Identity::from_secret(SECRET).public(), "C test server")
+            .unwrap();
+        let srv = CServer::start(SECRET, &base.join("srv-peers"), 0, 100, 3000, 800);
+        let pool: &'static Pool = Box::leak(Box::new(Pool::new(ava).with_addr(srv.addr())));
+        let transport = Arc::new(AvaTransport::with_pool(pool));
+        let scope = mgmt::scoped_transport(transport.clone());
+        T {
+            _one: one,
+            _srv: srv,
+            _scope: scope,
+            transport,
+            console: "c-console:9114".into(),
+            root,
+        }
+    }
+
+    impl T {
+        pub fn p(&self, rel: &str) -> String {
+            format!("{}/{rel}", self.root.display())
+        }
+    }
+
+    #[test]
+    fn list_dir_through_core_covers_a_directory_in_pages() {
+        let t = rig("t-list", true);
+        let d = t.root.join("many");
+        std::fs::create_dir_all(&d).unwrap();
+        for i in 0..700u32 {
+            std::fs::write(d.join(format!("e{i:04}")), b"x").unwrap();
+        }
+        let mut got = 0usize;
+        let mut offset = 0u64;
+        loop {
+            let l = ps5upload_core::fs_ops::list_dir(
+                &t.console,
+                &t.p("many"),
+                ps5upload_core::fs_ops::ListDirOptions { offset, limit: 256 },
+            )
+            .unwrap();
+            got += l.entries.len();
+            offset += l.entries.len() as u64;
+            if !l.truncated {
+                break;
+            }
+        }
+        assert_eq!(got, 700);
+    }
+
+    #[test]
+    fn fs_read_loops_to_2_mib() {
+        let t = rig("t-read", true);
+        let data: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 253) as u8).collect();
+        std::fs::write(t.root.join("big"), &data).unwrap();
+        // the FTX2 per-call ceiling is held: 3 MiB file, 5 MiB ask, 2 MiB back (8 round trips of <= 256 KiB)
+        let got =
+            ps5upload_core::fs_ops::fs_read(&t.console, &t.p("big"), 0, 5 * 1024 * 1024).unwrap();
+        assert_eq!(got.len(), 2 * 1024 * 1024);
+        assert_eq!(got, &data[..2 * 1024 * 1024]);
+        // a window near the end stops at eof
+        let tail =
+            ps5upload_core::fs_ops::fs_read(&t.console, &t.p("big"), 3 * 1024 * 1024 - 10, 100)
+                .unwrap();
+        assert_eq!(tail, &data[data.len() - 10..]);
+        // a refusal keeps the text callers match on
+        let e = ps5upload_core::fs_ops::fs_read(&t.console, "/etc/hosts", 0, 10).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "payload rejected FS_READ(/etc/hosts): fs_read_path_not_allowed"
+        );
+    }
+
+    #[test]
+    fn fs_write_bytes_chunks_above_48_kib_and_reports_create_refusals() {
+        let t = rig("t-write", true);
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 241) as u8).collect();
+        let r = ps5upload_core::diagnostics::fs_write_bytes(
+            &t.console,
+            &t.p("cfg/out.bin"),
+            &data,
+            false,
+        );
+        // the parent directory does not exist yet: a plain refusal, nothing half-written
+        assert!(r.is_err() || !t.root.join("cfg/out.bin.ps5upload.tmp").exists());
+        ps5upload_core::fs_ops::fs_mkdir(&t.console, &t.p("cfg")).unwrap();
+        ps5upload_core::diagnostics::fs_write_bytes(&t.console, &t.p("cfg/out.bin"), &data, false)
+            .unwrap();
+        assert_eq!(std::fs::read(t.root.join("cfg/out.bin")).unwrap(), data);
+        assert!(!t.root.join("cfg/out.bin.ps5upload.tmp").exists());
+        // create-only on an existing file: the legacy `exists` failure
+        let e = ps5upload_core::diagnostics::fs_write_bytes(
+            &t.console,
+            &t.p("cfg/out.bin"),
+            b"x",
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("exists"), "{e:#}");
+        assert_eq!(
+            std::fs::read(t.root.join("cfg/out.bin")).unwrap(),
+            data,
+            "untouched"
+        );
+    }
+
+    #[test]
+    fn fs_stat_exists_and_the_not_found_text() {
+        let t = rig("t-stat", true);
+        std::fs::write(t.root.join("f"), b"abc").unwrap();
+        let s = ps5upload_core::fs_ops::fs_stat(&t.console, &t.p("f")).unwrap();
+        assert_eq!((s.kind.as_str(), s.size), ("file", 3));
+        assert!(ps5upload_core::fs_ops::fs_exists(&t.console, &t.p("f")).unwrap());
+        assert!(!ps5upload_core::fs_ops::fs_exists(&t.console, &t.p("nope")).unwrap());
+    }
+
+    #[test]
+    fn a_cross_device_move_keeps_the_text_the_engine_matches_on() {
+        let t = rig("t-xdev", true);
+        std::fs::create_dir_all(t.root.join("mnt2")).unwrap();
+        std::fs::write(t.root.join("a"), b"1").unwrap();
+        mgmt_fs::set(true, 0, 0);
+        let e = ps5upload_core::fs_ops::fs_move(&t.console, &t.p("a"), &t.p("mnt2/a")).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "payload rejected FS_MOVE: fs_move_cross_mount"
+        );
+        assert_eq!(
+            e.downcast_ref::<MgmtError>().unwrap().status,
+            gen::ERR_CROSS_DEVICE
+        );
+        assert!(t.root.join("a").exists());
+        mgmt_fs::set(false, 0, 0);
+        ps5upload_core::fs_ops::fs_move(&t.console, &t.p("a"), &t.p("b")).unwrap();
+        assert!(t.root.join("b").exists());
+    }
+
+    #[test]
+    fn mkdir_chmod_and_the_path_policy_through_core() {
+        let t = rig("t-mk", true);
+        ps5upload_core::fs_ops::fs_mkdir(&t.console, &t.p("x/y/z")).unwrap();
+        assert!(t.root.join("x/y/z").is_dir());
+        ps5upload_core::fs_ops::fs_chmod(&t.console, &t.p("x"), "0700", false).unwrap();
+        assert_eq!(
+            std::fs::metadata(t.root.join("x")).unwrap().mode() & 0o7777,
+            0o700
+        );
+        let e = ps5upload_core::fs_ops::fs_mkdir(&t.console, "/etc/evil").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "payload rejected FS_MKDIR: fs_mkdir_path_not_allowed"
+        );
+    }
+
+    #[test]
+    fn log_and_net_calls_through_core() {
+        let t = rig("t-log", true);
+        mgmt_fs::set(false, 3000, 0);
+        let k = ps5upload_core::diagnostics::klog_read(&t.console, 2000).unwrap();
+        assert_eq!(k.len(), 2000);
+        let n = ps5upload_core::diagnostics::net_interfaces(&t.console).unwrap();
+        assert_eq!(n.interfaces.len(), 1);
+        // net.reach: an unreachable host is a REPLY (`ok:false` with its fields), not an error
+        let r = ps5upload_core::diagnostics::net_reach(&t.console, "unreachable", 9, 100).unwrap();
+        assert!(!r.ok && r.timed_out && r.ms == 3000, "{r:?}");
+        let r = ps5upload_core::diagnostics::net_reach(&t.console, "10.0.0.1", 9, 100).unwrap();
+        assert!(r.ok && r.ms == 4);
+        // the speed test is N round trips
+        let s = ps5upload_core::diagnostics::net_speed_test(&t.console, 5).unwrap();
+        assert_eq!(s.round_trips, 5);
+        // a mount failure keeps its code and says so
+        let e = ps5upload_core::diagnostics::pkg_direct_mount(&t.console, "/mnt/x.pkg", None)
+            .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("PKG_DIRECT_MOUNT failed"),
+            "{e:#}"
+        );
+        // cleanup and shutdown
+        let c = ps5upload_core::cleanup::cleanup_path(&t.console, "/data/x").unwrap();
+        assert_eq!(c.removed_files, 2);
+        assert!(ps5upload_core::payload_lifecycle::shutdown_running_payload(&t.console).unwrap());
+        assert_eq!(mgmt_fs::stats().1, 1);
+    }
+
+    #[test]
+    fn a_server_without_the_dispatcher_is_routed_to_ftx2_from_its_capability_bit() {
+        let t = rig("t-nocap", false);
+        // CAP_MGMT is absent (no table installed): the transport serves nothing, so the seam would
+        // run FTX2, and no management request was sent to find that out.
+        let r = ps5upload_core::mgmt::m::HW_INFO;
+        let out = {
+            use ps5upload_core::mgmt::MgmtTransport;
+            t.transport
+                .call(&t.console, r, "HW_INFO", b"", Duration::from_secs(5))
+                .unwrap()
+        };
+        assert!(out.is_none());
+        assert_eq!(mgmt_fs::stats(), (0, 0, 0));
+    }
+}

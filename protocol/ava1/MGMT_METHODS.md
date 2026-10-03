@@ -20,20 +20,20 @@ Generated from the tree at the Task 1 commit; line numbers drift, re-find with
 | AbortTx 16 | (none) | deleted: transfer pipeline | n/a | `src/runtime.c:15735` `handle_abort_tx_frame`; dispatch `runtime.c:16009` | `ps5upload-core/src/transfer.rs:1127`; lab `ps5upload-lab/src/main.rs:240`; +3 test/bench |
 | TakeoverRequest 18 | (none) | retired: takeover (Task 8) | n/a | inline in dispatch (runtime.c:16014); dispatch `runtime.c:16014` | lab `ps5upload-lab/src/main.rs:195` |
 | Status 20 | 4 `node.status` | empty -> `NodeStatus` | todo | `src/runtime.c:15049` `handle_status_frame`; dispatch `runtime.c:15994` | `ps5upload-core/src/health.rs:246`, `ps5upload-engine/src/lib.rs:4757`; lab `ps5upload-lab/src/main.rs:151`; +3 test/bench |
-| Shutdown 22 | 5 `node.shutdown` | empty -> empty | todo | inline in dispatch (runtime.c:16023); dispatch `runtime.c:16023` | `ps5upload-core/src/payload_lifecycle.rs:101`; lab `ps5upload-lab/src/main.rs:171` |
+| Shutdown 22 | 5 `node.shutdown` | empty -> empty | ported (host-tested; Task 4) | inline in dispatch (runtime.c:16023); dispatch `runtime.c:16023` | `ps5upload-core/src/payload_lifecycle.rs:101`; lab `ps5upload-lab/src/main.rs:171` |
 | StreamShard 30 | (none) | deleted: transfer pipeline | n/a | `src/runtime.c:5040` `handle_stream_shard`; dispatch `runtime.c:15876` | `ps5upload-core/src/transfer.rs:742`, `ps5upload-core/src/transfer.rs:977`, `ps5upload-core/src/transfer.rs:981`; lab `ps5upload-lab/src/main.rs:456`; +3 test/bench |
-| Cleanup 32 | 6 `node.cleanup` | `MgmtText` (job if > 2 s: `job.run` CLEANUP) | todo | `src/runtime.c:5543` `handle_cleanup`; dispatch `runtime.c:16031` | `ps5upload-core/src/cleanup.rs:56` |
-| FsListVolumes 34 | 32 `fs.volumes` | `MgmtText` | todo | `src/runtime.c:5901` `handle_fs_list_volumes`; dispatch `runtime.c:16037` | `ps5upload-core/src/volumes.rs:211`; +1 test/bench |
-| FsListDir 36 | 33 `fs.list` | `FsList` -> `FsListResult` (<= 256 entries per call, `more`) | todo | `src/runtime.c:6110` `handle_fs_list_dir`; dispatch `runtime.c:16042` | `ps5upload-core/src/fs_ops.rs:105` |
+| Cleanup 32 | 6 `node.cleanup` | `MgmtText` (job if > 2 s: `job.run` CLEANUP) | ported (host-tested; Task 4) | `src/runtime.c:5543` `handle_cleanup`; dispatch `runtime.c:16031` | `ps5upload-core/src/cleanup.rs:56` |
+| FsListVolumes 34 | 32 `fs.volumes` | `MgmtText` | ported (host-tested; Task 4) | `src/runtime.c:5901` `handle_fs_list_volumes`; dispatch `runtime.c:16037` | `ps5upload-core/src/volumes.rs:211`; +1 test/bench |
+| FsListDir 36 | 33 `fs.list` | `FsList` -> `FsListResult` (<= 256 entries per call, `more`) | ported (host-tested; Task 4) | native `src/mgmt_fs.c` `mgmt_run_fs_list` (path policy hooked from runtime.c) | `ps5upload-core/src/fs_ops.rs:105` |
 | FsHash 38 | 20 `job.run (op HASH)` | `JobRun` -> `Status` (ext `state`, `result`, `code`) | todo | `src/runtime.c:6319` `handle_fs_hash`; dispatch `runtime.c:16048` | `ps5upload-core/src/fs_ops.rs:159` |
 | FsDelete 40 | 20 `job.run (op DELETE)` | `JobRun` -> `Status` (ext `state`, `result`, `code`) | todo | `src/runtime.c:7500` `handle_fs_delete`; dispatch `runtime.c:16054` | `ps5upload-core/src/fs_ops.rs:335` |
-| FsMove 42 | 36 `fs.rename` | `FsRename` -> empty; `ERR_CROSS_DEVICE` | todo | `src/runtime.c:7584` `handle_fs_move`; dispatch `runtime.c:16058` | `ps5upload-core/src/fs_ops.rs:876` |
-| FsChmod 44 | 37 `fs.chmod` | `FsChmod` -> empty (recursive: `job.run` CHMOD_R) | todo | `src/runtime.c:7638` `handle_fs_chmod`; dispatch `runtime.c:16062` | `ps5upload-core/src/fs_ops.rs:911`; +1 test/bench |
-| FsMkdir 46 | 35 `fs.mkdir` | `FsMkdir` -> empty | todo | `src/runtime.c:7680` `handle_fs_mkdir`; dispatch `runtime.c:16066` | `ps5upload-core/src/fs_ops.rs:926` |
-| FsRead 48 | 38 `fs.read` | `FsRead` -> `FsReadResult` (len <= FS_READ_MAX, loop on `eof`) | todo | `src/runtime.c:7806` `handle_fs_read`; dispatch `runtime.c:16070` | `ps5upload-core/src/download.rs:90`, `ps5upload-core/src/fs_ops.rs:221` |
+| FsMove 42 | 36 `fs.rename` | `FsRename` -> empty; `ERR_CROSS_DEVICE` | ported (host-tested; Task 4) | native `src/mgmt_fs.c` `mgmt_run_fs_rename` (path policy hooked from runtime.c) | `ps5upload-core/src/fs_ops.rs:876` |
+| FsChmod 44 | 37 `fs.chmod` | `FsChmod` -> empty (recursive: `job.run` CHMOD_R) | ported (host-tested; Task 4) | native `src/mgmt_fs.c` `mgmt_run_fs_chmod` (path policy hooked from runtime.c) | `ps5upload-core/src/fs_ops.rs:911`; +1 test/bench |
+| FsMkdir 46 | 35 `fs.mkdir` | `FsMkdir` -> empty | ported (host-tested; Task 4) | native `src/mgmt_fs.c` `mgmt_run_fs_mkdir` (path policy hooked from runtime.c) | `ps5upload-core/src/fs_ops.rs:926` |
+| FsRead 48 | 38 `fs.read` | `FsRead` -> `FsReadResult` (len <= FS_READ_MAX, loop on `eof`) | ported (host-tested; Task 4) | native `src/mgmt_fs.c` `mgmt_run_fs_read` (path policy hooked from runtime.c) | `ps5upload-core/src/download.rs:90`, `ps5upload-core/src/fs_ops.rs:221` |
 | FsCopy 50 | 16 `job.copy` | `JobCopy` (exists) | todo | `src/runtime.c:7918` `handle_fs_copy`; dispatch `runtime.c:16074` | `ps5upload-core/src/fs_ops.rs:424` |
-| FsMount 52 | 40 `fs.mount` | `MgmtText` | todo | `src/runtime.c:8571` `handle_fs_mount`; dispatch `runtime.c:16084` | `ps5upload-core/src/fs_ops.rs:822` |
-| FsUnmount 54 | 41 `fs.unmount` | `MgmtText` | todo | `src/runtime.c:9027` `handle_fs_unmount`; dispatch `runtime.c:16088` | `ps5upload-core/src/fs_ops.rs:848` |
+| FsMount 52 | 40 `fs.mount` | `MgmtText` | ported (host-tested; Task 4) | `src/runtime.c:8571` `handle_fs_mount`; dispatch `runtime.c:16084` | `ps5upload-core/src/fs_ops.rs:822` |
+| FsUnmount 54 | 41 `fs.unmount` | `MgmtText` | ported (host-tested; Task 4) | `src/runtime.c:9027` `handle_fs_unmount`; dispatch `runtime.c:16088` | `ps5upload-core/src/fs_ops.rs:848` |
 | AppRegister 56 | 48 `app.register` | `MgmtText` | todo | `src/runtime.c:9164` `handle_app_register`; dispatch `runtime.c:16094` | `ps5upload-core/src/fs_ops.rs:969`; +1 test/bench |
 | AppUnregister 58 | 49 `app.unregister` | `MgmtText` | todo | `src/runtime.c:9244` `handle_app_unregister`; dispatch `runtime.c:16098` | `ps5upload-core/src/fs_ops.rs:1023`; +1 test/bench |
 | AppLaunch 60 | 50 `app.launch` | `MgmtText` | todo | `src/runtime.c:9295` `handle_app_launch`; dispatch `runtime.c:16102` | `ps5upload-core/src/fs_ops.rs:1060`; +1 test/bench |
@@ -58,26 +58,26 @@ Generated from the tree at the Task 1 commit; line numbers drift, re-find with
 | IndexCancel 102 | 70 `index.cancel` | `MgmtText` | todo | `src/runtime.c:13703` `handle_index_cancel`; dispatch `runtime.c:16374` | `ps5upload-core/src/search_index.rs:131` |
 | AppLifecycle 104 | 53 `app.lifecycle` | `MgmtText` | todo | `src/runtime.c:12107` `handle_app_lifecycle`; dispatch `runtime.c:16377` | `ps5upload-core/src/app_lifecycle.rs:60` |
 | ToastSend 106 | 125 `toast.send` | `MgmtText` | todo | `src/runtime.c:13661` `handle_toast_send`; dispatch `runtime.c:15889` | `ps5upload-core/src/app_lifecycle.rs:136` |
-| KlogRead 108 | 7 `log.klog` | `MgmtText` {max_bytes} -> text | todo | `src/runtime.c:12260` `handle_klog_read`; dispatch `runtime.c:16381` | `ps5upload-core/src/diagnostics.rs:24` |
-| NetInterfaces 110 | 9 `net.interfaces` | `MgmtText` | todo | `src/runtime.c:12308` `handle_net_interfaces`; dispatch `runtime.c:16385` | `ps5upload-core/src/diagnostics.rs:60` |
+| KlogRead 108 | 7 `log.klog` | `MgmtText` {max_bytes} -> text | ported (host-tested; Task 4) | `src/runtime.c:12260` `handle_klog_read`; dispatch `runtime.c:16381` | `ps5upload-core/src/diagnostics.rs:24` |
+| NetInterfaces 110 | 9 `net.interfaces` | `MgmtText` | ported (host-tested; Task 4) | `src/runtime.c:12308` `handle_net_interfaces`; dispatch `runtime.c:16385` | `ps5upload-core/src/diagnostics.rs:60` |
 | PeripheralControl 112 | 86 `periph.control` | `MgmtText` | todo | `src/runtime.c:12501` `handle_peripheral_control`; dispatch `runtime.c:16388` | `ps5upload-core/src/diagnostics.rs:118` |
 | ProcModules 114 | 61 `proc.modules` | `MgmtText` | todo | `src/runtime.c:13597` `handle_proc_modules`; dispatch `runtime.c:16392` | `ps5upload-core/src/diagnostics.rs:642` |
 | ShellExec 116 | 87 `shell.exec` | `MgmtText` | todo | `src/runtime.c:12705` `handle_shell_exec`; dispatch `runtime.c:16396` | `ps5upload-core/src/diagnostics.rs:193`; +1 test/bench |
 | Crc32File 118 | 20 `job.run (op CRC32)` | `JobRun` -> `Status` (ext `state`, `result`, `code`) | todo | `src/runtime.c:12843` `handle_crc32_file`; dispatch `runtime.c:16400` | `ps5upload-core/src/diagnostics.rs:224` |
 | AppDbQuery 120 | 56 `app.db_query` | `MgmtText` | todo | `src/runtime.c:12918` `handle_appdb_query`; dispatch `runtime.c:16404` | `ps5upload-core/src/diagnostics.rs:265` |
-| NetSpeedTest 122 | 11 `net.speedtest` | `MgmtText` | todo | `src/runtime.c:13581` `handle_net_speed_test`; dispatch `runtime.c:16415` | `ps5upload-core/src/diagnostics.rs:579` |
-| PkgDirectMount 124 | 42 `fs.mount_pkg` | `MgmtText` | todo | `src/runtime.c:13115` `handle_pkg_direct_mount`; dispatch `runtime.c:16423` | `ps5upload-core/src/diagnostics.rs:399` |
+| NetSpeedTest 122 | 11 `net.speedtest` | `MgmtText` | ported (host-tested; Task 4) | `src/runtime.c:13581` `handle_net_speed_test`; dispatch `runtime.c:16415` | `ps5upload-core/src/diagnostics.rs:579` |
+| PkgDirectMount 124 | 42 `fs.mount_pkg` | `MgmtText` | ported (host-tested; Task 4) | `src/runtime.c:13115` `handle_pkg_direct_mount`; dispatch `runtime.c:16423` | `ps5upload-core/src/diagnostics.rs:399` |
 | UfsFsck 126 | 20 `job.run (op FSCK)` | `JobRun` -> `Status` (ext `state`, `result`, `code`) | todo | `src/runtime.c:13174` `handle_ufs_fsck`; dispatch `runtime.c:16427` | `ps5upload-core/src/diagnostics.rs:548` |
-| LwfsMount 128 | 43 `fs.mount_lwfs` | `MgmtText` | todo | `src/runtime.c:13254` `handle_lwfs_mount`; dispatch `runtime.c:16431` | `ps5upload-core/src/diagnostics.rs:516` |
-| FsWriteBytes 130 | 39 `fs.write` | `FsWrite` -> empty (chunks <= FSW_CHUNK_MAX, SPEC §7.5) | todo | `src/runtime.c:13367` `handle_fs_write_bytes`; dispatch `runtime.c:15888` | `ps5upload-core/src/diagnostics.rs:463` |
+| LwfsMount 128 | 43 `fs.mount_lwfs` | `MgmtText` | ported (host-tested; Task 4) | `src/runtime.c:13254` `handle_lwfs_mount`; dispatch `runtime.c:16431` | `ps5upload-core/src/diagnostics.rs:516` |
+| FsWriteBytes 130 | 39 `fs.write` | `FsWrite` -> empty (chunks <= FSW_CHUNK_MAX, SPEC §7.5) | ported (host-tested; Task 4) | native `src/mgmt_fs.c` `mgmt_run_fs_write` (path policy hooked from runtime.c) | `ps5upload-core/src/diagnostics.rs:463` |
 | TimeGet 132 | 82 `time.get` | `MgmtText` | todo | `src/runtime.c:9495` `handle_time_get`; dispatch `runtime.c:16132` | `ps5upload-core/src/sys_time.rs:310` |
 | TimeSet 134 | 83 `time.set` | `MgmtText` | todo | `src/runtime.c:9528` `handle_time_set`; dispatch `runtime.c:16135` | `ps5upload-core/src/sys_time.rs:341` |
 | TimeStateGet 136 | 84 `time.state_get` | `MgmtText` | todo | `src/runtime.c:9631` `handle_time_state_get`; dispatch `runtime.c:16139` | `ps5upload-core/src/sys_time.rs:599` |
 | TimeStateSet 138 | 85 `time.state_set` | `MgmtText` | todo | `src/runtime.c:9792` `handle_time_state_set`; dispatch `runtime.c:16142` | `ps5upload-core/src/sys_time.rs:621` |
 | SmpMetaControl 140 | 112 `smp.meta_control` | `MgmtText` | todo | `src/runtime.c:9890` `handle_smp_meta_control`; dispatch `runtime.c:16146` | `ps5upload-core/src/smp_meta.rs:68` |
 | SmpMetaStats 142 | 113 `smp.meta_stats` | `MgmtText` | todo | `src/runtime.c:10010` `handle_smp_meta_stats`; dispatch `runtime.c:16150` | `ps5upload-core/src/smp_meta.rs:85` |
-| SyslogTail 144 | 8 `log.syslog` | `MgmtText` {max_bytes} -> text | todo | `src/runtime.c:14020` `handle_syslog_tail`; dispatch `runtime.c:16167` | `ps5upload-core/src/hw.rs:651` |
-| NetReach 148 | 10 `net.reach` | `MgmtText` | todo | `src/runtime.c:13504` `handle_net_reach`; dispatch `runtime.c:16419` | `ps5upload-core/src/diagnostics.rs:629` |
+| SyslogTail 144 | 8 `log.syslog` | `MgmtText` {max_bytes} -> text | ported (host-tested; Task 4) | `src/runtime.c:14020` `handle_syslog_tail`; dispatch `runtime.c:16167` | `ps5upload-core/src/hw.rs:651` |
+| NetReach 148 | 10 `net.reach` | `MgmtText` | ported (host-tested; Task 4) | `src/runtime.c:13504` `handle_net_reach`; dispatch `runtime.c:16419` | `ps5upload-core/src/diagnostics.rs:629` |
 | ProfileInfo 150 | 88 `profile.info` | `MgmtText` | todo | `src/runtime.c:14119` `handle_profile_info`; dispatch `runtime.c:16170` | `ps5upload-core/src/profile.rs:506` |
 | ProfileSetUsername 152 | 89 `profile.set_username` | `MgmtText` | todo | `src/runtime.c:14259` `handle_profile_set_username`; dispatch `runtime.c:16173` | `ps5upload-core/src/profile.rs:528` |
 | ProfileActivate 154 | 90 `profile.activate` | `MgmtText` | todo | `src/runtime.c:14282` `handle_profile_activate`; dispatch `runtime.c:16177` | `ps5upload-core/src/profile.rs:586` |
@@ -128,7 +128,7 @@ Generated from the tree at the Task 1 commit; line numbers drift, re-find with
 | ActivityReset 253 | 128 `activity.reset` | `MgmtText` | todo | `src/runtime.c:10895` `handle_activity_reset`; dispatch `runtime.c:16281` | `ps5upload-core/src/activity.rs:125` |
 | (raw :9114 probe) | none | TCP connect only (no frame) | todo | owned by Task 8 | `client/src-tauri/src/commands/discover.rs:80, 414, 559`, `client/src-tauri/src/commands/probes.rs:22, 273` probe the management port directly; they move to the AVA1 port |
 | (new) | 21 `job.list` | empty -> `JobListResult` | todo | owned by Task 5 | none |
-| (new) | 34 `fs.stat` | `FsPath` -> `FsStat`; replaces the 1-byte `FsRead` existence test (`ps5upload-engine/src/lib.rs:4033`) | todo | owned by Task 4 | none |
+| (new) | 34 `fs.stat` | `FsPath` -> `FsStat`; replaces the 1-byte `FsRead` existence test (`ps5upload-engine/src/lib.rs:4033`) | ported (host-tested; Task 4) | native `src/mgmt_fs.c` `mgmt_run_fs_stat` (path policy hooked from runtime.c) | none |
 
 ## Reply sizes (SPEC.md §7.4)
 

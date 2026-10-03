@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use ava1::gen::{self, MgmtText};
@@ -23,7 +23,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::mgmt_convert as conv;
 use crate::pool::{host_of, pool, Pool};
-use crate::route::{mode, use_ava1_in, Mode};
+use crate::route::use_ava1_mgmt_in;
 
 /// In-flight calls the payload allows per session (`RPC_WORKERS`, SPEC.md section 7.4).
 pub const IN_FLIGHT: usize = ava1::server::RPC_WORKERS;
@@ -38,9 +38,6 @@ pub const BUSY_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(300),
     Duration::from_millis(900),
 ];
-/// How long a console that answered `ERR_UNKNOWN_METHOD` (an older AVA1 helper without the
-/// management methods) is sent to FTX2 without asking again.
-const NO_MGMT_TTL: Duration = Duration::from_secs(30);
 
 /// True for the methods the reserved slots exist for.
 pub fn is_priority(method: u16) -> bool {
@@ -67,6 +64,9 @@ fn is_read_only(method: u16) -> bool {
             | gen::METHOD_FS_READ
             | gen::METHOD_LOG_KLOG
             | gen::METHOD_LOG_SYSLOG
+            | gen::METHOD_NET_INTERFACES
+            | gen::METHOD_NET_REACH
+            | gen::METHOD_NET_SPEEDTEST
             | gen::METHOD_HW_INFO
             | gen::METHOD_HW_TEMPS
             | gen::METHOD_HW_POWER
@@ -122,7 +122,6 @@ enum PoolRef {
 pub struct AvaTransport {
     pool: PoolRef,
     gates: Mutex<HashMap<String, Arc<MgmtGate>>>,
-    no_mgmt: Mutex<HashMap<String, Instant>>,
     busy_delays: [Duration; 3],
 }
 
@@ -146,7 +145,6 @@ impl AvaTransport {
         Self {
             pool,
             gates: Mutex::default(),
-            no_mgmt: Mutex::default(),
             busy_delays: BUSY_RETRY_DELAYS,
         }
     }
@@ -175,27 +173,11 @@ impl AvaTransport {
             .clone()
     }
 
-    /// Whether this console is served over AVA1 for management: the same `use_ava1`
-    /// decision uploads make, minus a console that just said it has no management methods.
+    /// Whether this console is served over AVA1 for management: it advertises `CAP_MGMT`
+    /// (the node says so in its `ServerInfo`; nothing is sent to find out). An older AVA1
+    /// helper that has transfers but no management methods goes to FTX2.
     fn serves(&self, console: &str) -> bool {
-        if mode() == Mode::Auto {
-            let mut n = self.no_mgmt.lock().unwrap_or_else(|e| e.into_inner());
-            match n.get(&host_of(console)) {
-                Some(t) if t.elapsed() < NO_MGMT_TTL => return false,
-                Some(_) => {
-                    n.remove(&host_of(console));
-                }
-                None => {}
-            }
-        }
-        use_ava1_in(self.pool(), console)
-    }
-
-    fn mark_no_mgmt(&self, console: &str) {
-        self.no_mgmt
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(host_of(console), Instant::now());
+        use_ava1_mgmt_in(self.pool(), console)
     }
 
     /// One RPC: gate permit, `ERR_BUSY` retries, one resend on a lost session for
@@ -282,18 +264,7 @@ impl AvaTransport {
         body: &[u8],
         timeout: Duration,
     ) -> Result<Option<Vec<u8>>> {
-        let r = self.dispatch(console, method, label, body, timeout).await;
-        if let Err(e) = &r {
-            let unknown = e
-                .downcast_ref::<MgmtError>()
-                .is_some_and(|m| m.status == gen::ERR_UNKNOWN_METHOD);
-            if unknown && mode() == Mode::Auto {
-                // An older AVA1 helper: it speaks transfers but has no management methods.
-                self.mark_no_mgmt(console);
-                return Ok(None);
-            }
-        }
-        r
+        self.dispatch(console, method, label, body, timeout).await
     }
 
     async fn dispatch(
@@ -326,6 +297,11 @@ impl AvaTransport {
                     .rpc(console, id, label, &req.to_bytes()?, timeout)
                     .await?;
                 json(conv::fs_stat_reply(&gen::FsStat::decode(&r)?))
+            }
+            gen::METHOD_NODE_SHUTDOWN => {
+                // An empty reply; the FTX2 ack was `{}`.
+                self.rpc(console, id, label, &[], timeout).await?;
+                Ok(Some(b"{}".to_vec()))
             }
             gen::METHOD_FS_MKDIR => {
                 let req = conv::fs_mkdir_request(body, label)?;

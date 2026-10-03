@@ -21,19 +21,7 @@ use crate::mgmt::{self, m};
 pub fn klog_read(addr: &str, max_bytes: u32) -> Result<String> {
     let body = serde_json::json!({ "max_bytes": max_bytes });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::KlogRead, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected KLOG_READ: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::KlogReadAck {
-        bail!("expected KLOG_READ_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::LOG_KLOG, &body)?;
     Ok(String::from_utf8_lossy(&resp).into_owned())
 }
 
@@ -57,19 +45,7 @@ pub struct NetInterfaceList {
 }
 
 pub fn net_interfaces(addr: &str) -> Result<NetInterfaceList> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::NetInterfaces, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected NET_INTERFACES: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::NetInterfacesAck {
-        bail!("expected NET_INTERFACES_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::NET_INTERFACES, &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -396,19 +372,9 @@ pub fn pkg_direct_mount(
         "mount_point": mount_point.unwrap_or(""),
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::PkgDirectMount, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected PKG_DIRECT_MOUNT: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::PkgDirectMountAck {
-        bail!("expected PKG_DIRECT_MOUNT_ACK, got {ft:?}");
-    }
+    // A failed mount is an error status whose cause is the failure body (code, mount_point):
+    // `call_legacy_ok` gives it back as the `{"ok":false,...}` this function reports on.
+    let resp = mgmt::call_legacy_ok(addr, m::FS_MOUNT_PKG, "PKG_DIRECT_MOUNT", &body)?;
     let parsed: PkgDirectMountResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(
@@ -504,19 +470,7 @@ pub fn lwfs_mount(
         "title_id": title_id.unwrap_or(""),
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::LwfsMount, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected LWFS_MOUNT: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::LwfsMountAck {
-        bail!("expected LWFS_MOUNT_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_legacy_ok(addr, m::FS_MOUNT_LWFS, "LWFS_MOUNT", &body)?;
     let parsed: LwfsMountResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(
@@ -564,16 +518,10 @@ pub fn ufs_fsck(addr: &str, device: &str, repair: bool) -> Result<UfsFsckResult>
 pub fn net_speed_test(addr: &str, round_trips: u32) -> Result<NetSpeedTestResult> {
     let n = round_trips.clamp(1, 2048);
     let mut latencies_us: Vec<u64> = Vec::with_capacity(n as usize);
-    let mut c = Connection::connect(addr)?;
     let started = std::time::Instant::now();
     for _ in 0..n {
         let t0 = std::time::Instant::now();
-        c.send_frame(FrameType::NetSpeedTest, &[])?;
-        let (hdr, _resp) = c.recv_frame()?;
-        let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-        if ft != FrameType::NetSpeedTestAck {
-            bail!("expected NET_SPEED_TEST_ACK, got {ft:?}");
-        }
+        mgmt::call(addr, m::NET_SPEEDTEST, &[])?;
         latencies_us.push(t0.elapsed().as_micros() as u64);
     }
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -617,13 +565,9 @@ pub fn net_reach(addr: &str, host: &str, port: u16, timeout_ms: u32) -> Result<N
         "timeout_ms": timeout_ms.to_string(),
     })
     .to_string();
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::NetReach, body.as_bytes())?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft != FrameType::NetReachAck {
-        bail!("expected NET_REACH_ACK, got {ft:?}");
-    }
+    // The payload answers an unreachable host with `ok:false` plus errno/timed_out/ms; over AVA1
+    // that is an error status carrying the body, which `call_legacy_ok` hands back as the reply.
+    let resp = mgmt::call_legacy_ok(addr, m::NET_REACH, "NET_REACH", body.as_bytes())?;
     Ok(serde_json::from_slice(&resp)?)
 }
 

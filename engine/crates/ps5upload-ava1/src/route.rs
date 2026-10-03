@@ -77,6 +77,28 @@ pub fn use_ava1(console: &str) -> bool {
 /// `use_ava1` against an explicit pool (the test seam, like the upload adapters'
 /// `_in` variants — A1 keeps process env out of the tests).
 pub fn use_ava1_in(pool: &Pool, console: &str) -> bool {
+    route_in(pool, console, ava1::gen::CAP_DATA_PLANE)
+}
+
+/// Whether management calls (`mgmt::call`) to `console` go over AVA1. Same rule as
+/// [`use_ava1`] with the capability that matters here: `CAP_MGMT`, which the node advertises
+/// in its `ServerInfo` when it serves the management methods (SPEC.md section 5). A helper
+/// that has the data plane but no management methods (an older AVA1 build) is not routed to,
+/// and nothing is sent to it to find out. Blocking, like [`use_ava1`].
+pub fn use_ava1_mgmt(console: &str) -> bool {
+    use_ava1_mgmt_in(pool(), console)
+}
+
+/// [`use_ava1_mgmt`] against an explicit pool.
+pub fn use_ava1_mgmt_in(pool: &Pool, console: &str) -> bool {
+    route_in(pool, console, ava1::gen::CAP_MGMT)
+}
+
+/// The shared rule. `Ftx2`: never. `Ava1`: always (failures surface). `Auto`: true only when a
+/// session can be established and the node advertises `cap`. A failed session attempt is cached
+/// for `NEGATIVE_TTL`; a node that answered but lacks `cap` is not (the live session is cached
+/// by the pool, so asking again costs nothing).
+fn route_in(pool: &Pool, console: &str, cap: u64) -> bool {
     match mode() {
         Mode::Ftx2 => false,
         Mode::Ava1 => true,
@@ -90,21 +112,23 @@ pub fn use_ava1_in(pool: &Pool, console: &str) -> bool {
             {
                 return false;
             }
-            let ok = crate::block_on(async {
+            let session = crate::block_on(async {
                 tokio::time::timeout(PROBE_TIMEOUT, pool.session(console))
                     .await
                     .ok()
                     .and_then(|r| r.ok())
-                    .is_some_and(|s| s.peer_caps() & ava1::gen::CAP_DATA_PLANE != 0)
             });
-            if !ok {
-                negative()
-                    .at
-                    .lock()
-                    .unwrap()
-                    .insert(console.to_string(), now());
+            match session {
+                Some(s) => s.peer_caps() & cap != 0,
+                None => {
+                    negative()
+                        .at
+                        .lock()
+                        .unwrap()
+                        .insert(console.to_string(), now());
+                    false
+                }
             }
-            ok
         }
     }
 }

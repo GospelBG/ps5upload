@@ -26,9 +26,8 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::time::Duration;
 
-use ftx2_proto::FrameType;
-
-use crate::connection::{resolve_connect_targets, Connection};
+use crate::connection::resolve_connect_targets;
+use crate::mgmt::{self, m};
 
 /// The PS5 ELF loader's well-known port. Bytes written here are executed
 /// as a fresh process once the sender half-closes the socket.
@@ -89,25 +88,17 @@ const ELF_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// either takes longer than 2 s we'd rather give up and let the
 /// new payload's bind tell the user whatever is really wrong.
 pub fn shutdown_running_payload(mgmt_addr: &str) -> std::io::Result<bool> {
-    let mut c = match Connection::connect(mgmt_addr) {
-        Ok(c) => c,
-        Err(_) => return Ok(false),
-    };
-    // Tighten IO timeout for the small handshake. A failure here is
-    // surprising (the TCP socket is freshly connected) so we surface
-    // it as a real io::Error — but the caller treats anything ≠ true
-    // the same way, so this still degrades gracefully.
-    c.set_io_timeout(Duration::from_secs(2))?;
-    if c.send_frame(FrameType::Shutdown, &[]).is_err() {
-        return Ok(false);
-    }
-    match c.recv_frame() {
-        Ok((hdr, _)) => {
-            let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-            Ok(ft == FrameType::ShutdownAck)
-        }
-        Err(_) => Ok(false),
-    }
+    // `node.shutdown` through the management seam: over AVA1 for a console that advertises it,
+    // FTX2 (the frame and its ack, checked) for an older helper. Any failure, a refusal for not
+    // being paired included, is "nothing to displace".
+    Ok(mgmt::call_with(
+        mgmt_addr,
+        m::NODE_SHUTDOWN,
+        "SHUTDOWN",
+        &[],
+        Some(Duration::from_secs(2)),
+    )
+    .is_ok())
 }
 
 /// Join a bare host/IP with a port. A bare IPv6 literal has to be

@@ -62,7 +62,10 @@ static int h_cleanup(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
     (void)st; (void)fd; (void)t; (void)l;
     if (strstr(b, "denied")) return send_frame(FRAME_ERROR, "cleanup_path_denied", 19);
     if (!strstr(b, "path")) return send_frame(FRAME_ERROR, "cleanup_missing_path", 20);
-    return send_frame(7, "{\"ok\":true,\"removed_files\":2,\"removed_dirs\":1}", 45);
+    {
+        static const char ok[] = "{\"ok\":true,\"path\":\"/data/x\",\"removed_files\":2,\"removed_dirs\":1}";
+        return send_frame(7, ok, sizeof ok - 1);
+    }
 }
 
 /* log.klog: the real handler's clamping (16 KiB default, 64 KiB cap, a request only when < 256 bytes). */
@@ -107,7 +110,7 @@ static int h_syslog(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
 }
 
 static int h_ifaces(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
-    static const char body[] = "{\"interfaces\":[{\"name\":\"em0\"}],\"source\":\"getifaddrs\"}";
+    static const char body[] = "{\"interfaces\":[{\"name\":\"em0\",\"mac\":\"aa:bb\",\"ipv4\":\"10.0.0.2\",\"mtu\":1500,\"flags\":3}],\"source\":\"getifaddrs\"}";
     (void)st; (void)fd; (void)t; (void)b; (void)l;
     return send_frame(111, body, sizeof body - 1);
 }
@@ -179,6 +182,7 @@ int ava1_test_mgmtfs_install(const char *root) {
 }
 
 void ava1_test_mgmtfs_uninstall(void) {
+    g_counted = g_shutdowns = g_unsafe_seen = 0;
     mgmt_fs_set_policy(NULL);
     (void)mgmt_rpc_install(NULL, 0, NULL, NULL, NULL);
 }
