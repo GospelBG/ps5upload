@@ -261,6 +261,12 @@ pub mod ffi {
             bytes: *mut u64,
         ) -> c_int;
         pub fn ava1_test_mstore_walk(root: *const c_char, hash: *mut u8, count: *mut u32) -> c_int;
+        pub fn ava1_test_mstore_walk_ex(
+            root: *const c_char,
+            flags: u32,
+            hash: *mut u8,
+            count: *mut u32,
+        ) -> c_int;
         pub fn ava1_test_thread_smoke(stack_bytes: *mut usize) -> c_int;
         pub fn ava1_test_ment_size() -> usize;
         pub fn ava1_test_path_ok(p: *const u8, n: usize) -> c_int;
@@ -291,6 +297,7 @@ pub mod ffi {
         pub fn ava1_test_page_next(out: *mut i64);
         pub fn ava1_test_data_clamp(start: u8, min: u8, max: u8, out: *mut c_int);
         pub fn ava1_test_set_same_device(v: c_int);
+        pub fn ava1_test_set_allow_read(v: c_int);
         pub fn ava1_test_apply_begin(
             jobs: *const c_char,
             root: *const c_char,
@@ -921,6 +928,14 @@ pub fn c_mstore_walk(root: &Path) -> (i32, [u8; 32], u32) {
     (rc, h, n)
 }
 
+/// `c_mstore_walk` with flags: `1` is AVA1_WALK_FOLLOW (the download sender's mode).
+pub fn c_mstore_walk_ex(root: &Path, flags: u32) -> (i32, [u8; 32], u32) {
+    let r = CString::new(root.to_str().unwrap()).unwrap();
+    let (mut h, mut n) = ([0u8; 32], 0u32);
+    let rc = unsafe { ffi::ava1_test_mstore_walk_ex(r.as_ptr(), flags, h.as_mut_ptr(), &mut n) };
+    (rc, h, n)
+}
+
 /// Starts a thread through ava1_thread_start; (rc, observed stack size in bytes).
 /// rc is 0 only when the 200 KiB frame survived and the observed stack is within
 /// [200 KiB, AVA1_THREAD_STACK + 4 KiB].
@@ -1086,6 +1101,13 @@ thread_local! {
 /// test is running.
 pub fn c_set_same_device(v: i32) {
     SAME_DEVICE.with(|c| c.set(v));
+}
+
+/// What the C data layer's `may_read` hook answers for the next download JobOpen
+/// (test_shim.c's `t_allow_read`): false refuses the open with AVA1_ERR_PATH. The
+/// refusal test restores it; a test that starts a server should set it true first.
+pub fn c_set_read_allowed(v: bool) {
+    unsafe { ffi::ava1_test_set_allow_read(v as c_int) };
 }
 
 /// The payload's apply engine on a hand-built job (one at a time: it shares the C

@@ -46,6 +46,10 @@ const ava1_data_hooks_t *ava1_data_hooks(void);
  * or -1 when the job is no longer listed or its feeder cannot start (the job is parked). */
 int ava1_job_attach(ava1_job_t *j, const uint8_t sid[16], uint64_t credit);
 
+/* Records a failure found off the job thread (a sender job's on_frame hook, a worker):
+ * the job thread ends the job within one 25 ms tick (ruling C4). Never blocks on I/O. */
+void ava1_data_fail_soon(ava1_job_t *j, uint16_t status, const char *what);
+
 /* Tests only (0 in the payload): JobOpen's work waits this long before it starts, and an
  * OK map this long before it is sent. */
 extern uint32_t ava1_data_test_open_delay_ms;

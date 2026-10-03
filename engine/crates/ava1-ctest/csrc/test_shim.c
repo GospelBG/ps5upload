@@ -651,6 +651,18 @@ int ava1_test_mstore_walk(const char *root, uint8_t hash[32], uint32_t *count) {
     return rc;
 }
 
+/* The walk with flags (AVA1_WALK_FOLLOW): the sender's mode (ruling C1). */
+int ava1_test_mstore_walk_ex(const char *root, unsigned flags, uint8_t hash[32], uint32_t *count) {
+    ava1_mstore_t m;
+    int rc;
+    memset(&m, 0, sizeof m);
+    rc = ava1_mstore_walk_ex(&m, root, flags);
+    ava1_mstore_hash(&m, hash);
+    *count = m.n;
+    ava1_mstore_free(&m);
+    return rc;
+}
+
 /* ---------------------------------------------------------------------------
  * ava1_thread_start: the mandated 256 KiB stacks (SPEC.md §15).
  */
@@ -933,10 +945,13 @@ static int t_allow(const char *p) {
     (void)p;
     return !__atomic_load_n(&g_deny_write, __ATOMIC_SEQ_CST);
 }
+/* The data layer's may_read hook (downloads): a test flips it through the FFI setter. */
+static int g_allow_read = 1;
+void ava1_test_set_allow_read(int v) { __atomic_store_n(&g_allow_read, v, __ATOMIC_SEQ_CST); }
 static int t_allow_read(const char *p, int u) {
     (void)p;
     (void)u;
-    return 1;
+    return __atomic_load_n(&g_allow_read, __ATOMIC_SEQ_CST);
 }
 
 static void ev_add(const char *s, int done) {

@@ -10,6 +10,7 @@
 #include "ava1_job.h"
 #include "ava1_platform.h"
 #include "ava1_recv.h"
+#include "ava1_send.h"
 #include "ava1_thread.h"
 
 #define IN_MAX (32u << 20)   /* control bytes one job's inbox holds */
@@ -322,7 +323,7 @@ static void emit_credit(ava1_job_t *j, uint64_t n) {
 /* A failure found off the job thread: recorded like a worker's (a nonzero final_status
  * on an unfinished job) and ended by the job thread, so JobDone has one emitter and never
  * overtakes a Durable it is still sending. */
-static void fail_soon(ava1_job_t *j, uint16_t status, const char *what) {
+void ava1_data_fail_soon(ava1_job_t *j, uint16_t status, const char *what) {
     pthread_mutex_lock(&j->mu);
     if (!j->finished && !j->final_status) {
         j->final_status = status;
@@ -343,9 +344,9 @@ static void feed_control(ava1_job_t *j, ava1_inframe_t *f) {
     case AVA1_TYPE_MANIFEST_PAGE: {
         ava1_manifest_page_t p;
         int rc = ava1_manifest_page_decode(f->body, f->len, &p) == 0 ? ava1_recv_page(j, &p) : AVA1_E_PROTO;
-        if (rc == AVA1_E_BADPATH) fail_soon(j, AVA1_ERR_PATH, "the manifest has a path that is not allowed");
-        else if (rc == AVA1_E_IO) fail_soon(j, AVA1_ERR_INTERNAL, "out of memory for the manifest");
-        else if (rc != 0) fail_soon(j, AVA1_ERR_PROTOCOL, "a manifest page does not follow the rules");
+        if (rc == AVA1_E_BADPATH) ava1_data_fail_soon(j, AVA1_ERR_PATH, "the manifest has a path that is not allowed");
+        else if (rc == AVA1_E_IO) ava1_data_fail_soon(j, AVA1_ERR_INTERNAL, "out of memory for the manifest");
+        else if (rc != 0) ava1_data_fail_soon(j, AVA1_ERR_PROTOCOL, "a manifest page does not follow the rules");
         break;
     }
     case AVA1_TYPE_MANIFEST_END: {
@@ -361,8 +362,8 @@ static void feed_control(ava1_job_t *j, ava1_inframe_t *f) {
     case AVA1_TYPE_FILE_ROOT: {
         ava1_file_root_t r;
         int rc = ava1_file_root_decode(f->body, f->len, &r) == 0 ? ava1_apply_root(j, r.file_id, r.root) : AVA1_E_PROTO;
-        if (rc == AVA1_E_PROTO) fail_soon(j, AVA1_ERR_PROTOCOL, "a FileRoot names no file");
-        else if (rc != 0) fail_soon(j, AVA1_ERR_INTERNAL, "out of memory");
+        if (rc == AVA1_E_PROTO) ava1_data_fail_soon(j, AVA1_ERR_PROTOCOL, "a FileRoot names no file");
+        else if (rc != 0) ava1_data_fail_soon(j, AVA1_ERR_INTERNAL, "out of memory");
         break;
     }
     default:
@@ -406,7 +407,7 @@ static void feed_lane(ava1_job_t *j, ava1_inframe_t *f) {
     }
     if (bad) {
         free_frame(f);
-        fail_soon(j, AVA1_ERR_PROTOCOL, bad);
+        ava1_data_fail_soon(j, AVA1_ERR_PROTOCOL, bad);
         return;
     }
     if (ava1_data_test_reserve_fail || ava1_apply_reserve(j, f->len) != 0) {
@@ -417,7 +418,7 @@ static void feed_lane(ava1_job_t *j, ava1_inframe_t *f) {
         pthread_mutex_lock(&j->mu);
         fin = j->finished || j->stopping;
         pthread_mutex_unlock(&j->mu);
-        if (!fin) fail_soon(j, AVA1_ERR_PROTOCOL, "a data frame beyond the granted credit");
+        if (!fin) ava1_data_fail_soon(j, AVA1_ERR_PROTOCOL, "a data frame beyond the granted credit");
         free_frame(f);
         return;
     }
@@ -431,8 +432,8 @@ static void feed_lane(ava1_job_t *j, ava1_inframe_t *f) {
         rc = ava1_apply_bundle(j, f->body, f->len, &b);
     }
     free(f); /* the body is the engine's now */
-    if (rc == AVA1_E_PROTO) fail_soon(j, AVA1_ERR_PROTOCOL, "a data frame does not fit the manifest");
-    else if (rc != 0) fail_soon(j, AVA1_ERR_INTERNAL, "out of memory");
+    if (rc == AVA1_E_PROTO) ava1_data_fail_soon(j, AVA1_ERR_PROTOCOL, "a data frame does not fit the manifest");
+    else if (rc != 0) ava1_data_fail_soon(j, AVA1_ERR_INTERNAL, "out of memory");
 }
 
 /* Control frames in order; a FileRoot names a file of the map, so it (and what follows
@@ -470,8 +471,8 @@ static void *feed_main(void *arg) {
         if (f) ava1_ctl_give(f->len); /* no longer queued: the global control cap */
         if (held && ava1_data_test_feed_delay_ms) ava1_platform_sleep_ms(ava1_data_test_feed_delay_ms);
         if (over)
-            fail_soon(j, over_status ? over_status : AVA1_ERR_PROTOCOL, "too many control messages are waiting");
-        if (oom) fail_soon(j, AVA1_ERR_INTERNAL, "out of memory");
+            ava1_data_fail_soon(j, over_status ? over_status : AVA1_ERR_PROTOCOL, "too many control messages are waiting");
+        if (oom) ava1_data_fail_soon(j, AVA1_ERR_INTERNAL, "out of memory");
         if (f) {
             feed_control(j, f);
             free_frame(f);
@@ -669,10 +670,29 @@ static void open_now(opening_t *o, const uint8_t sid[16], const uint8_t peer[32]
     } else if (q.root_len > AVA1_MAX_PATH || memchr(q.root, 0, q.root_len)) {
         ack.status = AVA1_ERR_PATH;
         snprintf(msg, sizeof msg, "the destination is not a valid path");
-    } else if (q.kind != AVA1_JOB_UPLOAD) { /* Task 18 adds JOB_DOWNLOAD */
-        ack.status = AVA1_ERR_PROTOCOL;
-        snprintf(msg, sizeof msg, "unknown job kind");
-    } else {
+    } else if (q.kind == AVA1_JOB_DOWNLOAD) {
+        int tries;
+        memcpy(root, q.root, q.root_len);
+        root[q.root_len] = 0;
+        /* No g_open_mu (a large walk would serialize every upload open) and no
+         * root_in_use (there is no destination lock for a read). */
+        for (tries = 0; tries < 2 && !j; tries++) {
+            j = ava1_send_open(&q, peer, &ack, msg, sizeof msg);
+            if (!j) break;
+            pthread_mutex_lock(&j->cmu);
+            j->emit = net_emit; /* C3: before it can matter */
+            j->emit_ctx = NULL;
+            pthread_mutex_unlock(&j->cmu);
+            if (ava1_job_attach(j, sid, 0) != 0) { /* credit 0 = not a grant */
+                ava1_job_put(j); /* attached nowhere; ava1_job_attach parked it */
+                j = NULL;
+                ack.status = AVA1_ERR_BUSY;
+                snprintf(msg, sizeof msg, "the job could not be attached");
+            } else {
+                ava1_send_start(j);
+            }
+        }
+    } else if (q.kind == AVA1_JOB_UPLOAD) {
         ava1_recv_spec_t s;
         int tries;
         memcpy(root, q.root, q.root_len);
@@ -707,6 +727,9 @@ static void open_now(opening_t *o, const uint8_t sid[16], const uint8_t peer[32]
             }
         }
         pthread_mutex_unlock(&g_open_mu);
+    } else {
+        ack.status = AVA1_ERR_PROTOCOL;
+        snprintf(msg, sizeof msg, "unknown job kind");
     }
     /* A refusal that landed while the work ran ends the open the same way one that landed
      * before it does: the ack is refused and the job just created goes — its sender

@@ -45,7 +45,11 @@ int ava1_mstore_from_blob(ava1_mstore_t *m, const uint8_t *blob, size_t len);
 /* One ManifestPage; `*next` is the first entry not written. */
 int ava1_mstore_page(const ava1_mstore_t *m, const uint8_t job[16], uint32_t *next, uint8_t *out,
                      size_t cap, size_t *len);
-int ava1_mstore_walk(ava1_mstore_t *m, const char *root);   /* depth first, sorted */
+/* ava1_mstore_walk_ex flags: follow directory symlinks (the sender's mode, matching
+ * Rust's walk); the default mode skips them, so a cycle cannot form. */
+#define AVA1_WALK_FOLLOW 1u
+int ava1_mstore_walk(ava1_mstore_t *m, const char *root); /* = ava1_mstore_walk_ex(m, root, 0) */
+int ava1_mstore_walk_ex(ava1_mstore_t *m, const char *root, unsigned flags); /* depth first, sorted */
 int ava1_mstore_single(ava1_mstore_t *m, const char *file); /* JF_SINGLE_FILE */
 void ava1_mstore_free(ava1_mstore_t *m);
 

@@ -81,6 +81,64 @@ fn c_and_rust_walk_a_tree_identically() {
 }
 
 #[test]
+fn c_follow_and_rust_agree_on_a_tree_with_a_directory_symlink() {
+    use std::os::unix::fs::symlink;
+    let d = std::env::temp_dir().join(format!("ava1-cwalk-sym-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("a2")).unwrap();
+    std::fs::write(d.join("a2/f"), b"abc").unwrap();
+    std::fs::write(d.join("top"), b"x").unwrap();
+    symlink(d.join("a2"), d.join("a")).unwrap();
+    // Rust follows the link: a (dir), a/f, a2, a2/f, top.
+    let m = walk(&LocalSource::new(d.clone()), &|_: &str| false).unwrap();
+    assert_eq!(m.entries.len(), 5);
+    // AVA1_WALK_FOLLOW (the download sender's mode) is the parity contract.
+    let (rc, hash, n) = c_mstore_walk_ex(&d, 1);
+    assert_eq!(rc, 0);
+    assert_eq!((hash, n), (m.hash(), m.entries.len() as u32));
+    // The default mode skips the directory symlink (and its subtree): the copy's mode.
+    let (rc0, _, n0) = c_mstore_walk(&d);
+    assert_eq!((rc0, n0), (0, 3));
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn a_dangling_symlink_fails_both_c_modes_and_rust() {
+    use std::os::unix::fs::symlink;
+    let d = std::env::temp_dir().join(format!("ava1-cwalk-dangle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    symlink(d.join("gone"), d.join("dead")).unwrap();
+    // Rust's walk fails on a dangling link; the C walk must too, in both modes (C1).
+    assert!(walk(&LocalSource::new(d.clone()), &|_: &str| false).is_err());
+    let (rc, ..) = c_mstore_walk(&d);
+    assert_ne!(
+        rc, 0,
+        "the default mode must not silently drop a dangling link"
+    );
+    let (rc2, ..) = c_mstore_walk_ex(&d, 1);
+    assert_ne!(
+        rc2, 0,
+        "the follow mode must not silently drop a dangling link"
+    );
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn a_symlink_cycle_fails_the_c_follow_walk_and_rust() {
+    use std::os::unix::fs::symlink;
+    let d = std::env::temp_dir().join(format!("ava1-cwalk-cycle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    symlink(&d, d.join("sub/loop")).unwrap();
+    assert!(walk(&LocalSource::new(d.clone()), &|_: &str| false).is_err());
+    // ELOOP or a path-length error — an error, never a spin (C1).
+    let (rc, ..) = c_mstore_walk_ex(&d, 1);
+    assert_ne!(rc, 0, "a cycle must end the follow walk, never spin");
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
 fn c_threads_start_with_their_own_stack() {
     // Not a smoke test: the C side reports the stack it actually ran on and fails unless
     // it is within [200 KiB, 256 KiB + 4 KiB] (64 KiB of ceiling on macOS, whose pthreads

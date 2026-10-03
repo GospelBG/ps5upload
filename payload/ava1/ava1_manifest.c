@@ -257,7 +257,9 @@ static void fill_entry(ava1_manifest_entry_t *w, uint32_t id, const char *rel, c
     w->path_len = (uint16_t)strlen(rel);
 }
 
-int ava1_mstore_walk(ava1_mstore_t *m, const char *root) {
+/* One implementation for both modes (ruling C1). The walk follows the path order Rust's
+ * walk produces; the entries are sorted by `path_cmp` afterwards either way. */
+int ava1_mstore_walk_ex(ava1_mstore_t *m, const char *root, unsigned flags) {
     strv_t dirs = { 0 }, found = { 0 };
     char *abs = malloc(2 * (AVA1_MAX_PATH + 2) + 512);
     int rc = 0;
@@ -282,8 +284,17 @@ int ava1_mstore_walk(ava1_mstore_t *m, const char *root) {
                 break;
             }
             snprintf(abs, 2 * (AVA1_MAX_PATH + 2) + 512, "%s/%s", root, child);
-            if (lstat(abs, &lst) != 0 || stat(abs, &st) != 0) continue;
-            if (S_ISLNK(lst.st_mode) && S_ISDIR(st.st_mode)) continue; /* no directory symlinks: no loops */
+            /* A stat failure on a discovered entry is fatal in both modes: Rust's walk
+             * fails on a dangling link, and a silent skip would produce a manifest that
+             * does not match the source tree (ruling C1). */
+            if (lstat(abs, &lst) != 0 || stat(abs, &st) != 0) {
+                rc = AVA1_E_IO;
+                break;
+            }
+            /* Default mode skips directory symlinks (no loops); AVA1_WALK_FOLLOW pushes
+             * them like directories and walks them. A cycle then ends in ELOOP (a fatal
+             * stat) or a path-length error — an error, never a spin. */
+            if (!(flags & AVA1_WALK_FOLLOW) && S_ISLNK(lst.st_mode) && S_ISDIR(st.st_mode)) continue;
             if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) continue;
             if (strv_push(&found, child) != 0 || (S_ISDIR(st.st_mode) && strv_push(&dirs, child) != 0)) rc = AVA1_E_IO;
         }
@@ -307,6 +318,8 @@ int ava1_mstore_walk(ava1_mstore_t *m, const char *root) {
     free(abs);
     return rc;
 }
+
+int ava1_mstore_walk(ava1_mstore_t *m, const char *root) { return ava1_mstore_walk_ex(m, root, 0); }
 
 int ava1_mstore_single(ava1_mstore_t *m, const char *file) {
     struct stat st;
