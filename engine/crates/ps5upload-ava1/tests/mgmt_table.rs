@@ -57,6 +57,23 @@ fn the_method_table_matches_the_checklist_row_for_row() {
     assert!(checked >= 95);
 }
 
+/// The ack frame of every method is pinned: FTX2 answers with it and a wrong one fails the call.
+/// Frame numbers are the payload's (`runtime.c` dispatch); an ack is the request + 1 except the
+/// Remote Play frames, which ack with themselves or with status (`remoteplay.rs`).
+#[test]
+fn every_ack_frame_is_pinned() {
+    for x in m::ALL {
+        let Some((req, ack)) = x.ftx2 else { continue };
+        let (r, a) = (req as u16, ack as u16);
+        let expect = match r {
+            188 | 189 => 189, // RemotePlayRequest and Status ack with RemotePlayStatus
+            248..=250 => r,   // readiness, enable, devices ack with their own frame
+            _ => r + 1,
+        };
+        assert_eq!(a, expect, "{}: request {r} acks with {a}", x.label);
+    }
+}
+
 #[test]
 fn the_ids_the_gate_and_the_converters_key_on_are_the_schema_numbers() {
     use ava1::gen;

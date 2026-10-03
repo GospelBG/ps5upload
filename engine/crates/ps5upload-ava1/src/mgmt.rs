@@ -22,7 +22,7 @@ use ps5upload_core::mgmt::{self, Method, MgmtError, MgmtTransport};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::mgmt_convert as conv;
-use crate::pool::{pool, Pool};
+use crate::pool::{host_of, pool, Pool};
 use crate::route::{mode, use_ava1_in, Mode};
 
 /// In-flight calls the payload allows per session (`RPC_WORKERS`, SPEC.md section 7.4).
@@ -164,12 +164,13 @@ impl AvaTransport {
         }
     }
 
-    /// The gate of a console (test seam).
+    /// The gate of a console, keyed by host like the pool's sessions: two ports of one console
+    /// share one gate of eight.
     pub fn gate(&self, console: &str) -> Arc<MgmtGate> {
         self.gates
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(console.to_string())
+            .entry(host_of(console))
             .or_default()
             .clone()
     }
@@ -179,10 +180,10 @@ impl AvaTransport {
     fn serves(&self, console: &str) -> bool {
         if mode() == Mode::Auto {
             let mut n = self.no_mgmt.lock().unwrap_or_else(|e| e.into_inner());
-            match n.get(console) {
+            match n.get(&host_of(console)) {
                 Some(t) if t.elapsed() < NO_MGMT_TTL => return false,
                 Some(_) => {
-                    n.remove(console);
+                    n.remove(&host_of(console));
                 }
                 None => {}
             }
@@ -194,7 +195,7 @@ impl AvaTransport {
         self.no_mgmt
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(console.to_string(), Instant::now());
+            .insert(host_of(console), Instant::now());
     }
 
     /// One RPC: gate permit, `ERR_BUSY` retries, one resend on a lost session for
@@ -410,6 +411,9 @@ impl AvaTransport {
     /// Writes `ask.data` as one atomic call, or as `FSW_CHUNK_MAX` chunks at their offsets
     /// with `COMMIT` on the last. A failed chunk leaves the `.ps5upload.tmp` file for the
     /// next write at offset 0 to truncate (SPEC.md section 7.5).
+    ///
+    /// TODO(Task 5): remove `<path>.ps5upload.tmp` best-effort on failure once `job.run`
+    /// DELETE is available here; no removal method exists before it. Tracked in CUTOVER.md.
     async fn write_chunks(
         &self,
         console: &str,
@@ -451,10 +455,30 @@ impl MgmtTransport for AvaTransport {
         body: &[u8],
         timeout: Duration,
     ) -> Result<Option<Vec<u8>>> {
-        if !self.serves(addr) {
-            return Ok(None);
-        }
-        crate::block_on(self.run(addr, method, label, body, timeout))
+        run_blocking(|| {
+            if !self.serves(addr) {
+                return Ok(None);
+            }
+            crate::block_on(self.run(addr, method, label, body, timeout))
+        })
+    }
+}
+
+/// Runs blocking work (which itself `block_on`s) without panicking when the caller sits on an
+/// async worker: a multi-thread runtime worker hands its role over (`block_in_place`); a
+/// current-thread runtime cannot, so the work runs on a helper thread while this one waits.
+/// Threads outside any runtime, and `spawn_blocking` threads (the engine's normal case), run it
+/// directly.
+fn run_blocking<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        Ok(_) => std::thread::scope(|s| {
+            s.spawn(f)
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p))
+        }),
+        Err(_) => f(),
     }
 }
 

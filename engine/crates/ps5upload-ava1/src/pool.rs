@@ -23,7 +23,7 @@ pub fn ava1_addr(console: &str) -> String {
 }
 
 /// The console string without its port (the pool's key).
-fn host_of(console: &str) -> String {
+pub(crate) fn host_of(console: &str) -> String {
     console
         .rsplit_once(':')
         .map(|(h, _)| h)

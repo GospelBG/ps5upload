@@ -67,6 +67,7 @@ fn text_of(req: &[u8]) -> String {
 /// A loopback console running `handler` that trusts the transport's identity, and the
 /// transport over its own pool.
 async fn console(tag: &str, handler: RpcHandler) -> (Arc<AvaTransport>, &'static Pool, String) {
+    force_auto();
     let base = temp(tag);
     let ava = base.join("ava");
     std::fs::create_dir_all(&ava).unwrap();
@@ -108,8 +109,15 @@ async fn call(
         .unwrap()
 }
 
-fn auto() -> bool {
-    ps5upload_ava1::route::mode() == ps5upload_ava1::route::Mode::Auto
+/// Forces `PS5UPLOAD_TRANSFER=auto` for the whole binary before any call reads it (the
+/// `Once` makes every test wait for the one `set_var`, so none reads the environment mid-write).
+fn force_auto() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("PS5UPLOAD_TRANSFER", "auto"));
+    assert_eq!(
+        ps5upload_ava1::route::mode(),
+        ps5upload_ava1::route::Mode::Auto
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -641,9 +649,7 @@ async fn one_session_serves_every_call() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_console_without_management_is_sent_to_ftx2_and_not_asked_again() {
-    if !auto() {
-        return;
-    }
+    force_auto();
     let n = Arc::new(AtomicUsize::new(0));
     let n2 = n.clone();
     let (t, _p, c) = console(
@@ -671,9 +677,7 @@ async fn a_console_without_management_is_sent_to_ftx2_and_not_asked_again() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_console_is_not_served_and_the_caller_uses_ftx2() {
-    if !auto() {
-        return;
-    }
+    force_auto();
     let base = temp("down");
     let pool: &'static Pool = Box::leak(Box::new(
         Pool::new(base.join("ava")).with_addr("127.0.0.1:1"),
@@ -822,4 +826,95 @@ async fn concurrent_first_calls_open_one_session() {
         assert_eq!(h.await.unwrap().unwrap().unwrap(), b"ok");
     }
     assert_eq!(p.attempts(), 1);
+}
+
+/// A mid-sequence failure leaves `<path>.ps5upload.tmp` on the console: no removal method exists
+/// before Task 5's `job.run` DELETE (`TODO(Task 5)`, CUTOVER.md). This documents today's behaviour:
+/// the second chunk is refused, the write stops, and no cleanup call is made.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_multi_chunk_write_makes_no_cleanup_call_and_leaves_the_tmp_to_the_next_write() {
+    let n = Arc::new(AtomicUsize::new(0));
+    let methods = Arc::new(Mutex::new(Vec::<u16>::new()));
+    let (n2, m2) = (n.clone(), methods.clone());
+    let (t, _p, c) = console(
+        "wtmp",
+        Box::new(move |method, _| {
+            m2.lock().unwrap().push(method);
+            if n2.fetch_add(1, Ordering::SeqCst) == 1 {
+                err(gen::ERR_NO_SPACE, "no_space")
+            } else {
+                ok(vec![])
+            }
+        }),
+    )
+    .await;
+    let size = 3 * gen::FSW_CHUNK_MAX as usize;
+    let e = call(
+        &t,
+        &c,
+        m::FS_WRITE,
+        "FS_WRITE_BYTES",
+        &write_body("/data/p", size, "overwrite"),
+        T,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.to_string(), "payload rejected FS_WRITE_BYTES: no_space");
+    assert_eq!(
+        *methods.lock().unwrap(),
+        vec![gen::METHOD_FS_WRITE, gen::METHOD_FS_WRITE],
+        "stopped at the failed chunk; nothing tried to remove the tmp"
+    );
+    // The retry starts at offset 0, which the payload treats as "truncate the abandoned tmp".
+    n.store(100, Ordering::SeqCst);
+    call(
+        &t,
+        &c,
+        m::FS_WRITE,
+        "FS_WRITE_BYTES",
+        &write_body("/data/p", size, "overwrite"),
+        T,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_ports_of_one_console_share_one_gate() {
+    let (t, _p, _c) = console("gate", Box::new(|_, _| text("x"))).await;
+    assert!(Arc::ptr_eq(
+        &t.gate("10.1.1.1:9114"),
+        &t.gate("10.1.1.1:9120")
+    ));
+    assert!(!Arc::ptr_eq(
+        &t.gate("10.1.1.1:9114"),
+        &t.gate("10.1.1.2:9114")
+    ));
+}
+
+/// `call` is blocking, but a caller on an async worker must not panic the runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_from_a_multi_thread_worker_does_not_panic() {
+    let (t, _p, c) = console("worker", Box::new(|_, _| text("fine"))).await;
+    let r = t.call(&c, m::HW_INFO, "HW_INFO", b"", T).unwrap();
+    assert_eq!(r.unwrap(), b"fine");
+}
+
+#[test]
+fn call_from_a_current_thread_runtime_does_not_panic() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (t, c) = rt.block_on(async {
+        let (t, _p, c) = console("curthread", Box::new(|_, _| text("fine"))).await;
+        (t, c)
+    });
+    let cur = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let r = cur.block_on(async { t.call(&c, m::HW_INFO, "HW_INFO", b"", T) });
+    assert_eq!(r.unwrap().unwrap(), b"fine");
+    drop(rt);
 }
