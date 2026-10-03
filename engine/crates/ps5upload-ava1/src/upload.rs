@@ -237,6 +237,36 @@ pub fn apply_existing_policy(
     manifest: &mut Manifest,
     opts: &mut SendOptions,
 ) -> io::Result<u8> {
+    apply_existing_policy_with(source, manifest, opts, &Hashing::default())
+}
+
+/// What a long up-front hash reports to and obeys: a cancel flag (checked between files
+/// and every MiB inside one) and a counter of source bytes hashed so far.
+#[derive(Default)]
+pub struct Hashing {
+    pub cancel: Option<Arc<AtomicBool>>,
+    pub done: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl Hashing {
+    fn check(&self) -> io::Result<()> {
+        match &self.cancel {
+            Some(c) if c.load(Ordering::Relaxed) => Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "transfer_cancelled",
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// [`apply_existing_policy`] that reports and obeys `hashing` while it reads the source.
+pub fn apply_existing_policy_with(
+    source: &dyn Source,
+    manifest: &mut Manifest,
+    opts: &mut SendOptions,
+    hashing: &Hashing,
+) -> io::Result<u8> {
     let files = |m: &Manifest| {
         m.entries
             .iter()
@@ -251,24 +281,59 @@ pub fn apply_existing_policy(
         opts.policy = gen::POLICY_SKIP_EXISTING;
         return Ok(opts.policy);
     }
+    apply_verify_policy(source, manifest, opts, hashing)?;
+    Ok(opts.policy)
+}
+
+/// The user's "skip files the console already has" choice, the engine's reconcile
+/// modes: `Fast` compares size and mtime when the source has them (SPEC.md §11.4),
+/// `Safe` always compares content (size plus BLAKE3 root).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipMode {
+    Fast,
+    Safe,
+}
+
+impl SkipMode {
+    /// The engine API's `"fast"` / `"safe"`.
+    pub fn parse(s: &str) -> Option<SkipMode> {
+        match s {
+            "fast" => Some(SkipMode::Fast),
+            "safe" => Some(SkipMode::Safe),
+            _ => None,
+        }
+    }
+}
+
+/// Reads every file once, puts its BLAKE3 root in the manifest and selects `verify`.
+/// Used by `Safe` mode, and by `Fast` mode when a file has no mtime. Stops with
+/// `ErrorKind::Interrupted` ("transfer_cancelled") when `hashing.cancel` is set.
+fn apply_verify_policy(
+    source: &dyn Source,
+    manifest: &mut Manifest,
+    opts: &mut SendOptions,
+    hashing: &Hashing,
+) -> io::Result<()> {
     for e in manifest
         .entries
         .iter_mut()
         .filter(|e| e.kind == gen::ENTRY_FILE)
     {
-        e.root = Some(hash_file(source, &e.path, e.size)?);
+        e.root = Some(hash_file(source, &e.path, e.size, hashing)?);
     }
     opts.policy = gen::POLICY_VERIFY;
-    Ok(opts.policy)
+    Ok(())
 }
 
 /// BLAKE3 of a source file (equal to the root the receiver computes, `ava1::verify`).
-fn hash_file(source: &dyn Source, rel: &str, size: u64) -> io::Result<[u8; 32]> {
+fn hash_file(source: &dyn Source, rel: &str, size: u64, hashing: &Hashing) -> io::Result<[u8; 32]> {
+    hashing.check()?;
     let mut r = source.open(rel)?;
     let mut h = blake3::Hasher::new();
     let mut buf = vec![0u8; 1 << 20];
     let mut off = 0u64;
     while off < size {
+        hashing.check()?;
         let n = ava1::source::read_full_at(r.as_mut(), off, &mut buf)?;
         if n == 0 {
             return Err(io::Error::new(
@@ -278,6 +343,9 @@ fn hash_file(source: &dyn Source, rel: &str, size: u64) -> io::Result<[u8; 32]> 
         }
         h.update(&buf[..n]);
         off += n as u64;
+        if let Some(d) = &hashing.done {
+            d.fetch_add(n as u64, Ordering::Relaxed);
+        }
     }
     Ok(*h.finalize().as_bytes())
 }
@@ -300,6 +368,11 @@ pub fn upload_with_in(
     opts: SendOptions,
     cfg: &TransferConfig,
 ) -> Result<TransferResult> {
+    let manifest_files = manifest
+        .entries
+        .iter()
+        .filter(|e| e.kind == gen::ENTRY_FILE)
+        .count() as u64;
     let manifest = Arc::new(manifest);
     let progress = Arc::new(Progress::default());
     let cancel = cfg
@@ -362,6 +435,8 @@ pub fn upload_with_in(
             match send_job(&mut link, manifest.clone(), source.clone(), o).await {
                 Ok(r) if r.status == gen::STATUS_OK => {
                     let _ = std::fs::remove_dir_all(&persist);
+                    let skipped_files = progress.skipped_files.load(Ordering::Relaxed);
+                    let skipped_bytes = progress.skipped_bytes.load(Ordering::Relaxed);
                     let body = serde_json::json!({
                         "protocol": "ava1",
                         "files": r.files,
@@ -370,6 +445,11 @@ pub fn upload_with_in(
                         "max_lanes": r.max_lanes,
                         "bottleneck": bottleneck_name(r.bottleneck),
                         "sequential": r.sequential,
+                        // What the receiver already had when the job first opened
+                        // (SPEC §11.4 skip policies), and the files actually sent.
+                        "skipped_files": skipped_files,
+                        "skipped_bytes": skipped_bytes,
+                        "files_sent": manifest_files.saturating_sub(skipped_files),
                     });
                     return Ok(TransferResult {
                         tx_id_hex: hex(&job_id),
@@ -480,6 +560,52 @@ pub fn upload_dir_in(
         SendOptions::upload(dest_root),
         cfg,
     )
+}
+
+/// A folder upload that skips what the console already has (the engine's "resume"
+/// strategy). Local and remote sources alike; see [`apply_existing_policy`].
+pub fn upload_dir_skip_existing_in(
+    pool: &Pool,
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    dest_root: &str,
+    src_dir: &Path,
+    mode: SkipMode,
+) -> Result<TransferResult> {
+    let source = source_for(cfg, src_dir);
+    let excludes = cfg.excludes.clone();
+    let mut manifest = manifest::walk(source.as_ref(), &|p: &str| {
+        ps5upload_core::excludes::is_excluded_strings(Path::new(p), &excludes)
+    })?;
+    let mut opts = SendOptions::upload(dest_root);
+    let hashing = Hashing {
+        cancel: cfg.cancel.clone(),
+        done: cfg.progress_verify.clone(),
+    };
+    let hashed = match mode {
+        SkipMode::Fast => {
+            apply_existing_policy_with(source.as_ref(), &mut manifest, &mut opts, &hashing)
+                .map(|_| ())
+        }
+        SkipMode::Safe => apply_verify_policy(source.as_ref(), &mut manifest, &mut opts, &hashing),
+    };
+    match hashed {
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+            return Err(anyhow!("transfer_cancelled"))
+        }
+        other => other?,
+    }
+    upload_with_in(pool, &cfg.addr, job_id, manifest, source, opts, cfg)
+}
+
+pub fn upload_dir_skip_existing(
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    dest_root: &str,
+    src_dir: &Path,
+    mode: SkipMode,
+) -> Result<TransferResult> {
+    upload_dir_skip_existing_in(pool(), cfg, job_id, dest_root, src_dir, mode)
 }
 
 /// The path within an AVA1 job's destination root. FTX2 treats relative list

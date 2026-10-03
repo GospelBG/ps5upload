@@ -55,7 +55,12 @@ impl Bridge {
 impl Counters {
     fn store(&self) {
         if let Some(x) = &self.bytes {
-            x.store(self.p.bytes_sent.load(Ordering::Relaxed), Ordering::Relaxed);
+            // Skipped bytes count as done, so a resume's bar reaches 100%.
+            x.store(
+                self.p.bytes_sent.load(Ordering::Relaxed)
+                    + self.p.skipped_bytes.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
         }
         if let Some(x) = &self.files {
             x.store(

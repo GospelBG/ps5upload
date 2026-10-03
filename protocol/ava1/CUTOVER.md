@@ -93,7 +93,9 @@ kept.
 - [x] NAS sources: `SourceFs` now has an `mtime` (SMB, FTP and SFTP report one; a backend that does
       not reports unknown), carried into the manifest. `upload::apply_existing_policy` picks
       `skip-existing` when every file has an mtime and `verify` (roots in the manifest) otherwise
-      (`SPEC.md` §11.4). The engine does not expose a skip-existing option yet; call it when it does.
+      (`SPEC.md` §11.4). The engine's Resume strategy (`/api/transfer/dir-reconcile`, mode `fast`/`safe`) on an AVA1 console now runs
+      the folder upload with that choice (`upload_dir_skip_existing`; `fast` = size+mtime or the verify fallback,
+      `safe` = always verify), local or remote source; tests: `ava1-ctest/tests/nas_skip.rs`.
 - [x] One session per identity (`SPEC.md` §8): two engines sharing an identity file (a copied
       `<data dir>/ava/identity`, a shared data directory, a Docker engine mounted on the
       desktop's directory) evict each other's console session. Give each engine its own data
