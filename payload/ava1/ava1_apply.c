@@ -271,7 +271,9 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
             done_written = 1;
     }
     pthread_mutex_lock(&j->mu);
-    j->durable_ok = status == AVA1_STATUS_OK && err == 0 && done_written;
+    /* A journaled Done(OK) that a restart replayed is itself the proof: the rename, the
+     * directory sync and the Done append all succeeded before the crash. */
+    j->durable_ok = status == AVA1_STATUS_OK && err == 0 && (done_written || j->replay_done);
     if (status == AVA1_STATUS_OK && journal_done && !done_written) {
         j->final_status = AVA1_ERR_IO;
         snprintf(j->message, sizeof j->message, "journal append failed");

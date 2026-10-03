@@ -766,6 +766,152 @@ async fn a_copy_resumes_after_a_payload_restart() {
     assert!(same_tree(&d.join("usb/g"), &d.join("data/g")));
 }
 
+/* ---- fix round 2 ------------------------------------------------------------------- */
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_reissued_after_a_crash_following_done_deletes_its_source() {
+    let d = dir("copy-move-crash-after-done");
+    let src = d.join("usb/g");
+    write_tree(&src, 6, |_| 4096);
+    let (me, mine) = paired_client(&d.join("peers"));
+    let mut srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    let job = [0x8a; 16];
+    {
+        let s = connect(&srv.addr(), me.clone(), mine.clone(), "rust", calm())
+            .await
+            .unwrap();
+        // The payload "dies" after the journaled Done(OK), before the delete phase.
+        srv.knob("copy_crash_before_delete", 1);
+        assert_eq!(
+            start(&s, job, &src, &d.join("data/g"), gen::JF_MOVE).await,
+            0
+        );
+        for _ in 0..400 {
+            if srv.copy_delete_active() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(srv.copy_delete_active(), "the copy never reached its Done");
+        assert!(src.join("d00/f00000").exists());
+    }
+    srv.restart_data();
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    assert_eq!(
+        start(&s, job, &src, &d.join("data/g"), gen::JF_MOVE).await,
+        0
+    );
+    let st = wait_finished(&s, job).await;
+    assert_eq!(st.state, Some(1), "{:?}", st.current);
+    wait_gone(&src).await;
+    assert!(d.join("data/g/d00/f00000").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_out_of_a_tree_a_copy_is_still_writing_is_busy() {
+    let d = dir("copy-move-src-in-writer");
+    write_tree(&d.join("usb/g"), 3000, |_| 2048);
+    std::fs::create_dir_all(d.join("w/g/sub")).unwrap();
+    std::fs::write(d.join("w/g/sub/one"), b"one").unwrap();
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        3000,
+    );
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let writer = [0x8b; 16];
+    assert_eq!(
+        start(
+            &s,
+            writer,
+            &d.join("usb/g"),
+            &d.join("w/g"),
+            gen::JF_OVERWRITE
+        )
+        .await,
+        0
+    );
+    assert!(status(&s, writer).await.files_done < 3000);
+    assert_eq!(
+        start(
+            &s,
+            [0x8c; 16],
+            &d.join("w/g/sub"),
+            &d.join("out/x"),
+            gen::JF_MOVE
+        )
+        .await,
+        gen::ERR_BUSY,
+        "a move took its source out of a tree a copy is writing"
+    );
+    assert!(d.join("w/g/sub/one").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_through_an_alias_of_a_running_moves_source_is_busy() {
+    let d = dir("copy-move-src-alias-busy");
+    write_tree(&d.join("usb/g"), 3000, |_| 2048);
+    std::os::unix::fs::symlink(d.join("usb/g"), d.join("alias")).unwrap();
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        3000,
+    );
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let first = [0x8d; 16];
+    assert_eq!(
+        start(&s, first, &d.join("usb/g"), &d.join("data/g"), gen::JF_MOVE).await,
+        0
+    );
+    assert!(status(&s, first).await.files_done < 3000);
+    assert_eq!(
+        start(
+            &s,
+            [0x8e; 16],
+            &d.join("alias"),
+            &d.join("data/h"),
+            gen::JF_MOVE
+        )
+        .await,
+        gen::ERR_BUSY,
+        "two moves share one source through an alias"
+    );
+}
+
+#[test]
+fn a_chunk_or_bundle_that_fails_to_decode_returns_its_reserved_bytes() {
+    assert_eq!(ava1_ctest::c_copy_put_decode_failure(), 0);
+}
+
+#[test]
+fn a_changed_retry_reaches_the_job_with_the_source_changed_message() {
+    assert_eq!(ava1_ctest::c_copy_retry_changed_message(), 0);
+}
+
 /* ---- C14: JF_OVERWRITE ------------------------------------------------------------- */
 
 #[tokio::test(flavor = "multi_thread")]

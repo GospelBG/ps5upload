@@ -1382,6 +1382,9 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     __atomic_store_n(&ava1_send_test_fail_sends, 0, __ATOMIC_SEQ_CST); /* the download sender's knobs */
     __atomic_store_n(&ava1_send_test_fail_writer_starts, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_fault_id, UINT32_MAX - 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&ava1_copy_test_crash_before_delete, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&ava1_copy_test_delete_delay_ms, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&ava1_copy_test_delete_active, 0, __ATOMIC_SEQ_CST);
     if (ava1_data_start(&dc) != 0) return -100;
     ava1_apply_fault = t_fault;
     memset(&cfg, 0, sizeof cfg);
@@ -1549,6 +1552,8 @@ int ava1_test_data_knob(const char *name, uint32_t v) {
     }
     else if (!strcmp(name, "copy_walk_delay_ms")) __atomic_store_n(&ava1_copy_test_walk_delay_ms, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "copy_delete_delay_ms")) __atomic_store_n(&ava1_copy_test_delete_delay_ms, v, __ATOMIC_SEQ_CST);
+    else if (!strcmp(name, "copy_crash_before_delete"))
+        __atomic_store_n(&ava1_copy_test_crash_before_delete, (int)v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "ctl_cap")) __atomic_store_n(&c->ctl_cap, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "send_fail")) __atomic_store_n(&ava1_send_test_fail_sends, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "writer_start_fail"))
@@ -1602,3 +1607,89 @@ uint32_t ava1_test_fd_peak(int which) { return which ? __atomic_load_n(&ava1_dat
 /* Chunk bytes the download sender has queued since the counter was last set (knob
  * "chunk_bytes"). */
 uint64_t ava1_test_send_chunk_bytes(void) { return __atomic_load_n(&ava1_send_test_chunk_bytes, __ATOMIC_SEQ_CST); }
+
+/* A copy's in-process put: a Chunk/Bundle that does not decode is freed and its reserved
+ * bytes go back (0 = both hold, else the failing step). */
+int ava1_test_copy_put_decode_failure(void) {
+    ava1_data_cfg_t dc;
+    ava1_job_t *j;
+    uint8_t id[16];
+    uint8_t type[2] = { AVA1_TYPE_CHUNK, AVA1_TYPE_BUNDLE };
+    int rc = 0, i;
+    memset(&dc, 0, sizeof dc);
+    snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "/tmp/ava1-copyput-unused");
+    if (ava1_data_start(&dc) != 0) return -100;
+    memset(id, 0x43, 16);
+    j = ava1_job_create(id, TEST_OWNER);
+    if (!j) rc = -1;
+    else {
+        pthread_mutex_lock(&j->mu);
+        j->credit = 1u << 20;
+        j->outstanding = 0;
+        pthread_mutex_unlock(&j->mu);
+        for (i = 0; i < 2 && !rc; i++) {
+            uint8_t *msg = calloc(1, 8); /* too short to be either message */
+            size_t before;
+            if (!msg) {
+                rc = -2;
+                break;
+            }
+            pthread_mutex_lock(&j->mu);
+            before = j->outstanding;
+            pthread_mutex_unlock(&j->mu);
+            if (ava1_copy_put(j, type[i], msg, 8) != -EIO) rc = -3 - i * 10;
+            pthread_mutex_lock(&j->mu);
+            if (j->outstanding != before) rc = -4 - i * 10;
+            pthread_mutex_unlock(&j->mu);
+        }
+        pthread_mutex_lock(&j->mu);
+        j->credit = 0; /* nothing was granted from the budget */
+        pthread_mutex_unlock(&j->mu);
+        ava1_job_put(j);
+    }
+    ava1_data_stop();
+    return rc;
+}
+
+/* A FILE_RETRY(changed) reaching a copy's emit hook records the failure for the job
+ * thread, with the user-facing message (0 = it does, else the failing step). */
+int ava1_test_copy_retry_changed_message(void) {
+    ava1_data_cfg_t dc;
+    ava1_job_t *j;
+    ava1_file_retry_t r;
+    uint8_t id[16], b[64];
+    ava1_w_t w;
+    int rc = 0;
+    memset(&dc, 0, sizeof dc);
+    snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "/tmp/ava1-copyretry-unused");
+    if (ava1_data_start(&dc) != 0) return -100;
+    memset(id, 0x44, 16);
+    j = ava1_job_create(id, TEST_OWNER);
+    if (!j) rc = -1;
+    else {
+        uint16_t reasons[2] = { AVA1_RETRY_CHANGED, AVA1_RETRY_VERIFY };
+        const char *want[2] = { "source changed while copying", "a copied file did not verify" };
+        int i;
+        for (i = 0; i < 2 && !rc; i++) {
+            memset(&r, 0, sizeof r);
+            memcpy(r.job_id, id, 16);
+            r.reason = reasons[i];
+            ava1_w_init(&w, b, sizeof b);
+            if (ava1_file_retry_encode(&r, &w) != 0) rc = -2;
+            else {
+                pthread_mutex_lock(&j->mu);
+                j->final_status = 0;
+                j->message[0] = 0;
+                pthread_mutex_unlock(&j->mu);
+                ava1_copy_emit(j, AVA1_TYPE_FILE_RETRY, 0, b, w.len);
+                pthread_mutex_lock(&j->mu);
+                if (j->final_status != AVA1_ERR_VERIFY) rc = -3 - i * 10;
+                else if (strcmp(j->message, want[i]) != 0) rc = -4 - i * 10;
+                pthread_mutex_unlock(&j->mu);
+            }
+        }
+        ava1_job_put(j);
+    }
+    ava1_data_stop();
+    return rc;
+}

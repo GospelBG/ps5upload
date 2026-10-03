@@ -727,18 +727,12 @@ typedef struct {
 
 /* Under the table lock (ava1_job_foreach), so taking a reference is refs++. A job's root
  * is written once, by ava1_recv_open, which runs under g_open_mu like this check. */
-static int root_contains(const char *parent, const char *path) {
-    size_t n = strlen(parent);
-    if (strlen(path) < n) return 0;
-    return strncmp(parent, path, n) == 0 && (path[n] == 0 || path[n] == '/');
-}
-
 static void root_each(ava1_job_t *j, void *ctx) {
     root_q_t *q = ctx;
     if (memcmp(j->id, q->id, 16) != 0 && (j->kind == AVA1_JOB_UPLOAD || j->kind == AVA1_JOB_COPY) &&
-        (root_contains(j->root, q->root) || root_contains(q->root, j->root) ||
+        (ava1_copy_paths_overlap(j->root, q->root) ||
          (j->kind == AVA1_JOB_COPY && __atomic_load_n(&j->copy_move, __ATOMIC_ACQUIRE) &&
-          (root_contains(j->src, q->root) || root_contains(q->root, j->src))))) {
+          ava1_copy_paths_overlap(j->src, q->root)))) {
         j->refs++;
         q->hit[q->n++] = j;
     }
@@ -931,7 +925,7 @@ int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *o
     case AVA1_METHOD_JOB_COPY: {
         ava1_job_copy_t c;
         ava1_mstore_t prepared = { 0 };
-        char dest[AVA1_MAX_PATH + 1];
+        char dest[AVA1_MAX_PATH + 1], src[AVA1_MAX_PATH + 1];
         char msg[160] = "";
         uint16_t st = AVA1_ERR_PATH;
         ava1_job_t *j;
@@ -955,7 +949,15 @@ int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *o
         if (c.dest_len <= AVA1_MAX_PATH) {
             memcpy(dest, c.dest, c.dest_len);
             dest[c.dest_len] = 0;
-            if (root_in_use(c.job_id, dest)) {
+            /* A move also takes its source out of the tree: no running writer (upload or
+             * copy) may be writing into it, nor another move reading from it. */
+            if (c.src_len <= AVA1_MAX_PATH) {
+                memcpy(src, c.src, c.src_len);
+                src[c.src_len] = 0; /* an embedded NUL only shortens it: copy_open refuses the path */
+            } else {
+                src[0] = 0;
+            }
+            if (root_in_use(c.job_id, dest) || ((c.flags & AVA1_JF_MOVE) && src[0] && root_in_use(c.job_id, src))) {
                 pthread_mutex_unlock(&g_open_mu);
                 ava1_mstore_free(&prepared);
                 return AVA1_ERR_BUSY;

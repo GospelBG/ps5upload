@@ -33,6 +33,7 @@ uint32_t ava1_copy_test_walk_delay_ms;
 int ava1_copy_test_walk_active;
 uint32_t ava1_copy_test_delete_delay_ms;
 int ava1_copy_test_delete_active;
+int ava1_copy_test_crash_before_delete;
 
 int ava1_copy_walk(const ava1_job_copy_t *c, ava1_mstore_t *out) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
@@ -54,7 +55,7 @@ int ava1_copy_walk(const ava1_job_copy_t *c, ava1_mstore_t *out) {
 }
 
 /* The in-process "network": apply the reader's message, waiting for credit. */
-static int cp_put(void *ctx, uint8_t type, uint8_t *msg, size_t len) {
+int ava1_copy_put(void *ctx, uint8_t type, uint8_t *msg, size_t len) {
     ava1_job_t *j = ctx;
     while (ava1_apply_reserve(j, len) != 0) {
         int ending;
@@ -105,7 +106,7 @@ static void *cp_reader(void *arg) {
     r.bundle = 1u << 20;
     r.skip = &c->skip;
     r.durable = c->durable;
-    r.put = cp_put;
+    r.put = ava1_copy_put;
     r.root = cp_root;
     r.ctx = j;
     r.stop = &c->stop;
@@ -158,7 +159,7 @@ static int delete_source(ava1_job_t *j) {
     return left;
 }
 
-static void cp_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len) {
+void ava1_copy_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len) {
     cp_t *c = C_(j);
     (void)flags;
     if (type == AVA1_TYPE_JOB_MAP) {
@@ -188,6 +189,11 @@ static void cp_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *b
              * below may run on this call, so the stamp goes first. */
             int left = 0;
             __atomic_store_n(&j->parked_at_ms, ava1_mono_ms(), __ATOMIC_RELEASE);
+            if (__atomic_load_n(&ava1_copy_test_crash_before_delete, __ATOMIC_ACQUIRE)) {
+                /* Tests: the payload died after the journaled Done and before the delete. */
+                __atomic_store_n(&ava1_copy_test_delete_active, 1, __ATOMIC_RELEASE);
+                return;
+            }
             if (d.status == AVA1_STATUS_OK && c->move && j->durable_ok) left = delete_source(j);
             if (left) {
                 ava1_jnl_done_t terminal = { .status = AVA1_ERR_IO };
@@ -264,6 +270,22 @@ static int path_has_inode_ancestor(const char *path, const struct stat *target) 
         if (slash == p) p[1] = 0;
         else *slash = 0;
     }
+}
+
+/* Two job roots overlap when one contains the other by path text, or by disk identity
+ * (a symlink alias or hard-linked ancestor). Paths that do not exist yet cannot alias. */
+static int text_contains(const char *parent, const char *path) {
+    size_t n = strlen(parent);
+    if (strlen(path) < n) return 0;
+    return strncmp(parent, path, n) == 0 && (path[n] == 0 || path[n] == '/');
+}
+
+int ava1_copy_paths_overlap(const char *a, const char *b) {
+    struct stat sa, sb;
+    if (text_contains(a, b) || text_contains(b, a)) return 1;
+    if (stat(a, &sa) == 0 && path_has_inode_ancestor(b, &sa) != 0) return 1;
+    if (stat(b, &sb) == 0 && path_has_inode_ancestor(a, &sb) != 0) return 1;
+    return 0;
 }
 
 /* Without JF_OVERWRITE the destination root must not exist. An absent root cannot
@@ -357,7 +379,7 @@ ava1_job_t *ava1_copy_open(const ava1_job_copy_t *in, const uint8_t owner[32],
     s.policy = AVA1_POLICY_REPLACE;
     s.flags = S_ISDIR(st.st_mode) ? 0 : AVA1_JF_SINGLE_FILE;
     s.root = dest;
-    s.emit = cp_emit;
+    s.emit = ava1_copy_emit;
     s.emit_ctx = NULL;
     s.sid = NULL; /* a local job has no session; any paired device may poll it */
     j = ava1_recv_open(&s, &ack, msg, cap);

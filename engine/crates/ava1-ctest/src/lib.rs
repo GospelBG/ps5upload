@@ -362,6 +362,8 @@ pub mod ffi {
         pub fn ava1_test_copy_walk_active() -> c_int;
         pub fn ava1_test_copy_delete_active() -> c_int;
         pub fn ava1_test_retiring_blocks_reopen() -> c_int;
+        pub fn ava1_test_copy_put_decode_failure() -> c_int;
+        pub fn ava1_test_copy_retry_changed_message() -> c_int;
         pub fn ava1_test_send_chunk_bytes() -> u64;
         pub fn ava1_send_test_begin(credit: u64);
         pub fn ava1_send_test_end();
@@ -853,6 +855,20 @@ pub fn c_retire_unlisted() -> i32 {
 pub fn c_retiring_blocks_reopen() -> i32 {
     let _lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { ffi::ava1_test_retiring_blocks_reopen() }
+}
+
+/// A copy's in-process put frees a malformed Chunk/Bundle and returns its reserved bytes
+/// (0 = it does, else the failing step).
+pub fn c_copy_put_decode_failure() -> i32 {
+    let _lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { ffi::ava1_test_copy_put_decode_failure() }
+}
+
+/// A changed-file retry reaches a copy job as ERR_VERIFY with the "source changed while
+/// copying" message (0 = it does, else the failing step).
+pub fn c_copy_retry_changed_message() -> i32 {
+    let _lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { ffi::ava1_test_copy_retry_changed_message() }
 }
 
 /// The reaper's rules, checked in C on a private data layer (0 = all hold, else the step
