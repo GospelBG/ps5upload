@@ -556,6 +556,17 @@ impl Session {
         self.est.peer_caps
     }
 
+    /// True when the node advertised `CAP_MGMT`: it serves the management methods (4 and up),
+    /// so the engine routes management through AVA1 without probing for ERR_UNKNOWN_METHOD.
+    pub fn has_mgmt(&self) -> bool {
+        self.est.peer_caps & gen::CAP_MGMT != 0
+    }
+
+    /// True when the node advertised `CAP_DATA_PLANE`.
+    pub fn has_data_plane(&self) -> bool {
+        self.est.peer_caps & gen::CAP_DATA_PLANE != 0
+    }
+
     /// True when the other device has not accepted us yet: a person must compare codes.
     /// False when it already trusts us (paired before, or it was launched by us).
     pub fn needs_user_pairing(&self) -> bool {

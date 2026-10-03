@@ -37,6 +37,7 @@
 #define PAIR_CONFIRM_MS 60000u
 #define NOTIFY_EVERY_MS 10000u
 #define THREAD_STACK (256u * 1024u)
+#define MGMT_STACK (512u * 1024u) /* = AVA1_MGMT_STACK; the thread test pins both */
 
 static const uint8_t PROLOGUE[] = { 'A', 'V', 'A', '1', ' ', 'v', '1' };
 
@@ -130,16 +131,24 @@ static void set_timeouts(int fd, uint32_t ms) {
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 }
 
-static int spawn_detached(void *(*fn)(void *), void *arg) {
+static int spawn_detached_stack(void *(*fn)(void *), void *arg, size_t stack) {
     pthread_attr_t attr;
     pthread_t t;
     int rc;
     if (pthread_attr_init(&attr) != 0) return -1;
-    (void)pthread_attr_setstacksize(&attr, THREAD_STACK);
+    (void)pthread_attr_setstacksize(&attr, stack);
     (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     rc = pthread_create(&t, &attr, fn, arg);
     pthread_attr_destroy(&attr);
     return rc == 0 ? 0 : -1;
+}
+
+static int spawn_detached(void *(*fn)(void *), void *arg) { return spawn_detached_stack(fn, arg, THREAD_STACK); }
+
+/* Management methods (4 and up, except the data plane's 16-19) call handlers written for the
+ * FTX2 management thread, which had 512 KiB; everything else keeps the 256 KiB rule. */
+static size_t rpc_stack(uint16_t method) {
+    return (method >= 4 && !(method >= 16 && method <= 19)) ? MGMT_STACK : THREAD_STACK;
 }
 
 static void conn_get(conn_t *k) {
@@ -637,7 +646,7 @@ static int do_rpc(conn_t *k, int idx, const uint8_t sid[16], uint32_t ch, const 
     j->ch = ch;
     j->method = q.method;
     conn_get(k);
-    if (spawn_detached(rpc_worker, j) != 0) {
+    if (spawn_detached_stack(rpc_worker, j, rpc_stack(q.method)) != 0) {
         conn_put(k);
         free(j->body);
         free(j);

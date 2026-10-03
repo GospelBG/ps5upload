@@ -270,6 +270,10 @@ void pop_notification(const char *message);
  * and have sensors/launch start working without a reboot. */
 void runtime_apply_ucred_jailbreak(void);
 
+/* Installs the AVA1 management table (mgmt_rpc.h) over this runtime. 0, or -1. Call before
+ * the AVA1 server starts. */
+int runtime_mgmt_install(runtime_state_t *state);
+
 /* `volatile` matches the definition in main.c — without it, the
  * compiler is allowed to cache reads across function calls into a
  * register, which on a multi-thread frame dispatcher (where every
