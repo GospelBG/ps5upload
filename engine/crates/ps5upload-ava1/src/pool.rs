@@ -12,17 +12,9 @@ use ava1::peers::PeerStore;
 use ava1::session::{connect_expecting, Session, Timing};
 use ava1::Ava1Error;
 
-/// `host:9120` — the AVA1 default port — or the whole address from `AVA1_ADDR` when
-/// it is set. That override is for the lab/chaos runs only: a single-console,
-/// whole-process override. The engine never honours it (A1) — a process-global
-/// address would silently redirect every console's transfer the moment two consoles
-/// are used.
+/// `host:9120` — the AVA1 default port. The lab can override an address on
+/// its own Pool; a process environment variable cannot redirect engine jobs.
 pub fn ava1_addr(console: &str) -> String {
-    if let Ok(a) = std::env::var("AVA1_ADDR") {
-        if !a.trim().is_empty() {
-            return a;
-        }
-    }
     format!("{}:{}", host_of(console), ava1::gen::DEFAULT_PORT)
 }
 
@@ -52,6 +44,17 @@ pub struct Pool {
 }
 
 impl Pool {
+    fn unavailable() -> Pool {
+        Pool {
+            dir: PathBuf::new(),
+            me: Err("no PS5Upload data directory; AVA1 identity unavailable".into()),
+            peers: Arc::new(Mutex::new(PeerStore::in_memory())),
+            sessions: tokio::sync::Mutex::default(),
+            addr: None,
+            attempts: AtomicUsize::new(0),
+        }
+    }
+
     pub fn new(dir: PathBuf) -> Pool {
         let _ = std::fs::create_dir_all(&dir);
         let me = Identity::load_or_create(&dir.join("identity"))
@@ -84,6 +87,10 @@ impl Pool {
 
     pub fn ava_dir(&self) -> &Path {
         &self.dir
+    }
+
+    pub fn has_identity(&self) -> bool {
+        self.me.is_ok()
     }
 
     /// The address `session()` connects to: the per-pool override first (A1: the
@@ -212,25 +219,41 @@ impl Pool {
     }
 }
 
-/// `<data dir>/ava` — the same rules as the engine's `remote::store::data_dir()`
-/// (which returns `Option` and has no CWD fallback; this crate needs a directory, so
-/// it keeps the plan's last resort).
-fn data_dir() -> PathBuf {
-    if let Ok(v) = std::env::var("PS5UPLOAD_DATA_DIR") {
-        if !v.trim().is_empty() {
-            return PathBuf::from(v);
-        }
-    }
-    if let Ok(h) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        if !h.trim().is_empty() {
-            return PathBuf::from(h).join(".ps5upload");
-        }
-    }
-    PathBuf::from(".ps5upload")
+/// `<data dir>/ava` — the same rules as the engine's `remote::store::data_dir()`.
+/// Without a data directory no identity is created in the current directory.
+fn data_dir() -> Option<PathBuf> {
+    let data = std::env::var("PS5UPLOAD_DATA_DIR").ok();
+    let home = std::env::var("HOME").ok();
+    let profile = std::env::var("USERPROFILE").ok();
+    data_dir_from(data.as_deref(), home.as_deref(), profile.as_deref())
+}
+
+fn data_dir_from(data: Option<&str>, home: Option<&str>, profile: Option<&str>) -> Option<PathBuf> {
+    data.filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|v| !v.trim().is_empty())
+                .or_else(|| profile.filter(|v| !v.trim().is_empty()))
+                .map(|v| PathBuf::from(v).join(".ps5upload"))
+        })
 }
 
 /// The process's pool (identity, peers and pins under `<data dir>/ava`).
 pub fn pool() -> &'static Pool {
     static P: OnceLock<Pool> = OnceLock::new();
-    P.get_or_init(|| Pool::new(data_dir().join("ava")))
+    P.get_or_init(|| match data_dir() {
+        Some(dir) => Pool::new(dir.join("ava")),
+        None => Pool::unavailable(),
+    })
+}
+
+#[cfg(test)]
+mod data_dir_tests {
+    use super::data_dir_from;
+
+    #[test]
+    fn no_data_directory_never_falls_back_to_the_current_directory() {
+        assert_eq!(data_dir_from(None, None, None), None);
+        assert_eq!(data_dir_from(Some(" "), Some(""), None), None);
+    }
 }

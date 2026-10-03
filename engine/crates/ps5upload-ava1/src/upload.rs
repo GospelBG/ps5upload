@@ -13,6 +13,7 @@ use ava1::gen;
 use ava1::manifest::{self, Entry, Manifest};
 use ava1::send::{send_job, Progress, SendError, SendOptions};
 use ava1::source::{LocalSource, Source};
+use ava1::Ava1Error;
 use ps5upload_core::transfer::{FileListEntry, TransferConfig, TransferResult};
 
 use crate::pool::{pool, Pool};
@@ -61,6 +62,42 @@ pub struct PostCommitError {
     pub kind: PostCommitKind,
     /// The console's own message, when it sent one.
     pub detail: String,
+}
+
+/// A refusal or terminal connection failure with a stable reason for the UI.
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+pub struct UploadFailure {
+    pub reason: String,
+    pub detail: String,
+}
+
+fn refusal_reason(status: u16) -> String {
+    match status {
+        gen::ERR_NO_SPACE => "ava1_no_space".into(),
+        gen::ERR_PATH => "ava1_not_allowed".into(),
+        gen::ERR_EXISTS => "ava1_exists".into(),
+        gen::ERR_CROSS_DEVICE => "ava1_cross_device".into(),
+        _ => format!("ava1_refused_{status}"),
+    }
+}
+
+fn terminal_connection_reason(error: &Ava1Error) -> Option<&'static str> {
+    match error {
+        Ava1Error::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            Some("ava1_unreachable")
+        }
+        Ava1Error::NotPaired => Some("ava1_not_paired"),
+        Ava1Error::WrongPeer => Some("ava1_wrong_console"),
+        _ => None,
+    }
+}
+
+fn refusal(status: u16, message: String) -> UploadFailure {
+    UploadFailure {
+        reason: refusal_reason(status),
+        detail: format!("console refused the transfer ({status}): {message}"),
+    }
 }
 
 impl PostCommitError {
@@ -113,8 +150,16 @@ pub fn upload_with_in(
     let persist = pool.ava_dir().join("send").join(hex(&job_id));
     let dest = opts.root.clone();
     crate::block_on(async {
+        if !pool.has_identity() {
+            return Err(UploadFailure {
+                reason: "ava1_no_identity".into(),
+                detail: "no AVA1 identity is available".into(),
+            }
+            .into());
+        }
         let _bridge = Bridge::start(progress.clone(), cfg);
         let mut backoff = Duration::from_millis(250);
+        let mut terminal_attempts = 0;
         let (mut last_at, mut last_durable) = (Instant::now(), 0u64);
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -131,10 +176,23 @@ pub fn upload_with_in(
             let session = match pool.session(console).await {
                 Ok(s) => s,
                 Err(e) => {
+                    if let Some(reason) = terminal_connection_reason(&e) {
+                        terminal_attempts += 1;
+                        if terminal_attempts >= 3 {
+                            return Err(UploadFailure {
+                                reason: reason.into(),
+                                detail: e.to_string(),
+                            }
+                            .into());
+                        }
+                    } else {
+                        terminal_attempts = 0;
+                    }
                     wait(&mut backoff, &e.to_string()).await;
                     continue;
                 }
             };
+            terminal_attempts = 0;
             let mut link = session.job(job_id);
             let o = SendOptions {
                 kind: opts.kind,
@@ -181,13 +239,7 @@ pub fn upload_with_in(
                 Ok(r) if r.status == gen::ERR_CROSS_DEVICE => {
                     return Err(PostCommitError::new(PostCommitKind::CrossDevice, r.message).into());
                 }
-                Ok(r) => {
-                    return Err(anyhow!(
-                        "console refused the transfer ({}): {}",
-                        r.status,
-                        r.message.unwrap_or_default()
-                    ))
-                }
+                Ok(r) => return Err(refusal(r.status, r.message.unwrap_or_default()).into()),
                 Err(SendError::Disconnected(why)) => {
                     let durable = progress.bytes_durable.load(Ordering::Relaxed);
                     pool.forget(console).await;
@@ -200,6 +252,9 @@ pub fn upload_with_in(
                     return Err(
                         PostCommitError::new(PostCommitKind::CrossDevice, Some(message)).into(),
                     );
+                }
+                Err(SendError::Refused { status, message }) => {
+                    return Err(refusal(status, message).into());
                 }
                 Err(SendError::Cancelled) => return Err(anyhow!("transfer_cancelled")),
                 Err(e) => return Err(anyhow!(e)),
@@ -280,6 +335,37 @@ pub fn upload_dir_in(
     )
 }
 
+/// The path within an AVA1 job's destination root. FTX2 treats relative list
+/// destinations as relative to that root; absolute destinations must really be
+/// below it, with a path-component boundary.
+fn relative_list_path(dest_root: &str, dest: &str) -> Result<String> {
+    let root = if dest_root == "/" {
+        "/"
+    } else {
+        dest_root.trim_end_matches('/')
+    };
+    let rel = if dest.starts_with('/') {
+        Path::new(dest)
+            .strip_prefix(Path::new(root))
+            .map_err(|_| anyhow!("{dest} is not under {root}"))?
+    } else {
+        Path::new(dest)
+    };
+    let rel = rel
+        .to_str()
+        .ok_or_else(|| anyhow!("destination is not UTF-8"))?;
+    manifest::check_path(rel)?;
+    Ok(rel.to_owned())
+}
+
+/// A mixed file list may contain absolute paths outside the AVA1 job root.
+/// The engine routes that entire job through FTX2, which supports them.
+pub fn upload_list_supported(dest_root: &str, entries: &[FileListEntry]) -> bool {
+    entries
+        .iter()
+        .all(|e| relative_list_path(dest_root, &e.dest).is_ok())
+}
+
 pub fn upload_list_in(
     pool: &Pool,
     cfg: &TransferConfig,
@@ -287,16 +373,14 @@ pub fn upload_list_in(
     dest_root: &str,
     entries: &[FileListEntry],
 ) -> Result<TransferResult> {
-    let root = dest_root.trim_end_matches('/');
+    let root = if dest_root == "/" {
+        "/"
+    } else {
+        dest_root.trim_end_matches('/')
+    };
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     for e in entries {
-        let rel = e
-            .dest
-            .strip_prefix(root)
-            .map(|r| r.trim_start_matches('/'))
-            .filter(|r| !r.is_empty())
-            .ok_or_else(|| anyhow!("{} is not under {root}", e.dest))?;
-        files.push((rel.to_string(), e.src.clone().into()));
+        files.push((relative_list_path(root, &e.dest)?, e.src.clone().into()));
     }
     // Exactly manifest::walk's order (depth-first preorder: component comparison).
     files.sort_by(|a, b| a.0.split('/').cmp(b.0.split('/')));
@@ -376,4 +460,83 @@ pub fn upload_list(
     entries: &[FileListEntry],
 ) -> Result<TransferResult> {
     upload_list_in(pool(), cfg, job_id, dest_root, entries)
+}
+
+#[cfg(test)]
+mod list_destination_tests {
+    use super::{relative_list_path, upload_list_supported};
+    use ps5upload_core::transfer::FileListEntry;
+
+    #[test]
+    fn relative_destination_stays_under_the_requested_root() {
+        assert_eq!(
+            relative_list_path("/data/games", "Title/file.bin").unwrap(),
+            "Title/file.bin"
+        );
+    }
+
+    #[test]
+    fn an_absolute_destination_uses_path_components() {
+        assert_eq!(
+            relative_list_path("/data/games", "/data/games/Title/file.bin").unwrap(),
+            "Title/file.bin"
+        );
+        assert!(relative_list_path("/data/games", "/data/gamesX/file.bin").is_err());
+    }
+
+    #[test]
+    fn a_destination_outside_the_root_is_rejected() {
+        assert!(relative_list_path("/data/games", "/data/other/file.bin").is_err());
+        assert!(relative_list_path("/data/games", "../other/file.bin").is_err());
+    }
+
+    #[test]
+    fn a_mixed_list_with_one_outside_path_uses_the_ftx2_route() {
+        let entries = [
+            FileListEntry {
+                src: "a".into(),
+                dest: "Title/a".into(),
+            },
+            FileListEntry {
+                src: "b".into(),
+                dest: "/data/other/b".into(),
+            },
+        ];
+        assert!(!upload_list_supported("/data/games", &entries));
+    }
+}
+
+#[cfg(test)]
+mod failure_reason_tests {
+    use super::{refusal_reason, terminal_connection_reason};
+    use ava1::{gen, Ava1Error};
+    use std::io;
+
+    #[test]
+    fn connection_refusal_and_pairing_errors_have_distinct_terminal_reasons() {
+        assert_eq!(
+            terminal_connection_reason(&Ava1Error::Io(io::Error::from(
+                io::ErrorKind::ConnectionRefused
+            ))),
+            Some("ava1_unreachable")
+        );
+        assert_eq!(
+            terminal_connection_reason(&Ava1Error::NotPaired),
+            Some("ava1_not_paired")
+        );
+        assert_eq!(
+            terminal_connection_reason(&Ava1Error::WrongPeer),
+            Some("ava1_wrong_console")
+        );
+        assert_eq!(terminal_connection_reason(&Ava1Error::Timeout), None);
+    }
+
+    #[test]
+    fn refusals_keep_their_machine_reason() {
+        assert_eq!(refusal_reason(gen::ERR_NO_SPACE), "ava1_no_space");
+        assert_eq!(refusal_reason(gen::ERR_PATH), "ava1_not_allowed");
+        assert_eq!(refusal_reason(gen::ERR_EXISTS), "ava1_exists");
+        assert_eq!(refusal_reason(gen::ERR_CROSS_DEVICE), "ava1_cross_device");
+        assert_eq!(refusal_reason(65535), "ava1_refused_65535");
+    }
 }

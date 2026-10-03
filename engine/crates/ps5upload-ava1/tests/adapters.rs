@@ -182,7 +182,7 @@ async fn upload_dir_lands_and_reports_progress() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn upload_list_maps_absolute_destinations_under_the_root() {
+async fn upload_list_maps_relative_destinations_under_the_root() {
     let d = temp_dir("list");
     std::fs::create_dir_all(d.join("a")).unwrap();
     std::fs::write(d.join("a/1"), b"one").unwrap();
@@ -191,11 +191,11 @@ async fn upload_list_maps_absolute_destinations_under_the_root() {
     let entries = vec![
         FileListEntry {
             src: d.join("a/1").to_string_lossy().into_owned(),
-            dest: "list/x/1".into(),
+            dest: "x/1".into(),
         },
         FileListEntry {
             src: d.join("a/2").to_string_lossy().into_owned(),
-            dest: "list/y/2".into(),
+            dest: "y/2".into(),
         },
     ];
     let c = cfg();
@@ -225,7 +225,7 @@ async fn upload_list_maps_absolute_destinations_under_the_root() {
     // (a fresh pool never connects).
     let bad = vec![FileListEntry {
         src: d.join("a/1").to_string_lossy().into_owned(),
-        dest: "elsewhere/3".into(),
+        dest: "/elsewhere/3".into(),
     }];
     let c2 = cfg();
     let p2 = Pool::new(d.join("ava")).with_addr("127.0.0.1:1");

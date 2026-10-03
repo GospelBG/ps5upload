@@ -338,14 +338,13 @@ pub(crate) enum JobState {
 /// parseable. Single call site for every transfer handler's `Err(e)`
 /// branch so the structured-field plumbing stays consistent.
 fn job_failed_from_err(started_at_ms: u64, completed_at_ms: u64, err: &anyhow::Error) -> JobState {
-    // A post-commit refusal (Task 22's typed error) must be matched before
-    // `extract_payload_error`: every byte is already durable on the console,
-    // the destination is taken, and nothing about sending it again changes
-    // that — so the reason is terminal and the client never auto-recovers it
+    // A typed commit refusal must be matched before `extract_payload_error`:
+    // the destination is unavailable, and retrying the same job cannot fix it,
+    // whether the refusal arrived before or after the data was sent.
     // (C2). The reason is built from the typed `PostCommitKind` (`as_str()` is
     // the crate's single mapping), never parsed out of the Display (C1/A2).
     if let Some(pce) = err.downcast_ref::<ps5upload_ava1::PostCommitError>() {
-        log_error!("transfer job failed after every byte was durable: {err:#}");
+        log_error!("the console refused to finish the transfer job: {err:#}");
         return JobState::Failed {
             started_at_ms,
             completed_at_ms,
@@ -353,6 +352,21 @@ fn job_failed_from_err(started_at_ms: u64, completed_at_ms: u64, err: &anyhow::E
             error: format!("{err:#}"),
             error_reason: Some(pce.kind.as_str().into()),
             error_detail: Some(pce.detail.clone()), // the console's message
+        };
+    }
+    if let Some(failure) = err.downcast_ref::<ps5upload_ava1::upload::UploadFailure>() {
+        log_error!(
+            "transfer job failed: {} (reason={})",
+            failure.detail,
+            failure.reason
+        );
+        return JobState::Failed {
+            started_at_ms,
+            completed_at_ms,
+            elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
+            error: failure.detail.clone(),
+            error_reason: Some(failure.reason.clone()),
+            error_detail: Some(failure.detail.clone()),
         };
     }
     let (reason, detail) = extract_payload_error(err);
@@ -7648,7 +7662,8 @@ async fn transfer_file_list_handler(
         // AVA1 (Task 22) or FTX2 for this job. The probe may take up to
         // ~3 s on the first AUTO job per console; it runs here, on the
         // blocking thread, and its session is reused by the transfer.
-        let use_ava1 = ps5upload_ava1::route::use_ava1(&addr);
+        let use_ava1 = ps5upload_ava1::route::use_ava1(&addr)
+            && ps5upload_ava1::upload::upload_list_supported(&req.dest_root, &entries);
         crate::log_info!(
             "transfer_file_list: job={job_id} protocol={}",
             if use_ava1 { "ava1" } else { "ftx2" }
@@ -8604,7 +8619,8 @@ async fn transfer_dir_reconcile_handler(
         // AVA1 (Task 22) or FTX2 for this job. The probe may take up to
         // ~3 s on the first AUTO job per console; it runs here, on the
         // blocking thread, and its session is reused by the transfer.
-        let use_ava1 = ps5upload_ava1::route::use_ava1(&addr);
+        let use_ava1 = ps5upload_ava1::route::use_ava1(&addr)
+            && ps5upload_ava1::upload::upload_list_supported(&req.dest_root, &entries);
         crate::log_info!(
             "reconcile: job={job_id} protocol={}{}",
             if use_ava1 { "ava1" } else { "ftx2" },
@@ -10477,6 +10493,25 @@ mod helpers_tests {
     // ── AVA1 post-commit mapping — the reason pair the client keys on (A1) ────
 
     #[test]
+    fn an_ava1_refusal_reaches_the_job_with_its_reason_and_detail() {
+        let e = anyhow::Error::from(ps5upload_ava1::upload::UploadFailure {
+            reason: "ava1_no_space".into(),
+            detail: "console drive is full".into(),
+        });
+        match job_failed_from_err(100, 200, &e) {
+            JobState::Failed {
+                error_reason,
+                error_detail,
+                ..
+            } => {
+                assert_eq!(error_reason.as_deref(), Some("ava1_no_space"));
+                assert_eq!(error_detail.as_deref(), Some("console drive is full"));
+            }
+            _ => panic!("expected Failed state"),
+        }
+    }
+
+    #[test]
     fn a_post_commit_failure_has_its_own_reason() {
         let pce = ps5upload_ava1::PostCommitError {
             kind: ps5upload_ava1::PostCommitKind::Exists,
@@ -10524,8 +10559,8 @@ mod helpers_tests {
 
     #[test]
     fn a_post_commit_error_is_not_retryable() {
-        // The queue re-run guarantee: every byte is durable and the
-        // destination is taken, so nothing may retry this failure.
+        // This pins the typed reason. The adapter's early return on this status
+        // is the retry guarantee; this helper does not run the upload loop.
         let pce = ps5upload_ava1::PostCommitError {
             kind: ps5upload_ava1::PostCommitKind::Exists,
             detail: "destination taken".to_string(),
