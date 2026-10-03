@@ -554,7 +554,7 @@ Scenarios:
   download      --src console path      --dest local directory (default: a temp directory)
   copy          --src console path      --dest console path (same console)
   drop60        --src local file/dir    --dest console DIR   AVA1 only: connections killed
-                every --kill-every-s (default 60) seconds through an in-process proxy;
+                every --kill-every-s seconds through an in-process proxy;
                 passes only with drops > 0 and resent <= drops x 64 MiB
   resume        --src local file/dir    --dest console path  payload stopped at 50 % durable
                 and re-sent (needs --elf); passes only if no durable byte went twice
@@ -577,7 +577,9 @@ Options:
                         payload/ps5upload.elf or ../payload/ps5upload.elf)
   --to CONSOLE2         second console for `relay`
   --out FILE            results file (default: <data dir>/bench-results.jsonl)
-  --kill-every-s N      drop60 only: seconds between kills (default 60)
+  --kill-every-s N      drop60 only: seconds between kills (default min(60, expected
+                        seconds / 4) at ~100 MB/s, so a run sees at least ~3 kills; a run
+                        with zero kills is reported as 'not exercised')
 
 Every attempt has a deadline: 120 s + bytes / 5 MB/s + files / 50 s; expiry fails the run
 (and stops the remaining runs, since the abandoned transfer may still be running).
@@ -658,7 +660,8 @@ pub struct BenchArgs {
     pub elf: Option<PathBuf>,
     pub to: Option<String>,
     pub out: Option<PathBuf>,
-    pub kill_every_s: u64,
+    /// `None` = derive it from the corpus size (see `derive_kill_interval`).
+    pub kill_every_s: Option<u64>,
     pub warmup: bool,
 }
 
@@ -676,7 +679,7 @@ impl BenchArgs {
         let mut pos: Vec<&str> = Vec::new();
         let (mut proto, mut src, mut dest, mut elf, mut to, mut out) =
             (None, None, None, None, None, None);
-        let (mut runs, mut kill_every_s, mut warmup) = (1u32, 60u64, false);
+        let (mut runs, mut kill_every_s, mut warmup) = (1u32, None::<u64>, false);
         let mut i = 0;
         while i < a.len() {
             let Some(flag) = a[i].strip_prefix("--") else {
@@ -709,11 +712,12 @@ impl BenchArgs {
                     }
                 }
                 "kill-every-s" => {
-                    kill_every_s = v
-                        .parse()
-                        .ok()
-                        .filter(|n| *n > 0)
-                        .ok_or_else(|| anyhow!("--kill-every-s needs a positive number"))?;
+                    kill_every_s = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|n| *n > 0)
+                            .ok_or_else(|| anyhow!("--kill-every-s needs a positive number"))?,
+                    );
                 }
                 _ => bail!("unknown option --{flag} (see `bench --help`)"),
             }
@@ -934,7 +938,7 @@ impl BenchRun {
 /// window of resent bytes per drop.
 pub fn drop60_verdict(resent: u64, drops: u64) -> Result<(), String> {
     if drops == 0 {
-        return Err("no drops".into());
+        return Err(NOT_EXERCISED.into());
     }
     let allowed = drops.saturating_mul(64 << 20);
     if resent > allowed {
@@ -944,6 +948,68 @@ pub fn drop60_verdict(resent: u64, drops: u64) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Throughput assumed when sizing the drop60 kill interval (the PS5 plateau is ~100 MB/s).
+const ASSUMED_MB_S: u64 = 100;
+
+/// drop60 kill interval: the explicit flag, else min(60, expected seconds / 4) at
+/// `ASSUMED_MB_S` (at least 1 s), so a run long enough to matter sees at least three kills.
+pub fn derive_kill_interval(explicit: Option<u64>, bytes: u64) -> u64 {
+    explicit.unwrap_or_else(|| {
+        let expected_s = bytes / (ASSUMED_MB_S * 1_000_000);
+        (expected_s / 4).clamp(1, 60)
+    })
+}
+
+/// The hint printed with a drop60 run in which the fault never fired.
+pub const NOT_EXERCISED: &str =
+    "not exercised: no connection was dropped before the transfer finished \
+     (use a larger --src or a shorter --kill-every-s)";
+
+/// Waits until every `host:port` accepts a TCP connection (the restarted helper's
+/// listeners come up some seconds after `send-elf` returns) or `deadline` passes. Each
+/// address must answer on two consecutive probes so a listener that is still being set up
+/// is not mistaken for ready. Returns the time waited, or which addresses stayed silent.
+pub fn wait_for_ports(
+    addrs: &[String],
+    deadline: Duration,
+    poll: Duration,
+) -> Result<Duration, String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let start = Instant::now();
+    let probe = |a: &str| -> bool {
+        a.to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())
+            .is_some_and(|sa| TcpStream::connect_timeout(&sa, Duration::from_secs(2)).is_ok())
+    };
+    let mut streak = vec![0u32; addrs.len()];
+    loop {
+        for (i, a) in addrs.iter().enumerate() {
+            streak[i] = if probe(a) { streak[i] + 1 } else { 0 };
+        }
+        if streak.iter().all(|n| *n >= 2) {
+            return Ok(start.elapsed());
+        }
+        if start.elapsed() >= deadline {
+            let silent: Vec<&str> = addrs
+                .iter()
+                .zip(&streak)
+                .filter(|(_, n)| **n < 2)
+                .map(|(a, _)| a.as_str())
+                .collect();
+            return Err(format!(
+                "{} not answering after {} s",
+                silent.join(", "),
+                deadline.as_secs()
+            ));
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// How long the helper gets to come back after a restart or before a cleanup.
+const PORTS_DEADLINE: Duration = Duration::from_secs(60);
 
 /// C14: the middle value, or the mean of the two middle values of an even count; `None`
 /// for no values (printed as `n/a`).
@@ -1439,12 +1505,40 @@ fn new_op_id() -> u64 {
 /// The upload itself, on a blocking thread: AVA1 through the adapter the engine uses,
 /// FTX2 through 4-stream file lists for a folder (what the app uses for game folders)
 /// and the resumable single-file path for a file (C4, C5).
+/// Hand-off between `run_resume` and an FTX2 upload thread. The FTX2 client's own retry
+/// loop would burn its attempts (31 s of backoff) while the restarted helper is still
+/// binding its ports, so for the fault run the harness drives the retry itself: attempt 0
+/// has no retries; after the restart is ready the same tx id is resumed with
+/// `TX_FLAG_RESUME`, exactly what the engine does for a user-initiated resume.
+struct FaultGate {
+    /// 0 = no fault yet, 1 = restarting, 2 = helper ready again.
+    state: std::sync::atomic::AtomicU8,
+    /// Bytes the first (interrupted) attempt had put on the wire when it failed.
+    first_attempt_bytes: AtomicU64,
+    progress: Arc<AtomicU64>,
+}
+
+const GATE_IDLE: u8 = 0;
+const GATE_RESTARTING: u8 = 1;
+const GATE_READY: u8 = 2;
+
 fn spawn_upload(
     pool: PoolRef,
     args: &BenchArgs,
     prep: &Prep,
     cfg: TransferConfig,
     id: [u8; 16],
+) -> tokio::task::JoinHandle<(f64, anyhow::Result<TransferResult>)> {
+    spawn_upload_gated(pool, args, prep, cfg, id, None)
+}
+
+fn spawn_upload_gated(
+    pool: PoolRef,
+    args: &BenchArgs,
+    prep: &Prep,
+    cfg: TransferConfig,
+    id: [u8; 16],
+    gate: Option<Arc<FaultGate>>,
 ) -> tokio::task::JoinHandle<(f64, anyhow::Result<TransferResult>)> {
     let (proto, dest, src) = (
         args.proto,
@@ -1461,19 +1555,48 @@ fn spawn_upload(
             (Proto::Ava1, false) => {
                 ps5upload_ava1::upload::upload_file_in(pool.get(), &cfg, id, &dest, &src)
             }
-            (Proto::Ftx2, true) => ftx2_entries(&dest, &src).and_then(|entries| {
-                transfer_file_list_multistream(
-                    &cfg,
-                    id,
-                    &dest,
-                    &entries,
-                    4,
-                    DEFAULT_RESUME_RETRIES,
-                    0,
-                )
-            }),
-            (Proto::Ftx2, false) => {
-                transfer_file_path_resumable(&cfg, id, &dest, &src, DEFAULT_RESUME_RETRIES, 0)
+            (Proto::Ftx2, is_dir) => {
+                let entries = if is_dir {
+                    ftx2_entries(&dest, &src)
+                } else {
+                    Ok(Vec::new())
+                };
+                entries.and_then(|entries| {
+                    let run = |retries: u32, flags: u32| {
+                        if is_dir {
+                            transfer_file_list_multistream(
+                                &cfg, id, &dest, &entries, 4, retries, flags,
+                            )
+                        } else {
+                            transfer_file_path_resumable(&cfg, id, &dest, &src, retries, flags)
+                        }
+                    };
+                    match &gate {
+                        None => run(DEFAULT_RESUME_RETRIES, 0),
+                        Some(g) => match run(0, 0) {
+                            Ok(r) => Ok(r),
+                            // Not our fault: report the failure as is.
+                            Err(e) if g.state.load(Ordering::SeqCst) == GATE_IDLE => Err(e),
+                            Err(_) => {
+                                g.first_attempt_bytes
+                                    .store(g.progress.load(Ordering::Relaxed), Ordering::SeqCst);
+                                // Wait for the restarted helper (bounded), then resume.
+                                let until =
+                                    Instant::now() + PORTS_DEADLINE + Duration::from_secs(30);
+                                while g.state.load(Ordering::SeqCst) == GATE_RESTARTING
+                                    && Instant::now() < until
+                                {
+                                    std::thread::sleep(Duration::from_millis(100));
+                                }
+                                if g.state.load(Ordering::SeqCst) != GATE_READY {
+                                    Err(anyhow!("the helper did not come back after the restart"))
+                                } else {
+                                    run(DEFAULT_RESUME_RETRIES, ftx2_proto::TX_FLAG_RESUME)
+                                }
+                            }
+                        },
+                    }
+                })
             }
         };
         (t.elapsed().as_secs_f64(), r)
@@ -1523,7 +1646,12 @@ async fn run_drop60(
     let mut m = run_upload(env, args, prep, cancel).await?;
     let drops = proxy.kills() - before;
     m.extra.insert("drops".into(), drops.into());
-    m.verdict = drop60_verdict(m.resent, drops).err();
+    if drops == 0 {
+        m.extra.insert("not_exercised".into(), true.into());
+        m.verdict = Some(NOT_EXERCISED.into());
+    } else {
+        m.verdict = drop60_verdict(m.resent, drops).err();
+    }
     Ok(m)
 }
 
@@ -1540,13 +1668,26 @@ async fn run_resume(env: &Env, args: &BenchArgs, prep: &Prep, cancel: &Arc<Atomi
     };
     let size = prep.bytes;
     let target = (size / 2).max(1);
-    let handle = spawn_upload(env.pool.clone(), args, prep, cfg, new_id());
+    let gate = Arc::new(FaultGate {
+        state: std::sync::atomic::AtomicU8::new(GATE_IDLE),
+        first_attempt_bytes: AtomicU64::new(0),
+        progress: c.bytes.clone(),
+    });
+    let handle = spawn_upload_gated(
+        env.pool.clone(),
+        args,
+        prep,
+        cfg,
+        new_id(),
+        (args.proto == Proto::Ftx2).then(|| gate.clone()),
+    );
     let mut fired: Option<(u64, f64)> = None;
     let mut fault_error: Option<String> = None;
     while !handle.is_finished() {
         let at = counter.load(Ordering::Relaxed);
         if at >= target {
             let t0 = Instant::now();
+            gate.state.store(GATE_RESTARTING, Ordering::SeqCst);
             let mgmt = args.mgmt.clone();
             let _ = blocking(move || {
                 ps5upload_core::payload_lifecycle::shutdown_running_payload(&mgmt)
@@ -1566,6 +1707,21 @@ async fn run_resume(env: &Env, args: &BenchArgs, prep: &Prep, cancel: &Arc<Atomi
             if let Err(e) = sent {
                 cancel.store(true, Ordering::Relaxed);
                 fault_error = Some(format!("re-sending the payload failed: {e}"));
+            } else if args.proto == Proto::Ftx2 {
+                // AVA1 reconnects through its own session logic (waits for :9120); FTX2
+                // needs :9113 and :9114 answering before the resume is attempted.
+                let addrs = vec![args.transfer.clone(), args.mgmt.clone()];
+                let ready = blocking(move || {
+                    wait_for_ports(&addrs, PORTS_DEADLINE, Duration::from_millis(500))
+                })
+                .await;
+                match ready {
+                    Ok(_) => gate.state.store(GATE_READY, Ordering::SeqCst),
+                    Err(e) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        fault_error = Some(format!("the helper did not come back: {e}"));
+                    }
+                }
             }
             fired = Some((at, t0.elapsed().as_secs_f64()));
             break;
@@ -1585,7 +1741,12 @@ async fn run_resume(env: &Env, args: &BenchArgs, prep: &Prep, cancel: &Arc<Atomi
     let mut m = measured_from_transfer(args.proto, &tr, secs);
     let sent = match args.proto {
         Proto::Ava1 => tr.bytes_sent,
-        Proto::Ftx2 => tr.bytes_sent.max(c.bytes.load(Ordering::Relaxed)),
+        // Honest accounting: what the interrupted attempt had sent plus what the resumed
+        // one sent (it skips shards the payload had already acknowledged).
+        Proto::Ftx2 => gate
+            .first_attempt_bytes
+            .load(Ordering::SeqCst)
+            .saturating_add(tr.bytes_sent),
     };
     m.extra.insert("sent_bytes".into(), sent.into());
     m.extra.insert("payload_size".into(), size.into());
@@ -1609,7 +1770,12 @@ async fn run_resume(env: &Env, args: &BenchArgs, prep: &Prep, cancel: &Arc<Atomi
                 }
             } else {
                 m.resent = sent.saturating_sub(size);
-                m.extra.insert("resent_best_effort".into(), true.into());
+                m.extra.insert(
+                    "first_attempt_bytes".into(),
+                    gate.first_attempt_bytes.load(Ordering::SeqCst).into(),
+                );
+                m.extra
+                    .insert("resume_attempt_bytes".into(), tr.bytes_sent.into());
             }
         }
     }
@@ -1873,6 +2039,13 @@ fn make_cfg_for(transfer: &str) -> TransferConfig {
 /// Deletes the destination between runs (C8). Missing is fine; anything else fails the
 /// run rather than measuring over leftovers.
 fn clean_console(mgmt: &str, path: &str) -> Result<(), String> {
+    // A helper restarted by the previous run (resume) may still be coming up.
+    wait_for_ports(
+        &[mgmt.to_string()],
+        PORTS_DEADLINE,
+        Duration::from_millis(500),
+    )
+    .map_err(|e| format!("cleaning {path}: management port: {e}"))?;
     match ps5upload_core::cleanup::cleanup_path(mgmt, path) {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -2082,17 +2255,34 @@ pub async fn run_bench_in(env: &Env, args: &BenchArgs) -> anyhow::Result<Vec<Ben
             .with_context(|| format!("resolving {}", args.ava1))?
             .next()
             .ok_or_else(|| anyhow!("{} resolves to nothing", args.ava1))?;
+        let src_bytes = {
+            let s = PathBuf::from(&args.src);
+            blocking(move || match std::fs::metadata(&s) {
+                Ok(m) if m.is_dir() => walk_local(&s)
+                    .map(|v| v.iter().map(|x| x.2).sum())
+                    .unwrap_or(0),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            })
+            .await
+        };
+        let kill_every_s = derive_kill_interval(args.kill_every_s, src_bytes);
         let p = ava1_chaos::ChaosProxy::start(
             upstream,
             ava1_chaos::ChaosConfig {
-                kill_every: Some(Duration::from_secs(args.kill_every_s)),
+                kill_every: Some(Duration::from_secs(kill_every_s)),
                 ..Default::default()
             },
         )
         .await?;
         println!(
-            "drop60: killing every connection each {} s through {} -> {upstream}",
-            args.kill_every_s, p.addr
+            "drop60: killing every connection each {kill_every_s} s{} through {} -> {upstream}",
+            if args.kill_every_s.is_some() {
+                ""
+            } else {
+                " (derived from the size)"
+            },
+            p.addr
         );
         env_owned = Some(Env {
             pool: PoolRef::Owned(Arc::new(
@@ -2193,7 +2383,13 @@ pub async fn run_bench_in(env: &Env, args: &BenchArgs) -> anyhow::Result<Vec<Ben
         println!(
             "run {run_no}/{} [{kind}]: {} {:.2}s {:.1} MB/s {:.1} files/s{}",
             args.runs,
-            if row.run.ok { "ok" } else { "FAILED" },
+            if row.run.ok {
+                "ok"
+            } else if row.extra.contains_key("not_exercised") {
+                "NOT EXERCISED"
+            } else {
+                "FAILED"
+            },
             row.run.seconds,
             row.run.json()["mb_s"].as_f64().unwrap_or(0.0),
             row.run.json()["files_s"].as_f64().unwrap_or(0.0),
@@ -2916,8 +3112,90 @@ mod tests {
     }
 
     #[test]
+    fn the_kill_interval_gives_at_least_three_kills_and_honours_the_flag() {
+        // 4 GiB at ~100 MB/s is ~42 s: 10 s kills.
+        assert_eq!(derive_kill_interval(None, 4 << 30), 10);
+        // A huge transfer is capped at the old 60 s default.
+        assert_eq!(derive_kill_interval(None, 100 << 30), 60);
+        // A tiny one still gets a 1 s interval, never 0.
+        assert_eq!(derive_kill_interval(None, 10_000), 1);
+        assert_eq!(derive_kill_interval(None, 0), 1);
+        // The explicit flag always wins.
+        assert_eq!(derive_kill_interval(Some(60), 4 << 30), 60);
+        assert_eq!(derive_kill_interval(Some(3), 100 << 30), 3);
+        let a = BenchArgs::parse(&[
+            "h", "drop60", "--proto", "ava1", "--src", "/x", "--dest", "/y",
+        ])
+        .unwrap();
+        assert_eq!(a.kill_every_s, None);
+        let a = BenchArgs::parse(&[
+            "h",
+            "drop60",
+            "--proto",
+            "ava1",
+            "--src",
+            "/x",
+            "--dest",
+            "/y",
+            "--kill-every-s",
+            "7",
+        ])
+        .unwrap();
+        assert_eq!(a.kill_every_s, Some(7));
+    }
+
+    #[test]
+    fn zero_drops_is_not_exercised_not_a_protocol_failure() {
+        let e = drop60_verdict(0, 0).unwrap_err();
+        assert!(e.starts_with("not exercised"), "{e}");
+        assert!(
+            e.contains("larger --src") && e.contains("--kill-every-s"),
+            "{e}"
+        );
+    }
+
+    fn free_addr() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    }
+
+    #[test]
+    fn wait_for_ports_waits_for_listeners_that_appear_late() {
+        let (a, b) = (free_addr(), free_addr());
+        let (a2, b2) = (a.clone(), b.clone());
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let la = std::net::TcpListener::bind(&a2).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            let lb = std::net::TcpListener::bind(&b2).unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+            drop((la, lb));
+        });
+        let waited =
+            wait_for_ports(&[a, b], Duration::from_secs(10), Duration::from_millis(50)).unwrap();
+        assert!(waited >= Duration::from_millis(700), "{waited:?}");
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn wait_for_ports_gives_up_at_the_deadline_naming_the_silent_port() {
+        let up = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let up_addr = up.local_addr().unwrap().to_string();
+        let down = free_addr();
+        let t = Instant::now();
+        let e = wait_for_ports(
+            &[up_addr.clone(), down.clone()],
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert!(e.contains(&down) && !e.contains(&up_addr), "{e}");
+    }
+
+    #[test]
     fn drop60_refuses_to_pass_without_drops() {
-        assert_eq!(drop60_verdict(0, 0), Err("no drops".to_string()));
+        assert_eq!(drop60_verdict(0, 0), Err(NOT_EXERCISED.to_string()));
         assert!(drop60_verdict(64 << 20, 1).is_ok());
         assert!(drop60_verdict((64 << 20) + 1, 1).is_err());
         assert!(drop60_verdict(128 << 20, 2).is_ok());
@@ -3100,7 +3378,7 @@ mod tests {
                     }
                 }
                 bench.push(format!(
-                    "bench {c} drop60 --proto ava1 --src /tmp/b/large/large-4g.bin --dest {t}/bench/drop.bin --runs 1 --kill-every-s 60 --out $O"
+                    "bench {c} drop60 --proto ava1 --src /tmp/b/large/large-4g.bin --dest {t}/bench/drop.bin --runs 1 --kill-every-s 10 --out $O"
                 ));
             }
         }
