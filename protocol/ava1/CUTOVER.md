@@ -89,6 +89,8 @@ kept.
       FTX2 (`ZipTooLarge`); they need a streaming entry reader.
 - [ ] Management RPCs: every :9114 FTX2 frame the engine core sends (list above) needs an AVA1
       method. `SPEC.md` §7.1 defines only 1–3 and 16–19. This is project 3's main work.
+- [ ] A failed multi-chunk `fs.write` (`ps5upload-ava1/src/mgmt.rs`, `write_chunks`) leaves `<path>.ps5upload.tmp` behind until the next
+  write of that path (offset 0 truncates it). Needs `job.run` DELETE (Task 5) for a best-effort cleanup; `TODO(Task 5)` marks the spot.
 - [ ] `ps5_fs_move`'s same-drive rename moves to an AVA1 RPC with the `st_dev` guard (never an
       unguarded `rename()` across mounts: that panics the console's kernel).
 - [x] NAS sources: `SourceFs` now has an `mtime` (SMB, FTP and SFTP report one; a backend that does

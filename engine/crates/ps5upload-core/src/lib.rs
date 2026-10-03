@@ -23,6 +23,7 @@ pub mod hw;
 pub mod installer_client;
 pub mod local_image;
 pub mod log;
+pub mod mgmt;
 pub mod notif;
 pub mod patch_verify;
 pub mod payload_lifecycle;

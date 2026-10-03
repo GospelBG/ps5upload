@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.23"
 blake3.workspace = true
 ava1 = { path = "../ava1" }
 ps5upload-core = { path = "../ps5upload-core" }
@@ -18,6 +19,7 @@ sevenz-rust2 = { version = "0.23", default-features = false }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
 
 [dev-dependencies]
+ftx2-proto = { path = "../ftx2-proto" }
 crc32fast = "1"
 sevenz-rust2 = { version = "0.23", default-features = false, features = ["compress"] }
 ava1-chaos = { path = "../ava1-chaos" }
