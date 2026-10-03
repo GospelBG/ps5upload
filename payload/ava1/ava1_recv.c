@@ -957,7 +957,7 @@ static void answer(ava1_job_t *j) {
     if (!j->prepared && staged_tree_landed(j)) {
         /* Stopped between the staging rename and its journaled Done: the tree is in place. */
         emit_map(j, AVA1_STATUS_OK, NULL);
-        ava1_apply_fail(j, AVA1_STATUS_OK, "", 0, 1);
+        ava1_apply_finish_landed(j);
         return;
     }
     if (!j->prepared && (st = prepare(j, msg, sizeof msg)) != AVA1_STATUS_OK) {

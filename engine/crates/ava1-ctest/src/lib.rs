@@ -358,6 +358,8 @@ pub mod ffi {
         pub fn ava1_test_retire_unlisted() -> c_int;
         pub fn ava1_test_job_counts(id: *const u8, out: *mut u64) -> c_int;
         pub fn ava1_test_data_knob(name: *const c_char, v: u32) -> c_int;
+        pub fn ava1_test_copy_walk_active() -> c_int;
+        pub fn ava1_test_copy_delete_active() -> c_int;
         pub fn ava1_test_retiring_blocks_reopen() -> c_int;
         pub fn ava1_test_send_chunk_bytes() -> u64;
         pub fn ava1_send_test_begin(credit: u64);
@@ -746,6 +748,11 @@ impl CServer {
         unsafe { ffi::ava1_test_data_delays(u32::MAX, ms) }
     }
 
+    /// Fail the directory sync at the named file, or the staged tree (u32::MAX).
+    pub fn fail_dir_sync(&self, id: u32) {
+        unsafe { ffi::ava1_test_apply_fail_dir_sync(id) }
+    }
+
     /// (bytes the apply engine has received, lane frames held) for job `id`.
     pub fn job_counts(&self, id: [u8; 16]) -> (u64, u64) {
         let mut out = [0u64; 2];
@@ -768,6 +775,14 @@ impl CServer {
             0,
             "{name}"
         );
+    }
+
+    pub fn copy_walk_active(&self) -> bool {
+        unsafe { ffi::ava1_test_copy_walk_active() != 0 }
+    }
+
+    pub fn copy_delete_active(&self) -> bool {
+        unsafe { ffi::ava1_test_copy_delete_active() != 0 }
     }
 
     /// Chunk bytes the C download sender has queued since knob "chunk_bytes" set it.

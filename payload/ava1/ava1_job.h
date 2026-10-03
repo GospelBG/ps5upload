@@ -75,6 +75,9 @@ struct ava1_job {
     char base[AVA1_MAX_PATH + 16];  /* where entries land: root, or root.ava-part */
     char dir[512];                  /* job directory (journal, manifest, outboards) */
     char src[AVA1_MAX_PATH + 1];    /* JOB_COPY source, JOB_DOWNLOAD root */
+    int copy_move;                    /* a running move also locks its source tree */
+    uint32_t copy_flags;              /* original job.copy flags; same-id opens must agree */
+    int copy_delete_done;             /* status stays running until source deletion finishes */
     ava1_mstore_t m;                /* the manifest; file ids index everything below */
     ava1_mstore_t m_in;             /* pages of a JobOpen still arriving (Task 13) */
     int have_manifest;
@@ -122,6 +125,7 @@ struct ava1_job {
     ava1_emit_fn emit;
     void *emit_ctx;
     uint16_t final_status;
+    int durable_ok;                  /* the final rename, parent sync and Done append succeeded */
     char message[128];
     /* ---- the wire (Task 14, ava1_data.c) ----
      * `cmu` is a leaf lock: held for a few field updates only, never across I/O and never

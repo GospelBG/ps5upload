@@ -68,6 +68,191 @@ async fn wait_gone(p: &std::path::Path) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn another_device_cannot_inspect_cancel_or_reopen_a_copy() {
+    let d = dir("copy-owner");
+    write_tree(&d.join("usb/g"), 100, |_| 4096);
+    let (owner, owner_peers) = paired_client(&d.join("peers"));
+    let (other, other_peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        3000,
+    );
+    let a = connect(&srv.addr(), owner, owner_peers, "owner", calm())
+        .await
+        .unwrap();
+    let b = connect(&srv.addr(), other, other_peers, "other", calm())
+        .await
+        .unwrap();
+    let id = [0x91; 16];
+    let src = d.join("usb/g");
+    let dest = d.join("data/g");
+    assert_eq!(start(&a, id, &src, &dest, 0).await, gen::STATUS_OK);
+    let reference = JobRef { job_id: id }.to_bytes().unwrap();
+    for method in [gen::METHOD_JOB_STATUS, gen::METHOD_JOB_CANCEL] {
+        assert_eq!(
+            b.rpc(method, &reference).await.unwrap().status,
+            gen::ERR_UNKNOWN_JOB
+        );
+    }
+    assert_eq!(start(&b, id, &src, &dest, 0).await, gen::ERR_UNKNOWN_JOB);
+    assert_eq!(
+        a.rpc(gen::METHOD_JOB_STATUS, &reference)
+            .await
+            .unwrap()
+            .status,
+        gen::STATUS_OK
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_source_walk_does_not_block_another_open() {
+    let d = dir("copy-slow-walk");
+    write_tree(&d.join("usb/large"), 100, |_| 1024);
+    std::fs::write(d.join("small.bin"), b"small").unwrap();
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    let s = std::sync::Arc::new(
+        connect(&srv.addr(), me, mine, "rust", calm())
+            .await
+            .unwrap(),
+    );
+    srv.knob("copy_walk_delay_ms", 1500);
+    let first_session = s.clone();
+    let first_src = d.join("usb/large");
+    let first_dest = d.join("data/large");
+    let first =
+        tokio::spawn(
+            async move { start(&first_session, [0x92; 16], &first_src, &first_dest, 0).await },
+        );
+    for _ in 0..100 {
+        if srv.copy_walk_active() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(srv.copy_walk_active(), "the source walk did not begin");
+    srv.knob("copy_walk_delay_ms", 0);
+    let second = tokio::time::timeout(
+        Duration::from_millis(700),
+        start(
+            &s,
+            [0x93; 16],
+            &d.join("small.bin"),
+            &d.join("data/small.bin"),
+            0,
+        ),
+    )
+    .await
+    .expect("another open waited for the first source walk");
+    assert_eq!(second, gen::STATUS_OK);
+    assert_eq!(first.await.unwrap(), gen::STATUS_OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reaper_keeps_a_running_copy_and_ages_a_finished_one() {
+    let d = dir("copy-reap");
+    write_tree(&d.join("usb/g"), 3000, |_| 1024);
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        3000,
+    );
+    srv.knob("park_ms", 250);
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let id = [0x94; 16];
+    assert_eq!(
+        start(&s, id, &d.join("usb/g"), &d.join("data/g"), 0).await,
+        0
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        status(&s, id).await.state,
+        Some(0),
+        "a running copy was reaped or finished too soon"
+    );
+    assert_eq!(wait_finished(&s, id).await.state, Some(1));
+    let reference = JobRef { job_id: id }.to_bytes().unwrap();
+    for _ in 0..40 {
+        let reply = s.rpc(gen::METHOD_JOB_STATUS, &reference).await.unwrap();
+        if reply.status == gen::ERR_UNKNOWN_JOB {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("a finished copy stayed listed past its park age");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_keeps_a_source_file_changed_after_copying() {
+    let d = dir("copy-source-changed");
+    let src = d.join("usb/g");
+    write_tree(&src, 2, |_| 4096);
+    let changed = src.join("d00/f00000");
+    let before = std::fs::read(&changed).unwrap();
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    srv.knob("copy_delete_delay_ms", 1000);
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let id = [0x95; 16];
+    assert_eq!(
+        start(&s, id, &src, &d.join("data/g"), gen::JF_MOVE).await,
+        0
+    );
+    for _ in 0..200 {
+        if srv.copy_delete_active() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        srv.copy_delete_active(),
+        "the move never began deleting its source"
+    );
+    std::fs::write(&changed, vec![0x55; before.len() + 1]).unwrap();
+    let st = wait_finished(&s, id).await;
+    assert_eq!(
+        st.state,
+        Some(2),
+        "a changed source file was silently deleted"
+    );
+    assert_eq!(
+        std::fs::read(&changed).unwrap(),
+        vec![0x55; before.len() + 1]
+    );
+    assert_eq!(std::fs::read(d.join("data/g/d00/f00000")).unwrap(), before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_folder_copies_on_the_console() {
     let d = dir("copy");
     write_tree(&d.join("usb/game"), 1500, |i| {
@@ -250,6 +435,73 @@ async fn a_copy_into_its_own_source_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_move_refuses_symlink_and_dotdot_aliases_of_its_source() {
+    use std::os::unix::fs::symlink;
+
+    let d = dir("copy-move-alias");
+    let src = d.join("usb/g");
+    std::fs::create_dir_all(src.join("d00")).unwrap();
+    std::fs::write(src.join("keep.bin"), b"only copy").unwrap();
+    symlink(d.join("usb"), d.join("alias")).unwrap();
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    for (id, from, to) in [
+        (0x81, d.join("usb/g/"), d.join("usb/g/b")),
+        (0x82, d.join("usb/g/d00/.."), d.join("usb/g/c")),
+        (0x83, d.join("usb/g"), d.join("alias/g")),
+    ] {
+        assert_eq!(
+            start(&s, [id; 16], &from, &to, gen::JF_MOVE | gen::JF_OVERWRITE).await,
+            gen::ERR_PATH,
+            "unsafe move {from:?} -> {to:?} was accepted"
+        );
+        assert_eq!(std::fs::read(src.join("keep.bin")).unwrap(), b"only copy");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_sync_failure_keeps_the_moves_source() {
+    let d = dir("copy-move-sync-fail");
+    let src = d.join("usb/g");
+    write_tree(&src, 6, |_| 4096);
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    srv.fail_dir_sync(u32::MAX);
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let job = [0x84; 16];
+    assert_eq!(
+        start(&s, job, &src, &d.join("data/g"), gen::JF_MOVE).await,
+        0
+    );
+    let _ = wait_finished(&s, job).await;
+    assert!(
+        src.join("d00/f00000").exists(),
+        "the source was deleted after a failed parent sync"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_second_copy_to_the_same_destination_is_refused() {
     let d = dir("copy-busy");
     write_tree(&d.join("usb/g"), 3000, |_| 2048);
@@ -272,6 +524,23 @@ async fn a_second_copy_to_the_same_destination_is_refused() {
         start(&s, a, &d.join("usb/g"), &d.join("data/g"), 0).await,
         0
     );
+    assert_eq!(
+        start(&s, a, &d.join("usb/g"), &d.join("data/other"), 0).await,
+        gen::ERR_PROTOCOL,
+        "a reused id cannot change its destination"
+    );
+    assert_eq!(
+        start(
+            &s,
+            [0x89; 16],
+            &d.join("usb/g"),
+            &d.join("data/other"),
+            1 << 30
+        )
+        .await,
+        gen::ERR_PROTOCOL,
+        "unknown copy flags must be refused"
+    );
     assert!(
         status(&s, a).await.files_done < 3000,
         "the first copy is still running"
@@ -279,6 +548,11 @@ async fn a_second_copy_to_the_same_destination_is_refused() {
     assert_eq!(
         start(&s, [0x78; 16], &d.join("usb/g"), &d.join("data/g"), 0).await,
         gen::ERR_BUSY
+    );
+    assert_eq!(
+        start(&s, [0x85; 16], &d.join("usb/g"), &d.join("data/g/child"), 0).await,
+        gen::ERR_BUSY,
+        "a nested writer must wait for the parent job"
     );
     // The same job id is not a second writer: it resumes.
     assert_eq!(
@@ -293,6 +567,124 @@ async fn a_second_copy_to_the_same_destination_is_refused() {
         .await
         .unwrap();
     assert_eq!(c.status, gen::STATUS_OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_move_locks_its_source_against_writers() {
+    let d = dir("copy-move-source-busy");
+    write_tree(&d.join("usb/g"), 3000, |_| 2048);
+    std::fs::create_dir_all(d.join("other")).unwrap();
+    std::fs::write(d.join("other/one"), b"one").unwrap();
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        3000,
+    );
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let moving = [0x86; 16];
+    assert_eq!(
+        start(
+            &s,
+            moving,
+            &d.join("usb/g"),
+            &d.join("data/g"),
+            gen::JF_MOVE
+        )
+        .await,
+        0
+    );
+    assert!(status(&s, moving).await.files_done < 3000);
+    assert_eq!(
+        start(
+            &s,
+            [0x87; 16],
+            &d.join("other/one"),
+            &d.join("usb/g/other"),
+            gen::JF_OVERWRITE
+        )
+        .await,
+        gen::ERR_BUSY,
+        "a writer must not change a running move's source"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_reports_a_source_file_it_could_not_delete() {
+    let d = dir("copy-move-delete-fail");
+    let src = d.join("usb/g");
+    write_tree(&src, 40, |_| 4096);
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        3000,
+    );
+    srv.knob("copy_delete_delay_ms", 1000);
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let job = [0x88; 16];
+    assert_eq!(
+        start(&s, job, &src, &d.join("data/g"), gen::JF_MOVE).await,
+        0
+    );
+    for _ in 0..200 {
+        if srv.copy_delete_active() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(srv.copy_delete_active());
+    let extra = src.join("added-after-copy.bin");
+    std::fs::write(&extra, b"must stay at source").unwrap();
+    let st = wait_finished(&s, job).await;
+    assert_eq!(
+        st.state,
+        Some(2),
+        "a move with leftover source files reported success"
+    );
+    assert_eq!(std::fs::read(extra).unwrap(), b"must stay at source");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_copy_can_retry_under_the_same_id() {
+    let d = dir("copy-retry-failed");
+    let src = d.join("usb/g");
+    write_tree(&src, 8, |_| 4096);
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    srv.fail_dir_sync(u32::MAX);
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let job = [0x8a; 16];
+    let dest = d.join("data/g");
+    assert_eq!(start(&s, job, &src, &dest, 0).await, 0);
+    assert_eq!(wait_finished(&s, job).await.state, Some(2));
+    srv.fail_dir_sync(u32::MAX - 1);
+    assert_eq!(start(&s, job, &src, &dest, 0).await, 0);
+    let retry = wait_finished(&s, job).await;
+    assert_eq!(retry.state, Some(1), "retry ended: {:?}", retry.current);
+    assert!(same_tree(&src, &dest));
 }
 
 #[tokio::test(flavor = "multi_thread")]

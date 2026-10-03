@@ -245,6 +245,7 @@ void ava1_apply_status(ava1_job_t *j) {
  * one place sets `finished`, journals Done and sends JobDone, exactly once. */
 void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, int journal_done) {
     int first;
+    int done_written = 0;
     uint64_t credit = 0;
     pthread_mutex_lock(&j->mu);
     first = !j->finished;
@@ -266,8 +267,16 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
         ava1_w_t w;
         d.status = status;
         ava1_w_init(&w, b, sizeof b);
-        if (ava1_jnl_done_encode(&d, &w) == 0) (void)ava1_jnl_append(&j->jnl, AVA1_JNL_DONE, b, w.len);
+        if (ava1_jnl_done_encode(&d, &w) == 0 && ava1_jnl_append(&j->jnl, AVA1_JNL_DONE, b, w.len) == 0)
+            done_written = 1;
     }
+    pthread_mutex_lock(&j->mu);
+    j->durable_ok = status == AVA1_STATUS_OK && err == 0 && done_written;
+    if (status == AVA1_STATUS_OK && journal_done && !done_written) {
+        j->final_status = AVA1_ERR_IO;
+        snprintf(j->message, sizeof j->message, "journal append failed");
+    }
+    pthread_mutex_unlock(&j->mu);
     emit_done(j);
 }
 
@@ -1249,7 +1258,8 @@ static void finish(ava1_job_t *j) {
         if (e) {
             /* The tree is in place and complete; only the rename's own durability is in
              * doubt. Reporting ERR_IO would make the sender resend a finished tree. */
-            ava1_apply_fail(j, AVA1_STATUS_OK, "the folder is in place; syncing its parent failed", e, 1);
+            ava1_apply_fail(j, j->kind == AVA1_JOB_COPY ? AVA1_ERR_IO : AVA1_STATUS_OK,
+                            "the folder is in place; syncing its parent failed", e, 1);
             return;
         }
         HOOK(j, AVA1_HOOK_DIR_SYNCED, UINT32_MAX);
@@ -1259,6 +1269,15 @@ static void finish(ava1_job_t *j) {
         }
     }
     ava1_apply_fail(j, AVA1_STATUS_OK, "", 0, 1); /* the success path: see ava1_apply_fail */
+}
+
+void ava1_apply_finish_landed(ava1_job_t *j) {
+    char parent[PATH_CAP];
+    int err;
+    parent_of(j->root, parent, sizeof parent);
+    err = sync_dir(parent);
+    if (err) ava1_apply_fail(j, AVA1_ERR_IO, "syncing the landed folder failed", err, 1);
+    else ava1_apply_fail(j, AVA1_STATUS_OK, "", 0, 1);
 }
 
 void ava1_apply_quiesce(ava1_job_t *j) {

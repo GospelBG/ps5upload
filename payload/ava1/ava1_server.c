@@ -99,6 +99,9 @@ static struct {
 } S = { .listen_fd = -1 };
 
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+static __thread uint8_t rpc_peer[32];
+
+const uint8_t *ava1_server_rpc_peer(void) { return rpc_peer; }
 /* Serialises peers-file writes. Taken before mu, and held across the write so two
  * pairings land in order; mu itself is never held during file I/O. */
 static pthread_mutex_t store_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -534,6 +537,7 @@ typedef struct {
     conn_t *k;
     int idx;
     uint8_t sid[16];
+    uint8_t peer[32];
     uint32_t ch;
     uint16_t method;
     uint8_t *body;
@@ -545,6 +549,7 @@ static void *rpc_worker(void *arg) {
     uint8_t *out = malloc(RPC_OUT_MAX);
     size_t out_len = 0;
     int status = AVA1_ERR_INTERNAL;
+    memcpy(rpc_peer, j->peer, sizeof rpc_peer);
     if (out && S.cfg.rpc) status = S.cfg.rpc(j->method, j->body, j->body_len, out, RPC_OUT_MAX, &out_len);
     else if (out) status = AVA1_ERR_UNKNOWN_METHOD;
     /* A handler that claims more than the buffer holds must not make us read past it. */
@@ -608,6 +613,9 @@ static int do_rpc(conn_t *k, int idx, const uint8_t sid[16], uint32_t ch, const 
     j->k = k;
     j->idx = idx;
     memcpy(j->sid, sid, 16);
+    pthread_mutex_lock(&mu);
+    if (sess_is_locked(idx, sid)) memcpy(j->peer, S.sessions[idx].peer_key, 32);
+    pthread_mutex_unlock(&mu);
     j->ch = ch;
     j->method = q.method;
     conn_get(k);
@@ -1176,4 +1184,3 @@ void ava1_server_stop(void) {
     S.accept_started = 0;
     pthread_mutex_unlock(&mu);
 }
-

@@ -601,10 +601,18 @@ typedef struct {
 
 /* Under the table lock (ava1_job_foreach), so taking a reference is refs++. A job's root
  * is written once, by ava1_recv_open, which runs under g_open_mu like this check. */
+static int root_contains(const char *parent, const char *path) {
+    size_t n = strlen(parent);
+    if (strlen(path) < n) return 0;
+    return strncmp(parent, path, n) == 0 && (path[n] == 0 || path[n] == '/');
+}
+
 static void root_each(ava1_job_t *j, void *ctx) {
     root_q_t *q = ctx;
     if (memcmp(j->id, q->id, 16) != 0 && (j->kind == AVA1_JOB_UPLOAD || j->kind == AVA1_JOB_COPY) &&
-        strcmp(j->root, q->root) == 0) {
+        (root_contains(j->root, q->root) || root_contains(q->root, j->root) ||
+         (j->kind == AVA1_JOB_COPY && __atomic_load_n(&j->copy_move, __ATOMIC_ACQUIRE) &&
+          (root_contains(j->src, q->root) || root_contains(q->root, j->src))))) {
         j->refs++;
         q->hit[q->n++] = j;
     }
@@ -770,8 +778,14 @@ static int encode_status(ava1_job_t *j, uint8_t *out, size_t cap, size_t *out_le
     st.bytes_total = j->have_manifest ? j->m.bytes : j->m_in.bytes;
     st.workers = j->want_workers;
     st.has_state = 1;
-    st.state = !j->finished ? 0 : (j->final_status == AVA1_STATUS_OK ? 1 : 2);
-    if (j->message[0]) {
+    st.state = !j->finished || (j->kind == AVA1_JOB_COPY && j->copy_move && !j->copy_delete_done)
+                   ? 0 : (j->final_status == AVA1_STATUS_OK ? 1 : 2);
+    if (j->kind == AVA1_JOB_COPY && j->copy_move && j->finished && !j->copy_delete_done) {
+        static const char deleting[] = "deleting source";
+        st.has_current = 1;
+        st.current = (const uint8_t *)deleting;
+        st.current_len = sizeof deleting - 1;
+    } else if (j->message[0]) {
         st.has_current = 1;
         st.current = (const uint8_t *)j->message;
         st.current_len = (uint16_t)strlen(j->message);
@@ -785,16 +799,30 @@ static int encode_status(ava1_job_t *j, uint8_t *out, size_t cap, size_t *out_le
 
 int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *out, size_t cap,
                   size_t *out_len) {
+    const uint8_t *peer = ava1_server_rpc_peer();
     *out_len = 0;
     switch (method) {
     case AVA1_METHOD_JOB_COPY: {
         ava1_job_copy_t c;
+        ava1_mstore_t prepared = { 0 };
         char dest[AVA1_MAX_PATH + 1];
         char msg[160] = "";
         uint16_t st = AVA1_ERR_PATH;
         ava1_job_t *j;
-        int rc;
+        int rc, prewalked = 0;
         if (ava1_job_copy_decode(body, len, &c) != 0) return AVA1_ERR_PROTOCOL;
+        /* The directory walk may take seconds on a large source. Do it before taking
+         * g_open_mu, which also serialises upload JobOpen. Listed jobs need no walk. */
+        j = ava1_job_find(c.job_id);
+        if (j) ava1_job_put(j);
+        else {
+            rc = ava1_copy_walk(&c, &prepared);
+            if (rc != AVA1_STATUS_OK) {
+                ava1_mstore_free(&prepared);
+                return rc;
+            }
+            prewalked = 1;
+        }
         /* The open lock is what makes the destination check race-free: ava1_recv_open
          * writes j->root under it (open_now, same rule). */
         pthread_mutex_lock(&g_open_mu);
@@ -803,13 +831,15 @@ int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *o
             dest[c.dest_len] = 0;
             if (root_in_use(c.job_id, dest)) {
                 pthread_mutex_unlock(&g_open_mu);
+                ava1_mstore_free(&prepared);
                 return AVA1_ERR_BUSY;
             }
-            j = ava1_copy_open(&c, &st, msg, sizeof msg);
+            j = ava1_copy_open(&c, peer, prewalked ? &prepared : NULL, &st, msg, sizeof msg);
         } else {
             j = NULL;
         }
         pthread_mutex_unlock(&g_open_mu);
+        ava1_mstore_free(&prepared);
         if (!j) return st;
         rc = encode_status(j, out, cap, out_len);
         ava1_job_put(j);
@@ -822,6 +852,10 @@ int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *o
         int st = AVA1_STATUS_OK;
         if (ava1_job_ref_decode(body, len, &r) != 0) return AVA1_ERR_PROTOCOL;
         if (!(j = ava1_job_find(r.job_id))) return AVA1_ERR_UNKNOWN_JOB;
+        if (memcmp(j->owner, peer, 32) != 0) {
+            ava1_job_put(j);
+            return AVA1_ERR_UNKNOWN_JOB;
+        }
         if (method == AVA1_METHOD_JOB_STATUS) st = encode_status(j, out, cap, out_len);
         else ava1_recv_cancel(j); /* stops it and unlists it: the journal stays */
         ava1_job_put(j);

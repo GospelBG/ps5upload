@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "ava1_apply.h"
+#include "ava1_copy.h"
 #include "ava1_recv.h"
 #include "ava1_conn.h"
 #include "ava1_data.h"
@@ -1380,7 +1381,9 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     ava1_test_set_same_device(1);
     __atomic_store_n(&ava1_send_test_fail_sends, 0, __ATOMIC_SEQ_CST); /* the download sender's knobs */
     __atomic_store_n(&ava1_send_test_fail_writer_starts, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_fault_id, UINT32_MAX - 1, __ATOMIC_SEQ_CST);
     if (ava1_data_start(&dc) != 0) return -100;
+    ava1_apply_fault = t_fault;
     memset(&cfg, 0, sizeof cfg);
     ava1_identity_from_secret(&cfg.identity, secret);
     strncpy(cfg.name, "C data server", sizeof cfg.name - 1);
@@ -1539,6 +1542,8 @@ int ava1_test_data_knob(const char *name, uint32_t v) {
     else if (!strcmp(name, "lane_alloc_fail")) ava1_data_test_lane_alloc_fail = (int)v;
     else if (!strcmp(name, "fb_force")) ava1_data_test_fb_force = (int)v;
     else if (!strcmp(name, "park_ms")) __atomic_store_n(&c->park_ms, v, __ATOMIC_SEQ_CST);
+    else if (!strcmp(name, "copy_walk_delay_ms")) __atomic_store_n(&ava1_copy_test_walk_delay_ms, v, __ATOMIC_SEQ_CST);
+    else if (!strcmp(name, "copy_delete_delay_ms")) __atomic_store_n(&ava1_copy_test_delete_delay_ms, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "ctl_cap")) __atomic_store_n(&c->ctl_cap, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "send_fail")) __atomic_store_n(&ava1_send_test_fail_sends, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "writer_start_fail"))
@@ -1547,6 +1552,9 @@ int ava1_test_data_knob(const char *name, uint32_t v) {
     else return -1;
     return 0;
 }
+
+int ava1_test_copy_walk_active(void) { return __atomic_load_n(&ava1_copy_test_walk_active, __ATOMIC_ACQUIRE); }
+int ava1_test_copy_delete_active(void) { return __atomic_load_n(&ava1_copy_test_delete_active, __ATOMIC_ACQUIRE); }
 
 /* Fix round 1, minor 5: a job unlisted (reaped) while someone still holds it keeps its id
  * until it is destroyed: a create of the same id fails until then. 0 or the failed step. */

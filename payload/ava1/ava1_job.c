@@ -318,6 +318,10 @@ void ava1_job_reap(uint64_t now_ms) {
          * reaps later. */
         if (!j || j->attached || j->parked_at_ms == 0) continue;
         fin = __atomic_load_n(&j->finished, __ATOMIC_ACQUIRE);
+        /* The receiver marks finished before the copy role removes its source. A move
+         * must remain listed throughout that delete phase, however long it takes. */
+        if (j->kind == AVA1_JOB_COPY && __atomic_load_n(&j->copy_move, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&j->copy_delete_done, __ATOMIC_ACQUIRE)) continue;
         /* A local job (JOB_COPY) is a writer with no session. Its park stamp is set at
          * creation and again when it ends, so `!fin` protects a running copy (whose stamp is
          * the creation one) from the age rule, and the window the operator can query is the

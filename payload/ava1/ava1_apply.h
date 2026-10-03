@@ -52,6 +52,9 @@ void ava1_apply_quiesce(ava1_job_t *j);
 void ava1_apply_commit_ready(ava1_job_t *j);
 /* Sends a finished job's JobDone again (a sender that lost the first one asks again). */
 void ava1_apply_done_again(ava1_job_t *j);
+/* The staged tree was renamed before a crash or sync failure: sync its parent and
+ * journal a fresh Done before a resumed move can remove its source. */
+void ava1_apply_finish_landed(ava1_job_t *j);
 
 /* Tests only (NULL in the payload): called at these points of a commit, in this order.
  * `id` is the file, or UINT32_MAX for the staged tree's rename. */
