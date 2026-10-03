@@ -202,6 +202,98 @@ pub trait MgmtTransport: Send + Sync {
         body: &[u8],
         timeout: Duration,
     ) -> Result<Option<Vec<u8>>>;
+
+    /// Runs one long operation as a `job.run` job and waits for it (polling its status) up
+    /// to `call.deadline`. Same `Ok(None)` and error rules as [`call`](Self::call).
+    fn run_job(
+        &self,
+        _addr: &str,
+        _op: JobOp,
+        _label: &str,
+        _body: &[u8],
+        _call: &JobCall<'_>,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Progress of the operation started under `op_id` by [`run_job`](Self::run_job):
+    /// `Ok(None)` = this transport does not serve `addr`; `Ok(Some(None))` = served, but no
+    /// such operation is running (finished, or never started).
+    fn job_progress(&self, _addr: &str, _op_id: u64) -> Result<Option<Option<JobProgress>>> {
+        Ok(None)
+    }
+
+    /// Asks the operation under `op_id` to stop: `Ok(Some(found))`, or `Ok(None)` when this
+    /// transport does not serve `addr`.
+    fn job_cancel(&self, _addr: &str, _op_id: u64) -> Result<Option<bool>> {
+        Ok(None)
+    }
+}
+
+/// A long management operation: one `job.run` op over AVA1, one request frame over FTX2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobOp {
+    /// The AVA1 `JOB_OP_*` number.
+    pub id: u8,
+    /// The legacy label callers put in `payload rejected <LABEL>: ...`.
+    pub label: &'static str,
+    /// What `fs_op_status` reports as the operation's kind (`fs_delete`, ...).
+    pub kind: &'static str,
+    /// FTX2 request and ack frames (removed with FTX2).
+    pub ftx2: (FrameType, FrameType),
+}
+
+macro_rules! job_ops {
+    ($(($name:ident, $id:expr, $label:expr, $kind:expr, $req:ident, $ack:ident),)*) => {
+        /// The operations that run as jobs (`JOB_OP_*` in `protocol/ava1/schema/ava1.toml`).
+        pub mod ops {
+            use super::JobOp;
+            use ftx2_proto::FrameType;
+            $(pub const $name: JobOp = JobOp {
+                id: $id,
+                label: $label,
+                kind: $kind,
+                ftx2: (FrameType::$req, FrameType::$ack),
+            };)*
+            /// All of them, for drift tests.
+            pub const ALL: &[JobOp] = &[$($name,)*];
+        }
+    };
+}
+
+job_ops! {
+    (DELETE, 1, "FS_DELETE", "fs_delete", FsDelete, FsDeleteAck),
+    (CHMOD_R, 2, "FS_CHMOD", "fs_chmod", FsChmod, FsChmodAck),
+    (HASH, 3, "FS_HASH", "fs_hash", FsHash, FsHashAck),
+    (CRC32, 4, "CRC32_FILE", "crc32_file", Crc32File, Crc32FileAck),
+    (FSCK, 5, "UFS_FSCK", "ufs_fsck", UfsFsck, UfsFsckAck),
+    (BACKUP_SNAPSHOT, 6, "BACKUP_SNAPSHOT", "backup_snapshot", BackupSnapshot, BackupSnapshotAck),
+    (BACKUP_RESTORE, 7, "BACKUP_RESTORE", "backup_restore", BackupRestore, BackupRestoreAck),
+    (CLEANUP, 8, "CLEANUP", "cleanup", Cleanup, CleanupAck),
+    (SDK_SCAN, 9, "SDK_SCAN", "sdk_scan", SdkScan, SdkScanAck),
+}
+
+/// How one long operation is run and followed.
+pub struct JobCall<'a> {
+    /// The caller's operation id (the engine's `op_id`): the key `/api/ps5/fs/op-status` and
+    /// `op-cancel` use, and the low 8 bytes of the AVA1 job id. 0 = nobody will ask.
+    pub op_id: u64,
+    /// What the operation works on, shown by `fs_op_status` (a path).
+    pub subject: &'a str,
+    /// The whole wait: the caller's `io_timeout` (the old socket deadline) is now this.
+    pub deadline: Duration,
+}
+
+/// A running operation's progress, from the console.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobProgress {
+    pub kind: String,
+    pub subject: String,
+    pub files_done: u64,
+    pub files_total: u64,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub cancel_requested: bool,
 }
 
 static TRANSPORT: RwLock<Option<Arc<dyn MgmtTransport>>> = RwLock::new(None);
@@ -304,6 +396,75 @@ pub fn legacy_ok(r: Result<Vec<u8>>) -> Result<Vec<u8>> {
         },
         ok => ok,
     }
+}
+
+/// Runs one long operation and returns its result body (the legacy handler's reply: the same
+/// JSON the FTX2 frame answered). Over AVA1 it is a job the console runs while this call polls
+/// it, so a long delete or checksum no longer holds a socket for an hour; over FTX2 it is the
+/// one frame it always was, with `call.op_id` as the trace id.
+///
+/// A refusal or a failed job is a [`MgmtError`] (`payload rejected <label>: <cause>`); a
+/// cancelled one has the status `ERR_CANCELLED` and the handler's own cancel token as cause.
+pub fn run_op(
+    addr: &str,
+    op: JobOp,
+    label: &str,
+    body: &[u8],
+    call: &JobCall<'_>,
+) -> Result<Vec<u8>> {
+    if let Some(t) = current() {
+        if let Some(reply) = t.run_job(addr, op, label, body, call)? {
+            return Ok(reply);
+        }
+    }
+    ftx2_run_op(addr, op, label, body, call)
+}
+
+/// Progress of an operation started by [`run_op`], for `/api/ps5/fs/op-status`.
+/// `Ok(None)`: not served over AVA1, ask FTX2. `Ok(Some(None))`: nothing running under `op_id`.
+pub fn op_progress(addr: &str, op_id: u64) -> Result<Option<Option<JobProgress>>> {
+    match current() {
+        Some(t) => t.job_progress(addr, op_id),
+        None => Ok(None),
+    }
+}
+
+/// Asks an operation started by [`run_op`] to stop. `Ok(None)`: not served over AVA1.
+pub fn op_cancel(addr: &str, op_id: u64) -> Result<Option<bool>> {
+    match current() {
+        Some(t) => t.job_cancel(addr, op_id),
+        None => Ok(None),
+    }
+}
+
+/// The FTX2 form of [`run_op`]: connect, one request frame carrying `op_id` as its trace id,
+/// one reply frame, read under the whole deadline.
+fn ftx2_run_op(
+    addr: &str,
+    op: JobOp,
+    label: &str,
+    body: &[u8],
+    call: &JobCall<'_>,
+) -> Result<Vec<u8>> {
+    let (req, ack) = op.ftx2;
+    let mut c = Connection::connect(addr)?;
+    c.set_io_timeout(call.deadline)
+        .with_context(|| format!("applying {label} I/O timeout"))?;
+    c.send_frame_with_trace(req, body, call.op_id)?;
+    let (hdr, resp) = c.recv_frame()?;
+    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
+    if ft == FrameType::Error {
+        return Err(MgmtError {
+            label: label.to_string(),
+            status: 0,
+            cause: String::from_utf8_lossy(&resp).into_owned(),
+        }
+        .into());
+    }
+    if ft != ack {
+        bail!("expected {ack:?}, got {ft:?}");
+    }
+    Ok(resp)
 }
 
 /// Today's FTX2 path, unchanged: connect, one request frame, one reply frame.

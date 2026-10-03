@@ -139,26 +139,21 @@ pub fn fs_hash_with_timeout(
     path: &str,
     io_timeout: Option<std::time::Duration>,
 ) -> Result<HashResult> {
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .context("applying fs_hash I/O timeout")?;
-    }
     let body = serde_json::to_vec(&serde_json::json!({ "path": path }))
         .context("serialize fs_hash body")?;
-    c.send_frame(FrameType::FsHash, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_HASH({}): {}",
-            path,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::FsHashAck {
-        bail!("expected FS_HASH_ACK, got {:?}", ft);
-    }
+    // A job over AVA1 (the hash of a multi-GiB file outlives any request deadline); the
+    // caller's timeout is now the whole wait.
+    let resp = mgmt::run_op(
+        addr,
+        mgmt::ops::HASH,
+        &format!("FS_HASH({path})"),
+        &body,
+        &mgmt::JobCall {
+            op_id: 0,
+            subject: path,
+            deadline: io_timeout.unwrap_or(mgmt::DEFAULT_TIMEOUT),
+        },
+    )?;
     let parsed: HashResult =
         serde_json::from_slice(&resp).context("decode FS_HASH_ACK body as JSON")?;
     Ok(parsed)
@@ -308,28 +303,30 @@ pub fn fs_delete_with_op_id(
 ) -> Result<()> {
     let body =
         serde_json::to_vec(&serde_json::json!({ "path": path })).context("serialize fs_delete")?;
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .context("applying FS_DELETE I/O timeout")?;
+    match mgmt::run_op(
+        addr,
+        mgmt::ops::DELETE,
+        "FS_DELETE",
+        &body,
+        &mgmt::JobCall {
+            op_id,
+            subject: path,
+            deadline: io_timeout.unwrap_or(mgmt::DEFAULT_TIMEOUT),
+        },
+    ) {
+        Ok(_) => Ok(()),
+        // Cancellation is a non-error outcome from the user's POV (they hit Stop): surface
+        // it distinctly so the engine HTTP layer can return 409 instead of 502, mirroring
+        // fs_copy.
+        Err(e) if is_cancel(&e, "fs_delete_cancelled") => bail!("cancelled"),
+        Err(e) => Err(e),
     }
-    c.send_frame_with_trace(FrameType::FsDelete, &body, op_id)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        let msg = String::from_utf8_lossy(&resp).to_string();
-        // Cancellation is a non-error outcome from the user's POV
-        // (they hit Stop) — surface it distinctly so the engine HTTP
-        // layer can return 409 instead of 502, mirroring fs_copy.
-        if msg == "fs_delete_cancelled" {
-            bail!("cancelled");
-        }
-        bail!("payload rejected FS_DELETE: {msg}");
-    }
-    if ft != FrameType::FsDeleteAck {
-        bail!("expected FS_DELETE_ACK, got {:?}", ft);
-    }
-    Ok(())
+}
+
+/// True when `e` is the payload's own cancel outcome `token`.
+fn is_cancel(e: &anyhow::Error, token: &str) -> bool {
+    e.downcast_ref::<mgmt::MgmtError>()
+        .is_some_and(|m| m.cause == token)
 }
 
 /// Copy a file or directory recursively on the PS5. Both `from` and `to`
@@ -450,6 +447,31 @@ pub struct FsOpSnapshot {
 /// second mgmt-port connection so the two requests don't serialize
 /// behind each other on the payload's worker pool.
 pub fn fs_op_status(addr: &str, op_id: u64) -> Result<FsOpSnapshot> {
+    // An operation the AVA1 transport runs as a job (delete, ...): its progress is the job's.
+    if let Some(found) = mgmt::op_progress(addr, op_id)? {
+        return Ok(match found {
+            Some(p) => FsOpSnapshot {
+                found: true,
+                op_id,
+                kind: p.kind,
+                from: p.subject,
+                to: String::new(),
+                total_bytes: p.bytes_total,
+                bytes_copied: p.bytes_done,
+                cancel_requested: p.cancel_requested,
+            },
+            None => FsOpSnapshot {
+                found: false,
+                op_id: 0,
+                kind: String::new(),
+                from: String::new(),
+                to: String::new(),
+                total_bytes: 0,
+                bytes_copied: 0,
+                cancel_requested: false,
+            },
+        });
+    }
     let mut c = Connection::connect(addr)?;
     // Short timeout — status calls should return in milliseconds. A
     // hung payload here would otherwise stall the poller every
@@ -480,6 +502,9 @@ pub fn fs_op_status(addr: &str, op_id: u64) -> Result<FsOpSnapshot> {
 /// found and the cancel flag was set; false if the op_id wasn't
 /// recognized (already finished or never registered).
 pub fn fs_op_cancel(addr: &str, op_id: u64) -> Result<bool> {
+    if let Some(found) = mgmt::op_cancel(addr, op_id)? {
+        return Ok(found);
+    }
     let mut c = Connection::connect(addr)?;
     c.set_io_timeout(std::time::Duration::from_secs(5))
         .context("applying FS_OP_CANCEL I/O timeout")?;
@@ -887,6 +912,21 @@ pub fn fs_chmod_with_timeout(
         "recursive": if recursive { 1 } else { 0 },
     }))
     .context("serialize fs_chmod")?;
+    if recursive {
+        // The walk of a big tree is a job (progress, cancel, no socket held for minutes).
+        mgmt::run_op(
+            addr,
+            mgmt::ops::CHMOD_R,
+            "FS_CHMOD",
+            &body,
+            &mgmt::JobCall {
+                op_id: 0,
+                subject: path,
+                deadline: io_timeout.unwrap_or(mgmt::DEFAULT_TIMEOUT),
+            },
+        )?;
+        return Ok(());
+    }
     send_empty_ack_op_with_timeout(
         addr,
         FrameType::FsChmod,

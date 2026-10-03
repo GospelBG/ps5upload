@@ -18,7 +18,9 @@ use anyhow::Result;
 use ava1::gen::{self, MgmtText};
 use ava1::wire::Message;
 use ava1::Ava1Error;
-use ps5upload_core::mgmt::{self, Method, MgmtError, MgmtTransport};
+use ps5upload_core::mgmt::{
+    self, ops, JobCall, JobOp, JobProgress, Method, MgmtError, MgmtTransport,
+};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::mgmt_convert as conv;
@@ -157,7 +159,7 @@ impl AvaTransport {
         self
     }
 
-    fn pool(&self) -> &Pool {
+    pub(crate) fn pool(&self) -> &Pool {
         match &self.pool {
             PoolRef::Global => pool(),
             PoolRef::Fixed(p) => p,
@@ -177,7 +179,7 @@ impl AvaTransport {
 
     /// Whether this console is served over AVA1 for management: the same `use_ava1`
     /// decision uploads make, minus a console that just said it has no management methods.
-    fn serves(&self, console: &str) -> bool {
+    pub(crate) fn serves(&self, console: &str) -> bool {
         if mode() == Mode::Auto {
             let mut n = self.no_mgmt.lock().unwrap_or_else(|e| e.into_inner());
             match n.get(&host_of(console)) {
@@ -191,7 +193,7 @@ impl AvaTransport {
         use_ava1_in(self.pool(), console)
     }
 
-    fn mark_no_mgmt(&self, console: &str) {
+    pub(crate) fn mark_no_mgmt(&self, console: &str) {
         self.no_mgmt
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -201,7 +203,7 @@ impl AvaTransport {
     /// One RPC: gate permit, `ERR_BUSY` retries, one resend on a lost session for
     /// read-only methods. `Ok` is the body of a status-0 reply; a non-zero status is a
     /// [`MgmtError`] carrying the legacy token.
-    async fn rpc(
+    pub(crate) async fn rpc(
         &self,
         console: &str,
         method: u16,
@@ -340,8 +342,17 @@ impl AvaTransport {
                 Ok(Some(Vec::new()))
             }
             gen::METHOD_FS_CHMOD => match conv::fs_chmod_request(body, label)? {
-                // Recursive chmod is a job.run op (Task 5); FTX2 still serves it until then.
-                None => Ok(None),
+                // Recursive chmod is a job.run op: progress, cancel, no socket held for minutes.
+                None => {
+                    let call = JobCall {
+                        op_id: 0,
+                        subject: "",
+                        deadline: timeout,
+                    };
+                    self.run_job_async(console, ops::CHMOD_R, label, body, &call)
+                        .await
+                        .map(|_| Some(Vec::new()))
+                }
                 Some(req) => {
                     self.rpc(console, id, label, &req.to_bytes()?, timeout)
                         .await?;
@@ -358,6 +369,21 @@ impl AvaTransport {
                 let ask = conv::fs_write_request(body, label)?;
                 let size = self.write_chunks(console, label, &ask, timeout).await?;
                 json(serde_json::json!({ "ok": true, "size": size }))
+            }
+            // The two methods whose work can take minutes (a whole tree removed, every title
+            // scanned) run as jobs; the caller keeps the legacy body and reply.
+            gen::METHOD_NODE_CLEANUP | gen::METHOD_SDK_SCAN => {
+                let op = if id == gen::METHOD_NODE_CLEANUP {
+                    ops::CLEANUP
+                } else {
+                    ops::SDK_SCAN
+                };
+                let call = JobCall {
+                    op_id: 0,
+                    subject: "",
+                    deadline: timeout,
+                };
+                self.run_job_async(console, op, label, body, &call).await
             }
             _ => self
                 .text(console, method, label, body, timeout)
@@ -409,11 +435,9 @@ impl AvaTransport {
     }
 
     /// Writes `ask.data` as one atomic call, or as `FSW_CHUNK_MAX` chunks at their offsets
-    /// with `COMMIT` on the last. A failed chunk leaves the `.ps5upload.tmp` file for the
-    /// next write at offset 0 to truncate (SPEC.md section 7.5).
-    ///
-    /// TODO(Task 5): remove `<path>.ps5upload.tmp` best-effort on failure once `job.run`
-    /// DELETE is available here; no removal method exists before it. Tracked in CUTOVER.md.
+    /// with `COMMIT` on the last. A chunk that fails after an earlier one was accepted leaves
+    /// `<path>.ps5upload.tmp` on the console; it is removed best-effort (a `job.run` DELETE),
+    /// and if that fails too the next write at offset 0 truncates it (SPEC.md section 7.5).
     async fn write_chunks(
         &self,
         console: &str,
@@ -433,16 +457,45 @@ impl AvaTransport {
                 data: ask.data[lo..hi].to_vec(),
                 mode: None,
             };
-            self.rpc(
-                console,
-                gen::METHOD_FS_WRITE,
-                label,
-                &req.to_bytes()?,
-                timeout,
-            )
-            .await?;
+            if let Err(e) = self
+                .rpc(
+                    console,
+                    gen::METHOD_FS_WRITE,
+                    label,
+                    &req.to_bytes()?,
+                    timeout,
+                )
+                .await
+            {
+                // Only after a chunk was accepted is there a temporary file of ours to remove:
+                // a refusal of the first chunk may name someone else's.
+                if i > 0 {
+                    self.remove_tmp(console, &ask.path).await;
+                }
+                return Err(e);
+            }
         }
         Ok(ask.data.len())
+    }
+
+    /// Best effort: deletes `<path>.ps5upload.tmp`. Never fails the caller, who is already
+    /// reporting the write's own error.
+    async fn remove_tmp(&self, console: &str, path: &str) {
+        let body = serde_json::json!({ "path": format!("{path}.ps5upload.tmp") }).to_string();
+        let call = JobCall {
+            op_id: 0,
+            subject: "",
+            deadline: Duration::from_secs(5),
+        };
+        let _ = self
+            .run_job_async(
+                console,
+                ops::DELETE,
+                "FS_WRITE_BYTES",
+                body.as_bytes(),
+                &call,
+            )
+            .await;
     }
 }
 
@@ -460,6 +513,51 @@ impl MgmtTransport for AvaTransport {
                 return Ok(None);
             }
             crate::block_on(self.run(addr, method, label, body, timeout))
+        })
+    }
+
+    fn run_job(
+        &self,
+        addr: &str,
+        op: JobOp,
+        label: &str,
+        body: &[u8],
+        call: &JobCall<'_>,
+    ) -> Result<Option<Vec<u8>>> {
+        run_blocking(|| {
+            if !self.serves(addr) {
+                return Ok(None);
+            }
+            let r = crate::block_on(self.run_job_async(addr, op, label, body, call));
+            if let Err(e) = &r {
+                let unknown = e
+                    .downcast_ref::<MgmtError>()
+                    .is_some_and(|m| m.status == gen::ERR_UNKNOWN_METHOD);
+                if unknown && mode() == Mode::Auto {
+                    // An older helper without job.run: FTX2 serves the operation.
+                    self.mark_no_mgmt(addr);
+                    return Ok(None);
+                }
+            }
+            r
+        })
+    }
+
+    fn job_progress(&self, addr: &str, op_id: u64) -> Result<Option<Option<JobProgress>>> {
+        run_blocking(|| {
+            if !self.serves(addr) {
+                return Ok(None);
+            }
+            crate::block_on(self.job_progress_async(addr, op_id)).map(Some)
+        })
+    }
+
+    fn job_cancel(&self, addr: &str, op_id: u64) -> Result<Option<bool>> {
+        run_blocking(|| {
+            if !self.serves(addr) {
+                return Ok(None);
+            }
+            crate::block_on(self.job_cancel_async(addr, op_id)).map(Some)
         })
     }
 }

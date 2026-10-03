@@ -95,8 +95,18 @@ struct Rig {
 async fn rig(tag: &str) -> Rig {
     let d = dir(tag);
     let (me, peers) = paired_client(&d.join("peers"));
-    let srv = CServer::start_data(SECRET, &d.join("peers"), &d.join("jobs"), 200, 2000, 2000, 0);
-    let s = connect(&srv.addr(), me, peers, "owner", calm()).await.unwrap();
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    let s = connect(&srv.addr(), me, peers, "owner", calm())
+        .await
+        .unwrap();
     Rig { srv, me: s, d }
 }
 
@@ -109,7 +119,11 @@ fn count_files(p: &Path) -> usize {
     if let Ok(rd) = std::fs::read_dir(p) {
         for e in rd.flatten() {
             let t = e.file_type().unwrap();
-            n += if t.is_dir() { count_files(&e.path()) } else { 1 };
+            n += if t.is_dir() {
+                count_files(&e.path())
+            } else {
+                1
+            };
         }
     }
     n
@@ -144,7 +158,10 @@ async fn delete_tree_returns_immediately_and_reports_progress() {
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
-    assert!(seen.len() >= 3, "progress should rise across polls: {seen:?}");
+    assert!(
+        seen.len() >= 3,
+        "progress should rise across polls: {seen:?}"
+    );
     assert!(seen.windows(2).all(|w| w[0] < w[1]));
     let done = status(&r.me, id(1)).await;
     assert_eq!(done.state, Some(1));
@@ -163,7 +180,9 @@ async fn cancel_stops_a_delete_midway_and_the_job_is_collected_after() {
     write_tree(&tree, 3000, |_| 16);
     c_set_fsj_delay_us(500);
     assert_eq!(
-        run(&r.me, id(2), gen::JOB_OP_DELETE, &delete_args(&tree)).await.0,
+        run(&r.me, id(2), gen::JOB_OP_DELETE, &delete_args(&tree))
+            .await
+            .0,
         gen::STATUS_OK
     );
     loop {
@@ -183,10 +202,16 @@ async fn cancel_stops_a_delete_midway_and_the_job_is_collected_after() {
     // A finished job is reaped a park age later; a running one never is.
     c_set_fsj_delay_us(0);
     c_reap_far();
-    assert_eq!(status_code(&r.me, id(2)).await, gen::ERR_UNKNOWN_JOB, "unlisted");
+    assert_eq!(
+        status_code(&r.me, id(2)).await,
+        gen::ERR_UNKNOWN_JOB,
+        "unlisted"
+    );
     // Another delete of the remains completes (the tree is deletable again).
     assert_eq!(
-        run(&r.me, id(3), gen::JOB_OP_DELETE, &delete_args(&tree)).await.0,
+        run(&r.me, id(3), gen::JOB_OP_DELETE, &delete_args(&tree))
+            .await
+            .0,
         gen::STATUS_OK
     );
     assert_eq!(finished(&r.me, id(3)).await.state, Some(1));
@@ -198,9 +223,16 @@ async fn cancel_stops_a_delete_midway_and_the_job_is_collected_after() {
 async fn a_running_operation_is_never_reaped() {
     let r = rig("jr-noreap").await;
     let args = r#"{"device":"/dev/md1","loops":40}"#;
-    assert_eq!(run(&r.me, id(4), gen::JOB_OP_FSCK, args).await.0, gen::STATUS_OK);
+    assert_eq!(
+        run(&r.me, id(4), gen::JOB_OP_FSCK, args).await.0,
+        gen::STATUS_OK
+    );
     c_reap_far();
-    assert_eq!(status(&r.me, id(4)).await.state, Some(0), "still listed and running");
+    assert_eq!(
+        status(&r.me, id(4)).await.state,
+        Some(0),
+        "still listed and running"
+    );
     assert_eq!(finished(&r.me, id(4)).await.state, Some(1));
     drop(r.srv);
 }
@@ -212,16 +244,32 @@ async fn repeat_job_run_is_idempotent() {
     write_tree(&tree, 400, |_| 8);
     c_set_fsj_delay_us(2000);
     let a = delete_args(&tree);
-    assert_eq!(run(&r.me, id(5), gen::JOB_OP_DELETE, &a).await.0, gen::STATUS_OK);
+    assert_eq!(
+        run(&r.me, id(5), gen::JOB_OP_DELETE, &a).await.0,
+        gen::STATUS_OK
+    );
     // The same id and parameters: the live job's status, not a second job.
     let (code, again) = run(&r.me, id(5), gen::JOB_OP_DELETE, &a).await;
     assert_eq!(code, gen::STATUS_OK);
     assert!(again.is_some());
-    assert_eq!(list(&r.me).await.iter().filter(|j| j.kind == OP_KIND).count(), 1);
+    assert_eq!(
+        list(&r.me)
+            .await
+            .iter()
+            .filter(|j| j.kind == OP_KIND)
+            .count(),
+        1
+    );
     // The same id with other parameters is refused, and so is another op.
     let other = delete_args(&r.d.join("elsewhere"));
-    assert_eq!(run(&r.me, id(5), gen::JOB_OP_DELETE, &other).await.0, gen::ERR_PROTOCOL);
-    assert_eq!(run(&r.me, id(5), gen::JOB_OP_CRC32, &a).await.0, gen::ERR_PROTOCOL);
+    assert_eq!(
+        run(&r.me, id(5), gen::JOB_OP_DELETE, &other).await.0,
+        gen::ERR_PROTOCOL
+    );
+    assert_eq!(
+        run(&r.me, id(5), gen::JOB_OP_CRC32, &a).await.0,
+        gen::ERR_PROTOCOL
+    );
     let done = finished(&r.me, id(5)).await;
     assert_eq!(done.state, Some(1));
     // After it finished, a repeat still answers with that finished job (no second delete).
@@ -236,14 +284,32 @@ async fn another_device_cannot_see_cancel_or_reuse_an_operation() {
     let d = dir("jr-owner");
     let (a_id, a_peers) = paired_client(&d.join("peers"));
     let (b_id, b_peers) = paired_client(&d.join("peers"));
-    let srv = CServer::start_data(SECRET, &d.join("peers"), &d.join("jobs"), 200, 2000, 2000, 0);
-    let a = connect(&srv.addr(), a_id, a_peers, "a", calm()).await.unwrap();
-    let b = connect(&srv.addr(), b_id, b_peers, "b", calm()).await.unwrap();
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    let a = connect(&srv.addr(), a_id, a_peers, "a", calm())
+        .await
+        .unwrap();
+    let b = connect(&srv.addr(), b_id, b_peers, "b", calm())
+        .await
+        .unwrap();
     let args = r#"{"device":"/dev/md1","loops":30}"#;
-    assert_eq!(run(&a, id(6), gen::JOB_OP_FSCK, args).await.0, gen::STATUS_OK);
+    assert_eq!(
+        run(&a, id(6), gen::JOB_OP_FSCK, args).await.0,
+        gen::STATUS_OK
+    );
     assert_eq!(status_code(&b, id(6)).await, gen::ERR_UNKNOWN_JOB);
     assert_eq!(cancel(&b, id(6)).await, gen::ERR_UNKNOWN_JOB);
-    assert_eq!(run(&b, id(6), gen::JOB_OP_FSCK, args).await.0, gen::ERR_UNKNOWN_JOB);
+    assert_eq!(
+        run(&b, id(6), gen::JOB_OP_FSCK, args).await.0,
+        gen::ERR_UNKNOWN_JOB
+    );
     assert!(list(&b).await.is_empty(), "b lists only its own jobs");
     assert_eq!(list(&a).await.len(), 1);
     assert_eq!(finished(&a, id(6)).await.state, Some(1));
@@ -262,7 +328,9 @@ async fn a_failure_midway_is_state_2_with_the_cause_and_the_rest_deleted() {
     let n_stuck = count_files(&stuck);
     std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
     assert_eq!(
-        run(&r.me, id(7), gen::JOB_OP_DELETE, &delete_args(&tree)).await.0,
+        run(&r.me, id(7), gen::JOB_OP_DELETE, &delete_args(&tree))
+            .await
+            .0,
         gen::STATUS_OK
     );
     let st = finished(&r.me, id(7)).await;
@@ -270,7 +338,11 @@ async fn a_failure_midway_is_state_2_with_the_cause_and_the_rest_deleted() {
     assert_eq!(st.state, Some(2));
     assert_eq!(st.code, Some(gen::ERR_IO));
     assert_eq!(st.current.as_deref(), Some("fs_delete_failed"));
-    assert_eq!(count_files(&tree), n_stuck, "everything else was removed, best effort");
+    assert_eq!(
+        count_files(&tree),
+        n_stuck,
+        "everything else was removed, best effort"
+    );
     drop(r.srv);
 }
 
@@ -305,7 +377,13 @@ async fn delete_refuses_outside_policy_a_mount_point_and_a_bad_request() {
     run(&r.me, id(11), gen::JOB_OP_DELETE, r#"{"path":"data/x"}"#).await;
     assert_eq!(finished(&r.me, id(11)).await.code, Some(gen::ERR_PATH));
     // A path that is already gone is a success.
-    run(&r.me, id(12), gen::JOB_OP_DELETE, &delete_args(&r.d.join("nothing"))).await;
+    run(
+        &r.me,
+        id(12),
+        gen::JOB_OP_DELETE,
+        &delete_args(&r.d.join("nothing")),
+    )
+    .await;
     assert_eq!(finished(&r.me, id(12)).await.state, Some(1));
     // A path with quotes and a backslash survives the JSON round trip.
     let odd = r.d.join("we\"ird\\name");
@@ -326,19 +404,31 @@ async fn chmod_recursive_applies_to_every_entry_and_reports_progress() {
     write_tree(&tree, 200, |_| 8);
     c_set_fsj_delay_us(200);
     let a = serde_json::json!({ "path": tree.to_str().unwrap(), "mode": "0700" }).to_string();
-    assert_eq!(run(&r.me, id(20), gen::JOB_OP_CHMOD_R, &a).await.0, gen::STATUS_OK);
+    assert_eq!(
+        run(&r.me, id(20), gen::JOB_OP_CHMOD_R, &a).await.0,
+        gen::STATUS_OK
+    );
     let st = finished(&r.me, id(20)).await;
     assert_eq!(st.state, Some(1));
-    assert_eq!((st.files_total, st.files_done), (200, 200), "every file counted, folders not");
+    assert_eq!(
+        (st.files_total, st.files_done),
+        (200, 200),
+        "every file counted, folders not"
+    );
     for e in std::fs::read_dir(&tree).unwrap().flatten() {
         assert_eq!(e.metadata().unwrap().permissions().mode() & 0o7777, 0o700);
     }
     let f = tree.join("d00/f00000");
-    assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o7777, 0o700);
+    assert_eq!(
+        std::fs::metadata(&f).unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
     // No mode, and a path outside the policy.
     run(&r.me, id(21), gen::JOB_OP_CHMOD_R, &delete_args(&tree)).await;
     assert_eq!(finished(&r.me, id(21)).await.code, Some(gen::ERR_PROTOCOL));
-    let denied = serde_json::json!({ "path": r.d.join("ps5-denied/a").to_str().unwrap(), "mode": "0777" }).to_string();
+    let denied =
+        serde_json::json!({ "path": r.d.join("ps5-denied/a").to_str().unwrap(), "mode": "0777" })
+            .to_string();
     run(&r.me, id(22), gen::JOB_OP_CHMOD_R, &denied).await;
     assert_eq!(finished(&r.me, id(22)).await.code, Some(gen::ERR_PATH));
     drop(r.srv);
@@ -366,9 +456,21 @@ async fn hash_result_rides_in_status_ext() {
     // A folder is not hashable, a missing file fails with a cause.
     run(&r.me, id(31), gen::JOB_OP_HASH, &delete_args(&r.d)).await;
     let st = finished(&r.me, id(31)).await;
-    assert_eq!((st.state, st.current.as_deref()), (Some(2), Some("fs_hash_not_regular_file")));
-    run(&r.me, id(32), gen::JOB_OP_HASH, &delete_args(&r.d.join("nope"))).await;
-    assert_eq!(finished(&r.me, id(32)).await.current.as_deref(), Some("fs_hash_stat_failed"));
+    assert_eq!(
+        (st.state, st.current.as_deref()),
+        (Some(2), Some("fs_hash_not_regular_file"))
+    );
+    run(
+        &r.me,
+        id(32),
+        gen::JOB_OP_HASH,
+        &delete_args(&r.d.join("nope")),
+    )
+    .await;
+    assert_eq!(
+        finished(&r.me, id(32)).await.current.as_deref(),
+        Some("fs_hash_stat_failed")
+    );
     drop(r.srv);
 }
 
@@ -377,7 +479,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &b in data {
         crc ^= b as u32;
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -390,14 +496,20 @@ async fn crc32_of_a_large_file_is_a_job_that_can_be_cancelled() {
     let data: Vec<u8> = (0..1_000_000u32).map(|i| (i ^ (i >> 8)) as u8).collect();
     std::fs::write(&f, &data).unwrap();
     let a = serde_json::json!({ "path": f.to_str().unwrap() }).to_string();
-    assert_eq!(run(&r.me, id(40), gen::JOB_OP_CRC32, &a).await.0, gen::STATUS_OK);
+    assert_eq!(
+        run(&r.me, id(40), gen::JOB_OP_CRC32, &a).await.0,
+        gen::STATUS_OK
+    );
     let st = finished(&r.me, id(40)).await;
     let v: serde_json::Value = serde_json::from_slice(&st.result.unwrap()).unwrap();
     assert_eq!(v["crc32"], crc32(&data));
     assert_eq!(v["size"], 1_000_000);
     // Slow it down (every 64 KiB block waits), then cancel after some progress.
     c_set_fsj_delay_us(30_000);
-    assert_eq!(run(&r.me, id(41), gen::JOB_OP_CRC32, &a).await.0, gen::STATUS_OK);
+    assert_eq!(
+        run(&r.me, id(41), gen::JOB_OP_CRC32, &a).await.0,
+        gen::STATUS_OK
+    );
     loop {
         if status(&r.me, id(41)).await.bytes_durable > 0 {
             break;
@@ -422,16 +534,28 @@ async fn fsck_keeps_its_ok_false_body_as_the_answer_and_a_frame_error_is_a_failu
     assert_eq!(st.state, Some(1));
     assert!(String::from_utf8_lossy(&st.result.unwrap()).contains("\"ok\":true"));
     // A dirty volume: the operation ran, its body says ok:false with the code the caller reads.
-    run(&r.me, id(51), gen::JOB_OP_FSCK, r#"{"device":"/dev/md1","dirty":1}"#).await;
+    run(
+        &r.me,
+        id(51),
+        gen::JOB_OP_FSCK,
+        r#"{"device":"/dev/md1","dirty":1}"#,
+    )
+    .await;
     let st = finished(&r.me, id(51)).await;
     assert_eq!(st.state, Some(1));
     let v: serde_json::Value = serde_json::from_slice(&st.result.unwrap()).unwrap();
-    assert_eq!((v["ok"].as_bool(), v["code"].as_i64()), (Some(false), Some(3)));
+    assert_eq!(
+        (v["ok"].as_bool(), v["code"].as_i64()),
+        (Some(false), Some(3))
+    );
     // An ERROR frame fails the job with its token as the cause.
     run(&r.me, id(52), gen::JOB_OP_FSCK, r#"{"error":1}"#).await;
     let st = finished(&r.me, id(52)).await;
     assert_eq!(st.state, Some(2));
-    assert_eq!(st.current.as_deref(), Some("libSceFsInternalForVsh_unavailable"));
+    assert_eq!(
+        st.current.as_deref(),
+        Some("libSceFsInternalForVsh_unavailable")
+    );
     assert_eq!(st.code, Some(gen::ERR_INTERNAL));
     drop(r.srv);
 }
@@ -439,7 +563,13 @@ async fn fsck_keeps_its_ok_false_body_as_the_answer_and_a_frame_error_is_a_failu
 #[tokio::test(flavor = "multi_thread")]
 async fn backup_snapshot_reports_progress_and_cancel_stops_it() {
     let r = rig("jr-backup").await;
-    run(&r.me, id(60), gen::JOB_OP_BACKUP_SNAPSHOT, r#"{"tag":"t","path":"/data/x","loops":15}"#).await;
+    run(
+        &r.me,
+        id(60),
+        gen::JOB_OP_BACKUP_SNAPSHOT,
+        r#"{"tag":"t","path":"/data/x","loops":15}"#,
+    )
+    .await;
     let mut seen = std::collections::BTreeSet::new();
     loop {
         let s = status(&r.me, id(60)).await;
@@ -453,7 +583,13 @@ async fn backup_snapshot_reports_progress_and_cancel_stops_it() {
     }
     assert!(seen.len() >= 3, "progress rose: {seen:?}");
     // Cancel mid-way: state 2 / cancelled, the cause token kept.
-    run(&r.me, id(61), gen::JOB_OP_BACKUP_SNAPSHOT, r#"{"tag":"t","path":"/data/x","loops":500}"#).await;
+    run(
+        &r.me,
+        id(61),
+        gen::JOB_OP_BACKUP_SNAPSHOT,
+        r#"{"tag":"t","path":"/data/x","loops":500}"#,
+    )
+    .await;
     loop {
         if status(&r.me, id(61)).await.files_done >= 3 {
             break;
@@ -471,7 +607,13 @@ async fn backup_snapshot_reports_progress_and_cancel_stops_it() {
     assert_eq!((st.state, st.code), (Some(2), Some(gen::ERR_IO)));
     assert_eq!(st.current.as_deref(), Some("backup_snapshot_io_error"));
     // Restore answers ok:false in a normal frame: the body is kept.
-    run(&r.me, id(63), gen::JOB_OP_BACKUP_RESTORE, r#"{"tag":"t","timestamp":1}"#).await;
+    run(
+        &r.me,
+        id(63),
+        gen::JOB_OP_BACKUP_RESTORE,
+        r#"{"tag":"t","timestamp":1}"#,
+    )
+    .await;
     let st = finished(&r.me, id(63)).await;
     assert_eq!(st.state, Some(1));
     assert!(String::from_utf8_lossy(&st.result.unwrap()).contains("restore failed"));
@@ -498,13 +640,25 @@ async fn cleanup_and_a_100_kib_sdk_scan_result_come_back_whole() {
 async fn status_survives_a_reconnect() {
     let d = dir("jr-reconnect");
     let (me, peers) = paired_client(&d.join("peers"));
-    let srv = CServer::start_data(SECRET, &d.join("peers"), &d.join("jobs"), 200, 2000, 2000, 0);
-    let first = connect(&srv.addr(), me.clone(), peers.clone(), "e1", calm()).await.unwrap();
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    let first = connect(&srv.addr(), me.clone(), peers.clone(), "e1", calm())
+        .await
+        .unwrap();
     let tree = d.join("g");
     write_tree(&tree, 800, |_| 8);
     c_set_fsj_delay_us(1500);
     assert_eq!(
-        run(&first, id(80), gen::JOB_OP_DELETE, &delete_args(&tree)).await.0,
+        run(&first, id(80), gen::JOB_OP_DELETE, &delete_args(&tree))
+            .await
+            .0,
         gen::STATUS_OK
     );
     let before = loop {
@@ -518,7 +672,11 @@ async fn status_survives_a_reconnect() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let second = connect(&srv.addr(), me, peers, "e2", calm()).await.unwrap();
     let s = status(&second, id(80)).await;
-    assert!(s.files_done >= before, "the new session reads the same job: {} vs {before}", s.files_done);
+    assert!(
+        s.files_done >= before,
+        "the new session reads the same job: {} vs {before}",
+        s.files_done
+    );
     assert!(list(&second).await.iter().any(|j| j.kind == OP_KIND));
     // Re-issuing the run from the new session is the idempotent answer, not a second delete.
     let (code, st) = run(&second, id(80), gen::JOB_OP_DELETE, &delete_args(&tree)).await;
@@ -534,7 +692,10 @@ async fn at_most_eight_operations_run_at_once_and_an_unknown_op_is_refused() {
     let r = rig("jr-cap").await;
     let slow = r#"{"device":"/dev/md1","loops":200}"#;
     for n in 0..8u8 {
-        assert_eq!(run(&r.me, id(100 + n), gen::JOB_OP_FSCK, slow).await.0, gen::STATUS_OK);
+        assert_eq!(
+            run(&r.me, id(100 + n), gen::JOB_OP_FSCK, slow).await.0,
+            gen::STATUS_OK
+        );
     }
     let (code, _) = run(&r.me, id(120), gen::JOB_OP_FSCK, slow).await;
     assert_eq!(code, gen::ERR_BUSY, "the ninth is refused while eight run");
@@ -543,7 +704,12 @@ async fn at_most_eight_operations_run_at_once_and_an_unknown_op_is_refused() {
         assert_eq!(cancel(&r.me, id(100 + n)).await, gen::STATUS_OK);
     }
     // Slots free up as they end.
-    assert_eq!(run(&r.me, id(121), gen::JOB_OP_FSCK, r#"{"device":"/dev/md1"}"#).await.0, gen::STATUS_OK);
+    assert_eq!(
+        run(&r.me, id(121), gen::JOB_OP_FSCK, r#"{"device":"/dev/md1"}"#)
+            .await
+            .0,
+        gen::STATUS_OK
+    );
     assert_eq!(run(&r.me, id(122), 99, "{}").await.0, gen::ERR_PROTOCOL);
     drop(r.srv);
 }
@@ -552,7 +718,10 @@ async fn at_most_eight_operations_run_at_once_and_an_unknown_op_is_refused() {
 async fn a_job_run_with_an_oversize_or_malformed_body_is_a_protocol_error() {
     let r = rig("jr-bad").await;
     let big = "x".repeat(61 * 1024);
-    assert_eq!(run(&r.me, id(130), gen::JOB_OP_DELETE, &big).await.0, gen::ERR_PROTOCOL);
+    assert_eq!(
+        run(&r.me, id(130), gen::JOB_OP_DELETE, &big).await.0,
+        gen::ERR_PROTOCOL
+    );
     let s = r.me.rpc(gen::METHOD_JOB_RUN, &[1, 2, 3]).await.unwrap();
     assert_eq!(s.status, gen::ERR_PROTOCOL);
     assert!(list(&r.me).await.is_empty());

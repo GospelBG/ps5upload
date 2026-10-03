@@ -206,9 +206,34 @@ delays liveness.
 | 4–141 | management methods | see §7.3 and `MGMT_METHODS.md` | see §7.3 |
 
 `Status.state` is 0 while the job runs, 1 when it finished OK and 2 when it failed (the cause is
-in ext `current`). Methods 16–19 are the version 1 data-plane RPCs and exist only on a node that
+in ext `current`, the `ERR_*` code in ext `code`; a finished `job.run` job's output is in ext `result`). Methods 16–19 are the version 1 data-plane RPCs and exist only on a node that
 advertises `CAP_DATA_PLANE`; the management methods are §7.3 and exist on a node that advertises `CAP_MGMT`. The behaviour of 16–18 is §15.5; of
 19, §16.10.
+
+7.1.1 `job.run` and `job.list` (long management operations). `job.run{job_id, op, args}` starts operation
+`op` (`JOB_OP_*`: DELETE 1, CHMOD_R 2, HASH 3, CRC32 4, FSCK 5, BACKUP_SNAPSHOT 6, BACKUP_RESTORE 7,
+CLEANUP 8, SDK_SCAN 9) on its own worker thread (the 512 KiB management stack) and answers at once with a
+`Status` (state 0). `args` is the operation's request body, the same legacy JSON the FTX2 frame carried
+(at most 60 KiB). The job is an entry of the job table (counted against the 32-job limit, owned by the
+peer that started it, no session, so a reconnect does not matter), at most 8 operations run at once
+(`ERR_BUSY` for a ninth) and an unknown `op` is `ERR_PROTOCOL` (`unknown_op`).
+* `job.status` returns the progress (`files_done/total`, `bytes_durable/total`: files are non-directories,
+  bytes the regular files' sizes; both totals are 0 while unknown), the current step in ext `current`, and,
+  once finished, `state` 1 with ext `result` (the operation's reply body, at most 128 KiB) or `state` 2 with
+  ext `code` (the `ERR_*`) and the cause token in `current`. A repeat of `job.run` with the same id and the
+  same owner, op and args answers the job's status whatever state it is in (nothing runs twice); other
+  parameters are `ERR_PROTOCOL`, another owner `ERR_UNKNOWN_JOB`.
+* `job.cancel` raises the job's cancel flag and waits up to 2 s for the worker. A delete, chmod, hash,
+  crc32 or backup stops at the next directory entry or read block and the job ends `state 2`,
+  `ERR_CANCELLED`; fsck, cleanup and sdk.scan are one system call and only honour a cancel that arrives
+  before they start. Unlike a copy, a cancelled operation stays listed (finished) so a poller reads how
+  it ended; it is collected a park age after it ended, like any finished job.
+* An operation that wraps an FTX2 handler (fsck, backup, cleanup, sdk.scan) keeps the handler's
+  `{"ok":false,...}` body as its result: the operation ran and the body is the answer. Only an ERROR
+  frame is a failed job. DELETE refuses a path outside the writable roots and a mount point (a path on
+  another device than its parent): `ERR_PATH`, `fs_delete_path_not_allowed` / `fs_delete_path_is_mount_point`.
+* `job.list` returns the peer's jobs of every kind as `JobListResult` (`JobEntry.kind` 1 upload, 2
+  download, 3 copy, 4 operation).
 
 7.2 Error codes. The numbers below are generated from `schema/ava1.toml`, whose constants are the
 normative table; the second column names the constant in the generated code.

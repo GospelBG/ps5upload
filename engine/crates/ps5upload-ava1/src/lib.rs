@@ -11,6 +11,7 @@ pub mod copy;
 pub mod download;
 pub mod mgmt;
 pub mod mgmt_convert;
+pub mod mgmt_job;
 pub mod pool;
 pub mod progress;
 #[cfg(not(target_os = "android"))]

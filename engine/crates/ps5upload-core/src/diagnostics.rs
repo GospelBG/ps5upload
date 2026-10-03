@@ -221,21 +221,35 @@ pub struct Crc32FileResult {
 pub fn crc32_file(addr: &str, path: &str) -> Result<Crc32FileResult> {
     let body = serde_json::json!({ "path": path });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::Crc32File, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected CRC32_FILE: {}",
-            String::from_utf8_lossy(&resp)
-        );
+    // A job over AVA1: checksumming a large file takes longer than a request deadline.
+    // The deadline is the old read timeout times ten (a 64 GiB image at ~100 MB/s).
+    match mgmt::run_op(
+        addr,
+        mgmt::ops::CRC32,
+        "CRC32_FILE",
+        &body,
+        &mgmt::JobCall {
+            op_id: 0,
+            subject: path,
+            deadline: CRC32_DEADLINE,
+        },
+    ) {
+        Ok(resp) => Ok(serde_json::from_slice(&resp)?),
+        // The FTX2 handler answered a failure as a normal ack carrying `err`; keep that shape
+        // for a job the console ran and could not finish (a missing file, a refused path).
+        Err(e) => match e.downcast_ref::<mgmt::MgmtError>() {
+            Some(m) if m.status != 0 => Ok(Crc32FileResult {
+                crc32: None,
+                size: None,
+                err: Some(m.cause.clone()),
+            }),
+            _ => Err(e),
+        },
     }
-    if ft != FrameType::Crc32FileAck {
-        bail!("expected CRC32_FILE_ACK, got {ft:?}");
-    }
-    Ok(serde_json::from_slice(&resp)?)
 }
+
+/// How long [`crc32_file`] waits for the console to finish.
+const CRC32_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppDbEntry {
@@ -536,19 +550,18 @@ pub fn ufs_fsck(addr: &str, device: &str, repair: bool) -> Result<UfsFsckResult>
         "repair": repair,
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::UfsFsck, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected UFS_FSCK: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::UfsFsckAck {
-        bail!("expected UFS_FSCK_ACK, got {ft:?}");
-    }
+    // fsck of a big volume runs for minutes: a job, polled (its reply is the same JSON).
+    let resp = mgmt::run_op(
+        addr,
+        mgmt::ops::FSCK,
+        "UFS_FSCK",
+        &body,
+        &mgmt::JobCall {
+            op_id: 0,
+            subject: device,
+            deadline: FSCK_DEADLINE,
+        },
+    )?;
     let parsed: UfsFsckResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(
@@ -558,6 +571,9 @@ pub fn ufs_fsck(addr: &str, device: &str, repair: bool) -> Result<UfsFsckResult>
     }
     Ok(parsed)
 }
+
+/// How long [`ufs_fsck`] waits for the console to finish.
+const FSCK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Measure round-trip latency to the payload by issuing N empty
 /// NetSpeedTest frames and timing each ACK.
