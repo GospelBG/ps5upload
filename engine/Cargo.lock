@@ -2206,6 +2206,7 @@ dependencies = [
  "anyhow",
  "ava1",
  "ava1-chaos",
+ "blake3",
  "ps5upload-core",
  "serde_json",
  "thiserror",

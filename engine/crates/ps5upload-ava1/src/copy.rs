@@ -1,0 +1,351 @@
+//! Console-local copy and move over AVA1 (`job.copy`, `job.status`, `job.cancel`).
+//! Blocking: call from `spawn_blocking` (the engine's `ps5_fs_copy` / `ps5_fs_move`).
+//!
+//! The console runs the job; the engine only asks for it and watches. The rules are the
+//! payload's (cca7b988): a job is owned by the device that issued it, so status and
+//! cancel from anyone else answer `ERR_UNKNOWN_JOB`; a `job.copy` for an id the console
+//! already has (same owner, same parameters) answers with that job instead of starting a
+//! second one, which is what makes re-issuing after a lost connection safe; a failed
+//! job is retired and restarted by a re-issue; and a move reports "running" until the
+//! source has been deleted, so `state = 1` is the only point at which a move is done.
+//! The op registry below mirrors the FTX2 op table the client already polls
+//! (`/api/ps5/fs/op-status`, `op-cancel`) for the ids this module owns.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Result};
+use ava1::gen::{self, JobCopy, JobRef, Status};
+use ava1::wire::Message;
+use ps5upload_core::fs_ops::FsOpSnapshot;
+
+use crate::pool::{pool, Pool};
+use crate::upload::{hex, refusal, terminal_connection_reason, wait, UploadFailure, STALL_LIMIT};
+
+const POLL: Duration = Duration::from_millis(500);
+/// `ERR_BUSY` is "another job holds this destination" or "the failed copy is still
+/// closing": the second is momentary, the first is not, so bound the wait.
+const BUSY_TRIES: u32 = 20;
+/// Consecutive re-issues that find the console no longer knowing the job.
+const REISSUE_LIMIT: u32 = 5;
+
+struct Op {
+    snap: FsOpSnapshot,
+    cancel: Arc<AtomicBool>,
+}
+
+fn ops() -> &'static Mutex<HashMap<u64, Op>> {
+    static OPS: OnceLock<Mutex<HashMap<u64, Op>>> = OnceLock::new();
+    OPS.get_or_init(Mutex::default)
+}
+
+/// Removes the registry entry on every exit: success, error, cancel, panic.
+struct Registered(u64);
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        ops().lock().unwrap().remove(&self.0);
+    }
+}
+
+fn register(op_id: u64, kind: &str, from: &str, to: &str) -> Result<(Registered, Arc<AtomicBool>)> {
+    let mut map = ops().lock().unwrap();
+    if map.contains_key(&op_id) {
+        return Err(anyhow!(
+            "op_id {op_id} is already running; a copy needs its own op id"
+        ));
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    map.insert(
+        op_id,
+        Op {
+            snap: FsOpSnapshot {
+                found: true,
+                op_id,
+                kind: kind.into(),
+                from: from.into(),
+                to: to.into(),
+                total_bytes: 0,
+                bytes_copied: 0,
+                cancel_requested: false,
+            },
+            cancel: cancel.clone(),
+        },
+    );
+    Ok((Registered(op_id), cancel))
+}
+
+/// Publishes the console's progress under `op_id` (a no-op for an id this module does
+/// not own). Public as the tests' seam.
+pub fn record_status(op_id: u64, st: &Status) {
+    if let Some(op) = ops().lock().unwrap().get_mut(&op_id) {
+        op.snap.total_bytes = st.bytes_total;
+        op.snap.bytes_copied = st.bytes_durable;
+    }
+}
+
+/// The snapshot for an op this module runs; `None` for any other id, so the caller falls
+/// through to the FTX2 query (which is how FTX2's own ops keep working).
+pub fn op_snapshot(op_id: u64) -> Option<FsOpSnapshot> {
+    ops().lock().unwrap().get(&op_id).map(|o| o.snap.clone())
+}
+
+/// Asks an op this module runs to stop. `false` for an id it does not own.
+pub fn op_cancel(op_id: u64) -> bool {
+    match ops().lock().unwrap().get_mut(&op_id) {
+        Some(op) => {
+            op.snap.cancel_requested = true;
+            op.cancel.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The console-side job id. Stable across this operation's own retries (a re-issue must
+/// find the job it started) and unique per operation: it hashes the kind and the
+/// overwrite choice, so a copy and a move of one path pair never alias a job directory
+/// or a status entry, AND the engine's `op_id`, so a user who copies the same pair
+/// again after deleting the destination does not get the console's still-listed
+/// finished job back as an instant, empty "success".
+pub fn copy_job_id(
+    op_id: u64,
+    from: &str,
+    to: &str,
+    move_source: bool,
+    overwrite: bool,
+) -> [u8; 16] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"ps5upload copy v1\0");
+    h.update(&op_id.to_le_bytes());
+    h.update(&[u8::from(move_source), u8::from(overwrite)]);
+    h.update(&(from.len() as u64).to_le_bytes());
+    h.update(from.as_bytes());
+    h.update(to.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    id
+}
+
+/// `JF_OVERWRITE` is sent exactly when the caller asked to overwrite; without it the
+/// console refuses an existing destination with `ERR_EXISTS` before writing anything.
+fn copy_flags(move_source: bool, overwrite: bool) -> u32 {
+    let mut f = 0;
+    if move_source {
+        f |= gen::JF_MOVE;
+    }
+    if overwrite {
+        f |= gen::JF_OVERWRITE;
+    }
+    f
+}
+
+pub fn console_copy(
+    console: &str,
+    from: &str,
+    to: &str,
+    op_id: u64,
+    move_source: bool,
+    overwrite: bool,
+) -> Result<()> {
+    console_copy_in(pool(), console, from, to, op_id, move_source, overwrite)
+}
+
+/// Sleeps `d`, waking early (and reporting it) when `cancel` is set.
+async fn nap(d: Duration, cancel: &AtomicBool) -> bool {
+    let end = Instant::now() + d;
+    while Instant::now() < end {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    cancel.load(Ordering::Relaxed)
+}
+
+pub fn console_copy_in(
+    pool: &Pool,
+    console: &str,
+    from: &str,
+    to: &str,
+    op_id: u64,
+    move_source: bool,
+    overwrite: bool,
+) -> Result<()> {
+    let kind = if move_source { "move" } else { "copy" };
+    let (_registered, cancel) = register(op_id, kind, from, to)?;
+    let id = copy_job_id(op_id, from, to, move_source, overwrite);
+    let flags = copy_flags(move_source, overwrite);
+    let issue = JobCopy {
+        job_id: id,
+        src: from.into(),
+        dest: to.into(),
+        flags,
+    }
+    .to_bytes()?;
+    let jobref = JobRef { job_id: id }.to_bytes()?;
+    crate::block_on(async {
+        if !pool.has_identity() {
+            return Err(UploadFailure {
+                reason: "ava1_no_identity".into(),
+                detail: "no AVA1 identity is available".into(),
+            }
+            .into());
+        }
+        let mut backoff = Duration::from_millis(250);
+        let mut terminal_attempts = 0;
+        // Whether the console is known to hold the job for this session. Cleared by any
+        // transport loss and by ERR_UNKNOWN_JOB (the console restarted or reaped it):
+        // issuing again is idempotent, and resumes from the console's own journal.
+        let mut issued = false;
+        let (mut busy, mut reissues) = (0u32, 0u32);
+        let (mut last_at, mut last_durable) = (Instant::now(), 0u64);
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                // Best effort: the user's stop must not wait on a console that is gone.
+                if let Ok(Ok(s)) =
+                    tokio::time::timeout(Duration::from_secs(5), pool.session(console)).await
+                {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        s.rpc(gen::METHOD_JOB_CANCEL, &jobref),
+                    )
+                    .await;
+                }
+                return Err(anyhow!("cancelled"));
+            }
+            let session = match pool.session(console).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(reason) = terminal_connection_reason(&e) {
+                        terminal_attempts += 1;
+                        if terminal_attempts >= 3 {
+                            return Err(UploadFailure {
+                                reason: reason.into(),
+                                detail: e.to_string(),
+                            }
+                            .into());
+                        }
+                    } else {
+                        terminal_attempts = 0;
+                    }
+                    issued = false;
+                    wait(&mut backoff, &e.to_string()).await;
+                    continue;
+                }
+            };
+            terminal_attempts = 0;
+            let (method, body) = if issued {
+                (gen::METHOD_JOB_STATUS, &jobref)
+            } else {
+                (gen::METHOD_JOB_COPY, &issue)
+            };
+            let reply = match session.rpc(method, body).await {
+                Ok(r) => r,
+                Err(e) => {
+                    pool.forget(console).await;
+                    issued = false;
+                    wait(&mut backoff, &e.to_string()).await;
+                    continue;
+                }
+            };
+            match reply.status {
+                gen::STATUS_OK => {}
+                gen::ERR_UNKNOWN_JOB if issued => {
+                    reissues += 1;
+                    if reissues > REISSUE_LIMIT {
+                        return Err(UploadFailure {
+                            reason: "ava1_copy_lost".into(),
+                            detail: "the console keeps forgetting this copy".into(),
+                        }
+                        .into());
+                    }
+                    issued = false;
+                    continue;
+                }
+                gen::ERR_BUSY if !issued && busy < BUSY_TRIES => {
+                    busy += 1;
+                    nap(POLL, &cancel).await;
+                    continue;
+                }
+                gen::ERR_EXISTS => {
+                    // The client keys its "already there" prompts on this token (the
+                    // FTX2 payload's own word for it).
+                    return Err(UploadFailure {
+                        reason: "ava1_exists".into(),
+                        detail: format!("fs_copy_dest_exists: {to} already exists"),
+                    }
+                    .into());
+                }
+                status => {
+                    return Err(refusal(status, format!("{kind} {from} -> {to}")).into());
+                }
+            }
+            let st = Status::decode(&reply.body)?;
+            record_status(op_id, &st);
+            if !issued {
+                issued = true;
+                backoff = Duration::from_millis(250);
+            }
+            match st.state {
+                Some(1) => return Ok(()),
+                Some(0) | None => {}
+                Some(_) => {
+                    // The console ran the job and it failed; it is terminal. A re-issue
+                    // would retire and restart it, which is the user's decision.
+                    let why = st
+                        .current
+                        .clone()
+                        .unwrap_or_else(|| "the console reported a failure".into());
+                    return Err(UploadFailure {
+                        reason: "ava1_copy_failed".into(),
+                        detail: format!("the console could not {kind} {from} to {to}: {why}"),
+                    }
+                    .into());
+                }
+            }
+            // A stalled copy ends the job. Once every byte is durable the console may
+            // still be renaming or (for a move) deleting a large tree, which moves no
+            // bytes, so the stall clock only runs while bytes are outstanding.
+            if st.bytes_durable > last_durable || st.bytes_durable >= st.bytes_total {
+                (last_at, last_durable) = (Instant::now(), st.bytes_durable);
+            } else if last_at.elapsed() > STALL_LIMIT {
+                return Err(anyhow!(
+                    "no copy progress for {STALL_LIMIT:?}; the job {} is still on the console",
+                    hex(&id)
+                ));
+            }
+            nap(POLL, &cancel).await;
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_ids_separate_kind_overwrite_and_operation() {
+        let base = copy_job_id(1, "/a", "/b", false, false);
+        assert_eq!(base, copy_job_id(1, "/a", "/b", false, false));
+        assert_ne!(base, copy_job_id(1, "/a", "/b", true, false));
+        assert_ne!(base, copy_job_id(1, "/a", "/b", false, true));
+        assert_ne!(base, copy_job_id(2, "/a", "/b", false, false));
+        assert_ne!(base, copy_job_id(1, "/b", "/a", false, false));
+        // The length prefix keeps ("/a","b/c") and ("/ab","/c") apart.
+        assert_ne!(
+            copy_job_id(1, "/a", "b/c", false, false),
+            copy_job_id(1, "/ab", "/c", false, false)
+        );
+    }
+
+    #[test]
+    fn overwrite_and_move_map_to_their_wire_flags() {
+        assert_eq!(copy_flags(false, false), 0);
+        assert_eq!(copy_flags(false, true), gen::JF_OVERWRITE);
+        assert_eq!(copy_flags(true, false), gen::JF_MOVE);
+        assert_eq!(copy_flags(true, true), gen::JF_MOVE | gen::JF_OVERWRITE);
+    }
+}

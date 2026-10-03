@@ -119,7 +119,7 @@ pub struct UploadFailure {
     pub detail: String,
 }
 
-fn refusal_reason(status: u16) -> String {
+pub(crate) fn refusal_reason(status: u16) -> String {
     match status {
         gen::ERR_NO_SPACE => "ava1_no_space".into(),
         gen::ERR_PATH => "ava1_not_allowed".into(),
@@ -129,7 +129,7 @@ fn refusal_reason(status: u16) -> String {
     }
 }
 
-fn terminal_connection_reason(error: &Ava1Error) -> Option<&'static str> {
+pub(crate) fn terminal_connection_reason(error: &Ava1Error) -> Option<&'static str> {
     match error {
         Ava1Error::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
             Some("ava1_unreachable")
@@ -140,7 +140,7 @@ fn terminal_connection_reason(error: &Ava1Error) -> Option<&'static str> {
     }
 }
 
-fn refusal(status: u16, message: String) -> UploadFailure {
+pub(crate) fn refusal(status: u16, message: String) -> UploadFailure {
     UploadFailure {
         reason: refusal_reason(status),
         detail: format!("console refused the transfer ({status}): {message}"),
@@ -163,9 +163,9 @@ const REMOTE_SOURCE_READERS: usize = 16;
 /// No durable progress for this long ends the job: the elapsed clock resets only when
 /// `bytes_durable` grows, so a link that keeps reconnecting but never lands a byte
 /// gives up.
-const STALL_LIMIT: Duration = Duration::from_secs(600);
+pub(crate) const STALL_LIMIT: Duration = Duration::from_secs(600);
 
-fn hex(b: &[u8; 16]) -> String {
+pub(crate) fn hex(b: &[u8; 16]) -> String {
     ava1::hex::encode(b)
 }
 
@@ -312,7 +312,7 @@ pub fn upload_with_in(
 
 /// Jittered doubling backoff, 250 ms → 5 s. Logs without ever panicking on a closed
 /// stderr (an engine under a dead parent).
-async fn wait(backoff: &mut Duration, why: &str) {
+pub(crate) async fn wait(backoff: &mut Duration, why: &str) {
     let jitter = Duration::from_millis(
         u64::from(std::process::id() % 97) * backoff.as_millis() as u64 / 400,
     );

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 ava1 = { path = "../ava1" }
 ps5upload-core = { path = "../ps5upload-core" }
 serde_json.workspace = true

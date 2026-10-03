@@ -1951,8 +1951,30 @@ async fn ps5_fs_move(
     // generous bound so the default 30 s socket timeout can't fire mid-op and
     // surface as the cryptic "read frame header" 502.
     let io_timeout = std::time::Duration::from_secs(60 * 60);
+    let overwrite = req.overwrite;
+    let op_id = if req.op_id != 0 {
+        req.op_id
+    } else {
+        next_fs_op_id()
+    };
+    // One blocking closure for the whole decision (the AVA1 probe is a blocking
+    // session attempt): the rename is still tried first — a same-drive move is
+    // metadata-only — and only a cross-mount refusal on an AVA1 console becomes a
+    // console-side move (copy, then delete the source after a verified finish), which
+    // replaces the client's copy-then-delete fallback for those consoles. `overwrite`
+    // travels with it, so a move that was not allowed to clobber still refuses.
     match tokio::task::spawn_blocking(move || {
-        fs_move_with_timeout(&addr, &from, &to, Some(io_timeout))
+        match fs_move_with_timeout(&addr, &from, &to, Some(io_timeout)) {
+            Err(e)
+                if {
+                    let msg = format!("{e:#}");
+                    msg.contains("cross_mount") || msg.contains("EXDEV")
+                } && ps5upload_ava1::route::use_ava1(&addr) =>
+            {
+                ps5upload_ava1::copy::console_copy(&addr, &from, &to, op_id, true, overwrite)
+            }
+            other => other,
+        }
     })
     .await
     .map_err(anyhow::Error::from)
@@ -1966,6 +1988,13 @@ async fn ps5_fs_move(
             (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
         }
         Err(e) => {
+            if e.to_string() == "cancelled" {
+                crate::log_info!(
+                    "fs_move cancelled: {from_for_log} -> {to_for_log} in {} ms",
+                    started.elapsed().as_millis()
+                );
+                return json_err(StatusCode::CONFLICT, "cancelled").into_response();
+            }
             crate::log_warn!(
                 "fs_move failed: {from_for_log} -> {to_for_log} in {} ms: {e}",
                 started.elapsed().as_millis()
@@ -2012,7 +2041,12 @@ async fn ps5_fs_copy(
     let stall = std::time::Duration::from_secs(180);
     let overwrite = req.overwrite;
     match tokio::task::spawn_blocking(move || {
-        fs_copy_robust(&addr, &from, &to, op_id, stall, overwrite)
+        // AVA1 (Task 25): the probe is blocking, so it runs here, not on the reactor.
+        if ps5upload_ava1::route::use_ava1(&addr) {
+            ps5upload_ava1::copy::console_copy(&addr, &from, &to, op_id, false, overwrite)
+        } else {
+            fs_copy_robust(&addr, &from, &to, op_id, stall, overwrite)
+        }
     })
     .await
     .map_err(anyhow::Error::from)
@@ -2424,6 +2458,23 @@ async fn ps5_fs_op_status(
 ) -> impl IntoResponse {
     let addr = mgmt_addr_or_default(q.addr, &state.default_ps5_addr);
     let op_id = q.op_id;
+    // An op this engine runs over AVA1 answers from its own registry, with the same
+    // field names the FTX2 branch emits; any other id falls through to the console.
+    if let Some(snap) = ps5upload_ava1::copy::op_snapshot(op_id) {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "op_id": snap.op_id,
+                "kind": snap.kind,
+                "from": snap.from,
+                "to": snap.to,
+                "total_bytes": snap.total_bytes,
+                "bytes_copied": snap.bytes_copied,
+                "cancel_requested": snap.cancel_requested,
+            })),
+        )
+            .into_response();
+    }
     match tokio::task::spawn_blocking(move || fs_op_status(&addr, op_id))
         .await
         .map_err(anyhow::Error::from)
@@ -2473,6 +2524,13 @@ async fn ps5_fs_op_cancel(
     let addr = mgmt_addr_or_default(req.addr, &state.default_ps5_addr);
     let op_id = req.op_id;
     crate::log_info!("fs_op_cancel: op_id={op_id}");
+    if ps5upload_ava1::copy::op_cancel(op_id) {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "cancelled": true })),
+        )
+            .into_response();
+    }
     match tokio::task::spawn_blocking(move || fs_op_cancel(&addr, op_id))
         .await
         .map_err(anyhow::Error::from)
@@ -7918,6 +7976,169 @@ struct TransferDownloadReq {
     unsafe_read: bool,
 }
 
+/// Where an AVA1 download lands (Task 25).
+enum Ava1DownloadTarget {
+    /// A tree under this directory: `dest_dir/<basename>`.
+    Folder(std::path::PathBuf),
+    /// One `.zip` at this path.
+    Zip(std::path::PathBuf),
+}
+
+/// Starts a console -> computer download over AVA1 and answers `ACCEPTED` with the job id,
+/// exactly like the FTX2 code in the two handlers it is called from (which stays
+/// byte-identical below their call). Three differences, all deliberate:
+/// - no FTX2 enumeration: the console's own manifest is the source of truth and the
+///   mgmt port is never touched, so the initial `Running` has an empty per-file list
+///   (bytes and total are correct; the list returns when the manifest feeds the UI) and
+///   no skipped-entry report;
+/// - the total is unknown until the manifest arrives, so the ticker reads
+///   `dynamic_total_bytes`, which the transfer fills in (a zero total is never published
+///   as if it were real);
+/// - the job id doubles as the AVA1 job id, so the journal, the `JobOpen` and the job
+///   record name the same value.
+fn start_ava1_download(
+    state: &AppState,
+    addr: String,
+    src: String,
+    kind: DownloadKind,
+    unsafe_read: bool,
+    target: Ava1DownloadTarget,
+) -> axum::response::Response {
+    let job_id = Uuid::new_v4();
+    let started_at_ms = now_ms();
+    let basename = src
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let dest_display = match &target {
+        Ava1DownloadTarget::Folder(dir) => dir.join(&basename).to_string_lossy().to_string(),
+        Ava1DownloadTarget::Zip(zip) => zip.to_string_lossy().to_string(),
+    };
+    crate::log_info!("transfer_download: job={job_id} protocol=ava1 src={src} dest={dest_display}");
+    let progress = Arc::new(AtomicU64::new(0));
+    let progress_files = Arc::new(AtomicU64::new(0));
+    let progress_files_finalized = Arc::new(AtomicU64::new(0));
+    let progress_bytes_finalized = Arc::new(AtomicU64::new(0));
+    let dynamic_total = Arc::new(AtomicU64::new(0));
+    let ctx = TickerContext {
+        started_at_ms,
+        total_bytes: 0,
+        dynamic_total_bytes: Some(Arc::clone(&dynamic_total)),
+        skipped_files: 0,
+        skipped_bytes: 0,
+    };
+    set_job(
+        &state.jobs,
+        &state.events_tx,
+        job_id,
+        JobState::Running {
+            stage: None,
+            started_at_ms,
+            bytes_sent: 0,
+            total_bytes: 0,
+            files: Vec::new(),
+            skipped_files: 0,
+            skipped_bytes: 0,
+            files_processing: 0,
+            files_finalized: 0,
+            files_finalizing_total: 0,
+            bytes_finalized: 0,
+        },
+    );
+    let jobs = Arc::clone(&state.jobs);
+    let events_tx = state.events_tx.clone();
+    let stop_ticker = spawn_progress_ticker(
+        Arc::clone(&jobs),
+        events_tx.clone(),
+        job_id,
+        ctx,
+        Arc::clone(&progress),
+        Arc::clone(&progress_files),
+        Arc::clone(&progress_files_finalized),
+        Arc::clone(&progress_bytes_finalized),
+    );
+    let counters = ps5upload_ava1::download::Counters {
+        bytes: Arc::clone(&progress),
+        files: Arc::clone(&progress_files),
+        files_finalized: Arc::clone(&progress_files_finalized),
+        bytes_finalized: Arc::clone(&progress_bytes_finalized),
+        total: Some(dynamic_total),
+    };
+    let cancel = register_transfer_cancel(job_id);
+    tokio::task::spawn_blocking(move || {
+        let _stop_guard = TickerStopGuard::new(stop_ticker);
+        let mut fail_guard =
+            JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
+        let id = *job_id.as_bytes();
+        let result = match &target {
+            Ava1DownloadTarget::Folder(dir) => ps5upload_ava1::download::to_local(
+                &addr,
+                &src,
+                kind,
+                dir,
+                unsafe_read,
+                id,
+                &counters,
+                Some(cancel),
+            ),
+            Ava1DownloadTarget::Zip(zip) => ps5upload_ava1::download::to_zip(
+                &addr,
+                &src,
+                kind,
+                zip,
+                unsafe_read,
+                id,
+                &counters,
+                Some(cancel),
+            ),
+        };
+        match result {
+            Ok(bytes) => {
+                let completed_at_ms = now_ms();
+                let files = progress_files.load(Ordering::Relaxed);
+                set_job(
+                    &jobs,
+                    &events_tx,
+                    job_id,
+                    JobState::Done {
+                        started_at_ms,
+                        completed_at_ms,
+                        elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
+                        tx_id_hex: id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        // The FTX2 field name; for AVA1 it carries files (as uploads do).
+                        shards_sent: files,
+                        bytes_sent: bytes,
+                        dest: dest_display,
+                        files_sent: files,
+                        skipped_files: 0,
+                        skipped_bytes: 0,
+                        commit_ack: None,
+                    },
+                );
+            }
+            Err(e) => {
+                let completed_at_ms = now_ms();
+                set_job(
+                    &jobs,
+                    &events_tx,
+                    job_id,
+                    job_failed_from_err(started_at_ms, completed_at_ms, &e),
+                );
+            }
+        }
+        fail_guard.mark_succeeded();
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(JobCreated {
+            job_id: job_id.to_string(),
+        }),
+    )
+        .into_response()
+}
+
 /// POST /api/transfer/download — PS5 → host file/folder pull.
 ///
 /// Mirrors the upload job machinery: returns a job_id immediately,
@@ -8004,6 +8225,23 @@ async fn transfer_download_handler(
         Err(e) => {
             return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
         }
+    }
+    // AVA1 (Task 25): decided after every input check above and before the FTX2
+    // enumeration, which an AVA1 download never runs. The probe is a blocking session
+    // attempt (up to ~3 s), so it never runs on the reactor.
+    let probe_addr = mgmt_addr.clone();
+    if tokio::task::spawn_blocking(move || ps5upload_ava1::route::use_ava1(&probe_addr))
+        .await
+        .unwrap_or(false)
+    {
+        return start_ava1_download(
+            &state,
+            mgmt_addr,
+            req.src_path.clone(),
+            kind,
+            req_unsafe,
+            Ava1DownloadTarget::Folder(dest_dir),
+        );
     }
     // `dest_root` is the LOGICAL landing path (dest_dir/<basename>) reported
     // back to the UI for display. It is NOT the write root: the download
@@ -8251,6 +8489,22 @@ async fn transfer_download_zip_handler(
                     .into_response()
             }
         }
+    }
+
+    // AVA1 (Task 25): after the parent-directory check, before the FTX2 enumeration.
+    let probe_addr = mgmt_addr.clone();
+    if tokio::task::spawn_blocking(move || ps5upload_ava1::route::use_ava1(&probe_addr))
+        .await
+        .unwrap_or(false)
+    {
+        return start_ava1_download(
+            &state,
+            mgmt_addr,
+            req.src_path.clone(),
+            kind,
+            req_unsafe_zip,
+            Ava1DownloadTarget::Zip(dest_zip),
+        );
     }
 
     let job_id = Uuid::new_v4();
