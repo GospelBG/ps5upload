@@ -1,6 +1,7 @@
 //! The payload's AVA1 C, built for the host (see build.rs). Test-only.
 #![cfg(unix)]
 
+pub mod mgmt_fs;
 use ava1::frame::Header;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};

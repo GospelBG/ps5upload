@@ -124,11 +124,12 @@ fn audit(check: &str) {
 fn real_table() -> Vec<(String, String)> {
     let src = std::fs::read_to_string(payload().join("src/mgmt_table.def")).unwrap();
     src.lines()
-        .filter(|l| l.starts_with("MGMT_H"))
+        .filter(|l| l.starts_with("MGMT_"))
         .map(|l| {
             let inner = &l[l.find('(').unwrap() + 1..l.rfind(')').unwrap()];
             let f: Vec<&str> = inner.split(',').map(str::trim).collect();
-            assert_eq!(f.len(), 6, "{l}");
+            // MGMT_H0/H1/HS: method, frame, ack, flags, handler, runner. MGMT_N: ..., run.
+            assert_eq!(f.len(), if l.starts_with("MGMT_N") { 5 } else { 6 }, "{l}");
             (f[0].to_string(), f[3].to_string())
         })
         .collect()

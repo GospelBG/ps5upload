@@ -62,6 +62,7 @@
 #include "smp_meta.h"
 #include "blake3.h"
 #include "mgmt_rpc.h"
+#include "mgmt_fs.h"
 
 /* PS5 SDK's `<fcntl.h>` hides `posix_fadvise` and its POSIX_FADV_* constants
  * behind `__POSIX_VISIBLE >= 200112`, but defining `_POSIX_C_SOURCE` to unlock
@@ -15815,6 +15816,32 @@ abort_done:
 
 __thread volatile unsigned int g_inflight_frame_type = 0;
 
+/* node.shutdown (the FTX2 SHUTDOWN frame's body, a handler of its own for the AVA1 table). */
+static int handle_shutdown(runtime_state_t *state, int client_fd, uint64_t trace_id) {
+    if (!state) return -1;
+    runtime_mark_active_transactions(state, "interrupted");
+    state->shutdown_requested = 1;
+    (void)runtime_append_tx_event(state, "shutdown");
+    return send_frame(client_fd, FTX2_FRAME_SHUTDOWN_ACK, 0, trace_id, "{}", 2);
+}
+
+/* The native filesystem methods (mgmt_fs.c) take their policy from here: the same allowlist, the same
+ * read carve-outs and the same command counter the FTX2 handlers use. */
+static runtime_state_t *g_mgmt_fs_state;
+
+static int mgmt_fs_read_allowed(const char *path, int unsafe_read) {
+    return is_path_allowed(path) || is_profile_avatar_read_path(path) ||
+           (unsafe_read && is_safe_unsafe_read_path(path));
+}
+
+static void mgmt_fs_count(void) {
+    runtime_state_t *st = g_mgmt_fs_state;
+    if (!st) return;
+    pthread_mutex_lock(&st->state_mtx);
+    st->command_count += 1;
+    pthread_mutex_unlock(&st->state_mtx);
+}
+
 /* The AVA1 management table (mgmt_table.def) and its thread environment. */
 #include "mgmt_install.inc"
 
@@ -16034,10 +16061,7 @@ static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
 
     /* ── SHUTDOWN ── */
     if (hdr.frame_type == FTX2_FRAME_SHUTDOWN) {
-        runtime_mark_active_transactions(state, "interrupted");
-        state->shutdown_requested = 1;
-        (void)runtime_append_tx_event(state, "shutdown");
-        return send_frame(client_fd, FTX2_FRAME_SHUTDOWN_ACK, 0, hdr.trace_id, "{}", 2);
+        return handle_shutdown(state, client_fd, hdr.trace_id);
     }
 
     /* ── CLEANUP ── */

@@ -220,10 +220,13 @@ def reach(name):
 def table():
     out = []
     for l in open("src/mgmt_table.def"):
-        m = re.match(r"MGMT_H([01])\((.*)\)\s*$", l)
+        m = re.match(r"MGMT_(H[01S]|N)\((.*)\)\s*$", l)
         if m:
             f = [x.strip() for x in m.group(2).split(",")]
-            out.append(dict(kind=m.group(1), method=f[0], frame=f[1], ack=f[2], flags=f[3], handler=f[4], runner=f[5]))
+            if m.group(1) == "N":  # a native runner: it is the handler, and it lives in its own file
+                out.append(dict(kind="N", method=f[0], frame=f[1], ack=f[2], flags=f[3], handler=f[4], runner=f[4]))
+            else:
+                out.append(dict(kind=m.group(1), method=f[0], frame=f[1], ack=f[2], flags=f[3], handler=f[4], runner=f[5]))
     return out
 
 
@@ -237,8 +240,9 @@ def check_table():
         seen.add(e["method"])
         if "#define " + e["method"] + " " not in gen:
             bad.append("%s is not a generated AVA1_METHOD_* constant" % e["method"])
-        if e["handler"] not in FUNCS or FUNCS[e["handler"]][1] != "src/runtime.c":
-            bad.append("%s: handler %s is not defined in runtime.c" % (e["method"], e["handler"]))
+        home = "src/mgmt_fs.c" if e["kind"] == "N" else "src/runtime.c"
+        if e["handler"] not in FUNCS or FUNCS[e["handler"]][1] != home:
+            bad.append("%s: handler %s is not defined in %s" % (e["method"], e["handler"], home))
         dotted = e["method"][len("AVA1_METHOD_"):].lower()
         if "`%s`" % dotted.replace("_", ".", 1) not in checklist and "`%s`" % dotted not in checklist:
             bad.append("%s is not in MGMT_METHODS.md (looked for %s)" % (e["method"], dotted.replace("_", ".", 1)))

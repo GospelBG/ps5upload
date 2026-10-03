@@ -103,6 +103,8 @@ int mgmt_status_for_token(const char *t) {
     if (!t) return AVA1_ERR_INTERNAL;
     /* Order matters: the first rule that matches wins. */
     if (has(t, "cross_mount") || has(t, "cross_device")) return AVA1_ERR_CROSS_DEVICE;
+    /* A missing argument is the caller's (cleanup_missing_path), whatever the argument is called. */
+    if (has(t, "missing")) return AVA1_ERR_PROTOCOL;
     /* A path the node's policy refuses (the allowlist) is ERR_PATH; an OS permission refusal is not
      * a path problem. The schema has no permission code, so it is ERR_IO ("the filesystem refused"). */
     if (has(t, "path") || has(t, "not_allowed")) return AVA1_ERR_PATH;
@@ -166,8 +168,15 @@ int mgmt_legacy_failure(const char *body, size_t len, char *token, size_t token_
 
 /* ---- calling a legacy handler ---- */
 
-int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
-                     mgmt_reply_t *rep) {
+/* How a captured frame is read: MODE_RAW = the body is data (a log, file bytes), never a
+ * {"ok":false} failure; MODE_KEEP = a failure's whole body is the error cause (the caller needs its
+ * fields: net.reach's errno and timed_out, a mount's code). */
+#define MODE_RAW 1u
+#define MODE_KEEP 2u
+#define MGMT_KEEP_MAX 1024u
+
+static int legacy_call_ex(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
+                          mgmt_reply_t *rep, unsigned mode) {
     capture_t c;
     char *rq, token[MGMT_CAUSE_MAX + 1];
     int rc;
@@ -202,15 +211,30 @@ int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t 
         free(c.buf);
         return st;
     }
-    if (mgmt_legacy_failure((const char *)c.buf, c.len, token, sizeof token)) {
+    if (!(mode & MODE_RAW) && mgmt_legacy_failure((const char *)c.buf, c.len, token, sizeof token)) {
         int st = mgmt_status_for_token(token);
-        mgmt_reply_error(cx, st, token);
+        if (mode & MODE_KEEP) {
+            size_t n = c.len < MGMT_KEEP_MAX && c.len <= cx->cap ? c.len : 0;
+            if (n) {
+                memcpy(cx->out, c.buf, n);
+                cx->out_len = n;
+            } else {
+                mgmt_reply_error(cx, st, token);
+            }
+        } else {
+            mgmt_reply_error(cx, st, token);
+        }
         free(c.buf);
         return st;
     }
     rep->body = c.buf;
     rep->len = c.len;
     return AVA1_STATUS_OK;
+}
+
+int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
+                     mgmt_reply_t *rep) {
+    return legacy_call_ex(cx, fn, req, req_len, capture_cap, rep, 0);
 }
 
 /* The text capacity this call can carry: the reply buffer minus the MgmtText encoding. */
@@ -289,6 +313,97 @@ int mgmt_call_paged(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_
     }
     rc = mgmt_reply_text(cx, page, page_len, more);
     free(page);
+    return rc;
+}
+
+/* A MgmtText method whose failure body is data the caller needs: the whole {"ok":false,...} body is
+ * the error cause (status from its "err" token). net.reach: errno/timed_out/ms; mounts: code. */
+int mgmt_call_text_keep(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn) {
+    const char *b;
+    uint32_t bl;
+    mgmt_reply_t rep;
+    int rc;
+    if ((rc = text_request(cx, req, n, &b, &bl)) != AVA1_STATUS_OK) return rc;
+    rc = legacy_call_ex(cx, fn, b, bl, text_cap(cx), &rep, MODE_KEEP);
+    if (rc != AVA1_STATUS_OK) return rc;
+    rc = mgmt_reply_text(cx, (const char *)rep.body, rep.len, -1);
+    mgmt_reply_free(&rep);
+    return rc;
+}
+
+/* A method whose answer is empty (node.shutdown): the handler's body is dropped. */
+int mgmt_call_empty(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn) {
+    mgmt_reply_t rep;
+    int rc;
+    (void)req;
+    (void)n;
+    rc = mgmt_legacy_call(cx, fn, "", 0, 4096, &rep);
+    if (rc != AVA1_STATUS_OK) return rc;
+    mgmt_reply_free(&rep);
+    cx->out_len = 0;
+    return AVA1_STATUS_OK;
+}
+
+/* The `max_bytes` of a log request: 1 found, 0 absent, -1 malformed (taken as absent, as atoll was). */
+static uint64_t request_max_bytes(const char *b, uint32_t bl, int *present) {
+    char *z;
+    uint64_t v = 0;
+    int rc;
+    *present = 0;
+    z = malloc((size_t)bl + 1);
+    if (!z) return 0;
+    memcpy(z, b, bl);
+    z[bl] = '\0';
+    rc = mgmt_json_u64(z, "max_bytes", &v);
+    free(z);
+    if (rc != 1) return 0;
+    *present = 1;
+    return v;
+}
+
+#define MGMT_KLOG_DEFAULT (16u * 1024u)
+#define MGMT_KLOG_MAX (64u * 1024u)
+#define MGMT_SYSLOG_MAX (1024u * 1024u) /* the handler's HARD_CAP */
+
+/* log.klog: the kernel log buffer, at most max_bytes (default 16 KiB, at most 64 KiB, as the handler
+ * clamps it). `more` = the read filled the whole ask, so older text probably remains. */
+int mgmt_call_klog(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn) {
+    const char *b;
+    uint32_t bl;
+    mgmt_reply_t rep;
+    uint64_t max = MGMT_KLOG_DEFAULT, v;
+    int rc, present;
+    if ((rc = text_request(cx, req, n, &b, &bl)) != AVA1_STATUS_OK) return rc;
+    /* The handler reads a request only when it is shorter than 256 bytes; the same rule here. */
+    if (bl > 0 && bl < 256) {
+        v = request_max_bytes(b, bl, &present);
+        if (present && v > 0) max = v > MGMT_KLOG_MAX ? MGMT_KLOG_MAX : v;
+    }
+    rc = legacy_call_ex(cx, fn, b, bl, MGMT_KLOG_MAX, &rep, MODE_RAW);
+    if (rc != AVA1_STATUS_OK) return rc;
+    rc = mgmt_reply_text(cx, (const char *)rep.body, rep.len, rep.len >= max);
+    mgmt_reply_free(&rep);
+    return rc;
+}
+
+/* log.syslog: the tail of the kernel message buffer. The handler can answer up to 1 MiB; a reply
+ * carries at most RPC_TEXT_MAX (or the request's max_bytes), so the LAST bytes are returned and
+ * `more` says older text was cut. */
+int mgmt_call_syslog(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn) {
+    const char *b;
+    uint32_t bl;
+    mgmt_reply_t rep;
+    uint64_t limit = text_cap(cx), v;
+    size_t skip = 0;
+    int rc, present;
+    if ((rc = text_request(cx, req, n, &b, &bl)) != AVA1_STATUS_OK) return rc;
+    v = request_max_bytes(b, bl, &present);
+    if (present && v > 0 && v < limit) limit = v;
+    rc = legacy_call_ex(cx, fn, "", 0, MGMT_SYSLOG_MAX, &rep, MODE_RAW);
+    if (rc != AVA1_STATUS_OK) return rc;
+    if (rep.len > limit) skip = rep.len - (size_t)limit;
+    rc = mgmt_reply_text(cx, (const char *)rep.body + skip, rep.len - skip, skip > 0);
+    mgmt_reply_free(&rep);
     return rc;
 }
 

@@ -1,0 +1,37 @@
+//! P3 Task 4: the native filesystem runners (`payload/src/mgmt_fs.c`) and the log/net/node
+//! runners over stub handlers, installed behind a temp-directory path policy (csrc/test_shim_fs.c).
+#![cfg(unix)]
+
+use std::ffi::CString;
+use std::os::raw::{c_char, c_int};
+use std::path::Path;
+
+extern "C" {
+    fn ava1_test_mgmtfs_install(root: *const c_char) -> c_int;
+    fn ava1_test_mgmtfs_uninstall();
+    fn ava1_test_mgmtfs_set(fake_dev: c_int, klog_avail: u32, syslog_len: u32);
+    fn ava1_test_mgmtfs_stats(counted: *mut u32, shutdowns: *mut u32, unsafe_seen: *mut u32);
+}
+
+/// Installs the table; every fs method acts only under `root` (the temp dir of the test).
+pub fn install(root: &Path) -> i32 {
+    let c = CString::new(root.to_str().unwrap()).unwrap();
+    unsafe { ava1_test_mgmtfs_install(c.as_ptr()) }
+}
+
+pub fn uninstall() {
+    unsafe { ava1_test_mgmtfs_uninstall() }
+}
+
+/// `fake_dev`: a path containing `/mnt2` is on another device (the rename guard's input).
+/// `klog_avail` / `syslog_len`: how much text the stub log handlers hold (`u32::MAX` = fail).
+pub fn set(fake_dev: bool, klog_avail: u32, syslog_len: u32) {
+    unsafe { ava1_test_mgmtfs_set(fake_dev as c_int, klog_avail, syslog_len) }
+}
+
+/// (commands counted by fs methods, node.shutdown handler calls, reads that asked for FSR_UNSAFE).
+pub fn stats() -> (u32, u32, u32) {
+    let (mut a, mut b, mut c) = (0, 0, 0);
+    unsafe { ava1_test_mgmtfs_stats(&mut a, &mut b, &mut c) };
+    (a, b, c)
+}
