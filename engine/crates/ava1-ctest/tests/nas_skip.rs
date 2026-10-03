@@ -3,6 +3,7 @@
 //! for a local folder, a remote (NAS) source that reports mtimes, and one that does not
 //! (SPEC.md §11.4). Each run is a new job (a new upload), as the engine's resume
 //! strategy makes it.
+#![cfg(unix)]
 mod common;
 
 use std::collections::BTreeMap;
