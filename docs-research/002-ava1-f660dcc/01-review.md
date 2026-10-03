@@ -1,7 +1,7 @@
 # AVA1 review: `ava1` e64002f → f660dcc (2026-10-03)
 
-Twenty-five commits, about 15k lines. Reviewed against `docs-research/ava1-design-review-v2.md`
-(the round-2 design review) and `docs-research/ava1-archive-sources.md` (the Task 11 research).
+Twenty-five commits, about 15k lines. Reviewed against `docs-research/001-ava1-e64002f/02-design-review-round2.md`
+(the round-2 design review) and `docs-research/001-ava1-e64002f/03-archive-sources.md` (the Task 11 research).
 Everything below was read in full: `ava1/src/seq.rs`, `ps5upload-ava1/src/{seq,rar_source,mgmt,
 upload}.rs`, the `send.rs`/`recv.rs`/`server.rs`/`session.rs`/`pool.rs` diffs, `core/mgmt.rs`,
 the `transfer.rs` RAR walk, `payload/src/mgmt_rpc.c` + `mgmt_install.inc` + `mgmt_table.def`, the
