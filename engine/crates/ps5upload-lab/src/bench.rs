@@ -563,15 +563,24 @@ Scenarios:
 Options:
   --proto ava1|ftx2     required: the protocol under test (never read from the environment)
   --src PATH            required (see the scenarios)
-  --dest PATH           console path (local directory for download); recursive deletes happen
-                        here between runs, so a path component must contain 'bench'
-                        (PS5UPLOAD_BENCH_ALLOW_ANY_DEST=1 lifts that)
+  --dest PATH           console path (local directory for download). Recursive deletes happen
+                        here between runs, so a console path must mirror the payload's cleanup
+                        allowlist: /data or /mnt/ext<N> or /mnt/usb<N>, then
+                        /ps5upload/tests/..., with a component equal to `bench` or starting
+                        with `bench-` below tests (`bench-src` is reserved for staging sources
+                        and is refused). A local download directory must be absent, empty or
+                        bench-named.
+  --warmup              run one extra, flagged (run_kind=warmup, run 0) first run; the summary
+                        medians use warm runs only (cold ones if there are none)
   --runs N              repetitions, N >= 1 (default 1)
   --elf FILE            payload for `resume` (default: --elf, then PS5UPLOAD_ELF, then
                         payload/ps5upload.elf or ../payload/ps5upload.elf)
   --to CONSOLE2         second console for `relay`
   --out FILE            results file (default: <data dir>/bench-results.jsonl)
   --kill-every-s N      drop60 only: seconds between kills (default 60)
+
+Every attempt has a deadline: 120 s + bytes / 5 MB/s + files / 50 s; expiry fails the run
+(and stops the remaining runs, since the abandoned transfer may still be running).
 
 Every run appends one JSON line to the results file; a summary per drive follows. Run from
 the engine/ directory. Nothing prompts: a console that needs a pairing code is an error.";
@@ -650,6 +659,7 @@ pub struct BenchArgs {
     pub to: Option<String>,
     pub out: Option<PathBuf>,
     pub kill_every_s: u64,
+    pub warmup: bool,
 }
 
 fn host_of(console: &str) -> String {
@@ -666,7 +676,7 @@ impl BenchArgs {
         let mut pos: Vec<&str> = Vec::new();
         let (mut proto, mut src, mut dest, mut elf, mut to, mut out) =
             (None, None, None, None, None, None);
-        let (mut runs, mut kill_every_s) = (1u32, 60u64);
+        let (mut runs, mut kill_every_s, mut warmup) = (1u32, 60u64, false);
         let mut i = 0;
         while i < a.len() {
             let Some(flag) = a[i].strip_prefix("--") else {
@@ -674,6 +684,11 @@ impl BenchArgs {
                 i += 1;
                 continue;
             };
+            if flag == "warmup" {
+                warmup = true;
+                i += 1;
+                continue;
+            }
             let v = *a
                 .get(i + 1)
                 .ok_or_else(|| anyhow!("--{flag} needs a value"))?;
@@ -734,6 +749,7 @@ impl BenchArgs {
             to,
             out,
             kill_every_s,
+            warmup,
         };
         if parsed.scenario != Scenario::Download && parsed.dest.is_none() {
             bail!("--dest is required for {}", parsed.scenario.name());
@@ -744,13 +760,23 @@ impl BenchArgs {
         if parsed.scenario == Scenario::Drop60 && parsed.proto != Proto::Ava1 {
             bail!("drop60 is AVA1 only: FTX2 has no credit-window resend to measure");
         }
+        if parsed.scenario == Scenario::Copy {
+            check_copy_overlap(&parsed.src, parsed.dest.as_deref().unwrap_or(""))?;
+        }
         Ok(parsed)
     }
 }
 
-/// A destination the bench may delete recursively between runs (C8). Absolute, no `..`,
-/// strictly below a drive root (`/data`, `/mnt/<drive>`, `/user`), and — so a typo can
-/// never point the cleanup at real data — some component says `bench`.
+/// A bench-owned name: `bench` or `bench-<anything>`.
+fn bench_named(c: &str) -> bool {
+    c == "bench" || c.starts_with("bench-")
+}
+
+/// A destination the bench may delete recursively between runs (C8). It mirrors the
+/// payload's `cleanup_path_allowed` (payload/src/runtime.c): `/data`, `/mnt/ext<N>` or
+/// `/mnt/usb<N>`, then `/ps5upload/tests/...`, no `.`/`..`. On top of that the bench
+/// demands a `bench` / `bench-*` component *below* `tests` (never the shared sandbox
+/// root itself) and reserves `bench-src*` for staged sources, which no run may delete.
 pub fn check_console_dest(path: &str) -> anyhow::Result<()> {
     if !path.starts_with('/') || path.contains("//") || path.contains('\\') {
         bail!("{path:?}: the destination must be an absolute console path");
@@ -759,24 +785,74 @@ pub fn check_console_dest(path: &str) -> anyhow::Result<()> {
     if comps.iter().any(|c| *c == ".." || *c == ".") {
         bail!("{path:?}: the destination must not contain . or ..");
     }
-    let below = match comps.first().copied() {
-        Some("mnt") => comps.len().saturating_sub(2),
-        Some("data") | Some("user") => comps.len().saturating_sub(1),
-        _ => bail!("{path:?}: the destination must be under /data, /mnt/<drive> or /user"),
+    let drive_len = match comps.as_slice() {
+        ["data", ..] => 1,
+        ["mnt", d, ..]
+            if (d.starts_with("ext") || d.starts_with("usb"))
+                && d.len() > 3
+                && d[3..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            2
+        }
+        _ => bail!(
+            "{path:?}: the payload only cleans /data, /mnt/ext<N> or /mnt/usb<N> (under \
+             /ps5upload/tests/)"
+        ),
     };
-    if below == 0 {
-        bail!("{path:?}: refusing a drive root; use a directory below it");
-    }
-    let allow_any = std::env::var("PS5UPLOAD_BENCH_ALLOW_ANY_DEST").is_ok_and(|v| v == "1");
-    if !allow_any
-        && !comps
-            .iter()
-            .any(|c| c.to_ascii_lowercase().contains("bench"))
-    {
+    let rest = &comps[drive_len..];
+    if rest.len() < 3 || rest[0] != "ps5upload" || rest[1] != "tests" {
         bail!(
-            "{path:?}: the bench deletes its destination between runs, so a component of the \
-             path must contain \"bench\" (or set PS5UPLOAD_BENCH_ALLOW_ANY_DEST=1)"
+            "{path:?}: the payload only cleans <drive>/ps5upload/tests/..., with a bench \
+             directory below tests (e.g. /data/ps5upload/tests/bench/tiny)"
         );
+    }
+    let below = &rest[2..];
+    if below.iter().any(|c| c.starts_with("bench-src")) {
+        bail!("{path:?}: bench-src is reserved for staged sources and is never a destination");
+    }
+    if !below.iter().any(|c| bench_named(c)) {
+        bail!("{path:?}: a component below tests must be `bench` or start with `bench-`");
+    }
+    Ok(())
+}
+
+/// The local download directory: the run deletes `<dir>/<basename of --src>` between
+/// runs, so the directory must be absent, empty, or bench-named, and the basename must
+/// be a real name (never empty, `.` or `..`).
+pub fn check_local_dest(dir: &Path, src: &str) -> anyhow::Result<()> {
+    let base = basename(src);
+    if base.is_empty() || base == "." || base == ".." {
+        bail!("--src {src:?} has no usable name to download into");
+    }
+    if dir.as_os_str().is_empty() || dir.parent().is_none() {
+        bail!(
+            "{}: refusing a root or empty download directory",
+            dir.display()
+        );
+    }
+    let named = dir
+        .components()
+        .any(|c| bench_named(&c.as_os_str().to_string_lossy()));
+    let empty_or_absent = match std::fs::read_dir(dir) {
+        Ok(mut rd) => rd.next().is_none(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    };
+    if !named && !empty_or_absent {
+        bail!(
+            "{}: the download directory holds files and is not bench-named; use an absent, \
+             empty or bench-* directory (the bench deletes <dir>/{base} between runs)",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// copy: the destination may not contain the source nor sit inside it.
+pub fn check_copy_overlap(src: &str, dest: &str) -> anyhow::Result<()> {
+    let (s, d) = (src.trim_end_matches('/'), dest.trim_end_matches('/'));
+    let inside = |a: &str, b: &str| a == b || a.starts_with(&format!("{b}/"));
+    if inside(d, s) || inside(s, d) {
+        bail!("copy: --dest {dest:?} and --src {src:?} overlap");
     }
     Ok(())
 }
@@ -900,6 +976,8 @@ pub struct Row {
     pub run: BenchRun,
     pub drive: String,
     pub verified: bool,
+    /// `warmup`, `cold` (the first measured run of an invocation without --warmup) or `warm`.
+    pub run_kind: String,
     /// The drive's calibrated create ceiling (files/s), when a calibrate record exists.
     pub ceiling: Option<u64>,
     pub extra: Map<String, Value>,
@@ -915,6 +993,7 @@ impl Row {
         o.insert("started_at".into(), started_at.into());
         o.insert("drive".into(), self.drive.clone().into());
         o.insert("verified".into(), self.verified.into());
+        o.insert("run_kind".into(), self.run_kind.clone().into());
         o.insert("ceiling_files_s".into(), self.ceiling.into());
         o.extend(self.extra.clone());
         v
@@ -986,11 +1065,22 @@ pub fn summary(rows: &[Row], out: &Path) -> String {
         s += "  proto  ok/runs   median MB/s   median files/s   files/s vs ceiling\n";
         let mut med: BTreeMap<&str, (Option<f64>, Option<f64>)> = BTreeMap::new();
         for proto in ["ava1", "ftx2"] {
-            let mine: Vec<&&Row> = rs.iter().filter(|r| r.run.proto == proto).collect();
+            // Warm-up runs are flagged and never counted in the table; medians use warm
+            // runs, falling back to the cold first run when no warm run exists.
+            let mine: Vec<&&Row> = rs
+                .iter()
+                .filter(|r| r.run.proto == proto && r.run_kind != "warmup")
+                .collect();
             if mine.is_empty() {
                 continue;
             }
-            let good: Vec<&&Row> = mine.iter().copied().filter(|r| r.run.ok).collect();
+            let any_warm = mine.iter().any(|r| r.run_kind == "warm");
+            let kind = if any_warm { "warm" } else { "cold" };
+            let good: Vec<&&Row> = mine
+                .iter()
+                .copied()
+                .filter(|r| r.run.ok && r.run_kind == kind)
+                .collect();
             let col = |f: fn(&BenchRun) -> f64| {
                 median(&good.iter().map(|r| f(&r.run)).collect::<Vec<_>>())
             };
@@ -1001,7 +1091,7 @@ pub fn summary(rows: &[Row], out: &Path) -> String {
                 _ => "n/a".into(),
             };
             s += &format!(
-                "  {proto:<5}  {:>2}/{:<4}    {:>11}   {:>14}   {pct:>18}\n",
+                "  {proto:<5}  {:>2}/{:<4}    {:>11}   {:>14}   {pct:>18}  [{kind} runs]\n",
                 good.len(),
                 mine.len(),
                 fmt1(mb),
@@ -1108,8 +1198,6 @@ struct Measured {
     /// The protocol the evidence shows (C13).
     observed: String,
     verified_by: &'static str,
-    /// Overrides the corpus byte count (resume counts bytes sent across attempts).
-    bytes: Option<u64>,
     /// An error the scenario's own pass rule found in an otherwise finished run.
     verdict: Option<String>,
     extra: Map<String, Value>,
@@ -1125,7 +1213,6 @@ impl Measured {
             sequential: false,
             observed,
             verified_by,
-            bytes: None,
             verdict: None,
             extra: Map::new(),
         }
@@ -1391,8 +1478,9 @@ fn measured_from_transfer(proto: Proto, tr: &TransferResult, seconds: f64) -> Me
     m
 }
 
-async fn run_upload(env: &Env, args: &BenchArgs, prep: &Prep) -> Attempt {
-    let (cfg, _c, _note) = make_cfg(args, args.proto);
+async fn run_upload(env: &Env, args: &BenchArgs, prep: &Prep, cancel: &Arc<AtomicBool>) -> Attempt {
+    let (mut cfg, _c, _note) = make_cfg(args, args.proto);
+    cfg.cancel = Some(cancel.clone());
     let (secs, r) = spawn_upload(env.pool.clone(), args, prep, cfg, new_id())
         .await
         .map_err(|e| (0.0, format!("upload task: {e}")))?;
@@ -1408,10 +1496,11 @@ async fn run_drop60(
     env: &Env,
     args: &BenchArgs,
     prep: &Prep,
+    cancel: &Arc<AtomicBool>,
     proxy: &ava1_chaos::ChaosProxy,
 ) -> Attempt {
     let before = proxy.kills();
-    let mut m = run_upload(env, args, prep).await?;
+    let mut m = run_upload(env, args, prep, cancel).await?;
     let drops = proxy.kills() - before;
     m.extra.insert("drops".into(), drops.into());
     m.verdict = drop60_verdict(m.resent, drops).err();
@@ -1421,10 +1510,9 @@ async fn run_drop60(
 /// resume: stop the payload at 50 % durable, re-send the stamped ELF (C16), and let the
 /// adapter's reconnect loop carry on. AVA1 reads durable bytes, FTX2 sent bytes (it has
 /// no durable counter).
-async fn run_resume(env: &Env, args: &BenchArgs, prep: &Prep) -> Attempt {
+async fn run_resume(env: &Env, args: &BenchArgs, prep: &Prep, cancel: &Arc<AtomicBool>) -> Attempt {
     let elf = prep.elf.as_ref().expect("resume loads its ELF first");
     let (mut cfg, c, _note) = make_cfg(args, args.proto);
-    let cancel = Arc::new(AtomicBool::new(false));
     cfg.cancel = Some(cancel.clone());
     let counter = match args.proto {
         Proto::Ava1 => c.bytes_finalized.clone(),
@@ -1479,7 +1567,7 @@ async fn run_resume(env: &Env, args: &BenchArgs, prep: &Prep) -> Attempt {
         Proto::Ava1 => tr.bytes_sent,
         Proto::Ftx2 => tr.bytes_sent.max(c.bytes.load(Ordering::Relaxed)),
     };
-    m.bytes = Some(sent);
+    m.extra.insert("sent_bytes".into(), sent.into());
     m.extra.insert("payload_size".into(), size.into());
     match fired {
         None => {
@@ -1501,6 +1589,7 @@ async fn run_resume(env: &Env, args: &BenchArgs, prep: &Prep) -> Attempt {
                 }
             } else {
                 m.resent = sent.saturating_sub(size);
+                m.extra.insert("resent_best_effort".into(), true.into());
             }
         }
     }
@@ -1515,12 +1604,19 @@ async fn session_evidence(env: &Env, console: &str) -> String {
     }
 }
 
-async fn run_download(env: &Env, args: &BenchArgs, prep: &Prep, dir: &Path) -> Attempt {
+async fn run_download(
+    env: &Env,
+    args: &BenchArgs,
+    prep: &Prep,
+    dir: &Path,
+    cancel: &Arc<AtomicBool>,
+) -> Attempt {
     let kind = prep.kind.expect("download resolves its kind first");
     let (dest, src) = (dir.to_path_buf(), args.src.clone());
     let (secs, r) = match args.proto {
         Proto::Ava1 => {
             let (pool, console) = (env.pool.clone(), args.transfer.clone());
+            let cancel = cancel.clone();
             blocking(move || {
                 let t = Instant::now();
                 let r = ps5upload_ava1::download::to_local_in(
@@ -1532,7 +1628,7 @@ async fn run_download(env: &Env, args: &BenchArgs, prep: &Prep, dir: &Path) -> A
                     false,
                     new_id(),
                     &ps5upload_ava1::download::Counters::default(),
-                    None,
+                    Some(cancel),
                 );
                 (t.elapsed().as_secs_f64(), r)
             })
@@ -1570,6 +1666,12 @@ async fn run_download(env: &Env, args: &BenchArgs, prep: &Prep, dir: &Path) -> A
             };
             let mut m = Measured::new(secs, observed, by);
             m.extra.insert("bytes_reported".into(), n.into());
+            if n != prep.bytes {
+                m.verdict = Some(format!(
+                    "the download reported {n} bytes, the source holds {}",
+                    prep.bytes
+                ));
+            }
             Ok(m)
         }
         Err(e) => Err((secs, format!("{e:#}"))),
@@ -1633,7 +1735,13 @@ async fn run_copy(env: &Env, args: &BenchArgs) -> Attempt {
 
 /// relay: AVA1 streams console to console; FTX2 is download-then-upload through this
 /// computer's disk (the app's current behaviour), timed end to end (C18).
-async fn run_relay(env: &Env, args: &BenchArgs, prep: &Prep, scratch: &Path) -> Attempt {
+async fn run_relay(
+    env: &Env,
+    args: &BenchArgs,
+    prep: &Prep,
+    scratch: &Path,
+    cancel: &Arc<AtomicBool>,
+) -> Attempt {
     let to = args.to.clone().expect("validated");
     let to_transfer = format!("{}:9113", host_of(&to));
     let dest = args.dest.clone().unwrap();
@@ -1643,6 +1751,7 @@ async fn run_relay(env: &Env, args: &BenchArgs, prep: &Prep, scratch: &Path) -> 
         Proto::Ava1 => {
             let (pool, from) = (env.pool.clone(), args.transfer.clone());
             let progress = Arc::new(ava1::send::Progress::default());
+            let cancel = cancel.clone();
             let (secs, r) = blocking(move || {
                 let t = Instant::now();
                 let r = ps5upload_ava1::relay::ps5_to_ps5_between(
@@ -1654,7 +1763,7 @@ async fn run_relay(env: &Env, args: &BenchArgs, prep: &Prep, scratch: &Path) -> 
                     &dest,
                     new_id(),
                     progress,
-                    Arc::new(AtomicBool::new(false)),
+                    cancel,
                 );
                 (t.elapsed().as_secs_f64(), r)
             })
@@ -1933,6 +2042,15 @@ pub async fn run_bench_in(env: &Env, args: &BenchArgs) -> anyhow::Result<Vec<Ben
             check_console_dest(d)?;
         }
     }
+    if env.clean && args.scenario == Scenario::Download {
+        let dir = args.dest.clone().unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join(format!("bench-download-{}", std::process::id()))
+                .to_string_lossy()
+                .into_owned()
+        });
+        check_local_dest(Path::new(&dir), &args.src)?;
+    }
     if args.scenario == Scenario::Relay && !matches!(env.pool, PoolRef::Global) {
         bail!("relay cannot run with AVA1_PORT moved: one address cannot serve two consoles");
     }
@@ -1976,7 +2094,7 @@ pub async fn run_bench_in(env: &Env, args: &BenchArgs) -> anyhow::Result<Vec<Ben
         .filter(|_| args.scenario == Scenario::Download);
     let local_dir = PathBuf::from(local_dir.map(String::from).unwrap_or_else(|| {
         std::env::temp_dir()
-            .join(format!("ps5upload-bench-download-{}", std::process::id()))
+            .join(format!("bench-download-{}", std::process::id()))
             .to_string_lossy()
             .into_owned()
     }));
@@ -1993,29 +2111,66 @@ pub async fn run_bench_in(env: &Env, args: &BenchArgs) -> anyhow::Result<Vec<Ben
     );
 
     let mut rows: Vec<Row> = Vec::new();
-    for run_no in 1..=args.runs {
+    let limit = attempt_timeout(prep.bytes, prep.files);
+    let first = if args.warmup { 0 } else { 1 };
+    for run_no in first..=args.runs {
+        let kind = match (run_no, args.warmup) {
+            (0, _) => "warmup",
+            (1, false) => "cold",
+            _ => "warm",
+        };
         let cleaned = clean_between(env, args, &local_dir).await;
         if env.clean {
             tokio::time::sleep(env.idle).await;
         }
         let started = unix_now();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut timed_out = false;
         let attempt: Attempt = match cleaned {
             Err(e) => Err((0.0, e)),
-            Ok(()) => match args.scenario {
-                Scenario::UploadFile | Scenario::UploadDir => run_upload(env, args, &prep).await,
-                Scenario::Drop60 => {
-                    run_drop60(env, args, &prep, proxy.as_ref().expect("started above")).await
+            Ok(()) => {
+                let work = async {
+                    match args.scenario {
+                        Scenario::UploadFile | Scenario::UploadDir => {
+                            run_upload(env, args, &prep, &cancel).await
+                        }
+                        Scenario::Drop60 => {
+                            let p = proxy.as_ref().expect("started above");
+                            run_drop60(env, args, &prep, &cancel, p).await
+                        }
+                        Scenario::Resume => run_resume(env, args, &prep, &cancel).await,
+                        Scenario::Download => {
+                            run_download(env, args, &prep, &local_dir, &cancel).await
+                        }
+                        Scenario::Copy => run_copy(env, args).await,
+                        Scenario::Relay => run_relay(env, args, &prep, &scratch, &cancel).await,
+                    }
+                };
+                match tokio::time::timeout(limit, work).await {
+                    Ok(a) => a,
+                    Err(_) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        timed_out = true;
+                        Err((
+                            limit.as_secs_f64(),
+                            format!(
+                                "timed out after {} s (120 s + bytes / 5 MB/s + files / 50 s)",
+                                limit.as_secs()
+                            ),
+                        ))
+                    }
                 }
-                Scenario::Resume => run_resume(env, args, &prep).await,
-                Scenario::Download => run_download(env, args, &prep, &local_dir).await,
-                Scenario::Copy => run_copy(env, args).await,
-                Scenario::Relay => run_relay(env, args, &prep, &scratch).await,
-            },
+            }
         };
-        let row = finish(args, &prep, run_no, attempt);
+        let landed = if attempt.is_ok() {
+            landing(env, args, &prep, &local_dir).await
+        } else {
+            None
+        };
+        let row = finish(args, &prep, run_no, kind, attempt, landed);
         record(&env.out, &row.json(started, &prep.corpus))?;
         println!(
-            "run {run_no}/{}: {} {:.2}s {:.1} MB/s {:.1} files/s{}",
+            "run {run_no}/{} [{kind}]: {} {:.2}s {:.1} MB/s {:.1} files/s{}",
             args.runs,
             if row.run.ok { "ok" } else { "FAILED" },
             row.run.seconds,
@@ -2027,6 +2182,13 @@ pub async fn run_bench_in(env: &Env, args: &BenchArgs) -> anyhow::Result<Vec<Ben
                 .map_or(String::new(), |e| format!(" — {e}"))
         );
         rows.push(row);
+        if timed_out {
+            eprintln!(
+                "stopping: the timed-out transfer may still be running on a blocking thread, \
+                 and further runs would measure on top of it"
+            );
+            break;
+        }
     }
     // Leave the console tidy; the run records are already written.
     if let Err(e) = clean_between(env, args, &local_dir).await {
@@ -2037,7 +2199,74 @@ pub async fn run_bench_in(env: &Env, args: &BenchArgs) -> anyhow::Result<Vec<Ben
     Ok(rows.into_iter().map(|r| r.run).collect())
 }
 
-fn finish(args: &BenchArgs, prep: &Prep, run_no: u32, attempt: Attempt) -> Row {
+/// Per-attempt deadline: 120 s + bytes at 5 MB/s + files at 50/s (the brief's floor and
+/// rate, plus a files term so a 200 000-file tree is not killed at its create ceiling).
+pub fn attempt_timeout(bytes: u64, files: u64) -> Duration {
+    Duration::from_secs(120 + bytes / 5_000_000 + files / 50)
+}
+
+/// What actually landed: the console destination listed over :9114 (the same FTX2
+/// listing for both protocols, so the check does not depend on the protocol under test),
+/// or the local tree for download. `None` when there is no console to ask (tests).
+async fn landing(
+    env: &Env,
+    args: &BenchArgs,
+    prep: &Prep,
+    local_dir: &Path,
+) -> Option<Result<(u64, u64), String>> {
+    if !env.clean {
+        return None;
+    }
+    if args.scenario == Scenario::Download {
+        let target = local_dir.join(basename(&args.src));
+        return Some(
+            blocking(move || {
+                let meta = std::fs::symlink_metadata(&target)
+                    .map_err(|e| format!("{}: {e}", target.display()))?;
+                if meta.is_file() {
+                    return Ok((1, meta.len()));
+                }
+                let set = walk_local(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+                Ok((set.len() as u64, set.iter().map(|x| x.2).sum()))
+            })
+            .await,
+        );
+    }
+    let (mgmt, dest) = match args.scenario {
+        Scenario::Relay => (
+            crate::to_mgmt_addr(&to_session_name(args.to.as_deref().unwrap_or(""))),
+            args.dest.clone().unwrap_or_default(),
+        ),
+        _ => (args.mgmt.clone(), args.dest.clone().unwrap_or_default()),
+    };
+    let kind = match args.scenario {
+        Scenario::Copy | Scenario::Relay => prep.kind.unwrap_or(DownloadKind::Folder),
+        _ if prep.src_is_dir => DownloadKind::Folder,
+        _ => DownloadKind::File,
+    };
+    Some(
+        blocking(move || {
+            enumerate_download_set(&mgmt, &dest, kind)
+                .map(|p| {
+                    (
+                        p.manifest.len() as u64,
+                        p.manifest.iter().map(|e| e.size).sum(),
+                    )
+                })
+                .map_err(|e| format!("listing {dest}: {e:#}"))
+        })
+        .await,
+    )
+}
+
+fn finish(
+    args: &BenchArgs,
+    prep: &Prep,
+    run_no: u32,
+    run_kind: &str,
+    attempt: Attempt,
+    landed: Option<Result<(u64, u64), String>>,
+) -> Row {
     let base = |ok: bool, seconds: f64, error: Option<String>| BenchRun {
         console: args.host.clone(),
         scenario: args.scenario.name().into(),
@@ -2061,7 +2290,7 @@ fn finish(args: &BenchArgs, prep: &Prep, run_no: u32, attempt: Attempt) -> Row {
         extra.insert("ceiling_dir".into(), dir.clone().into());
         extra.insert("ceiling_files_s_calibrated".into(), (*c).into());
     }
-    if let Some(ms) = prep.setup_ms.filter(|_| run_no == 1) {
+    if let Some(ms) = prep.setup_ms.filter(|_| run_kind != "warm") {
         extra.insert("session_setup_ms".into(), ms.into());
     }
     if let Some(e) = &prep.elf {
@@ -2078,21 +2307,42 @@ fn finish(args: &BenchArgs, prep: &Prep, run_no: u32, attempt: Attempt) -> Row {
                 run: base(false, seconds, Some(why)),
                 drive: prep.drive.clone(),
                 verified: false,
+                run_kind: run_kind.into(),
                 ceiling,
                 extra,
             }
         }
         Ok(m) => {
             let verification = verify_protocol(args.proto, &m.observed);
-            let error = verification.clone().err().or_else(|| m.verdict.clone());
+            // The landing check: files and bytes on the destination must equal the plan.
+            let landing_error = match &landed {
+                Some(Ok((f, b))) => {
+                    extra.insert("landed_files".into(), (*f).into());
+                    extra.insert("landed_bytes".into(), (*b).into());
+                    (*f != prep.files || *b != prep.bytes).then(|| {
+                        format!(
+                            "landed {f} files / {b} bytes, expected {} / {}",
+                            prep.files, prep.bytes
+                        )
+                    })
+                }
+                Some(Err(e)) => Some(format!("could not verify what landed: {e}")),
+                None => {
+                    extra.insert("landed_checked".into(), false.into());
+                    None
+                }
+            };
+            extra.insert("durable".into(), (args.proto == Proto::Ava1).into());
+            let error = verification
+                .clone()
+                .err()
+                .or_else(|| m.verdict.clone())
+                .or(landing_error);
             let mut run = base(error.is_none(), m.seconds, error);
             run.resent = m.resent;
             run.max_lanes = m.max_lanes;
             run.bottleneck = m.bottleneck.clone();
             run.sequential = m.sequential;
-            if let Some(b) = m.bytes {
-                run.bytes = b;
-            }
             extra.extend(m.extra);
             extra.insert("observed".into(), m.observed.into());
             extra.insert("verified_by".into(), m.verified_by.into());
@@ -2100,6 +2350,7 @@ fn finish(args: &BenchArgs, prep: &Prep, run_no: u32, attempt: Attempt) -> Row {
                 run,
                 drive: prep.drive.clone(),
                 verified: verification.is_ok(),
+                run_kind: run_kind.into(),
                 ceiling,
                 extra,
             }
@@ -2669,23 +2920,245 @@ mod tests {
     }
 
     #[test]
-    fn a_recursive_delete_target_must_be_below_a_drive_and_say_bench() {
-        for ok in ["/data/bench", "/mnt/usb0/bench-run/x", "/mnt/ext1/my-bench"] {
+    fn the_delete_guard_mirrors_the_payloads_cleanup_allowlist() {
+        for ok in [
+            "/data/ps5upload/tests/bench",
+            "/data/ps5upload/tests/bench/tiny",
+            "/mnt/usb0/ps5upload/tests/bench-run/x",
+            "/mnt/ext1/ps5upload/tests/foo/bench/y",
+            "/mnt/usb12/ps5upload/tests/bench-1",
+        ] {
             check_console_dest(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
         for bad in [
             "/",
             "/data",
+            "/data/bench",
+            "/mnt/usb0/bench-run",
             "/mnt",
             "/mnt/usb0",
+            "/mnt/usb/ps5upload/tests/bench",
+            "/mnt/original_m2/ps5upload/tests/bench",
+            "/user/ps5upload/tests/bench",
             "/data/ps5upload",
-            "/data/bench/../x",
-            "data/bench",
-            "/system/bench",
-            "/data//bench",
+            "/data/ps5upload/tests",
+            "/data/ps5upload/tests/tiny",
+            "/data/ps5upload/tests/benchmark",
+            "/data/ps5upload/tests/bench/../x",
+            "/data/ps5upload/tests/bench/./x",
+            "data/ps5upload/tests/bench",
+            "/data//ps5upload/tests/bench",
+            "/data/ps5upload/tests/bench-src/tiny",
+            "/data/ps5upload/tests/bench/bench-src",
+            "/data/ps5upload/runtime/bench",
         ] {
             assert!(check_console_dest(bad).is_err(), "{bad} must be refused");
         }
+    }
+
+    #[test]
+    fn a_local_download_dir_must_be_absent_empty_or_bench_named() {
+        let d = TempDir::new("bench-localdest");
+        let full = d.path().join("plain");
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::write(full.join("keep.txt"), b"x").unwrap();
+        assert!(check_local_dest(&full, "/data/ps5upload/tests/bench-src/tiny").is_err());
+        assert!(check_local_dest(&d.path().join("absent"), "/a/tiny").is_ok());
+        let empty = d.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(check_local_dest(&empty, "/a/tiny").is_ok());
+        let named = d.path().join("bench-dl");
+        std::fs::create_dir_all(&named).unwrap();
+        std::fs::write(named.join("old"), b"x").unwrap();
+        assert!(check_local_dest(&named, "/a/tiny").is_ok());
+        for src in ["/", "", "/a/..", "/a/."] {
+            assert!(check_local_dest(&named, src).is_err(), "{src:?}");
+        }
+        assert!(check_local_dest(Path::new("/"), "/a/tiny").is_err());
+        assert!(check_local_dest(Path::new(""), "/a/tiny").is_err());
+    }
+
+    #[test]
+    fn copy_refuses_overlapping_paths_either_way() {
+        for (a, b) in [
+            ("/d/x", "/d/x"),
+            ("/d/x", "/d/x/y"),
+            ("/d/x/y", "/d/x"),
+            ("/d/x/", "/d/x"),
+        ] {
+            assert!(check_copy_overlap(a, b).is_err(), "{a} {b}");
+        }
+        assert!(check_copy_overlap("/d/x", "/d/xy").is_ok());
+        assert!(check_copy_overlap("/d/x", "/e/x").is_ok());
+    }
+
+    #[test]
+    fn the_attempt_deadline_is_120s_plus_bytes_and_files() {
+        assert_eq!(attempt_timeout(0, 0), Duration::from_secs(120));
+        assert_eq!(attempt_timeout(5_000_000_000, 0), Duration::from_secs(1120));
+        assert_eq!(attempt_timeout(0, 5000), Duration::from_secs(220));
+    }
+
+    /// Every command line the report hands Task 28, for both consoles and all three
+    /// drives. The test parses each one (console after `bench`), applies the destination
+    /// guard, and — with BENCH_DUMP_LINES=FILE — writes them out so the report is
+    /// generated from exactly what is tested.
+    fn task28_lines() -> (Vec<String>, Vec<String>) {
+        let consoles = ["192.168.86.100", "192.168.86.99"];
+        let drives = ["/data", "/mnt/usb0", "/mnt/ext1"];
+        let (mut stage, mut bench) = (Vec::new(), Vec::new());
+        let mut n = 0u32;
+        for c in consoles {
+            let other = if c == consoles[0] {
+                consoles[1]
+            } else {
+                consoles[0]
+            };
+            for d in drives {
+                let t = format!("{d}/ps5upload/tests");
+                for (name, dir) in [("tiny", "/tmp/b/tiny"), ("ppsa", "/tmp/b/ppsa")] {
+                    n += 1;
+                    stage.push(format!(
+                        "{c}:9113 transfer-dir {n:032x} {t}/bench-src/{name} {dir}"
+                    ));
+                }
+                for proto in ["ava1", "ftx2"] {
+                    let b = |sc: &str, rest: String| {
+                        format!("bench {c} {sc} --proto {proto} {rest} --runs 3 --warmup --out $O")
+                    };
+                    bench.push(b(
+                        "upload-file",
+                        format!("--src /tmp/b/large/large-4g.bin --dest {t}/bench/large.bin"),
+                    ));
+                    bench.push(b(
+                        "upload-dir",
+                        format!("--src /tmp/b/tiny --dest {t}/bench/tiny"),
+                    ));
+                    bench.push(b(
+                        "upload-dir",
+                        format!("--src /tmp/b/ppsa --dest {t}/bench/ppsa"),
+                    ));
+                    bench.push(b(
+                        "download",
+                        format!("--src {t}/bench-src/tiny --dest /tmp/b/bench-dl"),
+                    ));
+                    bench.push(b(
+                        "copy",
+                        format!("--src {t}/bench-src/tiny --dest {t}/bench/tiny-copy"),
+                    ));
+                    bench.push(b("resume", format!("--src /tmp/b/large/large-4g.bin --dest {t}/bench/resume.bin --elf ../payload/ps5upload.elf")));
+                    bench.push(b(
+                        "relay",
+                        format!("--src {t}/bench-src/tiny --dest {t}/bench/relayed --to {other}"),
+                    ));
+                }
+                bench.push(format!(
+                    "bench {c} drop60 --proto ava1 --src /tmp/b/large/large-4g.bin --dest {t}/bench/drop.bin --runs 1 --kill-every-s 60 --out $O"
+                ));
+            }
+        }
+        (stage, bench)
+    }
+
+    #[test]
+    fn every_command_line_in_the_report_parses_and_passes_the_guard() {
+        let (stage, bench) = task28_lines();
+        for l in &bench {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            assert_eq!(words[0], "bench", "{l}");
+            let a = BenchArgs::parse(&words[1..]).unwrap_or_else(|e| panic!("{l}: {e}"));
+            if a.scenario == Scenario::Download {
+                check_local_dest(Path::new(a.dest.as_deref().unwrap()), &a.src).unwrap();
+            } else {
+                check_console_dest(a.dest.as_deref().unwrap())
+                    .unwrap_or_else(|e| panic!("{l}: {e}"));
+            }
+            assert_eq!(a.warmup, a.scenario != Scenario::Drop60, "{l}");
+        }
+        for l in &stage {
+            // Staging is a plain FTX2 upload (transfer-dir), never a bench command.
+            assert!(l.contains(" transfer-dir "), "{l}");
+            let dest = l.split_whitespace().nth(3).unwrap();
+            assert!(
+                check_console_dest(dest).is_err(),
+                "{dest} must not be bench-deletable"
+            );
+        }
+        if let Ok(f) = std::env::var("BENCH_DUMP_LINES") {
+            let mut out = String::new();
+            for l in &stage {
+                out += &format!("S {l}\n");
+            }
+            for l in &bench {
+                out += &format!("B {l}\n");
+            }
+            std::fs::write(f, out).unwrap();
+        }
+    }
+
+    #[test]
+    fn warmup_runs_are_flagged_and_medians_use_warm_runs() {
+        let k = |kind: &str, secs: f64| {
+            let mut r = row("ava1", true, secs, None);
+            r.run_kind = kind.into();
+            r
+        };
+        let rows = vec![k("warmup", 100.0), k("warm", 1.0), k("warm", 1.0)];
+        let s = summary(&rows, Path::new("r.jsonl"));
+        assert!(s.contains("[warm runs]"), "{s}");
+        assert!(
+            s.contains(" 2/2 "),
+            "the warm-up is not counted in the table: {s}"
+        );
+        let cold = summary(&[k("cold", 2.0)], Path::new("r.jsonl"));
+        assert!(cold.contains("[cold runs]"), "{cold}");
+        let a = BenchArgs::parse(&[
+            "h", "copy", "--proto", "ava1", "--src", "/a", "--dest", "/b", "--warmup",
+        ])
+        .unwrap();
+        assert!(a.warmup);
+    }
+
+    #[test]
+    fn a_landing_mismatch_fails_the_run_and_is_recorded() {
+        let args = BenchArgs::parse(&[
+            "h",
+            "upload-dir",
+            "--proto",
+            "ftx2",
+            "--src",
+            "/x",
+            "--dest",
+            "/y",
+        ])
+        .unwrap();
+        let prep = Prep {
+            files: 10,
+            bytes: 1000,
+            src_is_dir: true,
+            local: Arc::new(Vec::new()),
+            kind: None,
+            corpus: "x".into(),
+            drive: "/data".into(),
+            ceiling: None,
+            elf: None,
+            setup_ms: None,
+        };
+        let m = || Measured::new(1.0, "ftx2".into(), "commit_ack");
+        let good = finish(&args, &prep, 1, "cold", Ok(m()), Some(Ok((10, 1000))));
+        assert!(good.run.ok, "{:?}", good.run.error);
+        assert_eq!(good.extra["landed_files"], 10);
+        assert_eq!(good.extra["durable"], false);
+        let short = finish(&args, &prep, 1, "cold", Ok(m()), Some(Ok((9, 1000))));
+        assert!(!short.run.ok);
+        assert!(short
+            .run
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("landed 9 files"));
+        let unlisted = finish(&args, &prep, 1, "cold", Ok(m()), Some(Err("boom".into())));
+        assert!(!unlisted.run.ok);
     }
 
     #[test]
@@ -2742,6 +3215,7 @@ mod tests {
             run: r,
             drive: "/data".into(),
             verified: ok,
+            run_kind: "warm".into(),
             ceiling,
             extra: Map::new(),
         }
