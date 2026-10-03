@@ -183,7 +183,7 @@ answers `RpcResponse{status, body}` on the same channel; a request that does not
 decode is answered `Error(ERR_PROTOCOL)` and closes the connection. status 0 (`STATUS_OK`) = OK;
 error statuses are the `ERR_*` constants, and an error response's body is the cause as
 UTF-8 text (not an encoded message). An unpaired session's RPCs answer `ERR_NOT_PAIRED`; a
-session has at most 4 requests in flight and the next one answers `ERR_BUSY`. Only
+session has at most 8 requests in flight (§7.4) and the next one answers `ERR_BUSY`. Only
 `pairing.open` is answered on the reader; every other method runs on a worker, so a slow method never
 delays liveness.
 
@@ -198,11 +198,12 @@ delays liveness.
 | 17 | `job.status` | `JobRef{job_id}` | `Status`, ext `state` |
 | 18 | `job.cancel` | `JobRef{job_id}` | empty |
 | 19 | `disk.calibrate` | `DiskCalibrate{dir, files, size}` | `DiskCalibrateResult` (§16.10) |
+| 4–141 | management methods | see §7.3 and `MGMT_METHODS.md` | see §7.3 |
 
 `Status.state` is 0 while the job runs, 1 when it finished OK and 2 when it failed (the cause is
 in ext `current`). Methods 16–19 are the version 1 data-plane RPCs and exist only on a node that
-advertises `CAP_DATA_PLANE`; version 1 defines no others (management RPCs replacing FTX2 are
-project 3, §10). The behaviour of 16–18 is §15.5; of 19, §16.10.
+advertises `CAP_DATA_PLANE`; the management methods are §7.3. The behaviour of 16–18 is §15.5; of
+19, §16.10.
 
 7.2 Error codes. The numbers below are generated from `schema/ava1.toml`, whose constants are the
 normative table; the second column names the constant in the generated code.
@@ -216,7 +217,7 @@ normative table; the second column names the constant in the generated code.
 | 5 | `ERR_BAD_JOIN` | an unknown session, lane id outside 1..=8, wrong tag or replayed nonce (§9) |
 | 6 | `ERR_UNKNOWN_METHOD` | `RpcResponse` status for a method the node does not implement, including methods 16–19 on a node without the data plane |
 | 7 | `ERR_INTERNAL` | the node could not do what the peer asked for a reason that is neither the peer's nor the disk's: out of memory, a thread that would not start |
-| 8 | `ERR_BUSY` | a limit of §8 or §11.7: connections, sessions, an unconfirmed-session slot, in-flight RPCs (4 per session), jobs, a destination another job is writing, no buffer budget left for another job |
+| 8 | `ERR_BUSY` | a limit of §8 or §11.7: connections, sessions, an unconfirmed-session slot, in-flight RPCs (8 per session, §7.4), jobs, a destination another job is writing, no buffer budget left for another job |
 | 9 | `ERR_PATH` | a manifest or RPC path that breaks §11.2, a root the node's write or read policy refuses, a source that cannot be stat'd or a staging parent that is not a directory |
 | 10 | `ERR_NO_SPACE` | the destination drive is full (`ENOSPC` while writing) |
 | 11 | `ERR_UNKNOWN_JOB` | `Resume`, `job.status` or `job.cancel` for a job the node does not list, or lists for another peer key (the two are not told apart) |
@@ -226,6 +227,132 @@ normative table; the second column names the constant in the generated code.
 | 15 | `ERR_CANCELLED` | the job was cancelled (`job.cancel`, or a `JobCancel` carrying this reason) |
 | 16 | `ERR_CROSS_DEVICE` | a staged or part-file rename whose two sides are on different devices (`st_dev`); never attempted, because a cross-device `rename` panics the console's kernel |
 | 17 | `ERR_CREDIT` | a lane frame larger than the credit the receiver granted (§12.4) |
+
+7.3 Management methods (the console operations FTX2 carried on :9114). Numbers are assigned by
+block; the tracked list, one row per FTX2 frame with its payload handler and engine caller, is
+`MGMT_METHODS.md`. The generated constants `METHOD_*` in `schema/ava1.toml` are normative.
+
+| numbers | block | bodies |
+|---------|-------|--------|
+| 4–11 | node and diagnostics: `node.status`, `node.shutdown`, `node.cleanup`, `log.klog`, `log.syslog`, `net.interfaces`, `net.reach`, `net.speedtest` | `node.status` replies `NodeStatus`; the rest `MgmtText` |
+| 20–21 | `job.run`, `job.list` | `JobRun{job_id, op, args}` → `Status` (ext `state`, `result`, `code`); `job.list` → `JobListResult` |
+| 32–43 | filesystem: `fs.volumes`, `fs.list`, `fs.stat`, `fs.mkdir`, `fs.rename`, `fs.chmod`, `fs.read`, `fs.write`, `fs.mount`, `fs.unmount`, `fs.mount_pkg`, `fs.mount_lwfs` | `fs.list`, `fs.stat`, `fs.mkdir`, `fs.rename`, `fs.chmod`, `fs.read`, `fs.write` are typed (`FsList` → `FsListResult`, `FsPath` → `FsStat`, `FsMkdir`, `FsRename`, `FsChmod`, `FsRead` → `FsReadResult`, `FsWrite`); the others `MgmtText` |
+| 48–61 | apps, launch, install queries, processes | `MgmtText`; `app.list` pages with `offset`/`limit` and `more` (§7.4, the only text method that does not fit one reply) |
+| 64–70 | saves, screenshots, videos, search index | `MgmtText` |
+| 72–87 | hardware, power, time, peripherals, `shell.exec` | `MgmtText` |
+| 88–100 | profiles, users, backups (97 and 99 are unassigned: backup snapshot and restore run as `job.run` ops) | `MgmtText` |
+| 104–128 | cheats, SMP metadata, SDK changer, TMDB, FTP, firmware spoof, notifications, activity | `MgmtText` |
+| 136–141 | Remote Play | `MgmtText` |
+
+A `MgmtText` body is the payload handler's existing request or reply (UTF-8 text, in practice
+JSON), carried unchanged in `MgmtText.body`; `more = 1` on a reply means the method is paged and
+the caller asks again with the next `offset`. Typing the text methods is deferred (§10): the text
+bodies are stable and tested, and the cutover does not need them typed.
+
+Encoding overhead. A `MgmtText` is `u32 length + text + u16 ext count` (6 bytes), plus 7 bytes when
+`more` is present (tag u16, length u32, value u8). It is the `RpcResponse` body, so the largest text
+a handler may return is `RPC_REPLY_MAX - 16 = 262,128` bytes (`RPC_TEXT_MAX`, with 3 bytes to spare);
+a text request is bounded the same way by 56 KiB. Typed bodies carry their own overhead
+(`FsReadResult` is `data + 7`).
+
+Errors: the response status is an `ERR_*` code (§7.2) and the body is the cause as UTF-8. A ported
+handler's cause is its legacy token (`fs_move_cross_mount`, `cleanup_path_denied`, ...), so the
+engine can build the same `payload rejected <LABEL>: <cause>` text FTX2 callers produced. No new
+error codes were added for management methods. `fs.rename` answers `ERR_CROSS_DEVICE` when the
+source and the destination's parent are on different devices (`st_dev`); it never calls `rename(2)`
+across devices.
+
+Legacy failure bodies. Many FTX2 handlers answered a failure as a *successful* frame with a
+`{"ok":false,"err":"..."}` body (`handle_fs_write_bytes`, `handle_net_reach`, `handle_toast_send`,
+the TMDB, SDK and cheats handlers, ...). A ported handler never does that: it answers an `ERR_*`
+status (the closest of §7.2; `ERR_INTERNAL` when none fits) with the legacy token as the cause, and
+`STATUS_OK` only when the operation succeeded. A body that still contains `"ok":false` under
+`STATUS_OK` is a porting bug. Where the legacy body also carried data on failure (a partial list,
+a detail object), the cause is that body's `err` token and the data is dropped.
+
+Truncation. A ported handler must detect truncation and fail loudly. Every `snprintf` into a
+reply buffer is checked (`n < 0` or `n >= cap` is an error, never clamped to `cap - 1` and sent), a
+clamped read (`klog`, `syslog`, `fs.read`) reports a short read as a short read (`eof`, `more`), and
+a buffer that cannot hold the whole answer answers `ERR_INTERNAL` with the cause `reply truncated`.
+The payload helper is `ava1_rpc_text(out, cap, &out_len, fmt, ...)` (`ava1_data.h`): it returns
+`STATUS_OK`, or `ERR_INTERNAL` with that cause, so a handler returns it directly. The harness pins
+it (`ava1_rpc_text_answers_ok_when_it_fits_and_internal_when_truncated`) and the server answers
+`ERR_INTERNAL` ("reply exceeds the 256 KiB RPC cap") for a handler that claims more than the cap.
+
+Threads (Task 2 requirement). The payload runs an RPC on a worker whose stack is
+`AVA1_THREAD_STACK` (256 KiB) until Task 2 adds the management stack; either way a ported handler
+keeps stack buffers small: **no stack array of 16 KiB or more, and none of 2 KiB or more without an
+entry in the audit below**; large buffers go on the heap. 256 KiB stack buffers wedged the console
+before. Stack arrays of 2 KiB or more in the handlers being ported (to be heap-allocated or
+justified by Task 2): `handle_crc32_file` `buf[64 KiB]` (now a `job.run` op: heap), `handle_shell_exec`
+`cmd 2 KiB + tmp 4100 + probe 2100`, `handle_focus_probe` `buf[8 KiB]`, `handle_fan_curve_get`
+`buf[4 KiB]`, `handle_user_list` `body[4 KiB]`, `handle_profile_info` `body[4 KiB]`,
+`handle_fs_op_status` `body[2560]`, `handle_fs_mount` `resp[2 KiB]`, `handle_hw_temps` `body[2 KiB]`,
+`handle_hw_text_op` `body[2 KiB]` (serves hw.info, hw.power, hw.storage, hw.drive_sensors),
+`handle_time_state_get` `body[2 KiB]`, `handle_search_index` `esc_path[2 KiB]`. Task 2 re-runs the
+scan (`char|uint8_t name[N]` with N of 2048 or more in each ported handler) and updates this list.
+
+7.4 RPC limits. A session has at most **8** requests in flight; the ninth answers `ERR_BUSY`
+(earlier drafts said 4). A request body is at most **56 KiB** and a reply body at most **256 KiB**,
+both enforced by the server (`RPC_REQUEST_MAX`, `RPC_REPLY_MAX`): a larger request answers
+`ERR_PROTOCOL` with the cause `request exceeds the 56 KiB RPC cap` and the session continues; a
+handler that returns more than 256 KiB is answered `ERR_INTERNAL` with the cause `reply exceeds the
+256 KiB RPC cap` rather than clipped. The control connection's frame cap is 64 KiB while a session
+is being set up; once the handshake is done the client accepts replies up to
+`RPC_REPLY_MAX + RPC_FRAME_SLACK` (1 KiB for status, length, extension count and the AEAD tag). The
+worst case per session is 8 × 256 KiB = 2 MiB of reply buffers on the node (heap, per call). A
+method whose reply can exceed the cap takes `offset` and `limit` and sets `more`; no management
+method may return a larger body. `MGMT_METHODS.md` lists today's largest reply of every method and
+says which fit and which page.
+
+The engine side (a Task 4 requirement, not current behaviour): the engine's gate holds 6 permits per
+console and reserves the other 2 for `node.status`, `job.status` and `job.cancel`, so a flood of
+slow calls never hides a cancel or liveness; it retries `ERR_BUSY` with backoff (3 tries) and never
+reports it as "payload failed".
+
+7.5 Chunked and bounded filesystem calls.
+
+`fs.read` (`FsRead{path, offset, len, flags}` -> `FsReadResult{data, eof}`): `len` is at most
+`FS_READ_MAX = RPC_REPLY_MAX - 16 = 262,128` bytes (the reply is `data + 7`). A shorter reply with
+`eof = 1` means the end of the file; `eof = 0` with fewer bytes than asked means the node chose a
+short read, and the caller continues at `offset + data.len()`. A caller that needs more than
+`FS_READ_MAX` (FTX2 allowed 2 MiB per call) loops until `eof` or the byte count it wanted, and the
+core wrapper `fs_read_with_timeout` does that for every caller. Callers that can ask for more than
+the cap: `ps5upload-engine/src/lib.rs:3974`, `ps5upload-engine/src/fakelibs_api.rs:423`,
+`ps5upload-core/src/fs_ops.rs:1703`, `ps5upload-core/src/smp_image_rw.rs:174`,
+`ps5upload-core/src/smp_checkout.rs:185`. Existence tests by 1-byte `FsRead` that become `fs.stat`
+(Task 4): `lib.rs:4033`, `smp_checkout.rs:456`, `smp_image_rw.rs:229`, `fakelibs_api.rs:390` and
+`fakelibs_api.rs:594`.
+
+`fs.write` (`FsWrite{path, offset, flags, data}`, ext `mode`): FTX2 wrote up to 256 KiB atomically,
+and the request cap is 56 KiB, so a larger file is written in chunks of at most
+`FSW_CHUNK_MAX = 48 KiB` (49,152) of `data` (the rest of the request is the path, the header and
+the extension). Flags: `FSW_APPEND` (write at the end of the temporary file, `offset` ignored),
+`FSW_AT_OFFSET` (write at `offset`; a missing temporary file is created empty), `FSW_COMMIT`
+(after this chunk: fsync the temporary file, then `rename` it over `path`), `FSW_CREATE` (at commit
+fail with `ERR_EXISTS` when `path` exists) and `FSW_OVERWRITE` (replace it; the default when neither
+is set; both set is `ERR_PROTOCOL`). Neither `FSW_APPEND` nor `FSW_AT_OFFSET` means "the whole file in
+one call": `offset` must be 0, the file is written to the temporary file and committed in the same
+call, exactly FTX2's atomic small write (`COMMIT` is implied). Chunked protocol: the temporary file
+is `<path>.ps5upload.tmp` in the same directory as `path` (so the commit rename never crosses a
+device, with the `st_dev` guard of `fs.rename`); the caller sends chunks with `FSW_AT_OFFSET`
+(or `FSW_APPEND`) in order, the last one also carrying `FSW_COMMIT`. A caller that gives up
+deletes the temporary file (`fs.rename` is not needed; `job.run` DELETE removes it). A chunk at offset 0 (or the first `FSW_APPEND`) truncates an abandoned temporary file first, so a retry
+starts clean. `mode` (ext 1, the
+permission bits applied at commit; absent = 0644) is optional. Callers that need chunking because
+they write more than 48 KiB: `ps5upload-core/src/cheats.rs:701`, `ps5upload-core/src/profile.rs:664`,
+`ps5upload-core/src/smp_image_rw.rs:158` (the others, `smp_checkout.rs` and `smp_image_rw.rs:305/339`,
+write small state files). The core wrapper `fs_write_bytes` chunks transparently.
+
+Typed bodies decoded by the adapters: `NodeStatus.ucred_elevated` is a `u8` on the wire; the engine
+adapter restores the JSON boolean the client reads (`true`/`false`) and rebuilds the legacy
+`/api/ps5/status` object (Tasks 3 and 4). `NodeStatus.prior_instance` is one of `clean`,
+`killed_externally`, `wedged`, `stale` or `replaced` (the values of `instance_verdict_name`).
+`FsEntry.kind` and `FsStat.kind` are `ENTRY_FILE` (0), `ENTRY_DIR` (1), `ENTRY_LINK` (2, a symbolic
+link, not followed), `ENTRY_OTHER` (3, a device, socket or fifo) or `ENTRY_UNKNOWN` (4, the node could
+not stat the entry; FTX2 said `"other"`). `FsListResult` carries no `path` and no returned-entry
+count (FTX2's reply had both); the adapter reconstructs `path` from the request and the count from
+`entries.len()`.
 
 ## 8. Limits
 A server accepts at most 64 connections, 12 from one source address, and 16
@@ -303,9 +430,10 @@ Not in version 1, each with its reason:
   fresh job per attempt (progress stays monotonic). FTX2 resumes mid-entry, so this is a
   regression against FTX2 and is listed as one in `CUTOVER.md`.
 - Resuming a download whose remote manifest changed: the engine restarts that job.
-- A same-drive `fs.move` over AVA1 (a rename, with the `st_dev` guard): the engine still asks the
-  FTX2 management port for it; only a cross-mount move (copy, verify, delete) is an AVA1 job.
-- Management RPCs that replace FTX2's :9114 frames (project 3).
+- A same-drive `fs.move` over AVA1 is `fs.rename` (§7.3), with the `st_dev` guard; a cross-mount
+  move (copy, verify, delete) is an AVA1 job.
+- Typed bodies for the management text methods (§7.3): the filesystem, node and job methods are
+  typed; the rest carry `MgmtText` and are typed method by method after the cutover.
 
 ## 11. Jobs and manifest
 
@@ -695,6 +823,6 @@ than the manifest fails the job (the archive changed between listing and sending
 
 17.4 Cancellation. `pass` receives a flag raised by the job's cancel *or* by any other way the job ends (a lane,
 protocol or receiver failure) and must poll it at least every 1 MiB of input, including while
-skipping, and and every `EntrySink` call fails
+skipping, and every `EntrySink` call fails
 once the job is ending; `SeqSource::close` is called at teardown before the decode thread is
 joined. The bottleneck is `BN_SOURCE` while the decode thread is what the lanes wait on.

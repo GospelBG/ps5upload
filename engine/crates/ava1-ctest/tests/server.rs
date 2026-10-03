@@ -117,6 +117,101 @@ async fn rust_client_talks_to_the_c_server() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_allows_eight_calls_in_flight_and_answers_the_ninth_busy() {
+    // SPEC.md §7.4: 8 in flight per session.
+    let d = dir("inflight");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let s = Arc::new(
+        connect(&srv.addr(), me, peers, "laptop", fast())
+            .await
+            .unwrap(),
+    );
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let s2 = s.clone();
+        held.push(tokio::spawn(async move { s2.rpc(0x7701, &[]).await }));
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        s.rpc(gen::METHOD_NODE_INFO, &[]).await.unwrap().status,
+        gen::ERR_BUSY
+    );
+    for h in held {
+        assert_eq!(h.await.unwrap().unwrap().status, gen::STATUS_OK);
+    }
+    assert_eq!(
+        s.rpc(gen::METHOD_NODE_INFO, &[]).await.unwrap().status,
+        gen::STATUS_OK
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_replies_up_to_256_kib_and_never_clips_a_larger_claim() {
+    // SPEC.md §7.4: RPC_OUT_MAX is 256 KiB; a handler claiming more is ERR_INTERNAL with a cause.
+    let d = dir("replycap");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    let ask = |n: u32| n.to_le_bytes().to_vec();
+    let r = s.rpc(0x7702, &ask(256 * 1024)).await.unwrap();
+    assert_eq!((r.status, r.body.len()), (gen::STATUS_OK, 256 * 1024));
+    assert!(r.body.iter().all(|b| *b == 0xAB));
+    let r = s.rpc(0x7702, &ask(256 * 1024 + 1)).await.unwrap();
+    assert_eq!(r.status, gen::ERR_INTERNAL);
+    assert_eq!(r.body, b"reply exceeds the 256 KiB RPC cap");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_refuses_a_request_over_56_kib_and_keeps_the_session() {
+    let d = dir("reqcap");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    let r = s
+        .rpc(gen::METHOD_NODE_INFO, &vec![0u8; 56 * 1024])
+        .await
+        .unwrap();
+    assert_eq!(r.status, gen::STATUS_OK);
+    let r = s
+        .rpc(gen::METHOD_NODE_INFO, &vec![0u8; 56 * 1024 + 1])
+        .await
+        .unwrap();
+    assert_eq!(r.status, gen::ERR_PROTOCOL);
+    assert_eq!(r.body, b"request exceeds the 56 KiB RPC cap");
+    assert_eq!(
+        s.rpc(gen::METHOD_NODE_INFO, &[]).await.unwrap().status,
+        gen::STATUS_OK
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ava1_rpc_text_answers_ok_when_it_fits_and_internal_when_truncated() {
+    // The pattern ported management handlers use (SPEC.md §7.3): never `ok` with a clipped body.
+    let d = dir("rpctext");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
+    let s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .unwrap();
+    let r = s.rpc(0x7703, b"{\"ok\":true}").await.unwrap();
+    assert_eq!(
+        (r.status, r.body.as_slice()),
+        (gen::STATUS_OK, &b"{\"ok\":true}"[..])
+    );
+    // 15 bytes plus the NUL fit a 16-byte window; 16 do not.
+    let r = s.rpc(0x7703, &[b'a'; 15]).await.unwrap();
+    assert_eq!((r.status, r.body.len()), (gen::STATUS_OK, 15));
+    let r = s.rpc(0x7703, &[b'a'; 16]).await.unwrap();
+    assert_eq!(r.status, gen::ERR_INTERNAL);
+    assert_eq!(r.body, b"reply truncated");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pairing_with_the_c_server() {
     let d = dir("pair");
     let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);
@@ -570,7 +665,7 @@ async fn a_max_size_frame_slower_than_dead_after_keeps_the_c_session() {
         .unwrap();
     let start = Instant::now();
     let r = s
-        .rpc(gen::METHOD_NODE_INFO, &vec![0x5a; 65_000])
+        .rpc(gen::METHOD_NODE_INFO, &vec![0x5a; 56 * 1024])
         .await
         .unwrap();
     assert_eq!(r.status, gen::STATUS_OK);

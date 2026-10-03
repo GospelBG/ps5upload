@@ -61,6 +61,127 @@
 #define AVA1_RETRY_VERIFY 1ULL
 #define AVA1_RETRY_IO 2ULL
 #define AVA1_RETRY_CHANGED 3ULL
+#define AVA1_METHOD_NODE_STATUS 4ULL
+#define AVA1_METHOD_NODE_SHUTDOWN 5ULL
+#define AVA1_METHOD_NODE_CLEANUP 6ULL
+#define AVA1_METHOD_LOG_KLOG 7ULL
+#define AVA1_METHOD_LOG_SYSLOG 8ULL
+#define AVA1_METHOD_NET_INTERFACES 9ULL
+#define AVA1_METHOD_NET_REACH 10ULL
+#define AVA1_METHOD_NET_SPEEDTEST 11ULL
+#define AVA1_METHOD_JOB_RUN 20ULL
+#define AVA1_METHOD_JOB_LIST 21ULL
+#define AVA1_METHOD_FS_VOLUMES 32ULL
+#define AVA1_METHOD_FS_LIST 33ULL
+#define AVA1_METHOD_FS_STAT 34ULL
+#define AVA1_METHOD_FS_MKDIR 35ULL
+#define AVA1_METHOD_FS_RENAME 36ULL
+#define AVA1_METHOD_FS_CHMOD 37ULL
+#define AVA1_METHOD_FS_READ 38ULL
+#define AVA1_METHOD_FS_WRITE 39ULL
+#define AVA1_METHOD_FS_MOUNT 40ULL
+#define AVA1_METHOD_FS_UNMOUNT 41ULL
+#define AVA1_METHOD_FS_MOUNT_PKG 42ULL
+#define AVA1_METHOD_FS_MOUNT_LWFS 43ULL
+#define AVA1_METHOD_APP_REGISTER 48ULL
+#define AVA1_METHOD_APP_UNREGISTER 49ULL
+#define AVA1_METHOD_APP_LAUNCH 50ULL
+#define AVA1_METHOD_APP_LIST 51ULL
+#define AVA1_METHOD_APP_LAUNCH_BROWSER 52ULL
+#define AVA1_METHOD_APP_LIFECYCLE 53ULL
+#define AVA1_METHOD_APP_INFO_QUERY 54ULL
+#define AVA1_METHOD_APP_INFO_SET 55ULL
+#define AVA1_METHOD_APP_DB_QUERY 56ULL
+#define AVA1_METHOD_PROC_FOCUS 57ULL
+#define AVA1_METHOD_PROC_LIST 58ULL
+#define AVA1_METHOD_PROC_PROCESS_LIST 59ULL
+#define AVA1_METHOD_PROC_KILL 60ULL
+#define AVA1_METHOD_PROC_MODULES 61ULL
+#define AVA1_METHOD_SAVES_LIST 64ULL
+#define AVA1_METHOD_SHOTS_LIST 65ULL
+#define AVA1_METHOD_VIDEOS_LIST 66ULL
+#define AVA1_METHOD_INDEX_START 67ULL
+#define AVA1_METHOD_INDEX_STATUS 68ULL
+#define AVA1_METHOD_INDEX_SEARCH 69ULL
+#define AVA1_METHOD_INDEX_CANCEL 70ULL
+#define AVA1_METHOD_HW_INFO 72ULL
+#define AVA1_METHOD_HW_TEMPS 73ULL
+#define AVA1_METHOD_HW_POWER 74ULL
+#define AVA1_METHOD_HW_STORAGE 75ULL
+#define AVA1_METHOD_HW_FAN_THRESHOLD 76ULL
+#define AVA1_METHOD_HW_FAN_CURVE_SET 77ULL
+#define AVA1_METHOD_HW_FAN_CURVE_GET 78ULL
+#define AVA1_METHOD_HW_DRIVE_SENSORS 79ULL
+#define AVA1_METHOD_POWER_CONTROL 80ULL
+#define AVA1_METHOD_POWER_TELEMETRY 81ULL
+#define AVA1_METHOD_TIME_GET 82ULL
+#define AVA1_METHOD_TIME_SET 83ULL
+#define AVA1_METHOD_TIME_STATE_GET 84ULL
+#define AVA1_METHOD_TIME_STATE_SET 85ULL
+#define AVA1_METHOD_PERIPH_CONTROL 86ULL
+#define AVA1_METHOD_SHELL_EXEC 87ULL
+#define AVA1_METHOD_PROFILE_INFO 88ULL
+#define AVA1_METHOD_PROFILE_SET_USERNAME 89ULL
+#define AVA1_METHOD_PROFILE_ACTIVATE 90ULL
+#define AVA1_METHOD_PROFILE_APPLY_AVATAR 91ULL
+#define AVA1_METHOD_PROFILE_CLEAR_SLOT 92ULL
+#define AVA1_METHOD_PROFILE_SET_LOCAL_USERNAME 93ULL
+#define AVA1_METHOD_USER_LIST 94ULL
+#define AVA1_METHOD_USER_CREATE 95ULL
+#define AVA1_METHOD_USER_DELETE 96ULL
+#define AVA1_METHOD_BACKUP_LIST 98ULL
+#define AVA1_METHOD_BACKUP_DELETE 100ULL
+#define AVA1_METHOD_CHEATS_LIST 104ULL
+#define AVA1_METHOD_CHEATS_GET 105ULL
+#define AVA1_METHOD_CHEATS_TOGGLE 106ULL
+#define AVA1_METHOD_CHEATS_DELETE 107ULL
+#define AVA1_METHOD_CHEATS_RELOAD 108ULL
+#define AVA1_METHOD_CHEATS_STATUS 109ULL
+#define AVA1_METHOD_CHEATS_ENGINE_SET 110ULL
+#define AVA1_METHOD_SMP_META_CONTROL 112ULL
+#define AVA1_METHOD_SMP_META_STATS 113ULL
+#define AVA1_METHOD_SDK_SCAN 114ULL
+#define AVA1_METHOD_SDK_PATCH 115ULL
+#define AVA1_METHOD_SDK_RESTORE 116ULL
+#define AVA1_METHOD_TMDB_FETCH 117ULL
+#define AVA1_METHOD_TMDB_STORE 118ULL
+#define AVA1_METHOD_FTP_START 119ULL
+#define AVA1_METHOD_FTP_STATUS 120ULL
+#define AVA1_METHOD_FWSPOOF_STATUS 121ULL
+#define AVA1_METHOD_NOTIF_LIST 122ULL
+#define AVA1_METHOD_NOTIF_SEND 123ULL
+#define AVA1_METHOD_NOTIF_CLEAR 124ULL
+#define AVA1_METHOD_TOAST_SEND 125ULL
+#define AVA1_METHOD_ACTIVITY_GET 126ULL
+#define AVA1_METHOD_ACTIVITY_DB_QUERY 127ULL
+#define AVA1_METHOD_ACTIVITY_RESET 128ULL
+#define AVA1_METHOD_RP_REQUEST 136ULL
+#define AVA1_METHOD_RP_STATUS 137ULL
+#define AVA1_METHOD_RP_CANCEL 138ULL
+#define AVA1_METHOD_RP_READINESS 139ULL
+#define AVA1_METHOD_RP_ENABLE 140ULL
+#define AVA1_METHOD_RP_DEVICES 141ULL
+#define AVA1_JOB_OP_DELETE 1ULL
+#define AVA1_JOB_OP_CHMOD_R 2ULL
+#define AVA1_JOB_OP_HASH 3ULL
+#define AVA1_JOB_OP_CRC32 4ULL
+#define AVA1_JOB_OP_FSCK 5ULL
+#define AVA1_JOB_OP_BACKUP_SNAPSHOT 6ULL
+#define AVA1_JOB_OP_BACKUP_RESTORE 7ULL
+#define AVA1_JOB_OP_CLEANUP 8ULL
+#define AVA1_JOB_OP_SDK_SCAN 9ULL
+#define AVA1_ENTRY_LINK 2ULL
+#define AVA1_ENTRY_OTHER 3ULL
+#define AVA1_ENTRY_UNKNOWN 4ULL
+#define AVA1_RPC_TEXT_MAX 262128ULL
+#define AVA1_FS_READ_MAX 262128ULL
+#define AVA1_FSW_CHUNK_MAX 49152ULL
+#define AVA1_FSR_UNSAFE 1ULL
+#define AVA1_FSW_APPEND 1ULL
+#define AVA1_FSW_AT_OFFSET 2ULL
+#define AVA1_FSW_COMMIT 4ULL
+#define AVA1_FSW_CREATE 8ULL
+#define AVA1_FSW_OVERWRITE 16ULL
 
 #define AVA1_TYPE_HS1 0x01u
 #define AVA1_TYPE_HS2 0x02u
@@ -330,6 +451,251 @@ int ava1_disk_calibrate_result_decode(const uint8_t *buf, size_t len, ava1_disk_
 int ava1_disk_calibrate_result_append(ava1_w_t *blob, const ava1_disk_calibrate_result_t *m);
 int ava1_disk_calibrate_result_next(ava1_r_t *it, ava1_disk_calibrate_result_t *out);
 int ava1_disk_calibrate_result_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *body;
+    uint32_t body_len;
+    int has_more;
+    uint8_t more;
+} ava1_mgmt_text_t;
+
+int ava1_mgmt_text_encode(const ava1_mgmt_text_t *m, ava1_w_t *w);
+int ava1_mgmt_text_decode(const uint8_t *buf, size_t len, ava1_mgmt_text_t *m);
+
+int ava1_mgmt_text_append(ava1_w_t *blob, const ava1_mgmt_text_t *m);
+int ava1_mgmt_text_next(ava1_r_t *it, ava1_mgmt_text_t *out);
+int ava1_mgmt_text_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *version;
+    uint16_t version_len;
+    const uint8_t *ps5_kernel;
+    uint16_t ps5_kernel_len;
+    uint64_t instance_id;
+    uint64_t started_at_unix;
+    uint64_t command_count;
+    uint16_t startup_reason;
+    uint8_t ucred_elevated;
+    uint8_t max_transfer_streams;
+    uint16_t fan_threshold;
+    uint16_t fan_reapply_sec;
+    int has_prior_instance;
+    const uint8_t *prior_instance;
+    uint16_t prior_instance_len;
+} ava1_node_status_t;
+
+int ava1_node_status_encode(const ava1_node_status_t *m, ava1_w_t *w);
+int ava1_node_status_decode(const uint8_t *buf, size_t len, ava1_node_status_t *m);
+
+int ava1_node_status_append(ava1_w_t *blob, const ava1_node_status_t *m);
+int ava1_node_status_next(ava1_r_t *it, ava1_node_status_t *out);
+int ava1_node_status_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *path;
+    uint16_t path_len;
+    uint32_t offset;
+    uint16_t limit;
+} ava1_fs_list_t;
+
+int ava1_fs_list_encode(const ava1_fs_list_t *m, ava1_w_t *w);
+int ava1_fs_list_decode(const uint8_t *buf, size_t len, ava1_fs_list_t *m);
+
+int ava1_fs_list_append(ava1_w_t *blob, const ava1_fs_list_t *m);
+int ava1_fs_list_next(ava1_r_t *it, ava1_fs_list_t *out);
+int ava1_fs_list_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *name;
+    uint16_t name_len;
+    uint8_t kind;
+    uint64_t size;
+    int has_mtime;
+    uint64_t mtime;
+    int has_mode;
+    uint32_t mode;
+} ava1_fs_entry_t;
+
+int ava1_fs_entry_encode(const ava1_fs_entry_t *m, ava1_w_t *w);
+int ava1_fs_entry_decode(const uint8_t *buf, size_t len, ava1_fs_entry_t *m);
+
+int ava1_fs_entry_append(ava1_w_t *blob, const ava1_fs_entry_t *m);
+int ava1_fs_entry_next(ava1_r_t *it, ava1_fs_entry_t *out);
+int ava1_fs_entry_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *entries;
+    uint32_t entries_len;
+    uint32_t entries_count;
+    uint32_t total_scanned;
+    uint8_t more;
+} ava1_fs_list_result_t;
+
+int ava1_fs_list_result_encode(const ava1_fs_list_result_t *m, ava1_w_t *w);
+int ava1_fs_list_result_decode(const uint8_t *buf, size_t len, ava1_fs_list_result_t *m);
+
+int ava1_fs_list_result_append(ava1_w_t *blob, const ava1_fs_list_result_t *m);
+int ava1_fs_list_result_next(ava1_r_t *it, ava1_fs_list_result_t *out);
+int ava1_fs_list_result_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *path;
+    uint16_t path_len;
+} ava1_fs_path_t;
+
+int ava1_fs_path_encode(const ava1_fs_path_t *m, ava1_w_t *w);
+int ava1_fs_path_decode(const uint8_t *buf, size_t len, ava1_fs_path_t *m);
+
+int ava1_fs_path_append(ava1_w_t *blob, const ava1_fs_path_t *m);
+int ava1_fs_path_next(ava1_r_t *it, ava1_fs_path_t *out);
+int ava1_fs_path_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint8_t kind;
+    uint64_t size;
+    uint64_t mtime;
+    uint32_t mode;
+    uint64_t dev;
+} ava1_fs_stat_t;
+
+int ava1_fs_stat_encode(const ava1_fs_stat_t *m, ava1_w_t *w);
+int ava1_fs_stat_decode(const uint8_t *buf, size_t len, ava1_fs_stat_t *m);
+
+int ava1_fs_stat_append(ava1_w_t *blob, const ava1_fs_stat_t *m);
+int ava1_fs_stat_next(ava1_r_t *it, ava1_fs_stat_t *out);
+int ava1_fs_stat_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *path;
+    uint16_t path_len;
+    uint32_t mode;
+    uint8_t parents;
+} ava1_fs_mkdir_t;
+
+int ava1_fs_mkdir_encode(const ava1_fs_mkdir_t *m, ava1_w_t *w);
+int ava1_fs_mkdir_decode(const uint8_t *buf, size_t len, ava1_fs_mkdir_t *m);
+
+int ava1_fs_mkdir_append(ava1_w_t *blob, const ava1_fs_mkdir_t *m);
+int ava1_fs_mkdir_next(ava1_r_t *it, ava1_fs_mkdir_t *out);
+int ava1_fs_mkdir_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *from;
+    uint16_t from_len;
+    const uint8_t *to;
+    uint16_t to_len;
+    uint8_t overwrite;
+} ava1_fs_rename_t;
+
+int ava1_fs_rename_encode(const ava1_fs_rename_t *m, ava1_w_t *w);
+int ava1_fs_rename_decode(const uint8_t *buf, size_t len, ava1_fs_rename_t *m);
+
+int ava1_fs_rename_append(ava1_w_t *blob, const ava1_fs_rename_t *m);
+int ava1_fs_rename_next(ava1_r_t *it, ava1_fs_rename_t *out);
+int ava1_fs_rename_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *path;
+    uint16_t path_len;
+    uint32_t mode;
+} ava1_fs_chmod_t;
+
+int ava1_fs_chmod_encode(const ava1_fs_chmod_t *m, ava1_w_t *w);
+int ava1_fs_chmod_decode(const uint8_t *buf, size_t len, ava1_fs_chmod_t *m);
+
+int ava1_fs_chmod_append(ava1_w_t *blob, const ava1_fs_chmod_t *m);
+int ava1_fs_chmod_next(ava1_r_t *it, ava1_fs_chmod_t *out);
+int ava1_fs_chmod_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *path;
+    uint16_t path_len;
+    uint64_t offset;
+    uint32_t len;
+    uint32_t flags;
+} ava1_fs_read_t;
+
+int ava1_fs_read_encode(const ava1_fs_read_t *m, ava1_w_t *w);
+int ava1_fs_read_decode(const uint8_t *buf, size_t len, ava1_fs_read_t *m);
+
+int ava1_fs_read_append(ava1_w_t *blob, const ava1_fs_read_t *m);
+int ava1_fs_read_next(ava1_r_t *it, ava1_fs_read_t *out);
+int ava1_fs_read_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *data;
+    uint32_t data_len;
+    uint8_t eof;
+} ava1_fs_read_result_t;
+
+int ava1_fs_read_result_encode(const ava1_fs_read_result_t *m, ava1_w_t *w);
+int ava1_fs_read_result_decode(const uint8_t *buf, size_t len, ava1_fs_read_result_t *m);
+
+int ava1_fs_read_result_append(ava1_w_t *blob, const ava1_fs_read_result_t *m);
+int ava1_fs_read_result_next(ava1_r_t *it, ava1_fs_read_result_t *out);
+int ava1_fs_read_result_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *path;
+    uint16_t path_len;
+    uint64_t offset;
+    uint32_t flags;
+    const uint8_t *data;
+    uint32_t data_len;
+    int has_mode;
+    uint32_t mode;
+} ava1_fs_write_t;
+
+int ava1_fs_write_encode(const ava1_fs_write_t *m, ava1_w_t *w);
+int ava1_fs_write_decode(const uint8_t *buf, size_t len, ava1_fs_write_t *m);
+
+int ava1_fs_write_append(ava1_w_t *blob, const ava1_fs_write_t *m);
+int ava1_fs_write_next(ava1_r_t *it, ava1_fs_write_t *out);
+int ava1_fs_write_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint8_t op;
+    const uint8_t *args;
+    uint32_t args_len;
+} ava1_job_run_t;
+
+int ava1_job_run_encode(const ava1_job_run_t *m, ava1_w_t *w);
+int ava1_job_run_decode(const uint8_t *buf, size_t len, ava1_job_run_t *m);
+
+int ava1_job_run_append(ava1_w_t *blob, const ava1_job_run_t *m);
+int ava1_job_run_next(ava1_r_t *it, ava1_job_run_t *out);
+int ava1_job_run_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint8_t kind;
+    uint8_t state;
+    uint32_t files_done;
+    uint32_t files_total;
+    uint64_t bytes_done;
+    uint64_t bytes_total;
+} ava1_job_entry_t;
+
+int ava1_job_entry_encode(const ava1_job_entry_t *m, ava1_w_t *w);
+int ava1_job_entry_decode(const uint8_t *buf, size_t len, ava1_job_entry_t *m);
+
+int ava1_job_entry_append(ava1_w_t *blob, const ava1_job_entry_t *m);
+int ava1_job_entry_next(ava1_r_t *it, ava1_job_entry_t *out);
+int ava1_job_entry_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *jobs;
+    uint32_t jobs_len;
+    uint32_t jobs_count;
+} ava1_job_list_result_t;
+
+int ava1_job_list_result_encode(const ava1_job_list_result_t *m, ava1_w_t *w);
+int ava1_job_list_result_decode(const uint8_t *buf, size_t len, ava1_job_list_result_t *m);
+
+int ava1_job_list_result_append(ava1_w_t *blob, const ava1_job_list_result_t *m);
+int ava1_job_list_result_next(ava1_r_t *it, ava1_job_list_result_t *out);
+int ava1_job_list_result_count(const uint8_t *p, uint32_t len, uint32_t *count);
 
 typedef struct {
     uint8_t job_id[16];
@@ -686,6 +1052,11 @@ typedef struct {
     uint16_t current_len;
     int has_state;
     uint8_t state;
+    int has_result;
+    const uint8_t *result;
+    uint32_t result_len;
+    int has_code;
+    uint16_t code;
 } ava1_status_t;
 
 int ava1_status_encode(const ava1_status_t *m, ava1_w_t *w);

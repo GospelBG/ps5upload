@@ -45,8 +45,20 @@ static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t 
                size_t *out_len) {
     ava1_node_info_t ni;
     ava1_w_t w;
-    (void)body;
-    (void)body_len;
+    if (method == 0x7701) { /* holds its slot 1.5 s (the in-flight limit test) */
+        usleep(1500 * 1000);
+        *out_len = 0;
+        return AVA1_STATUS_OK;
+    }
+    if (method == 0x7702) { /* a reply of the requested size; claims it even past `cap` (guard test) */
+        uint32_t n = body_len >= 4 ? (uint32_t)body[0] | (uint32_t)body[1] << 8 | (uint32_t)body[2] << 16 : 0;
+        memset(out, 0xAB, n < cap ? n : cap);
+        *out_len = n;
+        return AVA1_STATUS_OK;
+    }
+    if (method == 0x7703) { /* ava1_rpc_text into a 16-byte window: "%s" of the request body */
+        return ava1_rpc_text(out, 16, out_len, "%.*s", (int)body_len, (const char *)body);
+    }
     if (method != AVA1_METHOD_NODE_INFO) return AVA1_ERR_UNKNOWN_METHOD;
     memset(&ni, 0, sizeof ni);
     ni.version = (const uint8_t *)"test";

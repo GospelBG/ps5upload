@@ -8,6 +8,13 @@ pub const HEADER_LEN: usize = 16;
 pub const MAX_BODY: u32 = 16 * 1024 * 1024;
 /// Largest body accepted on a control connection or before authentication.
 pub const CONTROL_MAX_BODY: u32 = 64 * 1024;
+/// SPEC.md §7.4: the largest RPC request body.
+pub const RPC_REQUEST_MAX: usize = 56 * 1024;
+/// SPEC.md §7.4: the largest RPC reply body. Replies travel on the control connection, whose
+/// reader accepts `RPC_REPLY_MAX` plus framing (`RPC_FRAME_SLACK`) once the handshake is done.
+pub const RPC_REPLY_MAX: usize = 256 * 1024;
+/// Room for an `RpcResponse`'s status, length, extension count and the AEAD tag.
+pub const RPC_FRAME_SLACK: usize = 1024;
 /// The body is ChaCha20-Poly1305 ciphertext followed by its 16-byte MAC (every frame
 /// after the handshake).
 pub const FLAG_SEALED: u8 = 0x01;

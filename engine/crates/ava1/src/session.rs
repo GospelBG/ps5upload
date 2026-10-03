@@ -153,6 +153,8 @@ pub async fn connect_expecting(
         // holds — and the token pairs the next session too until it expires.
         let _ = peers.lock().unwrap().add(est.peer_key, &est.peer_name);
     }
+    // Replies up to `RPC_REPLY_MAX` arrive on this connection (SPEC.md §7.4).
+    r.set_max_body((crate::frame::RPC_REPLY_MAX + crate::frame::RPC_FRAME_SLACK) as u32);
     let (tx, mut rx) = mpsc::channel(DELIVER_DEPTH);
     let (link, outbox) = drive(r, w, timing, tx);
     let router = Arc::new(Router::default());
