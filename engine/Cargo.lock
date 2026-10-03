@@ -2312,6 +2312,7 @@ dependencies = [
  "blake3",
  "flate2",
  "ftx2-proto",
+ "ps5upload-ava1",
  "ps5upload-core",
  "serde",
  "serde_json",

@@ -891,6 +891,89 @@ fn do_bench_stats(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn calibration_record(
+    console: &str,
+    dir: &str,
+    files: u32,
+    size: u32,
+    points: &[ava1::gen::CalPoint],
+) -> serde_json::Value {
+    let mut record = bench::record_envelope("calibrate", None, None, "ava1");
+    let object = record
+        .as_object_mut()
+        .expect("record envelope is an object");
+    object.insert("console".into(), console.into());
+    object.insert("dir".into(), dir.into());
+    object.insert("files".into(), files.into());
+    object.insert("size_bytes".into(), size.into());
+    object.insert(
+        "points".into(),
+        serde_json::Value::Array(
+            points
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "workers": p.workers,
+                        "files_per_s": p.files_per_s,
+                        "create_ms": p.create_us as f64 / 1000.0,
+                        "fsync_ms": p.fsync_us as f64 / 1000.0,
+                    })
+                })
+                .collect(),
+        ),
+    );
+    record
+}
+
+async fn do_ava1_calibrate(args: &[String]) -> Result<()> {
+    let console = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("ava1-calibrate needs a console"))?;
+    let dir = args
+        .get(1)
+        .ok_or_else(|| anyhow::anyhow!("ava1-calibrate needs a destination directory"))?;
+    let mut files = 2000u32;
+    let mut size = 4096u32;
+    let mut out = ava1_cmds::bench_results_default();
+    let mut positional = 0;
+    let mut i = 2;
+    while i < args.len() {
+        if args[i] == "--out" {
+            i += 1;
+            out = args
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("--out needs a path"))?
+                .into();
+        } else {
+            let v: u32 = args[i]
+                .parse()
+                .with_context(|| format!("invalid calibration value: {}", args[i]))?;
+            match positional {
+                0 => files = v,
+                1 => size = v,
+                _ => bail!("too many calibration values"),
+            }
+            positional += 1;
+        }
+        i += 1;
+    }
+    let session = ps5upload_ava1::pool().session(console).await?;
+    let points = session.calibrate(dir, files, size).await?;
+    println!("workers  files/s  create_us  fsync_us");
+    for p in &points {
+        println!(
+            "{:>7}  {:>7}  {:>9}  {:>8}",
+            p.workers, p.files_per_s, p.create_us, p.fsync_us
+        );
+    }
+    bench::record(
+        &out,
+        &calibration_record(console, dir, files, size, &points),
+    )?;
+    println!("recorded {}", out.display());
+    Ok(())
+}
+
 fn usage() -> ! {
     eprintln!(
         "  ava1-ping [SECONDS]            AVA1 handshake (pairs if needed), node.info, heartbeats"
@@ -913,6 +996,8 @@ fn usage() -> ! {
     eprintln!(
         "                                ratio (single-threaded; a 223k-file corpus takes minutes)"
     );
+    eprintln!("  ava1-calibrate CONSOLE DIR [FILES=2000] [SIZE=4096] [--out FILE]");
+    eprintln!("                                five disk points; FILES ≤ 20000, SIZE ≤ 1 MiB");
     eprintln!("Usage: ps5upload-lab [ADDR] COMMAND [ARGS...]");
     eprintln!("  Default ADDR: {DEFAULT_ADDR}");
     eprintln!("Commands:");
@@ -1322,12 +1407,39 @@ fn main() -> Result<()> {
         // and takes minutes on a 223k-file corpus (C13).
         "bench-corpus" => do_bench_corpus(&rest[1..]),
         "bench-stats" => do_bench_stats(&rest[1..]),
+        "ava1-calibrate" => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(do_ava1_calibrate(&rest[1..]))
+        }
         cmd => bail!("unknown command: {cmd}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn calibration_record_keeps_the_frozen_units_and_identity_fields() {
+        let point = ava1::gen::CalPoint {
+            workers: 4,
+            files_per_s: 123,
+            create_us: 2500,
+            fsync_us: 3750,
+        };
+        let row = super::calibration_record("192.168.86.100", "/data/cal", 2000, 4096, &[point]);
+        assert_eq!(row["schema"], 1);
+        assert_eq!(row["kind"], "calibrate");
+        assert_eq!(row["protocol"], "ava1");
+        assert_eq!(row["console"], "192.168.86.100");
+        assert_eq!(row["dir"], "/data/cal");
+        assert_eq!(row["files"], 2000);
+        assert_eq!(row["size_bytes"], 4096);
+        assert_eq!(row["points"][0]["files_per_s"], 123);
+        assert_eq!(row["points"][0]["create_ms"], 2.5);
+        assert_eq!(row["points"][0]["fsync_ms"], 3.75);
+        assert!(row["machine"].is_string());
+        assert!(row["started_at"].is_number());
+    }
+
     #[test]
     fn ava1_commands_use_port_9120() {
         assert_eq!(
