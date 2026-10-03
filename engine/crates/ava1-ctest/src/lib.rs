@@ -696,12 +696,26 @@ impl CServer {
         }
     }
 
+    /// The two halves of `restart_data`: stop the server and data layer (every job freed,
+    /// the disk kept), or start them again on the port the first start used.
+    pub fn stop_data_only(&mut self) {
+        self.data.as_ref().expect("stop_data_only needs start_data");
+        unsafe { ffi::ava1_test_server_stop_data() };
+    }
+
+    pub fn start_data_again(&mut self) {
+        let a = self
+            .data
+            .as_ref()
+            .expect("start_data_again needs start_data");
+        self.port = start_data_raw(a, self.port);
+    }
+
     /// A payload restart: server and data layer stopped (every job freed, the disk kept)
     /// and started again on the same port.
     pub fn restart_data(&mut self) {
-        let a = self.data.as_ref().expect("restart_data needs start_data");
-        unsafe { ffi::ava1_test_server_stop_data() };
-        self.port = start_data_raw(a, self.port);
+        self.stop_data_only();
+        self.start_data_again();
     }
 
     /// Test hooks: JobOpen's work waits `open_ms` before it starts; an OK map waits
