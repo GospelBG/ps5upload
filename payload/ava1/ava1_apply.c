@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ava1_b3.h"
@@ -107,12 +108,125 @@ static int mkdirs_to(const char *path, int self, int sync) {
 int ava1_mkparents(const char *path) { return mkdirs_to(path, 0, 0); }
 int ava1_mkdirs(const char *path, int sync) { return mkdirs_to(path, 1, sync); }
 
+/* ---- the large-file index (see ava1_job.h: lfl) ----------------------------------- */
+
+static int lfl_push(ava1_job_t *j, uint32_t id) {
+    if (j->lfl_all) return 0; /* every scan walks the whole manifest anyway */
+    if (j->lfl_n == j->lfl_cap) {
+        uint32_t c = j->lfl_cap ? j->lfl_cap * 2 : 64;
+        uint32_t *q = realloc(j->lfl, (size_t)c * sizeof *q);
+        if (!q) return -1;
+        j->lfl = q;
+        j->lfl_cap = c;
+    }
+    j->lfl[j->lfl_n++] = id;
+    return 0;
+}
+
 ava1_lfile_t *ava1_lfile_get(ava1_job_t *j, uint32_t id) {
+    int fresh = 0;
     if (!j->lf[id]) {
         j->lf[id] = calloc(1, sizeof(ava1_lfile_t));
-        if (j->lf[id]) j->lf[id]->fd = j->lf[id]->ob_fd = -1;
+        if (!j->lf[id]) return NULL;
+        j->lf[id]->fd = j->lf[id]->ob_fd = -1;
+        fresh = 1;
+    }
+    if (!j->lf[id]->in_list) {
+        if (lfl_push(j, id) != 0) {
+            /* Out of memory: the index can no longer be trusted, so the scans take every
+             * manifest entry from now on (slower, never wrong). */
+            j->lfl_all = 1;
+            (void)fresh;
+        }
+        j->lf[id]->in_list = 1;
     }
     return j->lf[id];
+}
+
+void ava1_lflist_rebuild(ava1_job_t *j) {
+    uint32_t i;
+    j->lfl_n = 0;
+    j->lfl_all = 0;
+    for (i = 0; j->lf && i < j->m.n; i++) {
+        if (!j->lf[i]) continue;
+        j->lf[i]->in_list = 1;
+        if (lfl_push(j, i) != 0) {
+            j->lfl_all = 1;
+            return;
+        }
+    }
+}
+
+void ava1_lflist_reset(ava1_job_t *j, int release) {
+    j->lfl_n = 0;
+    j->lfl_all = 0;
+    if (release) {
+        free(j->lfl);
+        j->lfl = NULL;
+        j->lfl_cap = 0;
+    }
+}
+
+static int u32cmp(const void *a, const void *b);
+
+/* A lf with nothing left for a batch, a commit or a snapshot to do. */
+static int lf_idle(const ava1_job_t *j, uint32_t id, const ava1_lfile_t *lf) {
+    return (lf->committed || ava1_bits_get(&j->done, id)) && !lf->written.n && !(lf->has_root && !lf->root_journaled);
+}
+
+/* The ids to scan, ascending and unique, as a malloc'd array (caller holds j->mu). `*n` is
+ * 0 with NULL when there is nothing to do, or UINT32_MAX with NULL when out of memory. */
+static uint32_t *lfl_snapshot(ava1_job_t *j, uint32_t *n) {
+    uint32_t *v, k, c = 0;
+    *n = 0;
+    if (j->lfl_all) {
+        if (!j->m.n) return NULL;
+        v = malloc((size_t)j->m.n * sizeof *v);
+        if (!v) {
+            *n = UINT32_MAX;
+            return NULL;
+        }
+        for (k = 0; k < j->m.n; k++)
+            if (j->lf[k]) v[c++] = k;
+    } else {
+        if (!j->lfl_n) return NULL;
+        v = malloc((size_t)j->lfl_n * sizeof *v);
+        if (!v) {
+            *n = UINT32_MAX;
+            return NULL;
+        }
+        memcpy(v, j->lfl, (size_t)j->lfl_n * sizeof *v);
+        qsort(v, j->lfl_n, sizeof *v, u32cmp);
+        for (k = 0; k < j->lfl_n; k++) {
+            if (v[k] >= j->m.n || !j->lf[v[k]]) continue; /* stale: its lf was freed */
+            if (c && v[c - 1] == v[k]) continue;
+            v[c++] = v[k];
+        }
+    }
+    if (!c) {
+        free(v);
+        return NULL;
+    }
+    *n = c;
+    return v;
+}
+
+/* After a batch: the index keeps only the files that still have work (ids in `v`, sorted). */
+static void lfl_prune(ava1_job_t *j, const uint32_t *v, uint32_t n) {
+    uint32_t k;
+    if (j->lfl_all) return;
+    j->lfl_n = 0;
+    for (k = 0; k < n; k++) {
+        ava1_lfile_t *lf = j->lf[v[k]];
+        if (lf_idle(j, v[k], lf)) lf->in_list = 0;
+        else j->lfl[j->lfl_n++] = v[k]; /* never more than it held */
+    }
+}
+
+static uint64_t mono_us(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
 }
 
 static int write_all(int fd, const uint8_t *p, size_t n) {
@@ -848,6 +962,9 @@ static int sync_new_dirs(ava1_job_t *j, const uint32_t *small, uint32_t n_small,
 static void sync_batch(ava1_job_t *j) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
     uint32_t *ids, n_small, i, nr = 0, ng = 0, nroots = 0, cap_g = 0, nlf = 0, nnew = 0;
+    uint32_t *snap = NULL, nsnap = 0, k; /* the large files with work (lfl_snapshot) */
+    uint64_t u0 = mono_us(), u1 = 0, u2 = 0, u3 = 0;
+    uint32_t nfiles;
     uint32_t *newlf = NULL; /* large files whose part file's directory entry is not yet synced */
     int *sfds, rc;
     ava1_file_run_t *runs = NULL;
@@ -860,13 +977,18 @@ static void sync_batch(ava1_job_t *j) {
     pthread_mutex_lock(&j->mu);
     ids = j->pend_small;
     sfds = j->pend_fd;
-    n_small = j->pend_n;
+    n_small = nfiles = j->pend_n;
     j->pend_small = NULL;
     j->pend_fd = NULL;
     j->pend_n = j->pend_cap = 0;
-    for (i = 0; i < j->m.n; i++) {
-        ava1_lfile_t *lf = j->lf[i];
-        if (!lf) continue;
+    snap = lfl_snapshot(j, &nsnap);
+    if (nsnap == UINT32_MAX) {
+        pthread_mutex_unlock(&j->mu);
+        ava1_apply_fail(j, AVA1_ERR_IO, "out of memory in a sync batch", ENOMEM, 0);
+        goto out;
+    }
+    for (k = 0; k < nsnap; k++) {
+        ava1_lfile_t *lf = j->lf[snap[k]];
         if (lf->committed || lf->fd < 0) {
             ava1_rset_clear(&lf->written); /* a late duplicate's range: nothing left to sync */
         } else if (lf->written.n) {
@@ -887,15 +1009,15 @@ static void sync_batch(ava1_job_t *j) {
     }
     for (i = 0; i < n_small; i++) l.fds[l.n++] = sfds[i];
     nroots = 0;
-    for (i = 0; i < j->m.n; i++) {
-        ava1_lfile_t *lf = j->lf[i];
-        size_t k;
-        if (!lf) continue;
+    for (k = 0; k < nsnap; k++) {
+        ava1_lfile_t *lf = j->lf[snap[k]];
+        size_t r;
+        i = snap[k];
         if (lf->written.n) {
-            for (k = 0; k < lf->written.n; k++) {
+            for (r = 0; r < lf->written.n; r++) {
                 rg[ng].file_id = i;
-                rg[ng].offset = lf->written.v[2 * k];
-                rg[ng].len = lf->written.v[2 * k + 1] - lf->written.v[2 * k];
+                rg[ng].offset = lf->written.v[2 * r];
+                rg[ng].len = lf->written.v[2 * r + 1] - lf->written.v[2 * r];
                 new_bytes += rg[ng].len;
                 ng++;
             }
@@ -912,6 +1034,8 @@ static void sync_batch(ava1_job_t *j) {
     }
     j->roots_new = 0;
     j->unsynced_bytes = 0;
+    lfl_prune(j, snap, nsnap);
+    u1 = mono_us();
     pthread_cond_broadcast(&j->cv); /* workers waiting for pend space */
     pthread_mutex_unlock(&j->mu);
 
@@ -924,11 +1048,13 @@ static void sync_batch(ava1_job_t *j) {
         goto out;
     }
     HOOK(j, AVA1_HOOK_BATCH_SYNCED, UINT32_MAX);
+    u2 = mono_us();
     /* A new file's bytes are durable, its name only once its directory is synced. */
     if ((rc = sync_new_dirs(j, ids, n_small, newlf, nnew)) != 0) {
         if (rc > 0) ava1_apply_fail(j, AVA1_ERR_IO, "syncing a folder failed", rc, 0);
         goto out; /* rc < 0: stopped */
     }
+    u3 = mono_us();
     pthread_mutex_lock(&j->mu);
     for (i = 0; i < nnew; i++)
         if (j->lf[newlf[i]]) j->lf[newlf[i]]->dir_synced = 1;
@@ -1013,7 +1139,21 @@ static void sync_batch(ava1_job_t *j) {
     ava1_pend_release(n_small);
     n_small = 0;
     if (nr || ng) emit_durable(j, runs, nr, rg, ng);
-    if (ava1_jnl_len(&j->jnl) > AVA1_JNL_COMPACT_AT) ava1_apply_compact(j);
+    {
+        uint64_t u4 = mono_us();
+        j->st_batches++;
+        j->st_files += nfiles;
+        j->st_scan_us += u1 - u0;
+        j->st_data_us += u2 - u1;
+        j->st_dirs_us += u3 - u2;
+        j->st_jnl_us += u4 - u3;
+    }
+    if (ava1_jnl_len(&j->jnl) > AVA1_JNL_COMPACT_AT) {
+        uint64_t c0 = mono_us();
+        ava1_apply_compact(j);
+        j->st_compact_us += mono_us() - c0;
+        j->st_compacts++;
+    }
     {
         uint64_t dt = ava1_mono_ms() - t0;
         if (dt > 1500 && j->batch_max > 16) j->batch_max /= 2;
@@ -1023,6 +1163,7 @@ static void sync_batch(ava1_job_t *j) {
 out:
     for (i = 0; i < n_small; i++) close(sfds[i]);
     ava1_pend_release(n_small);
+    free(snap);
     free(ids);
     free(sfds);
     free(l.fds);
@@ -1038,7 +1179,7 @@ void ava1_apply_compact(ava1_job_t *j) {
     ava1_jnl_snapshot_t s;
     ava1_w_t ow, fw, rw, tw, sw;
     size_t nr = 0, cap;
-    uint32_t i;
+    uint32_t *snap, nsnap, k;
     uint8_t ob[1200], *fb, *rb, *tb, *sb;
     memset(&o, 0, sizeof o);
     memcpy(o.job_id, j->id, 16);
@@ -1051,8 +1192,12 @@ void ava1_apply_compact(ava1_job_t *j) {
     ava1_w_init(&ow, ob, sizeof ob);
     if (ava1_jnl_open_encode(&o, &ow) != 0) return;
     pthread_mutex_lock(&j->mu);
-    for (i = 0; i < j->m.n; i++)
-        if (j->lf[i]) nr += j->lf[i]->durable.n + 1;
+    snap = lfl_snapshot(j, &nsnap);
+    if (nsnap == UINT32_MAX) { /* out of memory: keep the longer journal, it is still whole */
+        pthread_mutex_unlock(&j->mu);
+        return;
+    }
+    for (k = 0; k < nsnap; k++) nr += j->lf[snap[k]]->durable.n + 1;
     cap = 16u * (size_t)j->m.n + 8;
     fb = malloc(cap);
     rb = malloc(32u * nr + 8);
@@ -1063,15 +1208,16 @@ void ava1_apply_compact(ava1_job_t *j) {
         ava1_w_init(&rw, rb, 32u * nr + 8);
         ava1_w_init(&tw, tb, 48u * (size_t)j->m.n + 8);
         (void)ava1_bits_append_runs(&j->done, &fw);
-        for (i = 0; i < j->m.n; i++) {
+        for (k = 0; k < nsnap; k++) {
+            uint32_t i = snap[k];
             ava1_lfile_t *lf = j->lf[i];
-            size_t k;
-            if (!lf || ava1_bits_get(&j->done, i)) continue;
-            for (k = 0; k < lf->durable.n; k++) {
+            size_t r;
+            if (ava1_bits_get(&j->done, i)) continue;
+            for (r = 0; r < lf->durable.n; r++) {
                 ava1_file_range_t g;
                 g.file_id = i;
-                g.offset = lf->durable.v[2 * k];
-                g.len = lf->durable.v[2 * k + 1] - g.offset;
+                g.offset = lf->durable.v[2 * r];
+                g.len = lf->durable.v[2 * r + 1] - g.offset;
                 (void)ava1_file_range_append(&rw, &g);
             }
             if (lf->has_root && lf->root_journaled) {
@@ -1092,6 +1238,7 @@ void ava1_apply_compact(ava1_job_t *j) {
         if (ava1_jnl_snapshot_encode(&s, &sw) == 0) (void)ava1_jnl_compact(&j->jnl, ob, ow.len, sb, sw.len, NULL, 0);
     }
     pthread_mutex_unlock(&j->mu);
+    free(snap);
     free(fb);
     free(rb);
     free(tb);
@@ -1258,17 +1405,23 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
 }
 
 void ava1_apply_commit_ready(ava1_job_t *j) {
-    uint32_t i;
-    for (i = 0; i < j->m.n && !j->finished; i++) {
-        ava1_lfile_t *lf = j->lf[i];
+    uint32_t *snap, n, k;
+    pthread_mutex_lock(&j->mu);
+    snap = lfl_snapshot(j, &n);
+    pthread_mutex_unlock(&j->mu);
+    if (n == UINT32_MAX) return; /* out of memory: the next batch asks again */
+    for (k = 0; k < n && !j->finished; k++) {
+        uint32_t i = snap[k];
+        ava1_lfile_t *lf;
         int ready;
-        if (!lf || lf->committed || ava1_bits_get(&j->done, i)) continue;
         pthread_mutex_lock(&j->mu);
-        ready = lf->has_root && lf->root_journaled && !lf->written.n &&
-                (j->m.e[i].size == 0 || ava1_rset_covers(&lf->durable, 0, j->m.e[i].size));
+        lf = j->lf[i]; /* the same lf the snapshot saw: only this thread frees one at a commit */
+        ready = lf && !lf->committed && !ava1_bits_get(&j->done, i) && lf->has_root && lf->root_journaled &&
+                !lf->written.n && (j->m.e[i].size == 0 || ava1_rset_covers(&lf->durable, 0, j->m.e[i].size));
         pthread_mutex_unlock(&j->mu);
         if (ready) commit_large(j, i);
     }
+    free(snap);
 }
 
 /* ---- finishing --------------------------------------------------------------------- */
@@ -1351,8 +1504,17 @@ void ava1_apply_quiesce(ava1_job_t *j) {
     for (i = 0; i < j->pend_n; i++) close(j->pend_fd[i]);
     ava1_pend_release(j->pend_n);
     j->pend_n = 0;
-    for (i = 0; j->lf && i < j->m.n; i++)
-        if (j->lf[i]) ava1_rset_clear(&j->lf[i]->written);
+    if (j->lf) {
+        uint32_t *snap, n, k;
+        snap = lfl_snapshot(j, &n);
+        if (n == UINT32_MAX) { /* out of memory: clear them all, as before the index */
+            for (i = 0; i < j->m.n; i++)
+                if (j->lf[i]) ava1_rset_clear(&j->lf[i]->written);
+        } else {
+            for (k = 0; k < n; k++) ava1_rset_clear(&j->lf[snap[k]]->written);
+        }
+        free(snap);
+    }
     j->unsynced_bytes = 0;
     pthread_mutex_unlock(&j->mu);
 }
@@ -1380,6 +1542,23 @@ static void tune_workers(ava1_job_t *j, uint64_t now) {
     j->want_workers = want <= j->nworkers ? want : j->nworkers;
     pthread_cond_broadcast(&j->cv);
     pthread_mutex_unlock(&j->mu);
+}
+
+/* One line of stderr.log per ten seconds of batches: where this job's time goes. */
+static void log_stats(ava1_job_t *j, uint64_t now) {
+    double b = (double)j->st_batches;
+    j->st_log_ms = now;
+    fprintf(stderr,
+            "[ava1] job %02x%02x%02x%02x: %u/%u files, %llu batches (%.0f files each), per batch ms: "
+            "scan %.2f data %.1f dirs %.1f journal %.1f commit %.1f; %llu compactions %.1f ms total; "
+            "%u large in flight\n",
+            j->id[0], j->id[1], j->id[2], j->id[3], j->files_done, j->m.files,
+            (unsigned long long)j->st_batches, (double)j->st_files / b, (double)j->st_scan_us / b / 1000.0,
+            (double)j->st_data_us / b / 1000.0, (double)j->st_dirs_us / b / 1000.0,
+            (double)j->st_jnl_us / b / 1000.0, (double)j->st_commit_us / b / 1000.0,
+            (unsigned long long)j->st_compacts, (double)j->st_compact_us / 1000.0, j->lfl_n);
+    j->st_batches = j->st_files = j->st_data_us = j->st_dirs_us = j->st_jnl_us = j->st_scan_us = 0;
+    j->st_commit_us = j->st_compact_us = j->st_compacts = 0;
 }
 
 static void *job_main(void *arg) {
@@ -1421,8 +1600,13 @@ static void *job_main(void *arg) {
         if (batch) {
             sync_batch(j);
             j->last_batch_ms = now;
-            if (!j->stopping) ava1_apply_commit_ready(j);
+            if (!j->stopping) {
+                uint64_t c0 = mono_us();
+                ava1_apply_commit_ready(j);
+                j->st_commit_us += mono_us() - c0;
+            }
         }
+        if (j->st_batches && now - j->st_log_ms >= 10000) log_stats(j, now);
         if (all_done(j)) finish(j);
         if (now - j->status_ms >= 250) {
             j->status_ms = now;

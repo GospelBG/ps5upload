@@ -25,6 +25,11 @@ int ava1_mkdirs(const char *path, int sync);
 /* The large-file state of `id`, allocated (descriptors -1) when missing. Caller holds j->mu
  * or owns the job alone. NULL when out of memory. */
 ava1_lfile_t *ava1_lfile_get(ava1_job_t *j, uint32_t id);
+/* Rebuilds the large-file index from j->lf (after the array is replaced or reindexed).
+ * Caller holds j->mu or owns the job alone. */
+void ava1_lflist_rebuild(ava1_job_t *j);
+/* Forgets the index (the job's state is dropped or freed). */
+void ava1_lflist_reset(ava1_job_t *j, int release);
 /* A directory that gained an entry; `id` names a file in it (for the test hook). */
 typedef struct {
     char *dir; /* malloc'd; ava1_sync_dirset frees it */

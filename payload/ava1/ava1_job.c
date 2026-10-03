@@ -222,6 +222,7 @@ static void job_destroy(ava1_job_t *j) {
             }
         free(j->lf);
     }
+    free(j->lfl);
     ava1_jnl_close(&j->jnl);
     ava1_bits_free(&j->done);
     ava1_mstore_free(&j->m);

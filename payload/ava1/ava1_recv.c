@@ -171,6 +171,7 @@ static void recount(ava1_job_t *j) {
 
 static int alloc_state(ava1_job_t *j) {
     j->lf = calloc((size_t)j->m.n + 1, sizeof *j->lf);
+    ava1_lflist_reset(j, 0);
     return (j->lf && ava1_bits_init(&j->done, j->m.n) == 0) ? 0 : -1;
 }
 
@@ -191,6 +192,7 @@ static void drop_state(ava1_job_t *j) {
         for (i = 0; i < j->m.n; i++) free_lf(j->lf[i]);
     free(j->lf);
     j->lf = NULL;
+    ava1_lflist_reset(j, 0);
     ava1_bits_free(&j->done);
     memset(&j->done, 0, sizeof j->done);
     ava1_mstore_free(&j->m);
@@ -610,6 +612,7 @@ static int remap(ava1_job_t *j, ava1_mstore_t *in, ava1_bits_t *changed) {
     memset(in, 0, sizeof *in);
     j->lf = nlf;
     j->done = ndone;
+    ava1_lflist_rebuild(j); /* the files moved to new ids */
     pthread_mutex_unlock(&j->mu);
     return rc ? -1 : 0;
 }

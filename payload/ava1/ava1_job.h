@@ -47,6 +47,7 @@ typedef struct {        /* one large file being assembled */
     uint8_t root[32];
     int committed;
     int dir_synced;        /* its part file's directory entry is durable (Task 13) */
+    int in_list;           /* its id is in the job's lfl list (the batch scans' index) */
 } ava1_lfile_t;
 
 typedef struct ava1_work { /* a unit for the worker pool */
@@ -87,6 +88,18 @@ struct ava1_job {
     ava1_jnl_t jnl;
     ava1_bits_t done;               /* committed (small: synced; large: renamed) */
     ava1_lfile_t **lf;              /* per file_id; NULL for small files and directories */
+    /* The ids that may hold large-file work (a non-NULL lf that is not idle): the batch,
+     * commit and compaction scans walk this list, never the whole manifest, so their cost
+     * follows the large files in flight, not the file count. May hold stale or duplicate
+     * ids (a freed lf); lfl_snapshot sorts and filters them. Under j->mu. `lfl_all`: the
+     * list could not grow, so the scans fall back to every manifest entry. */
+    uint32_t *lfl;
+    uint32_t lfl_n, lfl_cap;
+    int lfl_all;
+    /* Where the job thread's time goes, logged every few seconds (stderr.log): batches,
+     * files, and microseconds spent in each step of the durability chain. */
+    uint64_t st_batches, st_files, st_data_us, st_dirs_us, st_jnl_us, st_scan_us, st_commit_us,
+        st_compact_us, st_compacts, st_log_ms;
     ava1_file_range_t *last_ranges; /* the last journal batch's ranges (resume check, Task 13) */
     uint32_t last_ranges_n;
     uint64_t credit, outstanding;   /* granted; lane-frame bytes held */

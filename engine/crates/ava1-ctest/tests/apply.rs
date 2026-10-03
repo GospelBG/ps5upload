@@ -80,6 +80,31 @@ fn a_large_file_assembles_out_of_order_and_commits() {
 }
 
 #[test]
+fn a_root_that_arrives_after_every_range_is_durable_still_commits() {
+    // The root travels on the control connection, the chunks on the lanes: it can land
+    // after the batch that made the last range durable. The file must still commit.
+    let t = tmp("late-root");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let d = data(3 * GROUP as usize + 5, 2);
+    let m = Manifest {
+        entries: vec![file("late.bin", d.len() as u64)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    for o in (0..d.len()).step_by(GROUP as usize) {
+        job.chunk(0, o as u64, &d[o..(o + GROUP as usize).min(d.len())]);
+    }
+    job.wait_event(" ranges=1", 10_000); // all ranges journaled, no root yet
+    assert!(!root.join("late.bin").exists() || std::fs::read(root.join("late.bin")).unwrap() != d);
+    std::thread::sleep(std::time::Duration::from_millis(600)); // several idle batches
+    job.root(0, *blake3::hash(&d).as_bytes());
+    assert_eq!(job.wait(10_000), 0);
+    assert_eq!(std::fs::read(root.join("late.bin")).unwrap(), d);
+    // a re-sent identical root changes nothing
+    assert!(job.events().ends_with("done 0\n"));
+}
+
+#[test]
 fn tiny_files_apply_in_parallel_and_become_durable_in_batches() {
     let t = tmp("tiny");
     let root = t.join("dest");
