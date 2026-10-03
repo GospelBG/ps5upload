@@ -357,6 +357,7 @@ pub fn upload_with_in(
                 // The shared flag, not a copy (C18): flipping cfg.cancel ends the job.
                 cancel: cancel.clone(),
                 bandwidth_cap: cfg.bandwidth_cap_bps,
+                seq: None,
             };
             match send_job(&mut link, manifest.clone(), source.clone(), o).await {
                 Ok(r) if r.status == gen::STATUS_OK => {

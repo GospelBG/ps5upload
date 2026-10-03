@@ -661,3 +661,38 @@ bottleneck, which already folds in the receiver's.
 measurements at 1, 2, 4, 8 and 16 workers. The request allows at most 20,000 files of at most
 1 MiB each, and `dir` must pass the node's write policy. The answer is a hint for the engine's
 starting worker count, never a contract. The node deletes every file and directory it created.
+
+## 17. Sequential sources (sender-local, no wire change)
+
+A sender may read a source that can only be read forward (a 7z folder, a solid RAR): a
+`SeqSource` (`engine/crates/ava1/src/seq.rs`). The receiver cannot tell: it sees ordinary
+`Bundle`, `Chunk` and `FileRoot` frames, and the manifest (sorted, §11.3) is built from the
+archive's headers before the job opens.
+
+17.1 One decode thread replaces the random readers. It calls `SeqSource::pass`, which visits
+entries in *decode* order, asks `want(path, size)` for each (`Keep::Skip`, `Keep::All` or
+`Keep::Ranges(lacking)`) and feeds the wanted ones to an `EntrySink` (`begin`/`data`/`end`).
+The thread maps the entry's path to its manifest id (the archive's order is unrelated to the
+manifest's), cuts files below `LARGE_CUTOFF` into records and the rest into group-aligned
+chunks exactly as the random readers do (§12.2, §13), and queues a `FileRoot` after a large
+file's last chunk. It takes the same read-ahead permits, so a slow lane parks the decoder
+and its memory stays bounded.
+
+17.2 Resume (§14). Files the receiver reports done are `Skip`. The pass starts at the minimum
+`restart_for(id)` over the unfinished files (7z: the folder's first entry; RAR non-solid: the
+entry), so everything the receiver already has before that point is not decoded. A partly
+durable large file is decoded from its start (a decoder cannot seek inside an entry); only the
+groups the receiver lacks are sent, durable groups are hashed only when no persisted outboard
+CV exists, and a file whose every CV is known needs no decoding at all. There are no decoder
+checkpoints: a resume costs a decode of at most the restart folder's prefix.
+
+17.3 `FileRetry` (§13) queues the file for a further pass over only the retried files
+(`Keep::All`, their outboards dropped). A job makes at most 3 decoding passes (the first plus two retry passes; a pass that
+has nothing to decode is not counted); a further retry request fails it. An entry that a pass never delivers, delivers twice, or delivers with a different size
+than the manifest fails the job (the archive changed between listing and sending).
+
+17.4 Cancellation. `pass` receives a flag raised by the job's cancel *or* by any other way the job ends (a lane,
+protocol or receiver failure) and must poll it at least every 1 MiB of input, including while
+skipping, and and every `EntrySink` call fails
+once the job is ending; `SeqSource::close` is called at teardown before the decode thread is
+joined. The bottleneck is `BN_SOURCE` while the decode thread is what the lanes wait on.

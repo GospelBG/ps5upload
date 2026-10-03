@@ -19,6 +19,7 @@ pub mod ranges;
 pub mod recv;
 pub mod router;
 pub mod send;
+pub mod seq;
 pub mod server;
 pub mod session;
 pub mod source;
