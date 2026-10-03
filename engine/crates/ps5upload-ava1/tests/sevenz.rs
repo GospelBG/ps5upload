@@ -642,3 +642,276 @@ async fn an_unsafe_entry_path_is_refused() {
     assert_eq!(failure(&e).reason, "ava1_7z_unsafe_path", "{e:#}");
     assert_eq!(p.attempts(), 0);
 }
+
+/// 7z variable-length number.
+fn num(v: u64) -> Vec<u8> {
+    let mut n = 0;
+    while n < 8 && v >= 1u64 << (7 * (n + 1)) {
+        n += 1;
+    }
+    let mut first = if n == 8 { 0xFFu8 } else { !(0xFFu8 >> n) };
+    if n < 8 {
+        first |= (v >> (8 * n)) as u8;
+    }
+    let mut out = vec![first];
+    out.extend_from_slice(&v.to_le_bytes()[..n]);
+    out
+}
+
+/// A hand-built 7z (COPY, uncompressed header, no CRCs) holding one solid folder whose
+/// file list interleaves stream-less directories among the streamed files: the
+/// `sevenz-rust2` writer cannot produce this valid shape, 7z the format allows it.
+/// `layout` lists `Some(file index)` for a streamed file and `None` for a directory.
+fn craft_interleaved(path: &Path, files: &[(String, Vec<u8>)], layout: &[Option<usize>]) {
+    let data: Vec<u8> = files.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+    let mut h = vec![0x01, 0x04];
+    h.extend([0x06]);
+    h.extend(num(0));
+    h.extend(num(1));
+    h.push(0x09);
+    h.extend(num(data.len() as u64));
+    h.push(0x00);
+    h.push(0x07);
+    h.push(0x0B);
+    h.extend(num(1));
+    h.push(0x00); // not external
+    h.extend(num(1)); // one coder
+    h.extend([0x01, 0x00]); // simple coder, id size 1, COPY
+    h.push(0x0C);
+    h.extend(num(data.len() as u64));
+    h.push(0x00);
+    h.push(0x08);
+    h.push(0x0D);
+    h.extend(num(files.len() as u64));
+    h.push(0x09);
+    for (_, d) in &files[..files.len() - 1] {
+        h.extend(num(d.len() as u64));
+    }
+    h.push(0x00);
+    h.push(0x00); // end of streams info
+    h.push(0x05);
+    h.extend(num(layout.len() as u64));
+    let mut bits = vec![0u8; layout.len().div_ceil(8)];
+    for (i, l) in layout.iter().enumerate() {
+        if l.is_none() {
+            bits[i / 8] |= 0x80 >> (i % 8);
+        }
+    }
+    h.push(0x0E);
+    h.extend(num(bits.len() as u64));
+    h.extend(&bits);
+    let mut names = vec![0u8]; // not external
+    for l in layout {
+        let n = match l {
+            Some(i) => files[*i].0.clone(),
+            None => format!("sub{}", names.len()),
+        };
+        for u in n.encode_utf16().chain([0]) {
+            names.extend(u.to_le_bytes());
+        }
+    }
+    h.push(0x11);
+    h.extend(num(names.len() as u64));
+    h.extend(&names);
+    h.push(0x00);
+    h.push(0x00);
+    let mut start = Vec::new();
+    start.extend((data.len() as u64).to_le_bytes());
+    start.extend((h.len() as u64).to_le_bytes());
+    start.extend(crc32fast::hash(&h).to_le_bytes());
+    let mut out = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4];
+    out.extend(crc32fast::hash(&start).to_le_bytes());
+    out.extend(start);
+    out.extend(data);
+    out.extend(h);
+    std::fs::write(path, out).unwrap();
+}
+
+#[test]
+fn directories_interleaved_in_a_solid_block_are_refused_not_misread() {
+    let d = temp_dir("interleave");
+    // Equal sizes, different bytes: a drifted index would swap them silently.
+    let files: Vec<(String, Vec<u8>)> = (0..4)
+        .map(|i| (format!("f{i}"), noise(i as u64 + 500, 1_000)))
+        .collect();
+    let want: BTreeMap<String, Vec<u8>> = files.iter().cloned().collect();
+    // Directories after f0 and f1: the stream-less entries sit inside the block.
+    craft_interleaved(
+        &d.join("a.7z"),
+        &files,
+        &[Some(0), None, Some(1), None, Some(2), Some(3)],
+    );
+    // The crate's block walk covers fewer entries than such a block spans (it would
+    // silently drop the last files), so the source refuses it up front as unsupported.
+    let e = SevenzSource::open(&d.join("a.7z"), &[])
+        .err()
+        .expect("refused at open");
+    assert!(matches!(
+        ps5upload_ava1::seq::fault_of(&e),
+        Some(ps5upload_ava1::seq::SevenzFault::Unsupported(_))
+    ));
+    // Directories after the last file: the walk is complete and every path is right.
+    craft_interleaved(
+        &d.join("b.7z"),
+        &files,
+        &[Some(0), Some(1), Some(2), Some(3), None, None],
+    );
+    let (m, src) = SevenzSource::open(&d.join("b.7z"), &[]).unwrap();
+    same(&want, &resume_pass(&src, &m, &[]).unwrap());
+    let (m, src) = SevenzSource::open(&d.join("b.7z"), &[]).unwrap();
+    let got = resume_pass(&src, &m, &["f0", "f1"]).unwrap();
+    assert_eq!(got.keys().collect::<Vec<_>>(), vec!["f2", "f3"]);
+    assert!(got["f2"] == want["f2"] && got["f3"] == want["f3"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_touched_copy_of_the_archive_keeps_its_resume() {
+    let d = temp_dir("touched");
+    let spec = folders(3, 20, 64 * 1024 - 20);
+    build(&d.join("a.7z"), &spec);
+    let total: u64 = expected(&spec).values().map(|v| v.len() as u64).sum();
+    let fin1 = partial_upload(&d, &d.join("a.7z"), [9; 16], 2 << 20).await;
+    // A byte-identical copy with a different mtime and name.
+    std::fs::copy(d.join("a.7z"), d.join("copy.7z")).unwrap();
+    let f = std::fs::File::options()
+        .write(true)
+        .open(d.join("copy.7z"))
+        .unwrap();
+    f.set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+        .unwrap();
+    drop(f);
+    let (addr, ava) = host(&d).await;
+    let pool = Pool::new(ava).with_addr(addr);
+    let c = cfg();
+    let sent = c.progress_bytes.clone().unwrap();
+    let (m, src) = SevenzSource::open(&d.join("copy.7z"), &[]).unwrap();
+    let r = within(
+        120,
+        tokio::task::spawn_blocking(move || {
+            upload::upload_7z_source_in(&pool, &c, [9; 16], "out", m, Arc::new(src))
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        r.tx_id_hex,
+        ava1::hex::encode(&[9; 16]),
+        "the caller's id is reported"
+    );
+    same(&expected(&spec), &read_tree(&d.join("share/out")));
+    assert!(
+        sent.load(Ordering::Relaxed) <= total - fin1,
+        "the copy resumed: sent {} of {} missing",
+        sent.load(Ordering::Relaxed),
+        total - fin1
+    );
+}
+
+// ---- memory ------------------------------------------------------------------------
+
+/// Resident set size of this process in KiB (`ps`, so it works on Linux and macOS).
+fn rss_kib() -> u64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// An endless-looking generator: `len` bytes of mixed, partly compressible data, made
+/// on the fly so building the archive does not itself hold the data in memory.
+struct Gen {
+    left: u64,
+    x: u64,
+}
+impl io::Read for Gen {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = buf.len().min(self.left as usize);
+        for (i, b) in buf[..n].iter_mut().enumerate() {
+            if i % 64 == 0 {
+                self.x ^= self.x << 13;
+                self.x ^= self.x >> 7;
+                self.x ^= self.x << 17;
+            }
+            *b = (self.x >> ((i % 8) * 8)) as u8 & if i % 3 == 0 { 0xFF } else { 0x0F };
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Peak RSS growth while decoding a 400 MiB single-folder solid archive on one thread
+/// stays near one LZMA2 window, not the archive (the 7z-mt-decode memory cliff:
+/// `PS5UPLOAD_7Z_THREADS` defaults to 1 because more threads buffer the whole solid
+/// stream). Ignored by default: building the archive takes minutes in a debug build.
+///
+/// Run: `cd engine && cargo test --release -p ps5upload-ava1 --test sevenz -- --ignored
+/// sevenz_rss_stays_bounded_at_one_thread` (leave `PS5UPLOAD_7Z_THREADS` unset).
+#[test]
+#[ignore = "builds a 400 MiB archive; run with --release (see the doc comment)"]
+fn sevenz_rss_stays_bounded_at_one_thread() {
+    assert!(
+        std::env::var("PS5UPLOAD_7Z_THREADS").is_err(),
+        "the bound is for the default single thread"
+    );
+    let d = temp_dir("rss");
+    let mut w = ArchiveWriter::create(d.join("big.7z")).unwrap();
+    let entries: Vec<ArchiveEntry> = (0..4)
+        .map(|i| ArchiveEntry::new_file(&format!("part{i}")))
+        .collect();
+    let readers: Vec<SourceReader<Gen>> = (0..4)
+        .map(|i| {
+            SourceReader::new(Gen {
+                left: 100 << 20,
+                x: 0x1234_5678 + i,
+            })
+        })
+        .collect();
+    w.push_archive_entries(entries, readers).unwrap();
+    w.finish().unwrap();
+    let (_m, src) = SevenzSource::open(&d.join("big.7z"), &[]).unwrap();
+
+    struct Drop0;
+    impl EntrySink for Drop0 {
+        fn begin(&mut self, _: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn data(&mut self, _: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn end(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let base = rss_kib();
+    let stop = Arc::new(AtomicBool::new(false));
+    let peak = Arc::new(AtomicU64::new(0));
+    let sampler = {
+        let (stop, peak) = (stop.clone(), peak.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                peak.fetch_max(rss_kib(), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+    src.pass(
+        Restart::START,
+        &mut |_, _| Keep::All,
+        &mut Drop0,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    stop.store(true, Ordering::Relaxed);
+    sampler.join().unwrap();
+    assert_eq!(src.bytes_decoded(), 400 << 20);
+    let growth_mib = peak.load(Ordering::Relaxed).saturating_sub(base) / 1024;
+    assert!(
+        growth_mib < 200,
+        "RSS grew {growth_mib} MiB decoding 400 MiB"
+    );
+}

@@ -20,3 +20,4 @@ blake3 = { workspace = true, features = ["pure"] }
 serde_json.workspace = true
 ava1-chaos = { path = "../ava1-chaos" }
 tokio = { workspace = true, features = ["net", "time", "io-util", "macros", "rt-multi-thread"] }
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["compress"] }

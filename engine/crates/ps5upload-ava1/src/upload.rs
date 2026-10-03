@@ -134,11 +134,13 @@ pub fn upload_7z_source_in(
     manifest: Manifest,
     source: Arc<crate::seq::SevenzSource>,
 ) -> Result<TransferResult> {
-    let job_id = sevenz_job_id(job_id, &source.identity());
-    upload_with_seq_in(
+    // The wire job id names the archive's contents (see `sevenz_job_id`); the result
+    // reports the caller's id so job bookkeeping keyed by it stays consistent.
+    let wire_id = sevenz_job_id(job_id, &source.identity());
+    let mut r = upload_with_seq_in(
         pool,
         &cfg.addr,
-        job_id,
+        wire_id,
         manifest,
         Arc::new(crate::seq::NoSource),
         Some(source),
@@ -148,7 +150,9 @@ pub fn upload_7z_source_in(
     .map_err(|e| match sevenz_failure(&e) {
         Some(f) => f.into(),
         None => e,
-    })
+    })?;
+    r.tx_id_hex = hex(&job_id);
+    Ok(r)
 }
 
 pub fn upload_7z(

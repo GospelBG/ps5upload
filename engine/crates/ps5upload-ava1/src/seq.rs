@@ -98,6 +98,9 @@ fn read_error(e: io::Error) -> io::Error {
 
 /// One entry of a folder, in decode order. `path` is `None` for an excluded file.
 struct Member {
+    /// The archive's own name, checked against the decoder's entry (a drifted walk
+    /// must fail, never write bytes under another path).
+    raw: String,
     path: Option<String>,
     size: u64,
 }
@@ -133,17 +136,20 @@ impl SevenzSource {
         })?;
         f.seek(SeekFrom::Start(0))?;
         let archive = Archive::read(&mut f, &Password::empty()).map_err(map_open_error)?;
-        // The start header's CRC covers the (encoded) next header, which carries every
-        // file's size and CRC: with the size and mtime it names this archive's contents.
+        // The next header lists every file's name, size and CRC-32: with the start
+        // header and the length it names this archive's contents.
+        let off = u64::from_le_bytes(head[12..20].try_into().unwrap());
+        let len = u64::from_le_bytes(head[20..28].try_into().unwrap());
+        let mut next_header = Vec::new();
+        if len <= meta.len() {
+            f.seek(SeekFrom::Start(32u64.saturating_add(off)))?;
+            f.by_ref().take(len).read_to_end(&mut next_header)?;
+        }
         let mut h = blake3::Hasher::new();
         h.update(&meta.len().to_le_bytes());
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_nanos());
-        h.update(&mtime.to_le_bytes());
+        // Not the mtime: a copied or touched identical archive keeps its resume.
         h.update(&head);
+        h.update(&next_header);
         let identity = *h.finalize().as_bytes();
 
         if archive
@@ -168,21 +174,30 @@ impl SevenzSource {
                 .get(fi)
                 .copied()
                 .flatten();
+            if block.is_some() && !e.has_stream() {
+                // A directory or empty file between the streamed files of one block: the
+                // crate's per-block walk covers fewer entries than the block spans and
+                // would skip the last files, so refuse before sending anything.
+                return Err(fault(SevenzFault::Unsupported(format!(
+                    "{:?} is a stream-less entry inside a solid block",
+                    e.name()
+                ))));
+            }
             if e.is_directory() {
                 // An unsafe directory name is ignored: its files are refused by name.
-                if let Ok(Some(rel)) = sanitize(e.name()) {
+                if let Ok(rel) = sanitize(e.name()) {
                     if !ps5upload_core::excludes::is_excluded_strings(Path::new(&rel), excludes) {
                         dirs.insert(rel);
                     }
                 }
                 continue;
             }
-            let rel = sanitize(e.name())?
-                .ok_or_else(|| fault(SevenzFault::UnsafePath(format!("{:?}", e.name()))))?;
+            let rel = sanitize(e.name())?;
             let excluded = ps5upload_core::excludes::is_excluded_strings(Path::new(&rel), excludes);
             let size = e.size();
             match block {
                 Some(b) => folders[b].push(Member {
+                    raw: e.name().to_string(),
                     path: (!excluded).then(|| rel.clone()),
                     size,
                 }),
@@ -350,12 +365,11 @@ impl SevenzSource {
     }
 }
 
-/// `Ok(None)` for an empty (root) name, an error for an unsafe one.
-fn sanitize(name: &str) -> io::Result<Option<String>> {
-    match ps5upload_core::transfer::sanitize_7z_entry(name) {
-        Some(p) => Ok(Some(p)),
-        None => Err(fault(SevenzFault::UnsafePath(format!("{name:?}")))),
-    }
+/// The destination-relative path for an entry name, or an `UnsafePath` fault when the
+/// name would escape it (or is empty).
+fn sanitize(name: &str) -> io::Result<String> {
+    ps5upload_core::transfer::sanitize_7z_entry(name)
+        .ok_or_else(|| fault(SevenzFault::UnsafePath(format!("{name:?}"))))
 }
 
 impl SeqSource for SevenzSource {
@@ -390,7 +404,11 @@ impl SeqSource for SevenzSource {
             let dec = BlockDecoder::new(self.threads, b, &self.archive, &pw, &mut src);
             let mut j = 0usize;
             let mut failure: Option<io::Error> = None;
-            let res = dec.for_each_entries(&mut |_entry, rd| {
+            let mut reached_last = false;
+            let res = dec.for_each_entries(&mut |entry, rd| {
+                if !entry.has_stream() {
+                    return Ok(true); // a directory or empty file inside the block
+                }
                 let i = j;
                 j += 1;
                 let (Some(m), Some(k)) = (members.get(i), keeps.get(i)) else {
@@ -399,11 +417,20 @@ impl SeqSource for SevenzSource {
                     )));
                     return Ok(false);
                 };
+                if entry.name() != m.raw {
+                    failure = Some(fault(SevenzFault::Corrupt(format!(
+                        "the decoder yielded {:?} where the header lists {:?}",
+                        entry.name(),
+                        m.raw
+                    ))));
+                    return Ok(false);
+                }
                 if let Err(e) = self.feed(m, k, rd, sink, cancel, &mut buf) {
                     failure = Some(e);
                     return Ok(false);
                 }
                 // Nothing wanted after `last`: do not decode the rest of the folder.
+                reached_last = i >= last;
                 Ok(i < last)
             });
             if let Some(e) = failure {
@@ -411,6 +438,12 @@ impl SeqSource for SevenzSource {
             }
             if let Err(e) = res {
                 return Err(map_pass_error(e));
+            }
+            if !reached_last {
+                return Err(fault(SevenzFault::Unsupported(format!(
+                    "folder {b} yielded {j} entries, the header lists {} (stream-less entries inside a block?)",
+                    members.len()
+                ))));
             }
         }
         for p in &self.empties {
