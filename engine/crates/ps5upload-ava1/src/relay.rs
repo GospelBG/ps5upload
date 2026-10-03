@@ -439,6 +439,11 @@ impl Source for RelaySource {
             turn: self.turn.clone(),
         }))
     }
+    /// The destination's job is over: wake every reader parked for the source's bytes or
+    /// its turn, so the sender's teardown join returns now, not after the stall bound.
+    fn close(&self) {
+        self.relay.fail();
+    }
     fn list(&self, _rel: &str) -> io::Result<Vec<(String, SourceMeta)>> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,

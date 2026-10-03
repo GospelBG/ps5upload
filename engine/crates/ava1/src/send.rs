@@ -1348,6 +1348,15 @@ pub async fn run_upload(
                         }),
                         Err(e) => break Err(SendError::Protocol(e.to_string())),
                     },
+                    // The receiver ended the job (cancel, disk full, verify...): its
+                    // session may stay open, so nothing else would tell this task.
+                    gen::JobCancel::TYPE => match f.decode::<gen::JobCancel>() {
+                        Ok(c) => break Err(SendError::Refused {
+                            status: c.reason,
+                            message: "the receiver ended the job".into(),
+                        }),
+                        Err(e) => break Err(SendError::Protocol(e.to_string())),
+                    },
                     _ => {}
                 },
             },
@@ -1415,6 +1424,7 @@ pub async fn run_upload(
     // Nothing of this job keeps running after the return.
     stop.store(true, Ordering::Relaxed);
     sh.wake();
+    source.close();
     for (_, h) in lane_tasks.drain() {
         h.abort();
         let _ = h.await;
@@ -2817,6 +2827,100 @@ mod tests {
         // ...and no reader thread is still inside the source (parked on the read-ahead
         // budget or otherwise).
         assert_eq!(active.load(Ordering::Relaxed), 0, "a reader thread leaked");
+    }
+
+    /// A source whose reads park on something outside the disk (a relay waiting for
+    /// another connection) until `close` wakes them.
+    struct ParkedSource {
+        closed: Arc<AtomicBool>,
+        parked: Arc<AtomicBool>,
+    }
+    struct ParkedRead(Arc<AtomicBool>, Arc<AtomicBool>);
+    impl crate::source::ReadAt for ParkedRead {
+        fn read_at(&mut self, _off: u64, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.1.store(true, Ordering::Relaxed);
+            while !self.0.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
+        }
+    }
+    impl Source for ParkedSource {
+        fn open(&self, _rel: &str) -> std::io::Result<Box<dyn crate::source::ReadAt>> {
+            Ok(Box::new(ParkedRead(
+                self.closed.clone(),
+                self.parked.clone(),
+            )))
+        }
+        fn list(&self, _rel: &str) -> std::io::Result<Vec<(String, SourceMeta)>> {
+            Ok(Vec::new())
+        }
+        fn stat(&self, _rel: &str) -> std::io::Result<SourceMeta> {
+            Ok(SourceMeta {
+                size: 64 << 20,
+                mtime: 0,
+                mode: 0o644,
+                is_dir: false,
+            })
+        }
+        fn close(&self) {
+            self.closed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn teardown_closes_the_source_so_a_parked_reader_cannot_hold_the_job() {
+        let (mut link, _lane_seen, _keep) = fake_link(
+            FakeReceiver {
+                credit: 4 << 20,
+                credit_on_apply: true,
+                done_when_complete: false,
+                credit_after_ack: None,
+                malformed_status: false,
+                retry_unknown: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let (closed, parked) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let src: Arc<dyn Source> = Arc::new(ParkedSource {
+            closed: closed.clone(),
+            parked: parked.clone(),
+        });
+        let m = Arc::new(Manifest {
+            entries: vec![Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: 64 << 20,
+                mtime: 1,
+                path: "big".into(),
+                root: None,
+            }],
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut opts = SendOptions::upload("dest");
+        opts.cancel = cancel.clone();
+        let job_task = tokio::spawn(async move { send_job(&mut link, m, src, opts).await });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !parked.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a reader parked in the source");
+        cancel.store(true, Ordering::Relaxed);
+        let result = tokio::time::timeout(Duration::from_secs(5), job_task)
+            .await
+            .expect("teardown waited on a parked reader")
+            .unwrap();
+        assert!(matches!(result, Err(SendError::Cancelled)), "{result:?}");
+        assert!(closed.load(Ordering::Relaxed));
     }
 
     /// An opener whose `open()` waits for the test's signal and then fails: the

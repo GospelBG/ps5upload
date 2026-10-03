@@ -35,6 +35,11 @@ pub trait Source: Send + Sync {
     /// Direct children of `rel`: (name, metadata).
     fn list(&self, rel: &str) -> io::Result<Vec<(String, SourceMeta)>>;
     fn stat(&self, rel: &str) -> io::Result<SourceMeta>;
+    /// Called once when the upload that reads this source is ending, before its readers
+    /// are joined. A source whose reads can park on something other than a disk (a
+    /// relay waiting for another connection's bytes) uses it to wake them, so an ended
+    /// job does not wait for a stall bound. Reads after `close` may fail. Must not block.
+    fn close(&self) {}
 }
 
 /// Any `Read + Seek` as a `ReadAt` (seeks only when the position differs).
