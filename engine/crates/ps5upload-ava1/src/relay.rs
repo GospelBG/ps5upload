@@ -15,7 +15,7 @@ use ava1::send::{open_upload, run_upload, Progress, SendError, SendOptions, Send
 use ava1::source::{ReadAt, Source, SourceMeta};
 
 use crate::pool::{pool, Pool};
-use crate::upload::SessionGate;
+use crate::upload::{refusal, SessionGate};
 
 const RELAY_CAP: usize = 64 << 20;
 // A blocked source or lane may leave both halves alive without progress.
@@ -48,6 +48,8 @@ struct State {
     failed: bool,
     /// A's download ended cleanly: nothing more will arrive, nothing is wrong.
     source_done: bool,
+    /// Last put/take/leave: a file waiting its turn gives up only after this long idle.
+    last_activity: Instant,
     /// Offsets a reader is parked on right now. A put that supplies one is admitted
     /// even into a full buffer (see `put`).
     wanted: Vec<(u32, u64)>,
@@ -88,6 +90,7 @@ impl Relay {
                 failed: false,
                 source_done: false,
                 wanted: Vec::new(),
+                last_activity: Instant::now(),
             }),
             changed: Condvar::new(),
         }
@@ -97,6 +100,10 @@ impl Relay {
     fn with_cap(mut self, cap: usize) -> Self {
         self.cap = cap;
         self
+    }
+
+    fn idle(&self) -> Duration {
+        self.state.lock().unwrap().last_activity.elapsed()
     }
 
     fn finished(&self) -> bool {
@@ -165,6 +172,7 @@ impl Relay {
                     s.bytes -= old.len();
                 }
                 s.bytes += data.len();
+                s.last_activity = Instant::now();
                 self.changed.notify_all();
                 return Ok(());
             }
@@ -197,6 +205,7 @@ impl Relay {
                 if key_id == id && s.chunks[&(key_id, start)].len() as u64 > off - start {
                     let data = s.chunks.remove(&(key_id, start)).unwrap();
                     s.bytes -= data.len();
+                    s.last_activity = Instant::now();
                     self.changed.notify_all();
                     break Ok(if off == start {
                         data
@@ -225,6 +234,29 @@ impl Relay {
             s.wanted.swap_remove(i);
         }
         result
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Settle {
+    Done,
+    Cancelled,
+    Retry,
+    Fail,
+}
+
+/// What one attempt's outcome means. The destination decides: once it reports OK the
+/// transfer is done whatever the source did afterwards (`a_dropped` is ignored);
+/// a destination refusal is final even if the source dropped too; only a transport
+/// loss on either side retries.
+fn settle(b: &Result<SendReport, SendError>, a_dropped: bool) -> Settle {
+    match b {
+        Ok(r) if r.status == gen::STATUS_OK => Settle::Done,
+        Ok(_) | Err(SendError::Refused { .. }) => Settle::Fail,
+        Err(SendError::Cancelled) => Settle::Cancelled,
+        Err(SendError::Disconnected(_)) => Settle::Retry,
+        Err(_) if a_dropped => Settle::Retry,
+        Err(_) => Settle::Fail,
     }
 }
 
@@ -276,11 +308,16 @@ struct Turn {
     next: Mutex<usize>,
     changed: Condvar,
     cancel: Arc<AtomicBool>,
+    /// When the last file left; with `Relay::idle` it measures a stalled predecessor.
+    last_leave: Mutex<Instant>,
 }
 impl Turn {
-    /// Waits for the previous file to finish. There is deliberately no wall-clock
-    /// bound: the predecessor may legitimately take hours; its own `take`/`put` carry
-    /// the no-progress bound, and a failure there fails the relay and wakes this wait.
+    /// Waits for the previous file to finish. There is no wall-clock bound on the
+    /// predecessor (it may legitimately take hours) but there is a progress bound: if
+    /// nothing at all happened (no chunk in or out, no file finished) for
+    /// `relay_wait()`, the predecessor will never come (its reader exited because
+    /// the destination's job ended while its session stayed open) and this wait
+    /// fails instead of hanging the sender's teardown join.
     fn enter(&self, id: u32, relay: &Relay) -> io::Result<()> {
         let mut next = self.next.lock().unwrap();
         while self.ids.get(*next) != Some(&id) {
@@ -299,6 +336,13 @@ impl Turn {
                     "relay cancelled",
                 ));
             }
+            let idle = relay.idle().min(self.last_leave.lock().unwrap().elapsed());
+            if idle > relay_wait() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("relay read order stalled before file {id}: no progress for {idle:?}"),
+                ));
+            }
             let (n, _) = self
                 .changed
                 .wait_timeout(next, Duration::from_millis(100))
@@ -310,6 +354,7 @@ impl Turn {
     fn leave(&self, id: u32) {
         let mut next = self.next.lock().unwrap();
         if self.ids.get(*next) == Some(&id) {
+            *self.last_leave.lock().unwrap() = Instant::now();
             *next += 1;
             self.changed.notify_all();
         }
@@ -374,6 +419,7 @@ impl RelaySource {
                 next: Mutex::new(0),
                 changed: Condvar::new(),
                 cancel,
+                last_leave: Mutex::new(Instant::now()),
             }),
         }
     }
@@ -611,35 +657,37 @@ pub fn ps5_to_ps5_between(
                     return Err(anyhow!("source relay did not stop within {grace:?}"));
                 }
             };
-            if matches!(a_result, Err(SendError::Disconnected(_))) {
-                from_pool.forget(from).await;
-                to_pool.forget(to).await;
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-                continue;
-            }
-            match b {
-                Ok(r) if r.status == gen::STATUS_OK => {
-                    a_result?;
+            let a_dropped = matches!(a_result, Err(SendError::Disconnected(_)));
+            match settle(&b, a_dropped) {
+                Settle::Done => {
+                    // Every file root is verified and committed on the destination: a
+                    // late error on the source side cannot undo that, nor restart it.
+                    if let Err(e) = a_result {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "ava1 relay: source ended with {e} after the destination committed"
+                        );
+                    }
                     let _ = std::fs::remove_dir_all(&persist);
-                    return Ok(r);
+                    return b.map_err(|e| anyhow!(e));
                 }
-                Ok(r) => {
-                    return Err(anyhow!(
-                        "console refused the relay ({}): {}",
-                        r.status,
-                        r.message.unwrap_or_default()
-                    ))
-                }
-                Err(SendError::Disconnected(why)) => {
+                Settle::Cancelled => return Err(anyhow!("transfer_cancelled")),
+                Settle::Retry => {
                     from_pool.forget(from).await;
                     to_pool.forget(to).await;
-                    let _ = why;
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(5));
                 }
-                Err(SendError::Cancelled) => return Err(anyhow!("transfer_cancelled")),
-                Err(e) => return Err(anyhow!(e)),
+                Settle::Fail => {
+                    return Err(match b {
+                        // The destination's own reason, whatever the source did after.
+                        Ok(r) => refusal(r.status, r.message.unwrap_or_default()).into(),
+                        Err(SendError::Refused { status, message }) => {
+                            refusal(status, message).into()
+                        }
+                        Err(e) => anyhow!(e),
+                    });
+                }
             }
         }
     })
@@ -757,19 +805,80 @@ mod tests {
     fn a_slow_predecessor_never_times_out_the_next_file() {
         let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
         set_wait_for_tests(Duration::from_millis(300));
-        let (relay, src) = rig(&[3, 3]);
+        let (relay, src) = rig(&[3000, 3]);
         let src = Arc::new(src);
         let first = src.open("f0").unwrap();
         let waiter = {
             let src = src.clone();
             std::thread::spawn(move || src.open("f1").map(|_| ()))
         };
-        std::thread::sleep(Duration::from_millis(900));
+        // The predecessor is slow but alive: a chunk every 100 ms for 900 ms (3x the
+        // bound), each consumed.
+        for i in 0..9u64 {
+            relay.put(0, i * 100, &[1u8; 100]).unwrap();
+            relay.take(0, i * 100).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        }
         drop(first);
         let r = waiter.join().unwrap();
         reset_wait_for_tests();
         r.expect("the wait for a live predecessor must not time out");
-        drop(relay);
+    }
+
+    // Review round 2, Critical 1: a predecessor that never starts (its reader exited
+    // because the destination's job ended while the session stayed open) must not hang
+    // the sender's teardown join forever.
+    #[test]
+    fn a_predecessor_that_never_starts_stalls_out_the_waiting_file() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        set_wait_for_tests(Duration::from_millis(400));
+        let (_relay, src) = rig(&[3, 3]);
+        // f0 is never opened.
+        let started = Instant::now();
+        let e = src.open("f1").err().expect("must give up");
+        reset_wait_for_tests();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_destination_decides_the_outcome() {
+        let report = |status| SendReport {
+            status,
+            message: None,
+            files: 1,
+            bytes: 1,
+            resent: 0,
+            max_lanes: 1,
+            bottleneck: 0,
+            sequential: false,
+        };
+        let dropped = || SendError::Disconnected("x".into());
+        // A late source error after the destination committed is still Done.
+        assert_eq!(settle(&Ok(report(gen::STATUS_OK)), true), Settle::Done);
+        assert_eq!(settle(&Ok(report(gen::STATUS_OK)), false), Settle::Done);
+        // A refusal is final even if the source also dropped.
+        assert_eq!(settle(&Ok(report(gen::ERR_NO_SPACE)), true), Settle::Fail);
+        assert_eq!(
+            settle(
+                &Err(SendError::Refused {
+                    status: gen::ERR_EXISTS,
+                    message: String::new()
+                }),
+                true
+            ),
+            Settle::Fail
+        );
+        assert_eq!(settle(&Err(dropped()), false), Settle::Retry);
+        assert_eq!(
+            settle(&Err(SendError::Protocol("x".into())), true),
+            Settle::Retry
+        );
+        assert_eq!(
+            settle(&Err(SendError::Protocol("x".into())), false),
+            Settle::Fail
+        );
+        assert_eq!(settle(&Err(SendError::Cancelled), true), Settle::Cancelled);
     }
 
     #[test]

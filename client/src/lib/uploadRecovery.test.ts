@@ -45,8 +45,15 @@ describe("isAutoRecoverable", () => {
   it.each([
     "ava1_exists",
     "ava1_cross_device",
-    "ava1_refused_9",
-    "ava1_refused_16",
+    "ava1_refused_1",
+    "ava1_refused_2",
+    "ava1_refused_3",
+    "ava1_refused_4",
+    "ava1_refused_5",
+    "ava1_refused_6",
+    "ava1_local_io",
+    "ava1_bad_manifest",
+    "ava1_copy_failed",
     "ava1_not_paired",
     "ava1_wrong_console",
     "ava1_no_identity",
@@ -54,6 +61,19 @@ describe("isAutoRecoverable", () => {
     "ava1_not_allowed",
   ])("does NOT recover AVA1 refusal %s (retrying cannot change it)", (r) => {
     expect(isAutoRecoverable(r, "")).toBe(false);
+  });
+
+  it.each([
+    "ava1_refused_7", // internal
+    "ava1_refused_8", // busy
+    "ava1_refused_11", // unknown job (console restarted)
+    "ava1_refused_12", // io
+    "ava1_refused_13", // verify
+    "ava1_refused_17", // credit
+    "ava1_refused_65535", // unknown code
+    "ava1_refused_",
+  ])("keeps the transient or unknown refusal %s retryable", (r) => {
+    expect(isAutoRecoverable(r, "")).toBe(true);
   });
 
   it("recovers ava1_unreachable: the payload may need a re-deploy", () => {

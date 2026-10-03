@@ -60,7 +60,10 @@ const FATAL_REASON_SUBSTRINGS = [
 const AVA1_FATAL_REASON_PREFIXES = [
   "ava1_exists",
   "ava1_cross_device",
-  "ava1_refused_",
+  // Download/copy failures a retry cannot change (engine download.rs / copy.rs).
+  "ava1_local_io",
+  "ava1_bad_manifest",
+  "ava1_copy_failed",
   "ava1_not_paired",
   "ava1_wrong_console",
   "ava1_no_identity",
@@ -152,6 +155,12 @@ export function isAutoRecoverable(
   // different console / has no identity. NOT ava1_unreachable: nothing was
   // listening, which a payload re-deploy can fix, so it stays recoverable.
   if (AVA1_FATAL_REASON_PREFIXES.some((p) => r.startsWith(p))) return false;
+  // ava1_refused_<code>: fatal only for codes that are protocol/pairing/version
+  // faults (1-6, gen.rs ERR_NOT_PAIRED..ERR_UNKNOWN_METHOD). Internal (7), busy
+  // (8), unknown job (11), io (12), verify (13), credit (17) and any code we do
+  // not know are transient, so they keep the default (recoverable).
+  const refused = /^ava1_refused_(\d+)$/.exec(r);
+  if (refused && Number(refused[1]) >= 1 && Number(refused[1]) <= 6) return false;
 
   // Only consult the raw message for fatality when there's no structured
   // reason — a payload that gave us a (non-fatal) reason has already told us

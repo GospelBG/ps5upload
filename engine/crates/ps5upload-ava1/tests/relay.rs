@@ -571,3 +571,37 @@ async fn a_relay_without_an_identity_fails_at_once() {
     assert_eq!(reason, "ava1_no_identity");
     assert!(took < Duration::from_secs(3), "{took:?}");
 }
+
+#[test]
+fn a_failed_read_restarts_the_inflater_instead_of_continuing_stale() {
+    let d = temp("zip-retry");
+    let path = d.join("r.zip");
+    const SIZE: u64 = 2 << 20;
+    zip_with(&path, &[("e", zip::CompressionMethod::Deflated, 4, SIZE)]);
+    let (_, source) = ZipSource::open(&path, &[]).unwrap();
+    let good = std::fs::read(&path).unwrap();
+    // The archive is cut short under the open source: the read hits EOF mid-stream.
+    std::fs::write(&path, &good[..good.len() / 2]).unwrap();
+    let mut r = source.open_entry("e").unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut off = 0u64;
+    let failed_at = loop {
+        match ava1::source::read_full_at(&mut r, off, &mut buf) {
+            Ok(n) => {
+                assert!(buf[..n] == pattern(4, off, n)[..], "bytes differ at {off}");
+                off += n as u64;
+            }
+            Err(_) => break off,
+        }
+        assert!(off < SIZE, "the truncated archive never failed");
+    };
+    assert_eq!(r.restarts(), 1);
+    // The file is whole again; the retry at the same offset must be right.
+    std::fs::write(&path, &good).unwrap();
+    let n = ava1::source::read_full_at(&mut r, failed_at, &mut buf).unwrap();
+    assert!(
+        buf[..n] == pattern(4, failed_at, n)[..],
+        "stale bytes after a failure"
+    );
+    assert_eq!(r.restarts(), 2, "a failed read must restart the inflater");
+}

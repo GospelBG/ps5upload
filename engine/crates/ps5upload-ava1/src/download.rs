@@ -111,10 +111,15 @@ fn basename(src: &str) -> Result<&str> {
     Ok(name)
 }
 
-const WINDOWS_RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+const WINDOWS_RESERVED: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
 
 /// Why a path component cannot be written safely on every host, if it cannot.
 fn host_unsafe_component(comp: &str) -> Option<&'static str> {
+    // CONIN$ / CONOUT$ are device names too; a '$' alone is fine ("price$").
+    let device_stem = comp.split('.').next().unwrap_or(comp).trim_end_matches(' ');
+    if WINDOWS_RESERVED.contains(&device_stem.to_ascii_uppercase().as_str()) {
+        return Some("a reserved device name");
+    }
     if comp.contains(':') {
         return Some("a name with ':' (a drive or stream on Windows)");
     }
@@ -125,8 +130,13 @@ fn host_unsafe_component(comp: &str) -> Option<&'static str> {
     let stem = comp.split('.').next().unwrap_or(comp).trim_end_matches(' ');
     let up = stem.to_ascii_uppercase();
     let numbered = |p: &str| {
-        up.strip_prefix(p)
-            .is_some_and(|n| matches!(n.as_bytes(), [b'1'..=b'9']))
+        up.strip_prefix(p).is_some_and(|n| {
+            let mut c = n.chars();
+            matches!(
+                (c.next(), c.next()),
+                (Some('1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+            )
+        })
     };
     if WINDOWS_RESERVED.contains(&up.as_str()) || numbered("COM") || numbered("LPT") {
         return Some("a reserved device name");
@@ -883,6 +893,12 @@ mod tests {
             "Aux.tar.gz",
             "COM1",
             "lpt9.log",
+            "CONIN$",
+            "conout$",
+            "CONIN$.txt",
+            "COM\u{b9}",
+            "com\u{b2}.txt",
+            "LPT\u{b3}",
             "x.",
             "a/x ",
             "dir./f",
@@ -909,6 +925,8 @@ mod tests {
             "a b/c d",
             "x.y",
             "price$",
+            "CONIN",
+            "CON$X",
         ] {
             check_shape(&files(&[good]), false)
                 .unwrap_or_else(|e| panic!("{good:?} must be accepted: {e}"));

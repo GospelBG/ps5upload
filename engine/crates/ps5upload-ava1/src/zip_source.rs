@@ -167,6 +167,18 @@ impl ZipEntryReader {
 
 impl ReadAt for ZipEntryReader {
     fn read_at(&mut self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let r = self.read_at_inner(off, buf);
+        if r.is_err() {
+            // A failed read leaves the decoder mid-stream at an unknown spot: a retry
+            // must start over, never continue from there.
+            self.inflater = None;
+        }
+        r
+    }
+}
+
+impl ZipEntryReader {
+    fn read_at_inner(&mut self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() || off >= self.size {
             return Ok(0);
         }
