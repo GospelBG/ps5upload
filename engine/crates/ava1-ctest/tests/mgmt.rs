@@ -529,7 +529,14 @@ fn legacy_tokens_map_to_the_closest_status() {
         ("eperm", gen::ERR_IO),
         ("fs_write_failed_errno_28", gen::ERR_IO),
         ("disk_full", gen::ERR_NO_SPACE),
+        // Ambiguous pairs (review L5): the first matching rule wins, so a substring that
+        // two rules share resolves by order. "already_running" is BUSY, bare "already"
+        // is EXISTS; "invalid_path" is PATH (the path rule precedes "invalid" -> PROTOCOL).
         ("already_running", gen::ERR_BUSY),
+        ("already", gen::ERR_EXISTS),
+        ("already_exists", gen::ERR_EXISTS),
+        ("invalid_path", gen::ERR_PATH),
+        ("invalid_title_id", gen::ERR_PROTOCOL),
         ("launch_title_id_missing", gen::ERR_PROTOCOL),
         ("something_else", gen::ERR_INTERNAL),
     ];
