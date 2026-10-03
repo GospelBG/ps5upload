@@ -33,12 +33,25 @@ fn dir(tag: &str) -> PathBuf {
 }
 
 /// A started C server with the stub table installed and a paired client.
-async fn rig(tag: &str) -> (CServer, Session) {
+/// The stub table, its counters and the C server are process-wide: tests of this file run one at a
+/// time (the lock is held for the rig's life; the server drops first).
+struct Rig {
+    _srv: CServer,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+fn rig_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: Mutex<()> = Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+async fn rig(tag: &str) -> (Rig, Session) {
     rig_with(tag, true).await
 }
 
 /// `install = false`: the server starts with no management table (no CAP_MGMT).
-async fn rig_with(tag: &str, install: bool) -> (CServer, Session) {
+async fn rig_with(tag: &str, install: bool) -> (Rig, Session) {
+    let lock = rig_lock();
     if install {
         assert_eq!(mgmt::install(), 0);
     } else {
@@ -63,7 +76,13 @@ async fn rig_with(tag: &str, install: bool) -> (CServer, Session) {
     )
     .await
     .unwrap();
-    (srv, s)
+    (
+        Rig {
+            _srv: srv,
+            _lock: lock,
+        },
+        s,
+    )
 }
 
 fn text(s: &str) -> Vec<u8> {
