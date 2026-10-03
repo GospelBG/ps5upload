@@ -666,3 +666,57 @@ async fn a_wire_resume_starts_writers_for_the_lanes_already_up() {
     .await
     .expect("the test hung");
 }
+
+/// Performance regression (T28): 2,000 tiny files downloaded from the C sender must not
+/// crawl. On the console this ran at 140-300 files/s against FTX2's 2,150+; the root cause was the
+/// receiver flushing the drive cache once per file (F_FULLFSYNC on macOS).
+#[tokio::test(flavor = "multi_thread")]
+async fn two_thousand_tiny_files_download_fast() {
+    ava1_ctest::c_set_read_allowed(true);
+    let d = dir("dl-perf");
+    let src = d.join("console/tiny");
+    write_tree(&src, 2000, |i| 1024 + (i * 977) % (63 * 1024));
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let mut link = s.job([0x63; 16]);
+    let sink = Arc::new(LocalSink::new(d.join("got"), false));
+    let t = std::time::Instant::now();
+    let r = download(
+        &mut link,
+        src.to_str().unwrap(),
+        0,
+        sink,
+        ro(&d.join("ejobs"), false),
+    )
+    .await
+    .unwrap();
+    let secs = t.elapsed().as_secs_f64();
+    let rate = r.files as f64 / secs;
+    eprintln!(
+        "tiny download: {} files in {secs:.2}s = {rate:.0} files/s",
+        r.files
+    );
+    assert_eq!(r.files, 2000);
+    assert!(same_tree(&src, &d.join("got")));
+    assert!(
+        rate >= FLOOR_FILES_PER_S,
+        "{rate:.0} files/s < {FLOOR_FILES_PER_S}"
+    );
+}
+
+/// Measured on a Mac (wired to nothing, loopback): the debug build (what `cargo test`
+/// runs; blake3 and the AEAD are unoptimised) does ~430 files/s, `--release` ~1,100; the
+/// per-file full-drive-flush bug measured 56. The floors sit at roughly half of healthy,
+/// far above the bug.
+const FLOOR_FILES_PER_S: f64 = if cfg!(debug_assertions) { 200.0 } else { 600.0 };

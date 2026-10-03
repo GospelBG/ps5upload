@@ -142,6 +142,54 @@ impl LocalSink {
     }
 }
 
+/// Plain `fsync(2)`: on macOS it hands the data to the drive without flushing the drive's
+/// own cache (that is `flush_drive_cache`'s one call per batch); elsewhere it is the full
+/// durable sync.
+#[cfg(unix)]
+fn sys_fsync(f: &std::fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn fsync(fd: i32) -> i32;
+    }
+    loop {
+        // SAFETY: fsync on a descriptor this File owns for the duration of the call.
+        if unsafe { fsync(f.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sys_fsync(f: &std::fs::File) -> io::Result<()> {
+    f.sync_data()
+}
+
+/// macOS only: `F_FULLFSYNC` flushes the drive's write cache for everything fsync'd before
+/// it, so one call per batch makes the whole batch durable. A no-op where fsync already is.
+#[cfg(target_vendor = "apple")]
+fn flush_drive_cache(f: &std::fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    const F_FULLFSYNC: i32 = 51;
+    // SAFETY: fcntl(F_FULLFSYNC) takes no argument and only reads the descriptor.
+    if unsafe { fcntl(f.as_raw_fd(), F_FULLFSYNC) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn flush_drive_cache(_f: &std::fs::File) -> io::Result<()> {
+    Ok(())
+}
+
 impl Sink for LocalSink {
     fn prepare(&self, m: &Manifest) -> io::Result<()> {
         let mut st = self.st.lock().unwrap();
@@ -168,15 +216,35 @@ impl Sink for LocalSink {
     }
 
     fn sync(&self, ids: &[u32]) -> io::Result<()> {
-        let files: Vec<std::fs::File> = {
+        let (files, dirs): (Vec<std::fs::File>, BTreeSet<PathBuf>) = {
             let st = self.st.lock().unwrap();
-            ids.iter()
+            let files = ids
+                .iter()
                 .filter_map(|i| st.open.get(i).and_then(|f| f.try_clone().ok()))
-                .collect()
+                .collect();
+            let dirs = ids
+                .iter()
+                .filter(|i| st.open.contains_key(i))
+                .filter_map(|i| self.path(&st, *i, true).parent().map(|p| p.to_path_buf()))
+                .collect();
+            (files, dirs)
         };
-        for f in files {
-            f.sync_data()?;
+        // One sync per batch, not one drive flush per file (T28): every file gets the
+        // cheap fsync, then ONE drive-cache flush covers them all, then the directories
+        // (so the new names are durable too). std's `sync_data` is F_FULLFSYNC on macOS —
+        // ~15 ms a file, which capped a 2,000-file download at 56 files/s.
+        for f in &files {
+            sys_fsync(f)?;
         }
+        if let Some(f) = files.last() {
+            flush_drive_cache(f)?;
+        }
+        #[cfg(unix)] // a directory cannot be opened for sync on Windows
+        for d in &dirs {
+            sys_fsync(&std::fs::File::open(d)?)?;
+        }
+        #[cfg(not(unix))]
+        let _ = dirs;
         Ok(())
     }
 
@@ -199,7 +267,9 @@ impl Sink for LocalSink {
                 .size;
         if let Some(f) = st.open.remove(&id) {
             f.set_len(size)?;
-            f.sync_all()?;
+            // Cheap fsync only: the batch's journal append (sync_all) flushes the drive cache
+            // once for every file this batch committed.
+            sys_fsync(&f)?;
         }
         let (part, fin) = (self.path(&st, id, true), self.path(&st, id, false));
         if part != fin {
@@ -1146,9 +1216,6 @@ fn snapshot_batch(
         if let Some(root) = l.root {
             roots.push(RootItem { file_id: *id, root });
         }
-        if l.written.covered() == 0 {
-            continue;
-        }
         let Some(e) = m.entry(*id) else {
             // `large` holds ids the journal replayed; a bad one is an error, not a panic
             // on the job task.
@@ -1156,6 +1223,14 @@ fn snapshot_batch(
                 "file {id} has written data but this manifest has none of it"
             )));
         };
+        // A file whose bytes were all made durable by an earlier batch but whose root
+        // arrived only afterwards (the root rides the control connection, the chunks the
+        // lanes: either may win) still has to be committed: without this it was skipped
+        // forever, the job never finished, and the receiver sat idle (T28: the "hang").
+        let awaiting_commit = l.root.is_some() && l.durable.is_full(e.size);
+        if l.written.covered() == 0 && !awaiting_commit {
+            continue;
+        }
         let size = e.size;
         for (s, e) in l.written.iter() {
             ranges.push(FileRange {
@@ -1355,9 +1430,15 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
         tokio::task::spawn_blocking(move || s2.commit(id))
             .await
             .map_err(proto)??;
-        let one: BTreeSet<u32> = [id].into_iter().collect();
+        committed.push(id);
+    }
+    // ONE journal record, one drive flush and one Durable for every file this batch
+    // committed (T28): per-file records meant a full-drive flush per file, so an ordered
+    // download (every file goes through the large path) crawled and, under load, looked hung.
+    if !committed.is_empty() {
+        let set: BTreeSet<u32> = committed.iter().copied().collect();
         let rec = Record::Batch(JnlBatch {
-            files: runs(&one),
+            files: runs(&set),
             ranges: Vec::new(),
             roots: Vec::new(),
         });
@@ -1370,16 +1451,18 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
         jnl = j;
         r?;
         st.apply(&rec);
-        pg.files_durable.fetch_add(1, Ordering::Relaxed);
-        control
-            .send(&Durable {
-                job_id,
-                files: runs(&one),
-                ranges: Vec::new(),
-            })
-            .await
-            .map_err(|e| SendError::Disconnected(e.to_string()))?;
-        committed.push(id);
+        pg.files_durable
+            .fetch_add(committed.len() as u64, Ordering::Relaxed);
+        for chunk in runs(&set).chunks(2000) {
+            control
+                .send(&Durable {
+                    job_id,
+                    files: chunk.to_vec(),
+                    ranges: Vec::new(),
+                })
+                .await
+                .map_err(|e| SendError::Disconnected(e.to_string()))?;
+        }
     }
     // The journal is compacted once it passes COMPACT_AT (ruling 5): the engine-side
     // journal must not grow without bound, and the C side does the same.

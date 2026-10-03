@@ -268,19 +268,19 @@ async fn rust_to_rust_download_from_a_folder_host() {
     same(&d.join("share/out"), &d.join("got"));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn an_ordered_download_reaches_the_sink_in_file_order() {
-    let d = common::temp_dir("rr-ordered");
+async fn ordered_download(tag: &str, job: u8, timing: ava1::session::Timing) {
+    let d = common::temp_dir(tag);
     tree(&d.join("share/out"));
     let host = Arc::new(FolderHost {
         root: d.join("share"),
         jobs_dir: d.join("hjobs"),
     });
-    let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(host)).await;
-    let s = connect(&addr.to_string(), id, peers, "client", common::fast())
+    let (addr, _ctx, id, peers) =
+        common::paired_ctx(|c| c.with_jobs(host).with_timing(timing)).await;
+    let s = connect(&addr.to_string(), id, peers, "client", timing)
         .await
         .unwrap();
-    let mut link = s.job([3; 16]);
+    let mut link = s.job([job; 16]);
     let sink = Arc::new(OrderCheckSink::default());
     download_job(
         &mut link,
@@ -295,6 +295,11 @@ async fn an_ordered_download_reaches_the_sink_in_file_order() {
         sink.in_order(),
         "writes arrived out of (file, offset) order"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ordered_download_reaches_the_sink_in_file_order() {
+    ordered_download("rr-ordered", 3, common::fast()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
