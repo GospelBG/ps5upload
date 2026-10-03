@@ -7552,14 +7552,37 @@ async fn transfer_7z_handler(
             fail_guard.mark_succeeded();
             return;
         }
-        let result = transfer_7z_resumable(
-            &cfg,
-            tx_id,
-            &req.dest_root,
-            std::path::Path::new(&req.archive_path),
-            DEFAULT_RESUME_RETRIES,
-            initial_flags,
-        );
+        let ftx2 = |reason: Option<&str>| {
+            let mut r = transfer_7z_resumable(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                std::path::Path::new(&req.archive_path),
+                DEFAULT_RESUME_RETRIES,
+                initial_flags,
+            )?;
+            r.commit_ack_body = tag_ack_body(&r.commit_ack_body, "ftx2", reason);
+            Ok::<_, anyhow::Error>(r)
+        };
+        let result = if ps5upload_ava1::route::use_ava1(&addr) {
+            match ps5upload_ava1::upload::upload_7z(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                std::path::Path::new(&req.archive_path),
+            ) {
+                Err(e)
+                    if e.downcast_ref::<ps5upload_ava1::upload::SevenzUnsupported>()
+                        .is_some() =>
+                {
+                    crate::log_info!("transfer_7z: AVA1 fallback to FTX2: {e}");
+                    ftx2(Some("7z_unsupported_by_ava1"))
+                }
+                other => other,
+            }
+        } else {
+            ftx2(Some("ava1_unavailable"))
+        };
         match result {
             Ok(r) => {
                 let completed_at_ms = now_ms();

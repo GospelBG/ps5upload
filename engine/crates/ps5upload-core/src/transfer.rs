@@ -3842,8 +3842,31 @@ pub fn transfer_zip_resumable(
 /// `sanitize_zip_entry`, except 7z archives created on Windows legitimately use
 /// '\\' as the path separator (zip always uses '/'), so backslashes are
 /// translated to forward slashes rather than rejected.
-pub(crate) fn sanitize_7z_entry(name: &str) -> Option<String> {
+pub fn sanitize_7z_entry(name: &str) -> Option<String> {
     sanitize_zip_entry(&name.replace('\\', "/"))
+}
+
+/// The refusal for a 7z whose solid block has stream-less entries (directories, empty
+/// files) between its streamed files. The `sevenz-rust2` per-block walk covers fewer
+/// entries than such a block spans and would silently drop the last files, so the
+/// archive is refused rather than partly uploaded. Shared by the FTX2 and AVA1 paths.
+pub const SEVENZ_LAYOUT_UNSUPPORTED: &str =
+    "this 7z archive's layout is not supported (a solid block has directories or empty files between its files); re-pack it with 7-Zip or extract it first";
+
+/// `Err` with [`SEVENZ_LAYOUT_UNSUPPORTED`] when any stream-less entry sits inside a
+/// block (before the block's last streamed file). Trailing and leading stream-less
+/// entries are not in a block and are fine.
+pub fn sevenz_check_layout(archive: &sevenz_rust2::Archive) -> Result<()> {
+    let fbi = &archive.stream_map.file_block_index;
+    let bad = archive
+        .files
+        .iter()
+        .enumerate()
+        .any(|(i, e)| !e.has_stream() && fbi.get(i).copied().flatten().is_some());
+    if bad {
+        bail!("{SEVENZ_LAYOUT_UNSUPPORTED}");
+    }
+    Ok(())
 }
 
 /// One planned 7z file. Forward-only: we record only the size and the
@@ -3888,7 +3911,7 @@ fn select_sevenz_decode_threads(configured: Option<&str>) -> u32 {
         .unwrap_or(1) as u32
 }
 
-pub(crate) fn sevenz_decode_threads() -> u32 {
+pub fn sevenz_decode_threads() -> u32 {
     select_sevenz_decode_threads(std::env::var("PS5UPLOAD_7Z_THREADS").ok().as_deref())
 }
 
@@ -3985,6 +4008,7 @@ pub fn sevenz_plan_preview_with_progress(
     let pw = sevenz_rust2::Password::from("");
     let archive = sevenz_rust2::Archive::read(&mut src, &pw)
         .map_err(|e| anyhow::anyhow!("read 7z header {}: {e}", archive_path.display()))?;
+    sevenz_check_layout(&archive)?;
 
     let mut total = 0u64;
     let mut files: Vec<(String, u64)> = Vec::new();
@@ -4043,6 +4067,7 @@ pub fn transfer_7z_with_opts(
             .map_err(|e| anyhow::anyhow!("read 7z header {}: {e}", archive_path.display()))?
     };
 
+    sevenz_check_layout(&archive)?;
     let mut plan: Vec<SevenzPlanFile> = Vec::new();
     let mut planned_files: Vec<ManifestFile> = Vec::new();
     let mut total_bytes = 0u64;

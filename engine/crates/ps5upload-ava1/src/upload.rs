@@ -65,6 +65,106 @@ pub fn upload_zip_in(
     })
 }
 
+/// The archive cannot be an AVA1 source for a reason FTX2 might not share (a header
+/// feature this source does not handle): the engine falls back to FTX2.
+#[derive(Debug, thiserror::Error)]
+#[error("7z is not usable as an AVA1 source: {0}")]
+pub struct SevenzUnsupported(pub String);
+
+/// A job id that names this archive's contents: a changed archive (same listing and
+/// sizes, different bytes) must not resume a journal written for the old one.
+fn sevenz_job_id(job_id: [u8; 16], identity: &[u8; 32]) -> [u8; 16] {
+    let mut h = blake3::Hasher::new();
+    h.update(&job_id);
+    h.update(identity);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    id
+}
+
+fn sevenz_failure(e: &anyhow::Error) -> Option<UploadFailure> {
+    use crate::seq::{fault_of, SevenzFault};
+    let f = e.chain().find_map(|c| fault_of(c))?;
+    let reason = match f {
+        SevenzFault::Corrupt(_) => "ava1_7z_corrupt",
+        SevenzFault::Encrypted(_) => "ava1_7z_encrypted",
+        SevenzFault::UnsafePath(_) => "ava1_7z_unsafe_path",
+        SevenzFault::Unsupported(_) => "ava1_7z_unsupported",
+        SevenzFault::UnsupportedLayout => "ava1_7z_unsupported_layout",
+    };
+    Some(UploadFailure {
+        reason: reason.into(),
+        detail: f.to_string(),
+    })
+}
+
+/// Uploads a `.7z`. Resume restarts at the solid folder holding the earliest
+/// unfinished file and discards what the console already has (no decoder checkpoints).
+pub fn upload_7z_in(
+    pool: &Pool,
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    dest_root: &str,
+    archive: &Path,
+) -> Result<TransferResult> {
+    let (manifest, source) = match crate::seq::SevenzSource::open(archive, &cfg.excludes) {
+        Ok(v) => v,
+        Err(e) => {
+            let e = anyhow::Error::from(e);
+            return Err(
+                match e.chain().find_map(|c| crate::seq::fault_of(c)).cloned() {
+                    Some(crate::seq::SevenzFault::Unsupported(why)) => {
+                        SevenzUnsupported(why).into()
+                    }
+                    Some(_) => sevenz_failure(&e).expect("a fault").into(),
+                    None => e.context(format!("open 7z {}", archive.display())),
+                },
+            );
+        }
+    };
+    upload_7z_source_in(pool, cfg, job_id, dest_root, manifest, Arc::new(source))
+}
+
+/// `upload_7z_in` for an already opened archive (the caller keeps the `Arc` to read
+/// the source's counters).
+pub fn upload_7z_source_in(
+    pool: &Pool,
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    dest_root: &str,
+    manifest: Manifest,
+    source: Arc<crate::seq::SevenzSource>,
+) -> Result<TransferResult> {
+    // The wire job id names the archive's contents (see `sevenz_job_id`); the result
+    // reports the caller's id so job bookkeeping keyed by it stays consistent.
+    let wire_id = sevenz_job_id(job_id, &source.identity());
+    let mut r = upload_with_seq_in(
+        pool,
+        &cfg.addr,
+        wire_id,
+        manifest,
+        Arc::new(crate::seq::NoSource),
+        Some(source),
+        SendOptions::upload(dest_root),
+        cfg,
+    )
+    .map_err(|e| match sevenz_failure(&e) {
+        Some(f) => f.into(),
+        None => e,
+    })?;
+    r.tx_id_hex = hex(&job_id);
+    Ok(r)
+}
+
+pub fn upload_7z(
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    dest_root: &str,
+    archive: &Path,
+) -> Result<TransferResult> {
+    upload_7z_in(pool(), cfg, job_id, dest_root, archive)
+}
+
 pub fn upload_zip(
     cfg: &TransferConfig,
     job_id: [u8; 16],
@@ -368,6 +468,22 @@ pub fn upload_with_in(
     opts: SendOptions,
     cfg: &TransferConfig,
 ) -> Result<TransferResult> {
+    upload_with_seq_in(pool, console, job_id, manifest, source, None, opts, cfg)
+}
+
+/// `upload_with_in` for a forward-only source (`seq`, SPEC.md section 17): one decode
+/// thread replaces the random readers and `source` is never read.
+#[allow(clippy::too_many_arguments)]
+pub fn upload_with_seq_in(
+    pool: &Pool,
+    console: &str,
+    job_id: [u8; 16],
+    manifest: Manifest,
+    source: Arc<dyn Source>,
+    seq: Option<Arc<dyn ava1::seq::SeqSource>>,
+    opts: SendOptions,
+    cfg: &TransferConfig,
+) -> Result<TransferResult> {
     let manifest_files = manifest
         .entries
         .iter()
@@ -430,7 +546,7 @@ pub fn upload_with_in(
                 // The shared flag, not a copy (C18): flipping cfg.cancel ends the job.
                 cancel: cancel.clone(),
                 bandwidth_cap: cfg.bandwidth_cap_bps,
-                seq: None,
+                seq: seq.clone(),
             };
             match send_job(&mut link, manifest.clone(), source.clone(), o).await {
                 Ok(r) if r.status == gen::STATUS_OK => {

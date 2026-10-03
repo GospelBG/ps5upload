@@ -202,6 +202,7 @@ dependencies = [
  "ps5upload-ava1",
  "ps5upload-core",
  "serde_json",
+ "sevenz-rust2",
  "tokio",
 ]
 
@@ -2209,9 +2210,11 @@ dependencies = [
  "ava1",
  "ava1-chaos",
  "blake3",
+ "crc32fast",
  "flate2",
  "ps5upload-core",
  "serde_json",
+ "sevenz-rust2",
  "thiserror",
  "tokio",
  "zip",
@@ -2340,6 +2343,7 @@ name = "ps5upload-tests"
 version = "5.41.0"
 dependencies = [
  "anyhow",
+ "crc32fast",
  "ftx2-proto",
  "ps5upload-core",
  "serde",

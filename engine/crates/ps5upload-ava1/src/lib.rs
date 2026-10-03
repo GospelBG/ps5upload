@@ -13,6 +13,7 @@ pub mod pool;
 pub mod progress;
 pub mod relay;
 pub mod route;
+pub mod seq;
 pub mod source;
 pub mod upload;
 pub mod zip_source;
