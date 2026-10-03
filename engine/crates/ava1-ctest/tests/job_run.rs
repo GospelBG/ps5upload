@@ -957,3 +957,35 @@ async fn an_atomic_copy_never_truncates_the_destination_and_a_cancel_removes_onl
     assert_eq!(secs(&dst), secs(&src));
     drop(r.srv);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_atomic_copy_keeps_the_source_mode_and_a_nul_in_a_path_is_refused() {
+    let r = rig("jr-mode").await;
+    let src = r.d.join("tool.sh");
+    let dst = r.d.join("live.sh");
+    std::fs::write(&src, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(&dst, b"old").unwrap();
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(c_copy_atomic(&src, &dst, -1), 0);
+    assert_eq!(
+        std::fs::metadata(&dst).unwrap().permissions().mode() & 0o7777,
+        0o755
+    );
+    // A fresh destination gets the source's mode too (not the temp file's 0644).
+    let fresh = r.d.join("fresh.sh");
+    assert_eq!(c_copy_atomic(&src, &fresh, -1), 0);
+    assert_eq!(
+        std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o7777,
+        0o755
+    );
+    // \u0000 would cut the path at the NUL (and delete the parent folder's sibling): refused.
+    let victim = r.d.join("victim");
+    write_tree(&victim, 2, |_| 4);
+    let args = format!(r#"{{"path":"{}\u0000/x"}}"#, victim.display());
+    run(&r.me, id(244), gen::JOB_OP_DELETE, &args).await;
+    let st = finished(&r.me, id(244)).await;
+    assert_eq!((st.state, st.code), (Some(2), Some(gen::ERR_PROTOCOL)));
+    assert_eq!(count_files(&victim), 2);
+    drop(r.srv);
+}

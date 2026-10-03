@@ -105,6 +105,7 @@ int fsj_json_str(const char *json, const char *key, char *out, size_t cap) {
                     else return 0;
                 }
                 p += 4;
+                if (v == 0) return 0; /* a NUL would silently cut the path short: refuse the request */
                 /* UTF-8 (surrogate pairs are not joined: a path with one is refused as unusable). */
                 if (v >= 0xd800 && v < 0xe000) return 0;
                 if (v < 0x80) {
@@ -419,8 +420,14 @@ int fsj_copy_atomic(const char *src, const char *dst, const fsj_hooks_t *h) {
     int sfd, dfd, rc = 0;
     ssize_t n;
     unsigned seq = __atomic_add_fetch(&g_seq, 1, __ATOMIC_RELAXED);
-    /* Next to dst: the final rename stays in one folder, so it can never cross a device. */
-    if (snprintf(tmp, sizeof tmp, "%s.part%u", dst, seq) >= (int)sizeof tmp) return -1;
+    struct timespec now;
+    struct stat dst_st;
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    /* Next to dst: the final rename stays in one folder, so it can never cross a device. The
+     * suffix (pid, clock, counter) keeps a stale temp left by a crash from ever colliding. */
+    if (snprintf(tmp, sizeof tmp, "%s.part%d.%llx.%u", dst, (int)getpid(),
+                 (unsigned long long)now.tv_sec * 1000000000ull + (unsigned long long)now.tv_nsec, seq) >= (int)sizeof tmp)
+        return -1;
     sfd = open(src, O_RDONLY);
     if (sfd < 0) return -1;
     if (fstat(sfd, &st) != 0) {
@@ -467,6 +474,13 @@ int fsj_copy_atomic(const char *src, const char *dst, const fsj_hooks_t *h) {
     close(sfd);
     if (rc == 0 && fsync(dfd) != 0) rc = -1;
     if (close(dfd) != 0 && rc == 0) rc = -1;
+    if (rc == 0) {
+        /* The temp file was created 0644: give it the source's mode (a 0755 file stays 0755);
+         * a source with no permission bits falls back to the destination's current mode. */
+        mode_t m = st.st_mode & 07777;
+        if (m == 0 && stat(dst, &dst_st) == 0) m = dst_st.st_mode & 07777;
+        if (m != 0 && chmod(tmp, m) != 0) rc = -1;
+    }
     if (rc == 0) {
         times[0].tv_sec = st.st_atime;
         times[0].tv_nsec = 0;
