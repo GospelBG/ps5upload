@@ -12,6 +12,7 @@ ps5upload-core = { path = "../ps5upload-core" }
 serde_json.workspace = true
 thiserror.workspace = true
 zip = { version = "8", default-features = false, features = ["deflate"] }
+flate2 = "1"
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
 
 [dev-dependencies]

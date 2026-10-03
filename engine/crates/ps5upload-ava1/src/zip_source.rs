@@ -1,15 +1,23 @@
 //! A zip archive as an AVA1 source. Entry reads inflate on demand.
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use ava1::gen;
 use ava1::manifest::{self, Entry, Manifest};
 use ava1::source::{ReadAt, Source, SourceMeta};
 
+/// Where one entry's bytes live in the archive file, found once at open.
+#[derive(Clone, Copy)]
+struct Located {
+    stored: bool,
+    data_start: u64,
+    compressed: u64,
+}
+
 pub struct ZipSource {
     path: PathBuf,
-    files: BTreeMap<String, (usize, SourceMeta)>,
+    files: BTreeMap<String, (Located, SourceMeta)>,
     dirs: BTreeSet<String>,
 }
 
@@ -42,10 +50,36 @@ impl ZipSource {
             if entry.is_dir() {
                 dirs.insert(name.to_owned());
             } else {
+                let stored = match entry.compression() {
+                    zip::CompressionMethod::Stored => true,
+                    zip::CompressionMethod::Deflated => false,
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("{name}: unsupported zip compression {other:?}"),
+                        ))
+                    }
+                };
+                if entry.encrypted() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{name}: encrypted zip entries are not supported"),
+                    ));
+                }
+                let data_start = entry.data_start().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{name}: no data offset"),
+                    )
+                })?;
                 files.insert(
                     name.to_owned(),
                     (
-                        i,
+                        Located {
+                            stored,
+                            data_start,
+                            compressed: entry.compressed_size(),
+                        },
                         SourceMeta {
                             size: entry.size(),
                             mtime: 0,
@@ -100,34 +134,97 @@ fn invalid_zip(e: zip::result::ZipError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
-struct ZipEntryReader {
-    path: PathBuf,
-    index: usize,
+/// One open entry. Reads are sequential in practice (`run_upload` walks a file front
+/// to back), so the inflater is kept between calls and only restarted when a read
+/// goes backwards: total work is O(entry), not O(entry x reads).
+pub struct ZipEntryReader {
+    file: BufReader<std::fs::File>,
+    at: Located,
+    size: u64,
+    inflater: Option<flate2::read::DeflateDecoder<io::Take<BufReader<std::fs::File>>>>,
+    /// Uncompressed offset the inflater is at.
+    pos: u64,
+    restarts: u32,
+}
+
+impl ZipEntryReader {
+    /// How many times the inflater was started (1 for a front-to-back read).
+    pub fn restarts(&self) -> u32 {
+        self.restarts
+    }
+
+    fn start(&mut self) -> io::Result<()> {
+        let mut f = BufReader::with_capacity(256 << 10, self.file.get_ref().try_clone()?);
+        f.seek(SeekFrom::Start(self.at.data_start))?;
+        self.inflater = Some(flate2::read::DeflateDecoder::new(
+            f.take(self.at.compressed),
+        ));
+        self.pos = 0;
+        self.restarts += 1;
+        Ok(())
+    }
 }
 
 impl ReadAt for ZipEntryReader {
     fn read_at(&mut self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
+        if buf.is_empty() || off >= self.size {
             return Ok(0);
         }
-        let f = std::fs::File::open(&self.path)?;
-        let mut zip = zip::ZipArchive::new(f).map_err(invalid_zip)?;
-        let mut entry = zip.by_index(self.index).map_err(invalid_zip)?;
-        io::copy(&mut entry.by_ref().take(off), &mut io::sink())?;
-        entry.read(buf)
+        if self.at.stored {
+            self.file.seek(SeekFrom::Start(self.at.data_start + off))?;
+            let want = (buf.len() as u64).min(self.size - off) as usize;
+            return self.file.read(&mut buf[..want]);
+        }
+        if self.inflater.is_none() || off < self.pos {
+            self.start()?;
+        }
+        let dec = self.inflater.as_mut().expect("started above");
+        let mut scratch = [0u8; 16 << 10];
+        while self.pos < off {
+            let n = ((off - self.pos) as usize).min(scratch.len());
+            let got = dec.read(&mut scratch[..n])?;
+            if got == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            self.pos += got as u64;
+        }
+        // Fill the buffer: a deflate stream yields short reads, and callers treat a
+        // short read as the end of the file.
+        let want = (buf.len() as u64).min(self.size - off) as usize;
+        let mut filled = 0;
+        while filled < want {
+            let got = dec.read(&mut buf[filled..want])?;
+            if got == 0 {
+                break;
+            }
+            filled += got;
+        }
+        self.pos += filled as u64;
+        Ok(filled)
+    }
+}
+
+impl ZipSource {
+    /// `Source::open` with the concrete reader (its `restarts` is a test seam).
+    pub fn open_entry(&self, rel: &str) -> io::Result<ZipEntryReader> {
+        let (at, meta) = self
+            .files
+            .get(rel)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, rel.to_owned()))?;
+        Ok(ZipEntryReader {
+            file: BufReader::with_capacity(256 << 10, std::fs::File::open(&self.path)?),
+            at: *at,
+            size: meta.size,
+            inflater: None,
+            pos: 0,
+            restarts: 0,
+        })
     }
 }
 
 impl Source for ZipSource {
     fn open(&self, rel: &str) -> io::Result<Box<dyn ReadAt>> {
-        let (index, _) = self
-            .files
-            .get(rel)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, rel.to_owned()))?;
-        Ok(Box::new(ZipEntryReader {
-            path: self.path.clone(),
-            index: *index,
-        }))
+        Ok(Box::new(self.open_entry(rel)?))
     }
 
     fn list(&self, rel: &str) -> io::Result<Vec<(String, SourceMeta)>> {

@@ -16,3 +16,5 @@ The CHANGELOG keeps its FTX2 entries: they describe releases that shipped FTX2.
 - [ ] `bench/README.md` — `run-ftx2-upload.mjs`, `check-ftx2-baseline.mjs`, `ftx2-upload-main.json` baselines, `--ps5-addr=…:9113`
 - [ ] `FAQ.md` — `FTX2_ZIP_RAM_THRESHOLD_MB` and `FTX2_ARCHIVE_STAGE_MB` environment variables (rename to `PS5UPLOAD_*` and accept the old names for one release)
 - [ ] In-app strings (`client/src/i18n/locales/*.ts`) that mention FTX2, ports 9113/9114 or "transfer port"
+
+Release gate: the engine's `auto` mode must not ship before the Task 28 hardware pass.

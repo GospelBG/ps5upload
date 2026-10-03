@@ -22,7 +22,7 @@ use ps5upload_core::download::DownloadKind;
 use zip::write::SimpleFileOptions;
 
 use crate::pool::{pool, Pool};
-use crate::upload::{refusal, terminal_connection_reason, wait, UploadFailure, STALL_LIMIT};
+use crate::upload::{refusal, wait, SessionGate, UploadFailure, STALL_LIMIT};
 
 /// The grant a download extends to the console (SPEC.md §12.4).
 const CREDIT: u64 = 64 << 20;
@@ -111,6 +111,29 @@ fn basename(src: &str) -> Result<&str> {
     Ok(name)
 }
 
+const WINDOWS_RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+
+/// Why a path component cannot be written safely on every host, if it cannot.
+fn host_unsafe_component(comp: &str) -> Option<&'static str> {
+    if comp.contains(':') {
+        return Some("a name with ':' (a drive or stream on Windows)");
+    }
+    if comp.ends_with('.') || comp.ends_with(' ') {
+        return Some("a name ending in '.' or a space");
+    }
+    // The device name is the part before the first dot: `CON.txt` is still CON.
+    let stem = comp.split('.').next().unwrap_or(comp).trim_end_matches(' ');
+    let up = stem.to_ascii_uppercase();
+    let numbered = |p: &str| {
+        up.strip_prefix(p)
+            .is_some_and(|n| matches!(n.as_bytes(), [b'1'..=b'9']))
+    };
+    if WINDOWS_RESERVED.contains(&up.as_str()) || numbered("COM") || numbered("LPT") {
+        return Some("a reserved device name");
+    }
+    None
+}
+
 /// What the manifest of a download may look like (peer-supplied data: `Manifest::
 /// from_pages` already ran `check_path` on every path; this adds the shape the request
 /// promised and the one path rule `check_path` leaves to the host OS).
@@ -121,6 +144,16 @@ fn check_shape(m: &Manifest, single: bool) -> io::Result<()> {
         // A backslash is a separator on Windows: `a\..\b` would climb out of the root.
         if e.path.contains('\\') {
             return Err(bad(format!("{:?} contains a backslash", e.path)));
+        }
+        // Peer-supplied names are written on THIS computer, whatever it is. A ':' makes
+        // `C:/x` a drive path and `C:evil` a drive-relative one on Windows (and an
+        // alternate data stream on NTFS); the reserved device names and a trailing dot
+        // or space name something other than the file asked for. Refused everywhere so
+        // the console's data lands the same way on every host.
+        for comp in e.path.split('/') {
+            if let Some(why) = host_unsafe_component(comp) {
+                return Err(bad(format!("{:?}: {why}", e.path)));
+            }
         }
     }
     if single {
@@ -234,6 +267,34 @@ fn zip_err(e: zip::result::ZipError) -> io::Error {
     io::Error::other(e)
 }
 
+/// A file arrived a second time (the receiver re-requested it after a verify mismatch).
+/// A deflate stream cannot rewrite what it already holds, so the archive attempt is
+/// abandoned and restarted — like a dropped connection — instead of being reported as
+/// a bad manifest.
+#[derive(Debug)]
+struct ZipRestart(String);
+
+impl std::fmt::Display for ZipRestart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ZipRestart {}
+
+fn zip_restart(why: impl Into<String>) -> io::Error {
+    io::Error::other(ZipRestart(why.into()))
+}
+
+/// True for the error a sink returns when a file it already wrote is sent again.
+#[doc(hidden)]
+pub fn is_zip_restart(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<ZipRestart>())
+}
+
+/// A file that keeps failing verification must end the job, not restart forever.
+const MAX_RETRY_RESTARTS: u32 = 3;
+
 fn invalid(why: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, why.into())
 }
@@ -295,6 +356,14 @@ impl ZipSink {
             };
         }
         if st.current != Some(id) {
+            if st.last.is_some_and(|l| id <= l) {
+                // From the start of a file already written: a retry, not a violation.
+                return Err(if off == 0 {
+                    zip_restart(format!("file {id} was sent again"))
+                } else {
+                    invalid(format!("file {id} arrived out of order"))
+                });
+            }
             if let Some(cur) = st.current {
                 let want = m.entry(cur).map(|c| c.size).unwrap_or(0);
                 if st.written != want {
@@ -303,9 +372,6 @@ impl ZipSink {
                         st.written
                     )));
                 }
-            }
-            if st.last.is_some_and(|l| id <= l) {
-                return Err(invalid(format!("file {id} arrived out of order")));
             }
             if off != 0 {
                 return Err(invalid(format!(
@@ -319,6 +385,9 @@ impl ZipSink {
             st.last = Some(id);
             st.written = 0;
             st.started += 1;
+        } else if off == 0 && st.written > 0 {
+            // The current file again from its first byte (a retry after a mismatch).
+            return Err(zip_restart(format!("file {id} was sent again")));
         } else if off != st.written {
             // A gap or an overlap (a duplicate range): never append it.
             return Err(invalid(format!(
@@ -501,18 +570,13 @@ fn run(
     let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let jobs_dir = pool.ava_dir().join("jobs");
     crate::block_on(async {
-        if !pool.has_identity() {
-            return Err(UploadFailure {
-                reason: "ava1_no_identity".into(),
-                detail: "no AVA1 identity is available".into(),
-            }
-            .into());
-        }
+        SessionGate::identity(pool)?;
         let mut sink = make_sink();
         let mut backoff = Duration::from_millis(250);
-        let mut terminal_attempts = 0;
+        let mut gate = SessionGate::default();
         let (mut base_bytes, mut base_files) = (0u64, 0u64);
         let mut attempt = 0u32;
+        let mut retry_restarts = 0u32;
         let (mut last_at, mut last_work) = (Instant::now(), 0u64);
         let mut progress = Arc::new(Progress::default());
         loop {
@@ -530,23 +594,14 @@ fn run(
             let session = match pool.session(console).await {
                 Ok(s) => s,
                 Err(e) => {
-                    if let Some(reason) = terminal_connection_reason(&e) {
-                        terminal_attempts += 1;
-                        if terminal_attempts >= 3 {
-                            return Err(UploadFailure {
-                                reason: reason.into(),
-                                detail: e.to_string(),
-                            }
-                            .into());
-                        }
-                    } else {
-                        terminal_attempts = 0;
+                    if let Some(failure) = gate.failed(&e) {
+                        return Err(failure.into());
                     }
                     wait(&mut backoff, &e.to_string()).await;
                     continue;
                 }
             };
-            terminal_attempts = 0;
+            gate.connected();
             let id = attempt_id(job_id, attempt, fresh_per_attempt);
             let mut link = session.job(id);
             let _ticker = Ticker::start(progress.clone(), counters, base_bytes, base_files);
@@ -559,32 +614,41 @@ fn run(
                 progress: progress.clone(),
                 cancel: cancel.clone(),
             };
-            match download_job(&mut link, src, flags, sink.clone(), o).await {
+            let (why, dropped) = match download_job(&mut link, src, flags, sink.clone(), o).await {
                 Ok(r) => {
                     let _ = std::fs::remove_dir_all(journal::job_dir(&jobs_dir, &id));
                     return Ok(r.bytes);
                 }
-                Err(SendError::Disconnected(why)) => {
-                    let durable = progress.bytes_durable.load(Ordering::Relaxed);
-                    pool.forget(console).await;
-                    if fresh_per_attempt {
-                        let _ = std::fs::remove_dir_all(journal::job_dir(&jobs_dir, &id));
-                        base_bytes += durable;
-                        base_files += progress.files_durable.load(Ordering::Relaxed);
-                        attempt += 1;
-                        progress = Arc::new(Progress::default());
-                        drop(std::mem::replace(&mut sink, make_sink()));
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "ava1: zip download restarts from the beginning (attempt {attempt}, \
-                             {base_bytes} bytes already spent): {why}"
-                        );
-                        wait(&mut backoff, "restarting the archive").await;
-                    } else {
-                        wait(&mut backoff, &format!("{why} ({durable} bytes durable)")).await;
-                    }
+                Err(SendError::Disconnected(why)) => (why, true),
+                Err(SendError::Source(e))
+                    if fresh_per_attempt
+                        && is_zip_restart(&e)
+                        && retry_restarts < MAX_RETRY_RESTARTS =>
+                {
+                    retry_restarts += 1;
+                    (e.to_string(), false)
                 }
                 Err(e) => return Err(terminal(e)),
+            };
+            let durable = progress.bytes_durable.load(Ordering::Relaxed);
+            if dropped {
+                pool.forget(console).await;
+            }
+            if fresh_per_attempt {
+                let _ = std::fs::remove_dir_all(journal::job_dir(&jobs_dir, &id));
+                base_bytes += durable;
+                base_files += progress.files_durable.load(Ordering::Relaxed);
+                attempt += 1;
+                progress = Arc::new(Progress::default());
+                drop(std::mem::replace(&mut sink, make_sink()));
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ava1: zip download restarts from the beginning (attempt {attempt}, \
+                     {base_bytes} bytes already spent): {why}"
+                );
+                wait(&mut backoff, "restarting the archive").await;
+            } else {
+                wait(&mut backoff, &format!("{why} ({durable} bytes durable)")).await;
             }
         }
     })
@@ -613,12 +677,27 @@ pub fn to_local_in(
     if unsafe_read {
         flags |= gen::JF_UNSAFE_READ;
     }
+    // The staging path every kind of landing uses (`<root>.ava-part`: the staging
+    // folder of a new folder, the part file of a single file).
+    let part = {
+        let mut p = target.clone().into_os_string();
+        p.push(".ava-part");
+        PathBuf::from(p)
+    };
+    let job_dir = journal::job_dir(&pool.ava_dir().join("jobs"), &job_id);
+    // A fresh job (no journal records) cannot own what is already in the staging path:
+    // it is what an earlier, failed download left behind, and renaming it into place
+    // would put that manifest's files into this one's folder. A job with a journal is
+    // a resume: the staging path is its work.
+    if journal_is_empty(&job_dir) {
+        remove_path(&part);
+    }
     let sink: Arc<dyn Sink> = Arc::new(CheckedSink {
         inner: LocalSink::new(target.clone(), single),
         root: target,
         single,
     });
-    run(
+    let r = run(
         pool,
         console,
         src,
@@ -628,7 +707,34 @@ pub fn to_local_in(
         &move || sink.clone(),
         counters,
         cancel,
-    )
+    );
+    if r.is_err() {
+        // `run` only returns a terminal error (a cancel, a refusal, a local write
+        // failure, the stall limit): nothing will resume this job, so neither the
+        // journal nor the staged bytes may outlive it.
+        let _ = std::fs::remove_dir_all(&job_dir);
+        remove_path(&part);
+    }
+    r
+}
+
+fn journal_is_empty(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(mut it) => it.next().is_none(),
+        Err(_) => true,
+    }
+}
+
+fn remove_path(p: &Path) {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => {
+            let _ = std::fs::remove_dir_all(p);
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(p);
+        }
+        Err(_) => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -745,5 +851,283 @@ mod tests {
         assert_eq!(basename("/data/foo/").unwrap(), "foo");
         assert!(basename("/").is_err());
         assert!(basename("/a/..").is_err());
+    }
+
+    fn entry(kind: u8, path: &str) -> manifest::Entry {
+        manifest::Entry {
+            kind,
+            mode: 0o644,
+            size: 0,
+            mtime: 0,
+            path: path.into(),
+            root: None,
+        }
+    }
+
+    fn files(paths: &[&str]) -> Manifest {
+        Manifest {
+            entries: paths.iter().map(|p| entry(gen::ENTRY_FILE, p)).collect(),
+        }
+    }
+
+    #[test]
+    fn check_shape_refuses_paths_a_host_would_misplace() {
+        for bad in [
+            "C:/x",
+            "C:evil",
+            "a/C:/x",
+            "a\\b",
+            "CON",
+            "con",
+            "a/NUL.txt",
+            "Aux.tar.gz",
+            "COM1",
+            "lpt9.log",
+            "x.",
+            "a/x ",
+            "dir./f",
+            "s:stream",
+        ] {
+            let e = check_shape(&files(&[bad]), false);
+            assert!(e.is_err(), "{bad:?} must be refused");
+            assert_eq!(e.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn check_shape_accepts_ordinary_and_lookalike_names() {
+        for good in [
+            "a/b.txt",
+            "COM",
+            "COM0",
+            "COM10",
+            "CONSOLE",
+            "console.txt",
+            "NULL",
+            "LPT",
+            ".hidden",
+            "a b/c d",
+            "x.y",
+            "price$",
+        ] {
+            check_shape(&files(&[good]), false)
+                .unwrap_or_else(|e| panic!("{good:?} must be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_single_file_manifest_must_be_exactly_one_file() {
+        check_shape(&files(&["one"]), true).unwrap();
+        assert!(check_shape(&files(&["one", "two"]), true).is_err());
+        let dir = Manifest {
+            entries: vec![entry(gen::ENTRY_DIR, "d")],
+        };
+        assert!(
+            check_shape(&dir, true).is_err(),
+            "a directory is not a file"
+        );
+        let dir_and_file = Manifest {
+            entries: vec![entry(gen::ENTRY_DIR, "d"), entry(gen::ENTRY_FILE, "d/f")],
+        };
+        assert!(check_shape(&dir_and_file, true).is_err());
+        // A folder download may hold one file.
+        check_shape(&dir_and_file, false).unwrap();
+    }
+
+    /// A sink that wraps `ZipSink` and, on its first write, reports that a file was
+    /// sent again (what the receiver's FileRetry causes), once per test.
+    struct RetrySink {
+        inner: ZipSink,
+        fail_first_write: bool,
+        failed: AtomicBool,
+    }
+
+    impl Sink for RetrySink {
+        fn prepare(&self, m: &Manifest) -> io::Result<()> {
+            self.inner.prepare(m)
+        }
+        fn write_at(&self, id: u32, off: u64, data: &[u8]) -> io::Result<()> {
+            if self.fail_first_write && !self.failed.swap(true, Ordering::Relaxed) {
+                return Err(zip_restart("injected: file sent again"));
+            }
+            self.inner.write_at(id, off, data)
+        }
+        fn write_whole(&self, id: u32, data: &[u8]) -> io::Result<()> {
+            if self.fail_first_write && !self.failed.swap(true, Ordering::Relaxed) {
+                return Err(zip_restart("injected: file sent again"));
+            }
+            self.inner.write_whole(id, data)
+        }
+        fn sync(&self, ids: &[u32]) -> io::Result<()> {
+            self.inner.sync(ids)
+        }
+        fn read_at(&self, id: u32, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read_at(id, off, buf)
+        }
+        fn commit(&self, id: u32) -> io::Result<()> {
+            self.inner.commit(id)
+        }
+        fn finish(&self) -> io::Result<()> {
+            self.inner.finish()
+        }
+    }
+
+    async fn folder_host(dir: &Path, engine_key: [u8; 32]) -> String {
+        use ava1::host::FolderHost;
+        use ava1::peers::PeerStore;
+        use ava1::server::{self, ServerCtx};
+        let mut peers = PeerStore::in_memory();
+        peers.add(engine_key, "engine").unwrap();
+        let rpc: server::RpcHandler = Box::new(|_, _| ava1::session::RpcReply {
+            status: gen::ERR_UNKNOWN_METHOD,
+            body: Vec::new(),
+        });
+        let ctx = ServerCtx::new(
+            ava1::keys::Identity::generate().unwrap(),
+            "host",
+            peers,
+            rpc,
+        )
+        .with_jobs(Arc::new(FolderHost {
+            root: dir.join("share"),
+            jobs_dir: dir.join("hjobs"),
+        }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(server::serve(l, Arc::new(ctx)));
+        addr
+    }
+
+    // A re-sent file restarts the archive attempt (like a drop) instead of failing the
+    // download as a bad manifest.
+    #[test]
+    fn a_zip_download_restarts_when_a_file_is_sent_again() {
+        let d = std::env::temp_dir().join(format!("p5a-zip-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("share/G")).unwrap();
+        for i in 0..3u8 {
+            std::fs::write(d.join(format!("share/G/f{i}")), vec![i + 1; 5000]).unwrap();
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ava = d.join("ava");
+        let key = ava1::keys::Identity::load_or_create(&ava.join("identity"))
+            .unwrap()
+            .public();
+        let addr = rt.block_on(folder_host(&d, key));
+        let pool = Pool::new(ava).with_addr(addr);
+        let dest = d.join("g.zip");
+        let made = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (made2, dest2) = (made.clone(), dest.clone());
+        let make = move || -> Arc<dyn Sink> {
+            let n = made2.fetch_add(1, Ordering::Relaxed);
+            Arc::new(RetrySink {
+                inner: ZipSink::new(dest2.clone(), "G"),
+                fail_first_write: n == 0,
+                failed: AtomicBool::new(false),
+            })
+        };
+        let flags = gen::JF_ORDERED;
+        // The test thread owns no runtime context: `run` blocks on its own.
+        let bytes = run(
+            &pool,
+            "c",
+            "G",
+            flags,
+            [9; 16],
+            true,
+            &make,
+            &Counters::default(),
+            None,
+        )
+        .expect("a re-sent file must restart the archive, not fail it");
+        assert_eq!(bytes, 15000);
+        // Two sinks were built: the original and the restart.
+        assert_eq!(made.load(Ordering::Relaxed), 2);
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&dest).unwrap()).unwrap();
+        assert_eq!(z.len(), 3);
+        for i in 0..3u8 {
+            let mut e = z.by_name(&format!("G/f{i}")).unwrap();
+            let mut got = Vec::new();
+            io::Read::read_to_end(&mut e, &mut got).unwrap();
+            assert_eq!(got, vec![i + 1; 5000]);
+        }
+        assert!(!d.join("g.zip.ava-part").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_rewrite_from_offset_zero_is_a_restart_and_a_gap_is_not() {
+        let d = std::env::temp_dir().join(format!("p5a-zip-sink-rw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut m = files(&["a", "b"]);
+        m.entries[0].size = 100;
+        m.entries[1].size = 50;
+        let s = ZipSink::new(d.join("o.zip"), "P");
+        s.prepare(&m).unwrap();
+        s.write_at(0, 0, &[1; 100]).unwrap();
+        s.write_at(1, 0, &[2; 10]).unwrap();
+        // An earlier, finished file sent again, and the current one again.
+        assert!(is_zip_restart(&s.write_at(0, 0, &[1; 100]).unwrap_err()));
+        assert!(is_zip_restart(&s.write_at(1, 0, &[2; 10]).unwrap_err()));
+        // A gap is a protocol violation, not a retry.
+        let gap = s.write_at(1, 30, &[2; 10]).unwrap_err();
+        assert!(!is_zip_restart(&gap));
+        assert_eq!(gap.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn terminal_errors_keep_their_reasons() {
+        let reason = |e: SendError| {
+            let e = terminal(e);
+            match e.downcast_ref::<UploadFailure>() {
+                Some(f) => f.reason.clone(),
+                None => e.to_string(),
+            }
+        };
+        assert_eq!(reason(SendError::Cancelled), "transfer_cancelled");
+        assert_eq!(
+            reason(SendError::Source(io::Error::from(
+                io::ErrorKind::PermissionDenied
+            ))),
+            "ava1_local_io"
+        );
+        assert_eq!(
+            reason(SendError::Source(io::Error::other("disk full"))),
+            "ava1_local_io"
+        );
+        assert_eq!(
+            reason(SendError::Source(invalid("bad name"))),
+            "ava1_bad_manifest"
+        );
+        assert_eq!(
+            reason(SendError::Refused {
+                status: gen::ERR_PATH,
+                message: "no".into()
+            }),
+            "ava1_not_allowed"
+        );
+    }
+
+    #[test]
+    fn a_stale_staging_path_is_cleared_only_for_a_fresh_journal() {
+        let d = std::env::temp_dir().join(format!("p5a-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("j")).unwrap();
+        assert!(journal_is_empty(&d.join("missing")));
+        assert!(journal_is_empty(&d.join("j")));
+        std::fs::write(d.join("j/rec"), b"x").unwrap();
+        assert!(!journal_is_empty(&d.join("j")));
+        std::fs::create_dir_all(d.join("p.ava-part/sub")).unwrap();
+        remove_path(&d.join("p.ava-part"));
+        assert!(!d.join("p.ava-part").exists());
+        std::fs::write(d.join("f.ava-part"), b"x").unwrap();
+        remove_path(&d.join("f.ava-part"));
+        assert!(!d.join("f.ava-part").exists());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

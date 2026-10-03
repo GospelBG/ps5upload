@@ -42,6 +42,24 @@ describe("isAutoRecoverable", () => {
     expect(isAutoRecoverable("ava1_commit_cross_device", "")).toBe(false);
   });
 
+  it.each([
+    "ava1_exists",
+    "ava1_cross_device",
+    "ava1_refused_9",
+    "ava1_refused_16",
+    "ava1_not_paired",
+    "ava1_wrong_console",
+    "ava1_no_identity",
+    "ava1_no_space",
+    "ava1_not_allowed",
+  ])("does NOT recover AVA1 refusal %s (retrying cannot change it)", (r) => {
+    expect(isAutoRecoverable(r, "")).toBe(false);
+  });
+
+  it("recovers ava1_unreachable: the payload may need a re-deploy", () => {
+    expect(isAutoRecoverable("ava1_unreachable", "")).toBe(true);
+  });
+
   it("still auto-recovers an unknown AVA1 reason", () => {
     // The post-commit entry is a prefix on ava1_commit_, not a blanket
     // ban on the ava1_ prefix — a future unrelated reason must keep the

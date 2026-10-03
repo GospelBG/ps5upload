@@ -22,7 +22,7 @@ use ava1::wire::Message;
 use ps5upload_core::fs_ops::FsOpSnapshot;
 
 use crate::pool::{pool, Pool};
-use crate::upload::{hex, refusal, terminal_connection_reason, wait, UploadFailure, STALL_LIMIT};
+use crate::upload::{hex, refusal, wait, SessionGate, UploadFailure, STALL_LIMIT};
 
 const POLL: Duration = Duration::from_millis(500);
 /// `ERR_BUSY` is "another job holds this destination" or "the failed copy is still
@@ -104,14 +104,22 @@ pub fn op_cancel(op_id: u64) -> bool {
     }
 }
 
-/// The console-side job id. Stable across this operation's own retries (a re-issue must
-/// find the job it started) and unique per operation: it hashes the kind and the
-/// overwrite choice, so a copy and a move of one path pair never alias a job directory
-/// or a status entry, AND the engine's `op_id`, so a user who copies the same pair
-/// again after deleting the destination does not get the console's still-listed
-/// finished job back as an instant, empty "success".
+/// A fresh 128-bit nonce for one `console_copy_in` call. The engine's `op_id` is a
+/// counter that restarts with the process, so it cannot keep a later run's id apart
+/// from an earlier run's finished job still listed on the console.
+fn new_nonce() -> Result<[u8; 16]> {
+    Ok(ava1::keys::random_bytes::<16>()?)
+}
+
+/// The console-side job id. Stable across one call's own retries (a re-issue must find
+/// the job it started: the caller draws `nonce` once) and unique per call: it hashes
+/// the kind and the overwrite choice, so a copy and a move of one path pair never alias
+/// a job directory or a status entry, AND the per-call nonce, so a user who copies the
+/// same pair again after deleting the destination (or after an engine restart reset
+/// `op_id`) does not get the console's still-listed finished job back as an instant,
+/// empty "success".
 pub fn copy_job_id(
-    op_id: u64,
+    nonce: &[u8; 16],
     from: &str,
     to: &str,
     move_source: bool,
@@ -119,7 +127,7 @@ pub fn copy_job_id(
 ) -> [u8; 16] {
     let mut h = blake3::Hasher::new();
     h.update(b"ps5upload copy v1\0");
-    h.update(&op_id.to_le_bytes());
+    h.update(nonce);
     h.update(&[u8::from(move_source), u8::from(overwrite)]);
     h.update(&(from.len() as u64).to_le_bytes());
     h.update(from.as_bytes());
@@ -176,7 +184,8 @@ pub fn console_copy_in(
 ) -> Result<()> {
     let kind = if move_source { "move" } else { "copy" };
     let (_registered, cancel) = register(op_id, kind, from, to)?;
-    let id = copy_job_id(op_id, from, to, move_source, overwrite);
+    // Once per call: the retries below re-issue this same id.
+    let id = copy_job_id(&new_nonce()?, from, to, move_source, overwrite);
     let flags = copy_flags(move_source, overwrite);
     let issue = JobCopy {
         job_id: id,
@@ -187,15 +196,9 @@ pub fn console_copy_in(
     .to_bytes()?;
     let jobref = JobRef { job_id: id }.to_bytes()?;
     crate::block_on(async {
-        if !pool.has_identity() {
-            return Err(UploadFailure {
-                reason: "ava1_no_identity".into(),
-                detail: "no AVA1 identity is available".into(),
-            }
-            .into());
-        }
+        SessionGate::identity(pool)?;
         let mut backoff = Duration::from_millis(250);
-        let mut terminal_attempts = 0;
+        let mut gate = SessionGate::default();
         // Whether the console is known to hold the job for this session. Cleared by any
         // transport loss and by ERR_UNKNOWN_JOB (the console restarted or reaped it):
         // issuing again is idempotent, and resumes from the console's own journal.
@@ -219,24 +222,15 @@ pub fn console_copy_in(
             let session = match pool.session(console).await {
                 Ok(s) => s,
                 Err(e) => {
-                    if let Some(reason) = terminal_connection_reason(&e) {
-                        terminal_attempts += 1;
-                        if terminal_attempts >= 3 {
-                            return Err(UploadFailure {
-                                reason: reason.into(),
-                                detail: e.to_string(),
-                            }
-                            .into());
-                        }
-                    } else {
-                        terminal_attempts = 0;
+                    if let Some(failure) = gate.failed(&e) {
+                        return Err(failure.into());
                     }
                     issued = false;
                     wait(&mut backoff, &e.to_string()).await;
                     continue;
                 }
             };
-            terminal_attempts = 0;
+            gate.connected();
             let (method, body) = if issued {
                 (gen::METHOD_JOB_STATUS, &jobref)
             } else {
@@ -328,17 +322,26 @@ mod tests {
 
     #[test]
     fn job_ids_separate_kind_overwrite_and_operation() {
-        let base = copy_job_id(1, "/a", "/b", false, false);
-        assert_eq!(base, copy_job_id(1, "/a", "/b", false, false));
-        assert_ne!(base, copy_job_id(1, "/a", "/b", true, false));
-        assert_ne!(base, copy_job_id(1, "/a", "/b", false, true));
-        assert_ne!(base, copy_job_id(2, "/a", "/b", false, false));
-        assert_ne!(base, copy_job_id(1, "/b", "/a", false, false));
+        let n = [1u8; 16];
+        let base = copy_job_id(&n, "/a", "/b", false, false);
+        assert_eq!(base, copy_job_id(&n, "/a", "/b", false, false));
+        assert_ne!(base, copy_job_id(&n, "/a", "/b", true, false));
+        assert_ne!(base, copy_job_id(&n, "/a", "/b", false, true));
+        assert_ne!(base, copy_job_id(&[2u8; 16], "/a", "/b", false, false));
+        assert_ne!(base, copy_job_id(&n, "/b", "/a", false, false));
         // The length prefix keeps ("/a","b/c") and ("/ab","/c") apart.
         assert_ne!(
-            copy_job_id(1, "/a", "b/c", false, false),
-            copy_job_id(1, "/ab", "/c", false, false)
+            copy_job_id(&n, "/a", "b/c", false, false),
+            copy_job_id(&n, "/ab", "/c", false, false)
         );
+    }
+
+    // Two calls with the same operation id and paths must not share a console job.
+    #[test]
+    fn two_calls_with_the_same_op_and_paths_get_different_job_ids() {
+        let a = copy_job_id(&new_nonce().unwrap(), "/a", "/b", false, false);
+        let b = copy_job_id(&new_nonce().unwrap(), "/a", "/b", false, false);
+        assert_ne!(a, b);
     }
 
     #[test]

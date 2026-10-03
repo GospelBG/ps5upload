@@ -44,7 +44,7 @@ pub struct Pool {
 }
 
 impl Pool {
-    fn unavailable() -> Pool {
+    pub(crate) fn unavailable() -> Pool {
         Pool {
             dir: PathBuf::new(),
             me: Err("no PS5Upload data directory; AVA1 identity unavailable".into()),
@@ -243,7 +243,16 @@ pub fn pool() -> &'static Pool {
     static P: OnceLock<Pool> = OnceLock::new();
     P.get_or_init(|| match data_dir() {
         Some(dir) => Pool::new(dir.join("ava")),
-        None => Pool::unavailable(),
+        None => {
+            // Once per process: this initialiser runs once. Never `eprintln!` (a
+            // closed stderr panics it).
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "ava1: no PS5Upload data directory (set PS5UPLOAD_DATA_DIR or HOME); using FTX2"
+            );
+            Pool::unavailable()
+        }
     })
 }
 

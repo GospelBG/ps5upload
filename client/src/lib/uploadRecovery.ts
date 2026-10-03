@@ -57,6 +57,15 @@ const FATAL_REASON_SUBSTRINGS = [
   "src_not_found",
 ] as const;
 
+const AVA1_FATAL_REASON_PREFIXES = [
+  "ava1_exists",
+  "ava1_cross_device",
+  "ava1_refused_",
+  "ava1_not_paired",
+  "ava1_wrong_console",
+  "ava1_no_identity",
+] as const;
+
 /** Local (no payload `reason`) error-message substrings that are FATAL. These
  *  are client-side problems a resume can't fix (the source moved, a local
  *  permission issue, the local disk filled). Connection-class messages
@@ -135,6 +144,14 @@ export function isAutoRecoverable(
   // a bare "ava1_commit" substring would also catch a future unrelated
   // reason and silently classify it as post-commit.
   if (r.startsWith("ava1_commit_")) return false;
+
+  // AVA1 refusals that happen before any data moves and cannot change on a
+  // retry (engine ps5upload_ava1::upload refusal_reason / SessionGate):
+  // the destination is taken, it is on another device, the console refused
+  // for a code we do not name, or this engine is not paired / talks to a
+  // different console / has no identity. NOT ava1_unreachable: nothing was
+  // listening, which a payload re-deploy can fix, so it stays recoverable.
+  if (AVA1_FATAL_REASON_PREFIXES.some((p) => r.startsWith(p))) return false;
 
   // Only consult the raw message for fatality when there's no structured
   // reason — a payload that gave us a (non-fatal) reason has already told us

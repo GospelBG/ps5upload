@@ -1,4 +1,5 @@
-//! AVA1 or FTX2 for one transfer (FTX2 stays the default until the Task 23 cutover).
+//! AVA1 or FTX2 for one transfer. `Auto` (the default) probes the console and prefers
+//! AVA1 when it speaks the data plane; FTX2 remains the fallback.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -140,5 +141,16 @@ mod tests {
         assert!(!use_ava1_in(&p, "c"));
         assert_eq!(p.attempts(), 2, "the entry expired and the probe ran again");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn auto_without_a_data_directory_falls_back_to_ftx2_without_connecting() {
+        if mode() != Mode::Auto {
+            return;
+        }
+        let p = Pool::unavailable();
+        assert!(!p.has_identity());
+        assert!(!use_ava1_in(&p, "no-dir-console"));
+        assert_eq!(p.attempts(), 0, "no identity means no connection attempt");
     }
 }

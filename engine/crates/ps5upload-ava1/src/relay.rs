@@ -1,8 +1,8 @@
 //! Bounded engine relay: ordered download from A feeds an upload to B in RAM.
 use std::collections::{BTreeMap, HashMap};
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,19 +15,48 @@ use ava1::send::{open_upload, run_upload, Progress, SendError, SendOptions, Send
 use ava1::source::{ReadAt, Source, SourceMeta};
 
 use crate::pool::{pool, Pool};
+use crate::upload::SessionGate;
 
 const RELAY_CAP: usize = 64 << 20;
 // A blocked source or lane may leave both halves alive without progress.
-const RELAY_WAIT: Duration = Duration::from_secs(120);
+const RELAY_WAIT_DEFAULT: Duration = Duration::from_secs(120);
+static RELAY_WAIT_MS: AtomicU64 = AtomicU64::new(120_000);
+
+/// How long one `put`/`take` may make no progress. Never a bound on how long a
+/// file may take: only a *stalled* hand-off fails, a slow one does not.
+fn relay_wait() -> Duration {
+    Duration::from_millis(RELAY_WAIT_MS.load(Ordering::Relaxed))
+}
+
+/// Test knob: shrink the no-progress bound so a stall test does not take minutes.
+#[doc(hidden)]
+pub fn set_wait_for_tests(d: Duration) {
+    RELAY_WAIT_MS.store(d.as_millis() as u64, Ordering::Relaxed);
+}
+
+#[doc(hidden)]
+pub fn reset_wait_for_tests() {
+    RELAY_WAIT_MS.store(RELAY_WAIT_DEFAULT.as_millis() as u64, Ordering::Relaxed);
+}
+/// How long a finished destination waits for the source's closing handshake.
+const A_GRACE: Duration = Duration::from_secs(15);
 const STALL_LIMIT: Duration = Duration::from_secs(600);
 
 struct State {
     chunks: BTreeMap<(u32, u64), Vec<u8>>,
     bytes: usize,
     failed: bool,
+    /// A's download ended cleanly: nothing more will arrive, nothing is wrong.
+    source_done: bool,
+    /// Offsets a reader is parked on right now. A put that supplies one is admitted
+    /// even into a full buffer (see `put`).
+    wanted: Vec<(u32, u64)>,
 }
 
 struct Relay {
+    /// A's receiver ran `finish`: every byte arrived and was verified on A's side.
+    finished: AtomicBool,
+    cap: usize,
     count: usize,
     expected: Need,
     state: Mutex<State>,
@@ -49,20 +78,46 @@ impl Relay {
             }
         }
         Self {
+            finished: AtomicBool::new(false),
+            cap: RELAY_CAP,
             count: m.entries.len(),
             expected,
             state: Mutex::new(State {
                 chunks: BTreeMap::new(),
                 bytes: 0,
                 failed: false,
+                source_done: false,
+                wanted: Vec::new(),
             }),
             changed: Condvar::new(),
         }
     }
 
+    #[cfg(test)]
+    fn with_cap(mut self, cap: usize) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    fn finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
+    }
+
     fn fail(&self) {
         let mut s = self.state.lock().unwrap();
         s.failed = true;
+        self.changed.notify_all();
+    }
+
+    /// A's download task ended. A clean end only means no more bytes are coming:
+    /// what is already buffered is still B's to read, and B may not have opened
+    /// its later (small) files yet. Only an error stops the relay.
+    fn source_ended(&self, ok: bool) {
+        if !ok {
+            return self.fail();
+        }
+        let mut s = self.state.lock().unwrap();
+        s.source_done = true;
         self.changed.notify_all();
     }
 
@@ -85,19 +140,27 @@ impl Relay {
                 format!("unexpected relay data {id}@{off}"),
             ));
         }
-        if data.len() > RELAY_CAP {
+        if data.len() > self.cap {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "relay frame exceeds capacity",
             ));
         }
-        let deadline = Instant::now() + RELAY_WAIT;
+        let deadline = Instant::now() + relay_wait();
         let mut s = self.state.lock().unwrap();
         loop {
             if s.failed {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "relay stopped"));
             }
-            if s.bytes + data.len() <= RELAY_CAP {
+            // The chunk a reader is parked on is admitted even into a full buffer: A's
+            // sink writes run concurrently, so later chunks may have taken the room
+            // while this one waited, and the reader cannot free any until it has this
+            // one. The overshoot is one chunk per parked reader.
+            let needed = s
+                .wanted
+                .iter()
+                .any(|&(wid, woff)| wid == id && off <= woff && woff < off + data.len() as u64);
+            if s.bytes + data.len() <= self.cap || needed {
                 if let Some(old) = s.chunks.insert((id, off), data.to_vec()) {
                     s.bytes -= old.len();
                 }
@@ -124,38 +187,51 @@ impl Relay {
                 format!("relay read outside expected set at {id}@{off}"),
             ));
         }
-        let deadline = Instant::now() + RELAY_WAIT;
+        let deadline = Instant::now() + relay_wait();
         let mut s = self.state.lock().unwrap();
-        loop {
+        s.wanted.push((id, off));
+        // A put parked for room may be exactly the chunk this read needs.
+        self.changed.notify_all();
+        let result = loop {
             if let Some((&(key_id, start), _)) = s.chunks.range(..=(id, off)).next_back() {
                 if key_id == id && s.chunks[&(key_id, start)].len() as u64 > off - start {
                     let data = s.chunks.remove(&(key_id, start)).unwrap();
                     s.bytes -= data.len();
                     self.changed.notify_all();
-                    return if off == start {
-                        Ok(data)
+                    break Ok(if off == start {
+                        data
                     } else {
-                        Ok(data[(off - start) as usize..].to_vec())
-                    };
+                        data[(off - start) as usize..].to_vec()
+                    });
                 }
             }
-            if s.failed {
-                return Err(io::Error::new(
+            if s.failed || s.source_done {
+                break Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("relay ended before {id}@{off}"),
                 ));
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(io::Error::new(
+                break Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("relay take timed out at {id}@{off}"),
                 ));
             }
             let (next, _) = self.changed.wait_timeout(s, deadline - now).unwrap();
             s = next;
+        };
+        if let Some(i) = s.wanted.iter().position(|w| *w == (id, off)) {
+            s.wanted.swap_remove(i);
         }
+        result
     }
+}
+
+/// The source's task may be abandoned only when the destination is complete and the
+/// source's receiver already finished (so nothing it could still say changes the data).
+fn may_abandon_source(destination_ok: bool, source_finished: bool) -> bool {
+    destination_ok && source_finished
 }
 
 struct RelaySink(Arc<Relay>);
@@ -183,6 +259,7 @@ impl Sink for RelaySink {
         Ok(())
     }
     fn finish(&self) -> io::Result<()> {
+        self.0.finished.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -198,10 +275,13 @@ struct Turn {
     ids: Vec<u32>,
     next: Mutex<usize>,
     changed: Condvar,
+    cancel: Arc<AtomicBool>,
 }
 impl Turn {
+    /// Waits for the previous file to finish. There is deliberately no wall-clock
+    /// bound: the predecessor may legitimately take hours; its own `take`/`put` carry
+    /// the no-progress bound, and a failure there fails the relay and wakes this wait.
     fn enter(&self, id: u32, relay: &Relay) -> io::Result<()> {
-        let deadline = Instant::now() + RELAY_WAIT;
         let mut next = self.next.lock().unwrap();
         while self.ids.get(*next) != Some(&id) {
             if relay.state.lock().unwrap().failed {
@@ -213,16 +293,15 @@ impl Turn {
                     format!("relay read order passed file {id}"),
                 ));
             }
-            let now = Instant::now();
-            if now >= deadline {
+            if self.cancel.load(Ordering::Relaxed) {
                 return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("relay read order timed out at file {id}"),
+                    io::ErrorKind::Interrupted,
+                    "relay cancelled",
                 ));
             }
             let (n, _) = self
                 .changed
-                .wait_timeout(next, (deadline - now).min(Duration::from_millis(100)))
+                .wait_timeout(next, Duration::from_millis(100))
                 .unwrap();
             next = n;
         }
@@ -267,7 +346,12 @@ struct RelaySource {
     turn: Arc<Turn>,
 }
 impl RelaySource {
-    fn new(relay: Arc<Relay>, manifest: Arc<Manifest>, b_need: &Need) -> Self {
+    fn new(
+        relay: Arc<Relay>,
+        manifest: Arc<Manifest>,
+        b_need: &Need,
+        cancel: Arc<AtomicBool>,
+    ) -> Self {
         let ids = manifest
             .entries
             .iter()
@@ -289,6 +373,7 @@ impl RelaySource {
                 ids: turns,
                 next: Mutex::new(0),
                 changed: Condvar::new(),
+                cancel,
             }),
         }
     }
@@ -379,12 +464,16 @@ pub fn ps5_to_ps5_between(
             "relay source and destination must be different consoles"
         ));
     }
+    // The same terminal classification as an upload: no identity ends the job at once.
+    SessionGate::identity(from_pool)?;
+    SessionGate::identity(to_pool)?;
     let hex = ava1::hex::encode(&job_id);
     let persist = to_pool.ava_dir().join("send").join(&hex);
     let scratch = from_pool.ava_dir().join("relay").join(&hex);
     let _scratch = Scratch(scratch.clone());
     crate::block_on(async {
         let mut backoff = Duration::from_millis(250);
+        let (mut gate_a, mut gate_b) = (SessionGate::default(), SessionGate::default());
         let (mut last_at, mut last_durable) = (Instant::now(), 0u64);
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -407,21 +496,32 @@ pub fn ps5_to_ps5_between(
             let sa = match from_pool.session(from).await {
                 Ok(s) => s,
                 Err(e) => {
+                    if let Some(failure) = gate_a.failed(&e) {
+                        return Err(failure.into());
+                    }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(5));
-                    eprintln!("ava1 relay: reconnecting source: {e}");
+                    let _ = writeln!(std::io::stderr(), "ava1 relay: reconnecting source: {e}");
                     continue;
                 }
             };
+            gate_a.connected();
             let sb = match to_pool.session(to).await {
                 Ok(s) => s,
                 Err(e) => {
+                    if let Some(failure) = gate_b.failed(&e) {
+                        return Err(failure.into());
+                    }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(5));
-                    eprintln!("ava1 relay: reconnecting destination: {e}");
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ava1 relay: reconnecting destination: {e}"
+                    );
                     continue;
                 }
             };
+            gate_b.connected();
             let (mut la, mut lb) = (sa.job(job_id), sb.job(job_id));
             let m = match download_open(&mut la, src, gen::JF_ORDERED, RELAY_CAP as u64).await {
                 Ok(m) => m,
@@ -468,17 +568,47 @@ pub fn ps5_to_ps5_between(
                     ro,
                 )
                 .await;
-                a_relay.fail();
+                a_relay.source_ended(result.is_ok());
                 result
             });
-            let source = Arc::new(RelaySource::new(relay.clone(), m.clone(), &opened.1));
+            let source = Arc::new(RelaySource::new(
+                relay.clone(),
+                m.clone(),
+                &opened.1,
+                cancel.clone(),
+            ));
+            // B's readers park inside `take` for A's data and the sender joins them
+            // on every exit: a dead destination session must wake them, or the
+            // attempt waits out the no-progress bound before it can reconnect.
+            let watch = {
+                let (relay, sb) = (relay.clone(), sb.clone());
+                tokio::spawn(async move {
+                    while !sb.is_closed() {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    relay.fail();
+                })
+            };
             let b = run_upload(&mut lb, m, source, o, opened).await;
+            watch.abort();
             relay.fail();
-            let a_result = match tokio::time::timeout(RELAY_WAIT, &mut a).await {
-                Ok(r) => r.map_err(|e| anyhow!(e))?,
+            // Once the destination has everything, only A's closing handshake can be
+            // outstanding: do not hold a finished transfer for the full bound.
+            let b_ok = matches!(&b, Ok(r) if r.status == gen::STATUS_OK);
+            let grace = if b_ok { A_GRACE } else { relay_wait() };
+            let a_result = match tokio::time::timeout(grace, &mut a).await {
+                Ok(r) => r.map_err(|e| anyhow!(e))?.map(|_| ()),
+                Err(_) if may_abandon_source(b_ok, relay.finished()) => {
+                    a.abort();
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ava1 relay: source closed late; its data was complete and verified"
+                    );
+                    Ok(())
+                }
                 Err(_) => {
                     a.abort();
-                    return Err(anyhow!("source relay did not stop within {RELAY_WAIT:?}"));
+                    return Err(anyhow!("source relay did not stop within {grace:?}"));
                 }
             };
             if matches!(a_result, Err(SendError::Disconnected(_))) {
@@ -513,4 +643,324 @@ pub fn ps5_to_ps5_between(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ava1::manifest::Entry;
+
+    /// The no-progress knob is process-wide; tests that move it take this lock.
+    static KNOB: Mutex<()> = Mutex::new(());
+
+    fn file(path: &str, size: u64) -> Entry {
+        Entry {
+            kind: gen::ENTRY_FILE,
+            mode: 0o644,
+            size,
+            mtime: 0,
+            path: path.into(),
+            root: None,
+        }
+    }
+
+    fn rig(sizes: &[u64]) -> (Arc<Relay>, RelaySource) {
+        let m = Arc::new(Manifest {
+            entries: sizes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| file(&format!("f{i}"), *n))
+                .collect(),
+        });
+        let relay = Arc::new(Relay::new(&m, &Need::default()));
+        let src = RelaySource::new(
+            relay.clone(),
+            m,
+            &Need::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        (relay, src)
+    }
+
+    fn read_all(src: &RelaySource, path: &str) -> io::Result<Vec<u8>> {
+        let mut r = src.open(path)?;
+        let size = src.stat(path)?.size as usize;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 16];
+        while out.len() < size {
+            let n = r.read_at(out.len() as u64, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        Ok(out)
+    }
+
+    // Flake root cause (Task 25): A finishing first used to mark the whole relay
+    // failed, so B's readers, which had not opened their small files yet, died with
+    // "relay stopped" depending on thread timing.
+    #[test]
+    fn a_source_that_finished_cleanly_still_lets_the_destination_read() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        let (relay, src) = rig(&[3, 3]);
+        relay.put(0, 0, b"abc").unwrap();
+        relay.put(1, 0, b"def").unwrap();
+        relay.source_ended(true);
+        assert_eq!(read_all(&src, "f0").unwrap(), b"abc");
+        assert_eq!(read_all(&src, "f1").unwrap(), b"def");
+    }
+
+    #[test]
+    fn a_source_that_finishes_while_a_file_waits_its_turn_does_not_stop_it() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        let (relay, src) = rig(&[3, 3]);
+        relay.put(0, 0, b"abc").unwrap();
+        relay.put(1, 0, b"def").unwrap();
+        let src = Arc::new(src);
+        let first = src.open("f0").unwrap();
+        let waiter = {
+            let src = src.clone();
+            std::thread::spawn(move || read_all(&src, "f1"))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        relay.source_ended(true);
+        std::thread::sleep(Duration::from_millis(300));
+        drop(first);
+        assert_eq!(waiter.join().unwrap().unwrap(), b"def");
+    }
+
+    #[test]
+    fn a_source_that_finished_cleanly_ends_a_read_of_bytes_it_never_sent() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        let (relay, src) = rig(&[3, 3]);
+        relay.put(0, 0, b"abc").unwrap();
+        relay.source_ended(true);
+        assert_eq!(read_all(&src, "f0").unwrap(), b"abc");
+        let started = Instant::now();
+        let e = read_all(&src, "f1").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+        assert!(started.elapsed() < Duration::from_secs(5), "{e}");
+    }
+
+    #[test]
+    fn a_failed_source_stops_the_destination() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        let (relay, src) = rig(&[3, 3]);
+        relay.source_ended(false);
+        let e = read_all(&src, "f0").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    // Task 24 review, Critical 1: waiting for the previous file has no wall-clock bound.
+    #[test]
+    fn a_slow_predecessor_never_times_out_the_next_file() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        set_wait_for_tests(Duration::from_millis(300));
+        let (relay, src) = rig(&[3, 3]);
+        let src = Arc::new(src);
+        let first = src.open("f0").unwrap();
+        let waiter = {
+            let src = src.clone();
+            std::thread::spawn(move || src.open("f1").map(|_| ()))
+        };
+        std::thread::sleep(Duration::from_millis(900));
+        drop(first);
+        let r = waiter.join().unwrap();
+        reset_wait_for_tests();
+        r.expect("the wait for a live predecessor must not time out");
+        drop(relay);
+    }
+
+    #[test]
+    fn a_cancelled_or_failed_relay_wakes_a_file_waiting_its_turn() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        let (relay, src) = rig(&[3, 3]);
+        let src = Arc::new(src);
+        let _first = src.open("f0").unwrap();
+        let waiter = {
+            let src = src.clone();
+            std::thread::spawn(move || src.open("f1").err().map(|e| e.kind()))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        relay.fail();
+        assert_eq!(waiter.join().unwrap(), Some(io::ErrorKind::BrokenPipe));
+    }
+
+    #[test]
+    fn a_cancelled_job_wakes_a_file_waiting_its_turn() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        let m = Arc::new(Manifest {
+            entries: vec![file("f0", 3), file("f1", 3)],
+        });
+        let relay = Arc::new(Relay::new(&m, &Need::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let src = Arc::new(RelaySource::new(relay, m, &Need::default(), cancel.clone()));
+        let _first = src.open("f0").unwrap();
+        let waiter = {
+            let src = src.clone();
+            std::thread::spawn(move || src.open("f1").err().map(|e| e.kind()))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(waiter.join().unwrap(), Some(io::ErrorKind::Interrupted));
+    }
+
+    // C7: fail() is unconditional and wakes a parked take.
+    #[test]
+    fn fail_wakes_a_take_parked_for_data() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        let (relay, _src) = rig(&[3]);
+        let r = relay.clone();
+        let t = std::thread::spawn(move || r.take(0, 0).map(|_| ()));
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        relay.fail();
+        let e = t.join().unwrap().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    // C14: only bytes of the expected set are accepted or read.
+    #[test]
+    fn data_outside_the_expected_set_is_refused() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        let m = Manifest {
+            entries: vec![file("f0", 3), file("f1", 3)],
+        };
+        let mut skip = Need::default();
+        skip.done.insert(1);
+        let relay = Relay::new(&m, &skip);
+        // Out of range id, a skipped (durable) file, and an offset past the end.
+        for (id, off) in [(2u32, 0u64), (1, 0), (0, 3)] {
+            let e = relay.put(id, off, b"x").unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "put {id}@{off}");
+        }
+        for (id, off) in [(2u32, 0u64), (1, 0), (0, 3)] {
+            let e = relay.take(id, off).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "take {id}@{off}");
+        }
+        relay.put(0, 0, b"abc").unwrap();
+    }
+
+    #[test]
+    fn a_put_into_a_full_buffer_times_out_instead_of_hanging() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        set_wait_for_tests(Duration::from_millis(200));
+        let m = Manifest {
+            entries: vec![file("f0", RELAY_CAP as u64 + 8)],
+        };
+        let relay = Relay::new(&m, &Need::default());
+        relay.put(0, 0, &vec![0u8; RELAY_CAP]).unwrap();
+        let started = Instant::now();
+        let e = relay.put(0, RELAY_CAP as u64, b"more").unwrap_err();
+        reset_wait_for_tests();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    // C6: what A withholds (skip_set) is exactly what B's sender does not read.
+    #[test]
+    fn the_relays_expected_bytes_are_exactly_the_destinations_read_set() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        use ava1::ranges::RangeSet;
+        use ava1::verify::{self, Outboard, GROUP};
+        let size = gen::LARGE_CUTOFF as u64 + 4 * GROUP;
+        let small = 1000u64;
+        let m = Manifest {
+            entries: vec![
+                file("done_large", size),
+                file("partial_large", size),
+                file("partial_small", small),
+                file("fresh_large", size),
+            ],
+        };
+        let dir = std::env::temp_dir().join(format!("relay-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The destination: file 0 fully durable, file 1 groups 0 and 1 durable
+        // (CV known for 0 only), file 2 (small) partly durable (meaningless: sent whole).
+        let mut durable = Need::default();
+        durable.done.insert(0);
+        let mut r1 = RangeSet::new();
+        r1.insert(0, 2 * GROUP);
+        durable.partial.insert(1, r1.clone());
+        let mut r2 = RangeSet::new();
+        r2.insert(0, 500);
+        durable.partial.insert(2, r2);
+        let groups = verify::groups(size);
+        let mut ob = Outboard::open(&dir.join("1.ob"), groups).unwrap();
+        ob.put(0, &[7u8; 32]).unwrap();
+        ob.sync().unwrap();
+        // A done file's outboard is irrelevant to the skip; a missing one is fine.
+        let skip = ava1::send::skip_set(&m, &durable, Some(&dir));
+        assert!(skip.done.contains(&0));
+        let relay = Relay::new(&m, &skip);
+        for (id, e) in m.entries.iter().enumerate() {
+            let id = id as u32;
+            // The destination's read set for this file: every piece (hashed or sent).
+            let mut read = RangeSet::new();
+            if skip.done.contains(&id) {
+                // Never read.
+            } else if e.size < gen::LARGE_CUTOFF as u64 {
+                read.insert(0, e.size);
+            } else {
+                let have =
+                    Outboard::open(&dir.join(format!("{id}.ob")), verify::groups(e.size)).unwrap();
+                let d = durable.partial.get(&id).cloned().unwrap_or_default();
+                for p in ava1::send::pieces(e.size, &d, &|g| have.get(g).is_some(), 1 << 20) {
+                    read.insert(p.offset, p.offset + p.len);
+                }
+            }
+            let expected = relay.expected.partial.get(&id).cloned().unwrap_or_default();
+            assert_eq!(
+                expected.iter().collect::<Vec<_>>(),
+                read.iter().collect::<Vec<_>>(),
+                "file {id}: relay expectation differs from the sender's read set"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A's sink writes run concurrently, so later chunks can fill the buffer while the
+    // chunk the destination is parked on is still waiting for room: a deadlock that
+    // only the no-progress bound ended (the restart/tree flake under load).
+    #[test]
+    fn the_chunk_a_reader_waits_for_is_admitted_into_a_full_buffer() {
+        let _k = KNOB.lock().unwrap_or_else(|e| e.into_inner());
+        set_wait_for_tests(Duration::from_secs(3));
+        let m = Manifest {
+            entries: vec![file("f0", 4000)],
+        };
+        let relay = Arc::new(Relay::new(&m, &Need::default()).with_cap(2000));
+        // Later chunks fill the buffer first.
+        relay.put(0, 2000, &[2u8; 1000]).unwrap();
+        relay.put(0, 3000, &[3u8; 1000]).unwrap();
+        let r = relay.clone();
+        let reader = std::thread::spawn(move || r.take(0, 0));
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        // The chunk the reader needs: no room, but nothing else can ever free any.
+        relay
+            .put(0, 0, &[1u8; 1000])
+            .expect("a wanted chunk must be admitted");
+        assert_eq!(reader.join().unwrap().unwrap(), vec![1u8; 1000]);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // An unwanted chunk still waits for room (the cap holds).
+        set_wait_for_tests(Duration::from_millis(200));
+        let e = relay.put(0, 1000, &[9u8; 1000]).unwrap_err();
+        reset_wait_for_tests();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_source_is_abandoned_only_when_both_halves_are_complete() {
+        assert!(may_abandon_source(true, true));
+        assert!(!may_abandon_source(true, false));
+        assert!(!may_abandon_source(false, true));
+        let (relay, _src) = rig(&[3]);
+        assert!(!relay.finished());
+        RelaySink(relay.clone()).finish().unwrap();
+        assert!(relay.finished());
+    }
 }

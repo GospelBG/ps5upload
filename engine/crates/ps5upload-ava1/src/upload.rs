@@ -27,6 +27,12 @@ use crate::zip_source::ZipSource;
 #[error("zip entry {0} is larger than 256 MiB: AVA1 sends this archive with FTX2")]
 pub struct ZipTooLarge(pub String);
 
+/// The archive cannot be an AVA1 source (a path the manifest refuses, an unsupported
+/// method, encryption, a damaged directory): FTX2 reads zips its own way.
+#[derive(Debug, thiserror::Error)]
+#[error("zip is not usable as an AVA1 source: {0}")]
+pub struct ZipUnsupported(pub String);
+
 pub const ZIP_MAX_ENTRY: u64 = 256 << 20;
 
 pub fn zip_too_large(m: &Manifest) -> Option<&str> {
@@ -43,7 +49,8 @@ pub fn upload_zip_in(
     dest_root: &str,
     zip_path: &Path,
 ) -> Result<TransferResult> {
-    let (manifest, source) = ZipSource::open(zip_path, &cfg.excludes)?;
+    let (manifest, source) =
+        ZipSource::open(zip_path, &cfg.excludes).map_err(|e| ZipUnsupported(e.to_string()))?;
     if let Some(path) = zip_too_large(&manifest) {
         return Err(ZipTooLarge(path.to_owned()).into());
     }
@@ -135,8 +142,57 @@ pub(crate) fn terminal_connection_reason(error: &Ava1Error) -> Option<&'static s
             Some("ava1_unreachable")
         }
         Ava1Error::NotPaired => Some("ava1_not_paired"),
+        // The console's own refusal of an unpaired peer (pairing window closed).
+        Ava1Error::Refused { code, .. }
+            if *code == gen::ERR_NOT_PAIRED || *code == gen::ERR_PAIRING_CLOSED =>
+        {
+            Some("ava1_not_paired")
+        }
         Ava1Error::WrongPeer => Some("ava1_wrong_console"),
         _ => None,
+    }
+}
+
+/// How many consecutive terminal connection failures end a job.
+pub(crate) const TERMINAL_ATTEMPTS: u32 = 3;
+
+/// The session-level retry policy every AVA1 job shares (uploads and the relay): a
+/// console that refuses us, is not paired, has another key or has no listener is
+/// given three tries and then reported with a stable reason; anything else is
+/// transient and resets the count.
+#[derive(Default)]
+pub(crate) struct SessionGate {
+    terminal: u32,
+}
+
+impl SessionGate {
+    /// No identity can never recover by retrying.
+    pub(crate) fn identity(pool: &Pool) -> Result<(), UploadFailure> {
+        if pool.has_identity() {
+            return Ok(());
+        }
+        Err(UploadFailure {
+            reason: "ava1_no_identity".into(),
+            detail: "no AVA1 identity is available".into(),
+        })
+    }
+
+    /// A session was opened.
+    pub(crate) fn connected(&mut self) {
+        self.terminal = 0;
+    }
+
+    /// A session attempt failed: `Some` when the job must end now.
+    pub(crate) fn failed(&mut self, e: &Ava1Error) -> Option<UploadFailure> {
+        let Some(reason) = terminal_connection_reason(e) else {
+            self.terminal = 0;
+            return None;
+        };
+        self.terminal += 1;
+        (self.terminal >= TERMINAL_ATTEMPTS).then(|| UploadFailure {
+            reason: reason.into(),
+            detail: e.to_string(),
+        })
     }
 }
 
@@ -197,16 +253,10 @@ pub fn upload_with_in(
     let persist = pool.ava_dir().join("send").join(hex(&job_id));
     let dest = opts.root.clone();
     crate::block_on(async {
-        if !pool.has_identity() {
-            return Err(UploadFailure {
-                reason: "ava1_no_identity".into(),
-                detail: "no AVA1 identity is available".into(),
-            }
-            .into());
-        }
+        SessionGate::identity(pool)?;
         let _bridge = Bridge::start(progress.clone(), cfg);
         let mut backoff = Duration::from_millis(250);
-        let mut terminal_attempts = 0;
+        let mut gate = SessionGate::default();
         let (mut last_at, mut last_durable) = (Instant::now(), 0u64);
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -223,23 +273,14 @@ pub fn upload_with_in(
             let session = match pool.session(console).await {
                 Ok(s) => s,
                 Err(e) => {
-                    if let Some(reason) = terminal_connection_reason(&e) {
-                        terminal_attempts += 1;
-                        if terminal_attempts >= 3 {
-                            return Err(UploadFailure {
-                                reason: reason.into(),
-                                detail: e.to_string(),
-                            }
-                            .into());
-                        }
-                    } else {
-                        terminal_attempts = 0;
+                    if let Some(failure) = gate.failed(&e) {
+                        return Err(failure.into());
                     }
                     wait(&mut backoff, &e.to_string()).await;
                     continue;
                 }
             };
-            terminal_attempts = 0;
+            gate.connected();
             let mut link = session.job(job_id);
             let o = SendOptions {
                 kind: opts.kind,
@@ -585,5 +626,82 @@ mod failure_reason_tests {
         assert_eq!(refusal_reason(gen::ERR_EXISTS), "ava1_exists");
         assert_eq!(refusal_reason(gen::ERR_CROSS_DEVICE), "ava1_cross_device");
         assert_eq!(refusal_reason(65535), "ava1_refused_65535");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused() -> Ava1Error {
+        Ava1Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+    }
+    fn other() -> Ava1Error {
+        Ava1Error::Io(std::io::Error::other("handshake reset"))
+    }
+
+    #[test]
+    fn the_third_consecutive_refusal_ends_the_job() {
+        let mut g = SessionGate::default();
+        assert!(g.failed(&refused()).is_none());
+        assert!(g.failed(&refused()).is_none());
+        let f = g.failed(&refused()).expect("third attempt is terminal");
+        assert_eq!(f.reason, "ava1_unreachable");
+    }
+
+    #[test]
+    fn a_transient_error_resets_the_count() {
+        let mut g = SessionGate::default();
+        for _ in 0..2 {
+            assert!(g.failed(&refused()).is_none());
+        }
+        assert!(g.failed(&other()).is_none());
+        for _ in 0..2 {
+            assert!(g.failed(&refused()).is_none(), "the count restarted");
+        }
+        assert!(g.failed(&refused()).is_some());
+    }
+
+    #[test]
+    fn a_connected_session_resets_the_count() {
+        let mut g = SessionGate::default();
+        for _ in 0..2 {
+            assert!(g.failed(&refused()).is_none());
+        }
+        g.connected();
+        assert!(g.failed(&refused()).is_none());
+    }
+
+    #[test]
+    fn pairing_and_identity_failures_have_their_own_reasons() {
+        for (e, reason) in [
+            (Ava1Error::NotPaired, "ava1_not_paired"),
+            (Ava1Error::WrongPeer, "ava1_wrong_console"),
+            (
+                Ava1Error::Refused {
+                    code: gen::ERR_PAIRING_CLOSED,
+                    message: "closed".into(),
+                },
+                "ava1_not_paired",
+            ),
+        ] {
+            let mut g = SessionGate::default();
+            assert!(g.failed(&e).is_none());
+            assert!(g.failed(&e).is_none());
+            assert_eq!(g.failed(&e).unwrap().reason, reason);
+        }
+    }
+
+    #[test]
+    fn no_identity_is_terminal_immediately() {
+        let d = std::env::temp_dir().join(format!("gate-noid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("identity")).unwrap();
+        let pool = Pool::new(d.clone());
+        assert_eq!(
+            SessionGate::identity(&pool).unwrap_err().reason,
+            "ava1_no_identity"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

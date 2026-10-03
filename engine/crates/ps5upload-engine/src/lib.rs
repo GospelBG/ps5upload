@@ -5924,13 +5924,7 @@ async fn transfer_zip_handler(
                 DEFAULT_RESUME_RETRIES,
                 initial_flags,
             )?;
-            let mut body = serde_json::from_str::<serde_json::Value>(&r.commit_ack_body)
-                .unwrap_or_else(|_| serde_json::json!({}));
-            body["protocol"] = serde_json::json!("ftx2");
-            if let Some(reason) = reason {
-                body["fallback_reason"] = serde_json::json!(reason);
-            }
-            r.commit_ack_body = body.to_string();
+            r.commit_ack_body = tag_ack_body(&r.commit_ack_body, "ftx2", reason);
             Ok::<_, anyhow::Error>(r)
         };
         let result = if ps5upload_ava1::route::use_ava1(&addr) {
@@ -5946,6 +5940,13 @@ async fn transfer_zip_handler(
                 {
                     crate::log_info!("transfer_zip: AVA1 fallback to FTX2: {e}");
                     ftx2(Some("zip_entry_too_large"))
+                }
+                Err(e)
+                    if e.downcast_ref::<ps5upload_ava1::upload::ZipUnsupported>()
+                        .is_some() =>
+                {
+                    crate::log_info!("transfer_zip: AVA1 fallback to FTX2: {e}");
+                    ftx2(Some("zip_unsupported_by_ava1"))
                 }
                 other => other,
             }
@@ -5994,6 +5995,32 @@ async fn transfer_zip_handler(
         }),
     )
         .into_response()
+}
+
+/// Adds `protocol` (and a fallback reason) to a commit acknowledgement. The ack is
+/// the payload's own JSON; a body that is not an object (an array, a number, text)
+/// is kept whole under `ack` instead of being indexed into or dropped.
+fn tag_ack_body(body: &str, protocol: &str, reason: Option<&str>) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(body);
+    let mut out = match parsed {
+        Ok(serde_json::Value::Object(map)) => map,
+        Ok(other) => {
+            let mut m = serde_json::Map::new();
+            m.insert("ack".into(), other);
+            m
+        }
+        Err(_) if body.trim().is_empty() => serde_json::Map::new(),
+        Err(_) => {
+            let mut m = serde_json::Map::new();
+            m.insert("ack".into(), serde_json::Value::String(body.to_owned()));
+            m
+        }
+    };
+    out.insert("protocol".into(), serde_json::json!(protocol));
+    if let Some(reason) = reason {
+        out.insert("fallback_reason".into(), serde_json::json!(reason));
+    }
+    serde_json::Value::Object(out).to_string()
 }
 
 // ── .7z handlers ── mirror the zip handlers; see those for the rationale on
@@ -11222,5 +11249,35 @@ mod appdb_installed_additions_tests {
         let rows = vec![("PLDM00001".to_string(), "Payload Manager".to_string())];
         let got = appdb_installed_additions(&rows, &set(&["PLDM00001"]), &set(&["PLDM00001"]));
         assert!(got.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tag_ack_body_tests {
+    use super::tag_ack_body;
+
+    fn parse(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn an_object_ack_keeps_its_fields() {
+        let v = parse(&tag_ack_body(r#"{"files":3}"#, "ftx2", Some("why")));
+        assert_eq!(v["files"], 3);
+        assert_eq!(v["protocol"], "ftx2");
+        assert_eq!(v["fallback_reason"], "why");
+    }
+
+    #[test]
+    fn a_non_object_ack_never_panics_and_is_kept() {
+        let v = parse(&tag_ack_body("[1,2]", "ftx2", None));
+        assert_eq!(v["ack"], serde_json::json!([1, 2]));
+        assert_eq!(v["protocol"], "ftx2");
+        let v = parse(&tag_ack_body("not json", "ftx2", None));
+        assert_eq!(v["ack"], "not json");
+        let v = parse(&tag_ack_body("7", "ftx2", None));
+        assert_eq!(v["ack"], 7);
+        let v = parse(&tag_ack_body("", "ftx2", None));
+        assert_eq!(v["protocol"], "ftx2");
     }
 }

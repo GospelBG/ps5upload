@@ -493,3 +493,64 @@ async fn block_on_works_from_a_blocking_thread_and_a_multithread_worker() {
     let out = tokio::task::block_in_place(|| block_on(async { 43 }));
     assert_eq!(out, 43);
 }
+
+async fn failure_of(pool: Pool, src: PathBuf) -> (String, Duration) {
+    let started = std::time::Instant::now();
+    let e = within(
+        60,
+        tokio::task::spawn_blocking(move || {
+            upload::upload_dir_in(&pool, &cfg(), [21; 16], "out", &src)
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    let f = e
+        .downcast_ref::<upload::UploadFailure>()
+        .unwrap_or_else(|| panic!("not an UploadFailure: {e:#}"));
+    (f.reason.clone(), started.elapsed())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn three_refused_connections_end_an_upload_as_unreachable() {
+    let d = temp_dir("refused");
+    let src = d.join("src");
+    tree(&src, 2, |_| 1000);
+    let pool = Pool::new(d.join("ava")).with_addr("127.0.0.1:1");
+    let (reason, took) = failure_of(pool, src).await;
+    assert_eq!(reason, "ava1_unreachable");
+    assert!(took < Duration::from_secs(20), "{took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_identity_ends_an_upload_without_a_connection_attempt() {
+    let d = temp_dir("noid");
+    let src = d.join("src");
+    tree(&src, 2, |_| 1000);
+    std::fs::create_dir_all(d.join("ava/identity")).unwrap();
+    let pool = Pool::new(d.join("ava")).with_addr("127.0.0.1:1");
+    assert!(!pool.has_identity());
+    let (reason, took) = failure_of(pool, src).await;
+    assert_eq!(reason, "ava1_no_identity");
+    assert!(took < Duration::from_secs(3), "{took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_console_that_wants_a_user_code_ends_an_upload_as_not_paired() {
+    let d = temp_dir("notpaired");
+    let src = d.join("src");
+    tree(&src, 2, |_| 1000);
+    let ctx = ServerCtx::new(
+        Identity::generate().unwrap(),
+        "stranger",
+        PeerStore::in_memory(),
+        node_info_rpc(),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(server::serve(l, Arc::new(ctx)));
+    let pool = Pool::new(d.join("ava")).with_addr(addr);
+    let (reason, took) = failure_of(pool, src).await;
+    assert_eq!(reason, "ava1_not_paired");
+    assert!(took < Duration::from_secs(20), "{took:?}");
+}

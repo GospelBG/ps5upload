@@ -926,3 +926,111 @@ async fn record_status_maps_a_move() {
     assert!(op_snapshot(99).is_none());
     assert!(!op_cancel(99));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_download_removes_its_staging_and_journal() {
+    let d = temp("cancel-mid");
+    let total = tree(&d.join("share/Game"), 24, |_| 1 << 20);
+    let (_flaky, pool) = Flaky::start(&d).await;
+    let pool = Arc::new(pool);
+    let out = d.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let c = counters();
+    let flag = Arc::new(AtomicBool::new(false));
+    let (p2, o2, c2, f2) = (pool.clone(), out.clone(), c.clone(), flag.clone());
+    let run = tokio::task::spawn_blocking(move || {
+        download::to_local_in(
+            &p2,
+            "console",
+            "Game",
+            DownloadKind::Folder,
+            &o2,
+            false,
+            [31; 16],
+            &c2,
+            Some(f2),
+        )
+    });
+    within(30, async {
+        while c.bytes.load(Ordering::Relaxed) < (3 << 20) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(c.bytes.load(Ordering::Relaxed) < total, "finished too soon");
+    assert!(out.join("Game.ava-part").exists(), "mid-flight staging");
+    flag.store(true, Ordering::Relaxed);
+    let e = within(30, run).await.unwrap().unwrap_err();
+    assert_eq!(e.to_string(), "transfer_cancelled");
+    assert!(!out.join("Game.ava-part").exists(), "staging left behind");
+    assert!(!out.join("Game").exists());
+    let jobs = d.join("ava/jobs");
+    let left = std::fs::read_dir(&jobs).map(|r| r.count()).unwrap_or(0);
+    assert_eq!(left, 0, "the journal of a dead job was kept");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_after_a_failed_one_has_no_stale_files() {
+    let d = temp("stale");
+    tree(&d.join("share/Game"), 6, |_| 70_000);
+    let (pool, _) = host(&d).await;
+    let pool = Arc::new(pool);
+    let out = d.join("out");
+    // What a crashed earlier download of a different manifest left behind.
+    std::fs::create_dir_all(out.join("Game.ava-part/old")).unwrap();
+    std::fs::write(out.join("Game.ava-part/old/stale"), b"stale").unwrap();
+    std::fs::write(out.join("Game.ava-part/f0"), b"half a file").unwrap();
+    local(
+        pool.clone(),
+        "Game",
+        DownloadKind::Folder,
+        &out,
+        counters(),
+        32,
+    )
+    .await
+    .unwrap();
+    assert_eq!(files_of(&out.join("Game")), files_of(&d.join("share/Game")));
+    assert!(!out.join("Game.ava-part").exists());
+    // A single file: a stale part file is not the start of this download.
+    std::fs::write(d.join("share/one.bin"), bytes_for(3, 50_000)).unwrap();
+    std::fs::write(out.join("one.bin.ava-part"), vec![9u8; 90_000]).unwrap();
+    local(pool, "one.bin", DownloadKind::File, &out, counters(), 33)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(out.join("one.bin")).unwrap(),
+        bytes_for(3, 50_000)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zip_entries_of_several_groups_download_intact() {
+    let d = temp("zip-groups");
+    let root = d.join("share/Game");
+    std::fs::create_dir_all(&root).unwrap();
+    // 1 MiB groups: 3 MiB and 2.5 MiB entries take the outboard (multi-group) path.
+    std::fs::write(root.join("a_big"), bytes_for(1, 3 << 20)).unwrap();
+    std::fs::write(root.join("b_mid"), bytes_for(2, (5 << 20) / 2)).unwrap();
+    std::fs::write(root.join("c_small"), bytes_for(3, 4_000)).unwrap();
+    let (pool, _) = host(&d).await;
+    let out = d.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    zipped(
+        Arc::new(pool),
+        "Game",
+        DownloadKind::Folder,
+        &out.join("g.zip"),
+        counters(),
+        34,
+    )
+    .await
+    .unwrap();
+    let got = zip_entries(&out.join("g.zip"));
+    let want: BTreeMap<String, Vec<u8>> = files_of(&root)
+        .into_iter()
+        .map(|(k, v)| (format!("Game/{k}"), v))
+        .collect();
+    assert_eq!(got.len(), 3);
+    assert!(got == want, "multi-group zip entries differ");
+}
