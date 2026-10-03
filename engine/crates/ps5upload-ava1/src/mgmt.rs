@@ -105,12 +105,27 @@ impl MgmtGate {
         }
     }
 
+    /// Calls currently holding a slot.
+    pub fn in_flight(&self) -> usize {
+        let (g, r) = self.available();
+        (GENERAL + RESERVED).saturating_sub(g + r)
+    }
+
     /// Free general / reserved slots (test seam).
     pub fn available(&self) -> (usize, usize) {
         (
             self.general.available_permits(),
             self.reserved.available_permits(),
         )
+    }
+}
+
+/// The text of an RPC timeout. `behind` is set when the call never got a gate slot: it
+/// queued behind that many calls instead of being slow itself (review L4).
+fn timeout_message(label: &str, timeout: Duration, behind: Option<usize>) -> String {
+    match behind {
+        Some(n) => format!("{label}: timed out after {timeout:?} waiting behind {n} calls"),
+        None => format!("{label}: timed out after {timeout:?}"),
     }
 }
 
@@ -213,14 +228,25 @@ impl AvaTransport {
         let mut busy = 0usize;
         let mut resent = false;
         loop {
+            let queued = std::sync::atomic::AtomicBool::new(false);
             let attempt = tokio::time::timeout(timeout, async {
                 let session = self.pool().session(console).await?;
+                queued.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _permit = gate.acquire(is_priority(method)).await;
+                queued.store(false, std::sync::atomic::Ordering::Relaxed);
                 session.rpc(method, body).await
             })
             .await;
             let reply = match attempt {
-                Err(_) => return Err(anyhow::anyhow!("{label}: timed out after {timeout:?}")),
+                Err(_) => {
+                    let behind = queued
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .then(|| gate.in_flight());
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        timeout_message(label, timeout, behind)
+                    ));
+                }
                 Ok(Err(e)) => {
                     let lost =
                         matches!(e, Ava1Error::Lost(_) | Ava1Error::Closed | Ava1Error::Io(_));
@@ -575,6 +601,19 @@ mod tests {
         );
         drop(held);
         assert_eq!(g.available(), (GENERAL, RESERVED));
+    }
+
+    #[tokio::test]
+    async fn a_gate_wait_timeout_says_it_waited_behind_calls() {
+        let g = MgmtGate::default();
+        let mut held = Vec::new();
+        for _ in 0..GENERAL {
+            held.push(g.acquire(false).await);
+        }
+        assert_eq!(g.in_flight(), GENERAL);
+        let m = timeout_message("HW_INFO", Duration::from_secs(30), Some(g.in_flight()));
+        assert_eq!(m, "HW_INFO: timed out after 30s waiting behind 6 calls");
+        assert!(!timeout_message("HW_INFO", Duration::from_secs(30), None).contains("behind"));
     }
 
     #[tokio::test]
