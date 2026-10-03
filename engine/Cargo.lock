@@ -2260,6 +2260,7 @@ dependencies = [
  "ftx2-proto",
  "getrandom 0.4.3",
  "mime_guess",
+ "ps5upload-ava1",
  "ps5upload-core",
  "ps5upload-fpkg",
  "ps5upload-pkg",
@@ -2308,8 +2309,12 @@ dependencies = [
  "anyhow",
  "ava1",
  "ava1-chaos",
+ "blake3",
+ "flate2",
  "ftx2-proto",
  "ps5upload-core",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

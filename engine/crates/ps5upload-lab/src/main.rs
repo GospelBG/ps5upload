@@ -31,6 +31,9 @@ use ps5upload_core::transfer::{
     inspect_zip, transfer_dir, transfer_file, transfer_zip, TransferConfig,
 };
 use ps5upload_core::volumes::list_volumes;
+use std::path::Path;
+
+mod bench;
 
 const DEFAULT_ADDR: &str = "192.168.137.2:9113";
 
@@ -491,23 +494,36 @@ mod ava1_cmds {
     use ava1::peers::PeerStore;
     use ava1::session::{connect, Session, Timing};
 
+    /// The lab's data dir — same order as the engine's data_dir(): HOME, then
+    /// USERPROFILE, overridden by PS5UPLOAD_DATA_DIR.
+    pub fn data_dir() -> PathBuf {
+        std::env::var("PS5UPLOAD_DATA_DIR")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_else(|_| ".".into());
+                PathBuf::from(home).join(".ps5upload")
+            })
+    }
+
     /// Same files the engine uses (`<data dir>/ava/`), so a lab-stamped payload trusts the engine.
     fn ava_dir() -> PathBuf {
         if let Ok(p) = std::env::var("AVA1_DIR") {
             return PathBuf::from(p);
         }
-        let base = std::env::var("PS5UPLOAD_DATA_DIR")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                // Same order as the engine's data_dir(): HOME, then USERPROFILE.
-                let home = std::env::var("HOME")
-                    .or_else(|_| std::env::var("USERPROFILE"))
-                    .unwrap_or_else(|_| ".".into());
-                PathBuf::from(home).join(".ps5upload")
-            });
-        base.join("ava")
+        data_dir().join("ava")
+    }
+
+    /// C2/A3: the default results file is `<data dir>/bench-results.jsonl` — the same
+    /// directory the engine treats as its data dir, never the repo or an implicit CWD.
+    /// Commands that record take `--out PATH` to override it.
+    // Consumed by the follow-up calibrate arm (Task 26b) and Task 27's runner.
+    #[allow(dead_code)]
+    pub fn bench_results_default() -> PathBuf {
+        data_dir().join("bench-results.jsonl")
     }
 
     fn identity() -> Result<Arc<Identity>> {
@@ -754,6 +770,127 @@ mod ava1_cmds {
     }
 }
 
+// ─── Benchmarks (Tasks 26–28) ─────────────────────────────────────────────────
+
+/// `bench-corpus DIR large GIB | tiny N | ppsa01342 [--scale F] [--from-listing FILE] [--force]`
+///
+/// A2: refuses a non-empty target directory unless `--force` (which logs what is
+/// being overwritten). Never deletes the target directory itself.
+fn do_bench_corpus(args: &[String]) -> Result<()> {
+    let dir = args.first().map(|s| s.as_str()).unwrap_or_else(|| usage());
+    let mode = args.get(1).map(|s| s.as_str()).unwrap_or_else(|| usage());
+    let mut force = false;
+    let mut scale = 1.0f64;
+    let mut scale_set = false;
+    let mut listing: Option<String> = None;
+    let mut positional: Vec<&String> = Vec::new();
+    let mut it = args[2..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--force" => force = true,
+            "--scale" => {
+                scale = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--scale needs a value"))?
+                    .parse()
+                    .context("--scale")?;
+                scale_set = true;
+            }
+            "--from-listing" => {
+                listing = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--from-listing needs a file"))?
+                        .clone(),
+                )
+            }
+            _ => positional.push(a),
+        }
+    }
+    if mode != "ppsa01342" && (scale_set || listing.is_some()) {
+        bail!("--scale and --from-listing only apply to ppsa01342");
+    }
+    let dir = Path::new(dir);
+    bench::ensure_writable_target(dir, force)?;
+    match mode {
+        "large" => {
+            let gib: u64 = positional
+                .first()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| usage());
+            bench::corpus_large(dir, gib)?;
+            println!(
+                "wrote {}/large-{gib}g.bin ({} B, BLAKE3 XOF, seed {gib})",
+                dir.display(),
+                gib << 30
+            );
+        }
+        "tiny" => {
+            let n: u64 = positional
+                .first()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| usage());
+            bench::corpus_tiny(dir, n)?;
+            println!(
+                "wrote {n} files (1–64 KiB, 64 per directory) into {}",
+                dir.display()
+            );
+        }
+        "ppsa01342" => match listing {
+            Some(f) => {
+                bench::corpus_listing(dir, Path::new(&f), scale)?;
+                println!(
+                    "reproduced the listing {f} into {} (scale {scale}; the duplicate ratio \
+                     will report undefined — a listing carries no real bytes)",
+                    dir.display()
+                );
+            }
+            None => {
+                bench::corpus_ppsa01342(dir, scale, bench::PPSA_COUNT)?;
+                println!(
+                    "wrote {} files into {} (scale {scale})",
+                    bench::PPSA_COUNT,
+                    dir.display()
+                );
+            }
+        },
+        other => bail!("unknown corpus mode: {other} (large | tiny | ppsa01342)"),
+    }
+    Ok(())
+}
+
+/// `bench-stats DIR` — files, bytes, size histogram, compressible fraction and
+/// duplicate ratio. Single-threaded by design (C13): a 223 000-file corpus reads
+/// ~15 GiB of samples and deflates them, so expect minutes, not seconds.
+fn do_bench_stats(args: &[String]) -> Result<()> {
+    let dir = args.first().map(|s| s.as_str()).unwrap_or_else(|| usage());
+    let st = bench::stats(Path::new(dir))?;
+    println!("files: {}", st.files);
+    println!("bytes: {} ({})", st.bytes, format_bytes(st.bytes));
+    println!("size histogram:");
+    for (label, n) in bench::histogram_labels().iter().zip(st.histogram.iter()) {
+        println!("  {label:<12} {n}");
+    }
+    println!(
+        "compressible_fraction: {:.4}  (byte-weighted share of sampled bytes whose \
+         deflate output is ≤ 90 %; sample = head+middle+tail 3×340 KiB for files > 1 MiB, \
+         the whole file otherwise)",
+        st.compressible_fraction
+    );
+    if st.duplicate_ratio.is_nan() {
+        println!(
+            "duplicate_ratio: undefined  (corpus reproduced from a listing — the listing \
+             carries no real bytes, so a duplicate-by-content ratio is not measurable; \
+             reported as undefined, never 0)"
+        );
+    } else {
+        println!(
+            "duplicate_ratio: {:.4}  (files < 64 KiB whose whole-file BLAKE3 repeats)",
+            st.duplicate_ratio
+        );
+    }
+    Ok(())
+}
+
 fn usage() -> ! {
     eprintln!(
         "  ava1-ping [SECONDS]            AVA1 handshake (pairs if needed), node.info, heartbeats"
@@ -763,6 +900,19 @@ fn usage() -> ! {
     eprintln!("  ava1-pairing-open [SECONDS]    let another device pair with the console");
     eprintln!("  ava1-stamp IN.elf OUT.elf      stamp this machine's AVA1 key into a payload");
     eprintln!("  chaos-proxy PORT HOST:PORT [--delay-ms N] [--kbps N] [--kill-every-s N]");
+    eprintln!("  bench-corpus DIR large GIB    one incompressible file (BLAKE3 XOF, seed = GIB)");
+    eprintln!(
+        "  bench-corpus DIR tiny N       N files of 1–64 KiB, 64 per directory (~2 % duplicates)"
+    );
+    eprintln!("  bench-corpus DIR ppsa01342 [--scale F] [--from-listing FILE] [--force]");
+    eprintln!("                                synthetic PPSA01342 shape, 223 000 files ≈ 30 GB at scale 1.0");
+    eprintln!(
+        "  bench-corpus … [--force]      refuse a non-empty target directory without --force"
+    );
+    eprintln!("  bench-stats DIR               files, bytes, size histogram, compressible fraction, duplicate");
+    eprintln!(
+        "                                ratio (single-threaded; a 223k-file corpus takes minutes)"
+    );
     eprintln!("Usage: ps5upload-lab [ADDR] COMMAND [ARGS...]");
     eprintln!("  Default ADDR: {DEFAULT_ADDR}");
     eprintln!("Commands:");
@@ -1167,6 +1317,11 @@ fn main() -> Result<()> {
                 .join(" ");
             do_shell(addr, session, cwd, &cmd)
         }
+        // Benchmarks (Tasks 26–28): synchronous, console-free. bench-corpus refuses
+        // a non-empty target without --force (A2); bench-stats is single-threaded
+        // and takes minutes on a 223k-file corpus (C13).
+        "bench-corpus" => do_bench_corpus(&rest[1..]),
+        "bench-stats" => do_bench_stats(&rest[1..]),
         cmd => bail!("unknown command: {cmd}"),
     }
 }
