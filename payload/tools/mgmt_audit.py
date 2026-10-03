@@ -7,6 +7,9 @@
                          (the capture path calls handlers with fd = -1)
   mgmt_audit.py sony     every entry whose handler can reach register/profile/registry/Remote
                          Play/notification code or a Sony API carries MGMT_SONY
+  mgmt_audit.py sonylock every entry whose handler reaches sceUserService / sceRegMgr / sys_registry_* code
+                         also reaches a function that takes sony_api_lock (CE-108262-9: those APIs must be
+                         called one at a time; AVA1 runs up to 8 management calls at once)
   mgmt_audit.py stack    no stack array of 16 KiB or more is reachable from a table handler
                          (AVA1 workers have 512 KiB, the rule is the SPEC.md section 7.3 one)
   mgmt_audit.py report   every array of 2 KiB or more reachable from each handler in
@@ -288,6 +291,20 @@ def check_sony():
     return bad
 
 
+REG_RE = re.compile(r"\b(sceUserService\w*|sceRegMgr\w*|sys_registry_\w+)\s*\(")
+LOCK_RE = re.compile(r"pthread_mutex_lock\s*\(\s*&\s*sony_api_lock\s*\)")
+
+
+def check_sonylock():
+    bad = []
+    for e in table():
+        r = reach(e["handler"])
+        touches = sorted(fn for fn in r if REG_RE.search(strip(FUNCS[fn][0])))
+        if touches and not any(LOCK_RE.search(strip(FUNCS[fn][0])) for fn in r):
+            bad.append("%s (%s) reaches %s but no function on its path takes sony_api_lock" % (e["method"], e["handler"], ", ".join(touches[:3])))
+    return bad
+
+
 def findings(handler, floor):
     out = []
     for fn in sorted(reach(handler)):
@@ -347,8 +364,8 @@ def report():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
-    checks = dict(table=check_table, recv=check_recv, sony=check_sony, stack=check_stack, report=report, selftest=selftest)
-    todo = ["table", "recv", "sony", "stack"] if cmd == "all" else [cmd]
+    checks = dict(table=check_table, recv=check_recv, sony=check_sony, sonylock=check_sonylock, stack=check_stack, report=report, selftest=selftest)
+    todo = ["table", "recv", "sony", "sonylock", "stack"] if cmd == "all" else [cmd]
     failed = 0
     for c in todo:
         for line in checks[c]():

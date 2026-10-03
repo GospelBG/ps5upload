@@ -10,6 +10,7 @@ use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
 use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -132,19 +133,9 @@ pub fn toast_send(addr: &str, req: &ToastRequest) -> Result<ToastSendAck> {
         "useIconImageUri": !req.icon.is_empty(),
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::ToastSend, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected TOAST_SEND: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::ToastSendAck {
-        bail!("expected TOAST_SEND_ACK, got {ft:?}");
-    }
+    // toast.send: over 4 KiB the payload answers ERR_PROTOCOL "body_too_large" (a refusal, an error here);
+    // `{"ok":false,"code":N}` (daemon offline) comes back as the body, as FTX2 delivered it.
+    let resp = mgmt::call_keep(addr, m::TOAST_SEND, "TOAST_SEND", &body)?;
     let parsed: ToastSendAck = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(

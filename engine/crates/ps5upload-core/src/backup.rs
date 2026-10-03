@@ -7,10 +7,11 @@
 //! back to its original path.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
 use crate::connection::Connection;
+use crate::mgmt::{self, m};
+use ftx2_proto::FrameType;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupSnapshotResult {
@@ -107,20 +108,13 @@ pub fn backup_snapshot(addr: &str, tag: &str, path: &str) -> Result<BackupSnapsh
 }
 
 pub fn backup_list(addr: &str, tag: &str) -> Result<BackupList> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::json!({ "tag": tag });
-    c.send_frame(FrameType::BackupList, &serde_json::to_vec(&body)?)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected BACKUP_LIST: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::BackupListAck {
-        bail!("expected BACKUP_LIST_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(
+        addr,
+        m::BACKUP_LIST,
+        "BACKUP_LIST",
+        &serde_json::to_vec(&body)?,
+    )?;
     let parsed: BackupList = serde_json::from_slice(&resp)?;
     Ok(parsed)
 }
@@ -157,20 +151,13 @@ pub fn backup_restore(addr: &str, tag: &str, timestamp: i64) -> Result<BackupRes
 
 pub fn backup_delete(addr: &str, tag: &str, timestamp: i64) -> Result<()> {
     validate_tag(tag)?;
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::json!({ "tag": tag, "timestamp": timestamp });
-    c.send_frame(FrameType::BackupDelete, &serde_json::to_vec(&body)?)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected BACKUP_DELETE: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::BackupDeleteAck {
-        bail!("expected BACKUP_DELETE_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(
+        addr,
+        m::BACKUP_DELETE,
+        "BACKUP_DELETE",
+        &serde_json::to_vec(&body)?,
+    )?;
     let parsed: BackupDeleteResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(

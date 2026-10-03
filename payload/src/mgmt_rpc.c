@@ -166,8 +166,15 @@ int mgmt_legacy_failure(const char *body, size_t len, char *token, size_t token_
 
 /* ---- calling a legacy handler ---- */
 
-int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
-                     mgmt_reply_t *rep) {
+/* How a captured frame is read: MODE_RAW = the body is data (a log, file bytes), never a
+ * {"ok":false} failure; MODE_KEEP = a failure's whole body is the error cause (the caller needs its
+ * fields: net.reach's errno and timed_out, a mount's code). */
+#define MODE_RAW 1u
+#define MODE_KEEP 2u
+#define MGMT_KEEP_MAX 1024u
+
+static int legacy_call_ex(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
+                          mgmt_reply_t *rep, unsigned mode) {
     capture_t c;
     char *rq, token[MGMT_CAUSE_MAX + 1];
     int rc;
@@ -202,15 +209,30 @@ int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t 
         free(c.buf);
         return st;
     }
-    if (mgmt_legacy_failure((const char *)c.buf, c.len, token, sizeof token)) {
+    if (!(mode & MODE_RAW) && mgmt_legacy_failure((const char *)c.buf, c.len, token, sizeof token)) {
         int st = mgmt_status_for_token(token);
-        mgmt_reply_error(cx, st, token);
+        if (mode & MODE_KEEP) {
+            size_t n = c.len < MGMT_KEEP_MAX && c.len <= cx->cap ? c.len : 0;
+            if (n) {
+                memcpy(cx->out, c.buf, n);
+                cx->out_len = n;
+            } else {
+                mgmt_reply_error(cx, st, token);
+            }
+        } else {
+            mgmt_reply_error(cx, st, token);
+        }
         free(c.buf);
         return st;
     }
     rep->body = c.buf;
     rep->len = c.len;
     return AVA1_STATUS_OK;
+}
+
+int mgmt_legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
+                     mgmt_reply_t *rep) {
+    return legacy_call_ex(cx, fn, req, req_len, capture_cap, rep, 0);
 }
 
 /* The text capacity this call can carry: the reply buffer minus the MgmtText encoding. */
@@ -249,6 +271,21 @@ int mgmt_text_call(mgmt_ctx_t *cx, const uint8_t *req, uint32_t req_len, mgmt_le
 
 int mgmt_call_text(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn) {
     return mgmt_text_call(cx, req, n, fn, 1);
+}
+
+/* A MgmtText method whose failure body is data the caller needs: the whole {"ok":false,...} body is
+ * the error cause (status from its "err" token). net.reach: errno/timed_out/ms; mounts: code. */
+int mgmt_call_text_keep(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn) {
+    const char *b;
+    uint32_t bl;
+    mgmt_reply_t rep;
+    int rc;
+    if ((rc = text_request(cx, req, n, &b, &bl)) != AVA1_STATUS_OK) return rc;
+    rc = legacy_call_ex(cx, fn, b, bl, text_cap(cx), &rep, MODE_KEEP);
+    if (rc != AVA1_STATUS_OK) return rc;
+    rc = mgmt_reply_text(cx, (const char *)rep.body, rep.len, -1);
+    mgmt_reply_free(&rep);
+    return rc;
 }
 
 /* A paged text method: the request body is {"offset":N,"limit":M} (both optional); the reply

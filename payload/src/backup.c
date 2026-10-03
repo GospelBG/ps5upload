@@ -74,13 +74,22 @@ static int copy_file(const char *src, const char *dst) {
         close(sfd);
         return -1;
     }
-    char buf[64 * 1024];
+    /* On the heap, not the stack: profile.apply_avatar and the SMP meta handler reach this on an AVA1
+     * management worker next to Sony calls (mgmt_audit.py stack). */
+    char *buf = malloc(64 * 1024);
+    if (!buf) {
+        close(sfd);
+        close(dfd);
+        unlink(dst);
+        return -1;
+    }
     ssize_t n;
-    while ((n = read(sfd, buf, sizeof(buf))) > 0) {
+    while ((n = read(sfd, buf, 64 * 1024)) > 0) {
         ssize_t off = 0;
         while (off < n) {
             ssize_t w = write(dfd, buf + off, n - off);
             if (w <= 0) {
+                free(buf);
                 close(sfd);
                 close(dfd);
                 unlink(dst);
@@ -89,6 +98,7 @@ static int copy_file(const char *src, const char *dst) {
             off += w;
         }
     }
+    free(buf);
     fsync(dfd);
     close(sfd);
     close(dfd);

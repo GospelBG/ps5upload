@@ -5,11 +5,10 @@
 //! files from GitHub repositories (etaHEN/PS5_Cheats, GoldHEN, etc.)
 //! and installs them to the PS5 filesystem.
 
-use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m, Method};
 
 #[cfg(not(target_os = "android"))]
 use std::io::Read;
@@ -100,34 +99,14 @@ pub struct CheatsEngineSetResponse {
     pub enabled: bool,
 }
 
-/// Helper: send a frame and expect an ACK of the given type.
-fn send_recv(
-    addr: &str,
-    req_type: FrameType,
-    ack_type: FrameType,
-    body: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    let mut c = Connection::connect(addr)?;
-    let empty: Vec<u8> = Vec::new();
-    let body = body.unwrap_or(&empty);
-    c.send_frame(req_type, body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected {:?}: {}",
-            req_type,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != ack_type {
-        bail!("expected {:?}, got {ack_type:?}", ack_type);
-    }
-    Ok(resp)
+fn send_recv(addr: &str, method: Method, label: &str, body: Option<&[u8]>) -> Result<Vec<u8>> {
+    // The handler's `{"ok":false,...}` bodies carry data the callers read; call_keep gives them back
+    // as the FTX2 path did, and leaves a plain refusal an error ("payload rejected <label>: <cause>").
+    mgmt::call_keep(addr, method, label, body.unwrap_or(&[]))
 }
 
 pub fn cheats_list(addr: &str) -> Result<CheatsListResponse> {
-    let resp = send_recv(addr, FrameType::CheatsList, FrameType::CheatsListAck, None)?;
+    let resp = send_recv(addr, m::CHEATS_LIST, "CheatsList", None)?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -135,8 +114,8 @@ pub fn cheats_get(addr: &str, title_id: &str) -> Result<CheatsGetResponse> {
     let body = serde_json::json!({ "title_id": title_id });
     let resp = send_recv(
         addr,
-        FrameType::CheatsGet,
-        FrameType::CheatsGetAck,
+        m::CHEATS_GET,
+        "CheatsGet",
         Some(&serde_json::to_vec(&body)?),
     )?;
     Ok(serde_json::from_slice(&resp)?)
@@ -155,8 +134,8 @@ pub fn cheats_toggle(
     };
     let resp = send_recv(
         addr,
-        FrameType::CheatsToggle,
-        FrameType::CheatsToggleAck,
+        m::CHEATS_TOGGLE,
+        "CheatsToggle",
         Some(&serde_json::to_vec(&req)?),
     )?;
     Ok(serde_json::from_slice(&resp)?)
@@ -166,8 +145,8 @@ pub fn cheats_delete(addr: &str, title_id: &str) -> Result<bool> {
     let body = serde_json::json!({ "title_id": title_id });
     let resp = send_recv(
         addr,
-        FrameType::CheatsDelete,
-        FrameType::CheatsDeleteAck,
+        m::CHEATS_DELETE,
+        "CheatsDelete",
         Some(&serde_json::to_vec(&body)?),
     )?;
     let v: serde_json::Value = serde_json::from_slice(&resp)?;
@@ -175,23 +154,13 @@ pub fn cheats_delete(addr: &str, title_id: &str) -> Result<bool> {
 }
 
 pub fn cheats_reload(addr: &str) -> Result<bool> {
-    let resp = send_recv(
-        addr,
-        FrameType::CheatsReload,
-        FrameType::CheatsReloadAck,
-        None,
-    )?;
+    let resp = send_recv(addr, m::CHEATS_RELOAD, "CheatsReload", None)?;
     let v: serde_json::Value = serde_json::from_slice(&resp)?;
     Ok(v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false))
 }
 
 pub fn cheats_status(addr: &str) -> Result<CheatsStatusResponse> {
-    let resp = send_recv(
-        addr,
-        FrameType::CheatsStatus,
-        FrameType::CheatsStatusAck,
-        None,
-    )?;
+    let resp = send_recv(addr, m::CHEATS_STATUS, "CheatsStatus", None)?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -199,8 +168,8 @@ pub fn cheats_engine_set(addr: &str, enabled: bool) -> Result<CheatsEngineSetRes
     let req = CheatsEngineSetRequest { enabled };
     let resp = send_recv(
         addr,
-        FrameType::CheatsEngineSet,
-        FrameType::CheatsEngineSetAck,
+        m::CHEATS_ENGINE_SET,
+        "CheatsEngineSet",
         Some(&serde_json::to_vec(&req)?),
     )?;
     Ok(serde_json::from_slice(&resp)?)

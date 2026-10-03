@@ -97,6 +97,9 @@ pub struct PeripheralAck {
     pub err: Option<String>,
 }
 
+/// The longest a `shell.exec` call may take (AVA1 plan: bounded to 10 s).
+pub const SHELL_MAX_SECS: u64 = 10;
+
 /// Send a peripheral-control action. `port` only matters for
 /// `UsbPortOff` / `UsbPortOn`; ignored otherwise.
 pub fn peripheral_control(
@@ -115,19 +118,7 @@ pub fn peripheral_control(
         "port": port,
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::PeripheralControl, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected PERIPHERAL_CONTROL: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::PeripheralControlAck {
-        bail!("expected PERIPHERAL_CONTROL_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::PERIPH_CONTROL, "PERIPHERAL_CONTROL", &body)?;
     let parsed: PeripheralAck = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(
@@ -190,19 +181,16 @@ pub fn shell_run(
         "timeout_secs": timeout_secs,
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::ShellExec, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected SHELL_RUN: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::ShellExecAck {
-        bail!("expected SHELL_RUN ack, got {ft:?}");
-    }
+    // Bounded: the call's deadline is the shell's own timeout, never more than 10 s (the payload runs
+    // an allowlisted built-in only and answers at most 32 KiB, with "truncated":true past that).
+    let deadline = std::time::Duration::from_secs(u64::from(timeout_secs).clamp(1, SHELL_MAX_SECS));
+    let resp = mgmt::keep_body(mgmt::call_with(
+        addr,
+        m::SHELL_EXEC,
+        "SHELL_RUN",
+        &body,
+        Some(deadline),
+    ))?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
