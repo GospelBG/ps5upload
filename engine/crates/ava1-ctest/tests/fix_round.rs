@@ -152,6 +152,11 @@ fn big_data(n: usize) -> Vec<u8> {
 /// Fix brief, Important 1: a session that ends while a JobOpen's work is still delayed
 /// must leave the job parked (never attached to the dead session), and the reaper then
 /// collects it after the shortened park age.
+///
+/// Regression guard only: this also passes against the pre-fix code (the pre-fix open
+/// already parked on E_CLOSED once the delayed send failed), so it guards the end-to-end
+/// outcome. The red-first evidence for the park-on-session-end fix lives in
+/// `an_open_ack_send_failure_parks_the_job` and `a_job_whose_feeder_cannot_start_is_parked`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_ending_during_a_delayed_open_parks_and_reaps_the_job() {
     bounded(async {
