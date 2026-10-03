@@ -4280,8 +4280,9 @@ pub use rar_support::{
     inspect_rar, rar_plan_entries_for_test, rar_plan_preview, spawn_rar_worker_for_test,
     transfer_rar_resumable, transfer_rar_streaming,
 };
-#[cfg(not(target_os = "android"))]
 pub(crate) use rar_support::{rar_dirs, rar_plan_entries, spawn_rar_worker};
+#[cfg(not(target_os = "android"))]
+pub use rar_support::{rar_layout, rar_walk, RarFailKind, RarLayout, RarWalkError, RarWalkSink};
 
 #[cfg(not(target_os = "android"))]
 mod rar_support {
@@ -4776,6 +4777,255 @@ mod rar_support {
         });
 
         (rx, handle)
+    }
+
+    /// What an archive holds, in archive order, for the AVA1 source.
+    #[derive(Debug, Clone)]
+    pub struct RarLayout {
+        /// Extractable files (sanitised path, unpacked size), archive order.
+        pub files: Vec<(String, u64)>,
+        /// Directory entries, sanitised.
+        pub dirs: Vec<String>,
+        /// A solid archive cannot skip an entry without decoding it.
+        pub solid: bool,
+    }
+
+    /// One header pass: files, dirs and the solid flag. Never decodes.
+    pub fn rar_layout(
+        archive_path: &Path,
+        password: Option<&str>,
+        excludes: &[String],
+    ) -> Result<RarLayout> {
+        let path_str = archive_path.to_string_lossy().into_owned();
+        let opened = match password {
+            Some(pw) => Archive::with_password(&path_str, pw).open_for_listing(),
+            None => Archive::new(&path_str).open_for_listing(),
+        }
+        .map_err(|e| map_rar_open_err(&path_str, "open rar", e))?;
+        let solid = opened.is_solid();
+        let (mut files, mut dirs) = (Vec::new(), Vec::new());
+        for entry in opened {
+            let e = entry.map_err(|e| map_rar_err("read rar header", e))?;
+            let Some(rel) = sanitize_rar_entry(&e.filename) else {
+                bail!(
+                    "rar contains an unsafe or invalid entry path: {:?}",
+                    e.filename
+                );
+            };
+            if e.is_directory() {
+                dirs.push(rel);
+                continue;
+            }
+            if !excludes.is_empty()
+                && crate::excludes::is_excluded_strings(Path::new(&rel), excludes)
+            {
+                continue;
+            }
+            files.push((rel, e.unpacked_size));
+        }
+        Ok(RarLayout { files, dirs, solid })
+    }
+
+    /// Why a RAR could not be read, in terms a caller can act on.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RarFailKind {
+        PasswordRequired,
+        PasswordWrong,
+        /// Damaged data: a bad CRC, a truncated stream, a broken header.
+        Corrupt,
+        MissingVolume,
+        Other,
+    }
+
+    #[derive(Debug)]
+    pub enum RarWalkError {
+        /// `cancel` was raised.
+        Cancelled,
+        /// The sink refused a call; its error, unchanged.
+        Sink(std::io::Error),
+        Failed {
+            kind: RarFailKind,
+            message: String,
+        },
+    }
+
+    /// Receives the entries a [`rar_walk`] delivers.
+    pub trait RarWalkSink {
+        /// Called for every file entry in header order, including those before
+        /// `start`; false stops the walk (the caller reports why).
+        fn visit(&mut self, ordinal: u64, path: &str) -> bool;
+        /// Whether to deliver the entry at archive-order file ordinal `ordinal`
+        /// (false: skip it; a non-solid archive does not decode it).
+        fn want(&mut self, ordinal: u64, path: &str, size: u64) -> bool;
+        fn begin(&mut self, path: &str) -> std::io::Result<()>;
+        fn data(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+        fn end(&mut self) -> std::io::Result<()>;
+    }
+
+    fn classify(e: &UnrarError, encrypted_with_password: bool) -> RarFailKind {
+        match e.code {
+            RarCode::MissingPassword => RarFailKind::PasswordRequired,
+            RarCode::BadPassword => RarFailKind::PasswordWrong,
+            // UnRAR reports a wrong password on a content-encrypted entry as a
+            // CRC error; with a password given that is what it means.
+            RarCode::BadData if encrypted_with_password => RarFailKind::PasswordWrong,
+            RarCode::BadData
+            | RarCode::BadArchive
+            | RarCode::UnknownFormat
+            | RarCode::ERead
+            | RarCode::EReference => RarFailKind::Corrupt,
+            _ => RarFailKind::Other,
+        }
+    }
+
+    fn walk_fail(path: &str, ctx: &str, e: UnrarError, enc_pw: bool) -> RarWalkError {
+        let mut kind = classify(&e, enc_pw);
+        let message = if kind == RarFailKind::Other {
+            // A missing volume surfaces as a generic open failure.
+            let on_disk = |p: &str| std::path::Path::new(p).exists();
+            if let Some(missing) = missing_volume(path, &on_disk) {
+                kind = RarFailKind::MissingVolume;
+                format!("rar_missing_volume: {missing}")
+            } else {
+                format!("{ctx}: {e}")
+            }
+        } else {
+            match kind {
+                RarFailKind::PasswordRequired => "rar_password_required".to_string(),
+                RarFailKind::PasswordWrong => "rar_password_wrong".to_string(),
+                _ => format!("{ctx}: {e}"),
+            }
+        };
+        RarWalkError::Failed { kind, message }
+    }
+
+    /// One forward pass over the archive on the calling thread (no worker, no
+    /// channel): the sink is called as UnRAR produces data, and `cancel` is polled
+    /// on every piece UnRAR hands over (at most a few MiB of output apart) and
+    /// between entries. Entries with ordinal below `start`, and entries the sink
+    /// does not `want`, are skipped: a non-solid archive seeks past them, a solid
+    /// one decodes and discards them (it must, to stay aligned) but still polls
+    /// `cancel`, so a stop never waits out a long skip.
+    ///
+    /// The password is used only to open the archive; it is never logged or put in
+    /// an error message.
+    pub fn rar_walk(
+        archive_path: &Path,
+        password: Option<&str>,
+        excludes: &[String],
+        start: u64,
+        sink: &mut dyn RarWalkSink,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> std::result::Result<(), RarWalkError> {
+        use std::sync::atomic::Ordering;
+        let path_str = archive_path.to_string_lossy().into_owned();
+        let cancelled = || cancel.load(Ordering::Relaxed);
+        let opened = match password {
+            Some(pw) => Archive::with_password(&path_str, pw).open_for_processing(),
+            None => Archive::new(&path_str).open_for_processing(),
+        };
+        let mut open = opened.map_err(|e| walk_fail(&path_str, "open rar", e, false))?;
+        let solid = open.is_solid();
+        let mut ordinal = 0u64;
+        loop {
+            if cancelled() {
+                return Err(RarWalkError::Cancelled);
+            }
+            let header = match open.read_header() {
+                Ok(Some(h)) => h,
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(walk_fail(&path_str, "read rar header", e, false)),
+            };
+            let name = header.entry().filename.clone();
+            let size = header.entry().unpacked_size;
+            let is_dir = header.entry().is_directory();
+            let encrypted = header.entry().is_encrypted();
+            let Some(rel) = sanitize_rar_entry(&name) else {
+                return Err(RarWalkError::Failed {
+                    kind: RarFailKind::Other,
+                    message: format!("rar contains an unsafe entry path: {name:?}"),
+                });
+            };
+            let excluded = !excludes.is_empty()
+                && crate::excludes::is_excluded_strings(Path::new(&rel), excludes);
+            if is_dir || excluded {
+                open = header
+                    .skip()
+                    .map_err(|e| walk_fail(&path_str, "skip rar entry", e, false))?;
+                continue;
+            }
+            let this = ordinal;
+            ordinal += 1;
+            if !sink.visit(this, &rel) {
+                return Err(RarWalkError::Failed {
+                    kind: RarFailKind::Other,
+                    message: format!("rar entry {rel:?} is out of the listed order"),
+                });
+            }
+            let deliver = this >= start && sink.want(this, &rel, size);
+            if !deliver && !solid {
+                open = header
+                    .skip()
+                    .map_err(|e| walk_fail(&path_str, "skip rar entry", e, false))?;
+                continue;
+            }
+            if deliver {
+                sink.begin(&rel).map_err(RarWalkError::Sink)?;
+            }
+            let mut got = 0u64;
+            let mut sink_err: Option<std::io::Error> = None;
+            let mut overrun = false;
+            let result = header.read_to_fn(&mut |bytes: &[u8]| {
+                if cancelled() {
+                    return false;
+                }
+                got += bytes.len() as u64;
+                if got > size {
+                    overrun = true;
+                    return false;
+                }
+                if deliver {
+                    if let Err(e) = sink.data(bytes) {
+                        sink_err = Some(e);
+                        return false;
+                    }
+                }
+                true
+            });
+            if let Some(e) = sink_err {
+                return Err(RarWalkError::Sink(e));
+            }
+            if cancelled() {
+                return Err(RarWalkError::Cancelled);
+            }
+            if overrun {
+                return Err(RarWalkError::Failed {
+                    kind: RarFailKind::Corrupt,
+                    message: format!(
+                        "rar entry {rel:?} produced more bytes than its header declared"
+                    ),
+                });
+            }
+            open = result.map_err(|e| {
+                walk_fail(
+                    &path_str,
+                    "extract rar entry",
+                    e,
+                    encrypted && password.is_some(),
+                )
+            })?;
+            if got != size {
+                return Err(RarWalkError::Failed {
+                    kind: RarFailKind::Corrupt,
+                    message: format!(
+                        "rar entry {rel:?} produced {got} bytes but its header declared {size}"
+                    ),
+                });
+            }
+            if deliver {
+                sink.end().map_err(RarWalkError::Sink)?;
+            }
+        }
     }
 
     /// Test-only shim: archive-order entries, for harnesses that need to
