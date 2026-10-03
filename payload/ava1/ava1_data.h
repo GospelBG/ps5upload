@@ -2,6 +2,7 @@
 #ifndef AVA1_DATA_H
 #define AVA1_DATA_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "ava1_job.h"
@@ -31,6 +32,26 @@ void ava1_data_stop(void);                         /* stops and frees every job 
 const ava1_data_cfg_t *ava1_data_cfg(void);
 uint64_t ava1_budget_take(uint64_t want, uint64_t min); /* grants up to want, 0 if < min free */
 void ava1_budget_give(uint64_t n);
+/* Open-file budget (derived from RLIMIT_NOFILE at ava1_data_start: soft limit - 128, 512
+ * when unreadable). The apply engine's pending small-file descriptors, all jobs together,
+ * stay within ava1_pend_share() (half of it); disk.calibrate holds at most that many. */
+uint32_t ava1_fd_budget(void);
+uint32_t ava1_pend_share(void);
+/* Waits until a pending-fd slot is free, then takes it (before the open). Gives up (0) when
+ * `stop` is set; `idle` runs between polls (the apply engine runs queued sync work there).
+ * 1 = slot taken. */
+int ava1_pend_reserve(int (*stopping)(void *), void (*idle)(void *), void *arg);
+void ava1_pend_release(uint32_t n);
+int ava1_pend_full(void);  /* the global pending-fd count has reached its share */
+/* Tests only: 0 = derive from the limit; else forces the budget. Peaks are high-water marks
+ * since the last reset. */
+extern uint32_t ava1_data_test_fd_budget;
+uint32_t ava1_pend_peak(void);
+void ava1_pend_peak_reset(void);
+extern uint32_t ava1_data_test_cal_peak; /* most fds disk.calibrate held at once */
+/* Writes a failure's cause into an RPC reply body (sent with the error status). */
+void ava1_rpc_msg(uint8_t *out, size_t cap, size_t *out_len, const char *fmt, ...);
+
 /* Runs fn(arg) on a short-lived detached thread that ava1_data_stop waits for. 0 or -1. */
 int ava1_data_spawn(void *(*fn)(void *), void *arg);
 

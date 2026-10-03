@@ -206,6 +206,7 @@ static void job_destroy(ava1_job_t *j) {
         free(w);
     }
     for (i = 0; i < j->pend_n; i++) close(j->pend_fd[i]);
+    ava1_pend_release(j->pend_n);
     free(j->pend_small);
     free(j->pend_fd);
     free(j->last_ranges);

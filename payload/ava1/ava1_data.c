@@ -1,6 +1,8 @@
 #include "ava1_data.h"
 
 #include <errno.h>
+#include <stdarg.h>
+#include <sys/resource.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,6 +107,94 @@ static void *house_main(void *arg) {
     return NULL;
 }
 
+uint32_t ava1_data_test_fd_budget;
+uint32_t ava1_data_test_cal_peak;
+static uint32_t g_fd_budget = 512 - 128;
+static uint32_t g_pend_open, g_pend_peak;
+static int g_fd_logged;
+
+static void fd_limit_init(void) {
+    struct rlimit rl;
+    uint64_t soft = 512;
+    int have = getrlimit(RLIMIT_NOFILE, &rl) == 0;
+    if (have) {
+        rlim_t hard = rl.rlim_max, want = rl.rlim_cur;
+        if (!g_fd_logged)
+            fprintf(stderr, "[ava1] RLIMIT_NOFILE soft=%llu hard=%llu\n", (unsigned long long)rl.rlim_cur,
+                    (unsigned long long)rl.rlim_max);
+        {
+            struct rlimit up = rl;
+            up.rlim_cur = hard > 65536 ? 65536 : hard;
+            if (up.rlim_cur > rl.rlim_cur) {
+                int ok = setrlimit(RLIMIT_NOFILE, &up) == 0;
+                if (ok) want = up.rlim_cur;
+                if (!g_fd_logged)
+                    fprintf(stderr, "[ava1] raising RLIMIT_NOFILE soft to %llu: %s\n", (unsigned long long)up.rlim_cur,
+                            ok ? "ok" : strerror(errno));
+            }
+        }
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) want = rl.rlim_cur;
+        soft = want == RLIM_INFINITY || want > 1000000 ? 1000000 : (uint64_t)want;
+    } else if (!g_fd_logged) {
+        fprintf(stderr, "[ava1] getrlimit(RLIMIT_NOFILE) failed: %s; assuming 512\n", strerror(errno));
+    }
+    g_fd_budget = soft > 144 ? (uint32_t)(soft - 128) : 16;
+    if (!g_fd_logged) fprintf(stderr, "[ava1] open-file budget %u\n", g_fd_budget);
+    g_fd_logged = 1;
+}
+
+uint32_t ava1_fd_budget(void) {
+    uint32_t t = __atomic_load_n(&ava1_data_test_fd_budget, __ATOMIC_SEQ_CST);
+    return t ? t : g_fd_budget;
+}
+
+uint32_t ava1_pend_share(void) {
+    uint32_t s = ava1_fd_budget() / 2;
+    return s < 4 ? 4 : s;
+}
+
+int ava1_pend_full(void) { return __atomic_load_n(&g_pend_open, __ATOMIC_SEQ_CST) >= ava1_pend_share(); }
+
+int ava1_pend_reserve(int (*stopping)(void *), void (*idle)(void *), void *arg) {
+    for (;;) {
+        uint32_t cur = __atomic_load_n(&g_pend_open, __ATOMIC_SEQ_CST);
+        while (cur < ava1_pend_share()) {
+            if (__atomic_compare_exchange_n(&g_pend_open, &cur, cur + 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                uint32_t pk = __atomic_load_n(&g_pend_peak, __ATOMIC_SEQ_CST);
+                while (cur + 1 > pk &&
+                       !__atomic_compare_exchange_n(&g_pend_peak, &pk, cur + 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
+                return 1;
+            }
+        }
+        if (stopping && stopping(arg)) return 0;
+        if (idle) idle(arg);
+        else ava1_platform_sleep_ms(2);
+    }
+}
+
+void ava1_pend_release(uint32_t n) {
+    uint32_t cur = __atomic_load_n(&g_pend_open, __ATOMIC_SEQ_CST);
+    while (n) {
+        uint32_t take = cur < n ? cur : n;
+        if (__atomic_compare_exchange_n(&g_pend_open, &cur, cur - take, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;
+    }
+}
+
+uint32_t ava1_pend_peak(void) { return __atomic_load_n(&g_pend_peak, __ATOMIC_SEQ_CST); }
+void ava1_pend_peak_reset(void) { __atomic_store_n(&g_pend_peak, __atomic_load_n(&g_pend_open, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST); }
+
+void ava1_rpc_msg(uint8_t *out, size_t cap, size_t *out_len, const char *fmt, ...) {
+    va_list ap;
+    int n;
+    *out_len = 0;
+    if (!cap) return;
+    va_start(ap, fmt);
+    n = vsnprintf((char *)out, cap, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    *out_len = (size_t)n >= cap ? cap - 1 : (size_t)n;
+}
+
 int ava1_data_start(const ava1_data_cfg_t *cfg) {
     if (D.running) return -EBUSY; /* one housekeeping thread; a second start changes nothing */
     D.cfg = *cfg;
@@ -119,6 +209,9 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     if (D.cfg.workers_start < D.cfg.workers_min) D.cfg.workers_start = D.cfg.workers_min;
     if (!D.cfg.cutoff) D.cfg.cutoff = 256u << 10;
     D.budget_free = D.cfg.budget;
+    fd_limit_init();
+    __atomic_store_n(&g_pend_open, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&ava1_data_test_fd_budget, 0, __ATOMIC_SEQ_CST);
     D.admitted = 0;
     ava1_data_test_open_delay_ms = ava1_data_test_map_delay_ms = ava1_data_test_feed_delay_ms = 0;
     ava1_data_test_open_work_delay_ms = 0;

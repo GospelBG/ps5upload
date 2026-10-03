@@ -1553,6 +1553,11 @@ int ava1_test_data_knob(const char *name, uint32_t v) {
     else if (!strcmp(name, "send_fail")) __atomic_store_n(&ava1_send_test_fail_sends, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "writer_start_fail"))
         __atomic_store_n(&ava1_send_test_fail_writer_starts, v, __ATOMIC_SEQ_CST);
+    else if (!strcmp(name, "fd_budget")) __atomic_store_n(&ava1_data_test_fd_budget, v, __ATOMIC_SEQ_CST);
+    else if (!strcmp(name, "fd_peak_reset")) {
+        ava1_pend_peak_reset();
+        __atomic_store_n(&ava1_data_test_cal_peak, 0, __ATOMIC_SEQ_CST);
+    }
     else if (!strcmp(name, "chunk_bytes")) __atomic_store_n(&ava1_send_test_chunk_bytes, v, __ATOMIC_SEQ_CST);
     else return -1;
     return 0;
@@ -1590,6 +1595,9 @@ int ava1_test_retiring_blocks_reopen(void) {
     ava1_data_stop();
     return rc;
 }
+
+/* Tests: high-water marks of open pending fds (apply) and calibrate-held fds. */
+uint32_t ava1_test_fd_peak(int which) { return which ? __atomic_load_n(&ava1_data_test_cal_peak, __ATOMIC_SEQ_CST) : ava1_pend_peak(); }
 
 /* Chunk bytes the download sender has queued since the counter was last set (knob
  * "chunk_bytes"). */

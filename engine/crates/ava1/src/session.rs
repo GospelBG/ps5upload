@@ -318,7 +318,10 @@ impl Session {
         if reply.status != gen::STATUS_OK {
             return Err(Ava1Error::Refused {
                 code: reply.status,
-                message: "disk.calibrate failed".into(),
+                message: match String::from_utf8(reply.body) {
+                    Ok(m) if !m.is_empty() => m,
+                    _ => "disk.calibrate failed".into(),
+                },
             });
         }
         Ok(gen::DiskCalibrateResult::decode(&reply.body)?.points)

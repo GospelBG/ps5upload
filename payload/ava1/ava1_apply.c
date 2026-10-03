@@ -571,6 +571,39 @@ static int write_chunk(ava1_job_t *j, uint32_t id, uint64_t off, const uint8_t *
     return 0;
 }
 
+/* The open-file budget (ava1_data.h): a slot is taken before a small file is opened and given
+ * back once its fd is closed. While the share is used up, a worker runs queued sync stripes
+ * (the batch that frees slots needs workers) or waits; the job thread syncs early (pend_full). */
+static int pend_gate_stopping(void *a) {
+    ava1_job_t *j = a;
+    int st;
+    pthread_mutex_lock(&j->mu);
+    st = j->stopping;
+    pthread_mutex_unlock(&j->mu);
+    return st;
+}
+
+static void pend_gate_idle(void *a) {
+    ava1_job_t *j = a;
+    ava1_work_t *w;
+    pthread_mutex_lock(&j->mu);
+    w = j->q_head;
+    if (w && w->kind == AVA1_W_CALL) {
+        j->q_head = w->next;
+        if (!j->q_head) j->q_tail = NULL;
+        j->q_len--;
+        pthread_mutex_unlock(&j->mu);
+        w->fn(j, w->arg, w->i);
+        pthread_mutex_lock(&j->mu);
+        if (--j->calls_left == 0) pthread_cond_broadcast(&j->cv);
+        free(w);
+        pthread_mutex_unlock(&j->mu);
+    } else {
+        pthread_mutex_unlock(&j->mu);
+        ava1_platform_sleep_ms(2);
+    }
+}
+
 /* Small files wait here (holding their fd) until a sync batch covers them. */
 static void pend_add(ava1_job_t *j, uint32_t id, int fd) {
     pthread_mutex_lock(&j->mu);
@@ -603,6 +636,7 @@ static void pend_add(ava1_job_t *j, uint32_t id, int fd) {
         j->pend_fd[j->pend_n++] = fd;
     } else {
         close(fd); /* out of memory: the file will be in no batch and is sent again on resume */
+        ava1_pend_release(1);
     }
     pthread_mutex_unlock(&j->mu);
 }
@@ -635,11 +669,17 @@ static int apply_record(ava1_job_t *j, const ava1_bundle_record_t *r) {
     for (fd = 0; !rc && (uint32_t)fd < j->pend_n; fd++) rc = j->pend_small[fd] == r->file_id;
     pthread_mutex_unlock(&j->mu);
     if (rc) return 0;
+    if (!ava1_pend_reserve(pend_gate_stopping, pend_gate_idle, j)) return 0; /* stopping */
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0 && errno == ENOENT && mkparents(path) == 0) fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-    if (fd < 0) return -errno;
+    if (fd < 0) {
+        rc = -errno;
+        ava1_pend_release(1);
+        return rc;
+    }
     if ((rc = write_all(fd, r->data, r->data_len)) != 0) {
         close(fd);
+        ava1_pend_release(1);
         return rc;
     }
     (void)fchmod(fd, (mode_t)(e->mode & 07777));
@@ -968,6 +1008,7 @@ static void sync_batch(ava1_job_t *j) {
     j->bytes_durable += new_bytes;
     pthread_mutex_unlock(&j->mu);
     for (i = 0; i < n_small; i++) close(sfds[i]);
+    ava1_pend_release(n_small);
     n_small = 0;
     if (nr || ng) emit_durable(j, runs, nr, rg, ng);
     if (ava1_jnl_len(&j->jnl) > AVA1_JNL_COMPACT_AT) ava1_apply_compact(j);
@@ -979,6 +1020,7 @@ static void sync_batch(ava1_job_t *j) {
     }
 out:
     for (i = 0; i < n_small; i++) close(sfds[i]);
+    ava1_pend_release(n_small);
     free(ids);
     free(sfds);
     free(l.fds);
@@ -1289,6 +1331,7 @@ void ava1_apply_quiesce(ava1_job_t *j) {
         int sync = j->pend_n != 0, can = j->prepared && !j->finished && !j->final_status;
         if (sync && !can) {
             for (i = 0; i < j->pend_n; i++) close(j->pend_fd[i]); /* unsynced: sent again */
+            ava1_pend_release(j->pend_n);
             j->pend_n = 0;
             pthread_cond_broadcast(&j->cv);
         }
@@ -1304,6 +1347,7 @@ void ava1_apply_quiesce(ava1_job_t *j) {
     /* Whatever could not be made durable is dropped: it is not in the map, so it is sent again. */
     pthread_mutex_lock(&j->mu);
     for (i = 0; i < j->pend_n; i++) close(j->pend_fd[i]);
+    ava1_pend_release(j->pend_n);
     j->pend_n = 0;
     for (i = 0; j->lf && i < j->m.n; i++)
         if (j->lf[i]) ava1_rset_clear(&j->lf[i]->written);
@@ -1365,7 +1409,7 @@ static void *job_main(void *arg) {
             memcpy(fail_msg, j->message, sizeof fail_msg);
         }
         batch = j->prepared && !j->finished && !failed && !__atomic_load_n(&ava1_apply_hold_batches, __ATOMIC_SEQ_CST) &&
-                (j->pend_n >= j->batch_max || j->unsynced_bytes >= BATCH_BYTES ||
+                ((j->pend_n && (j->pend_n >= j->batch_max || ava1_pend_full())) || j->unsynced_bytes >= BATCH_BYTES ||
                  ((j->pend_n || j->unsynced_bytes || j->roots_new) && now - j->last_batch_ms >= BATCH_MS));
         pthread_mutex_unlock(&j->mu);
         if (failed) ava1_apply_fail(j, fail_status, fail_msg, 0, 0);

@@ -358,6 +358,7 @@ pub mod ffi {
         pub fn ava1_test_retire_unlisted() -> c_int;
         pub fn ava1_test_job_counts(id: *const u8, out: *mut u64) -> c_int;
         pub fn ava1_test_data_knob(name: *const c_char, v: u32) -> c_int;
+        pub fn ava1_test_fd_peak(which: c_int) -> u32;
         pub fn ava1_test_copy_walk_active() -> c_int;
         pub fn ava1_test_copy_delete_active() -> c_int;
         pub fn ava1_test_retiring_blocks_reopen() -> c_int;
@@ -775,6 +776,12 @@ impl CServer {
             0,
             "{name}"
         );
+    }
+
+    /// High-water mark of open pending small-file fds (0) or fds held by disk.calibrate (1)
+    /// since the `fd_peak_reset` knob.
+    pub fn fd_peak(&self, which: i32) -> u32 {
+        unsafe { ffi::ava1_test_fd_peak(which) }
     }
 
     pub fn copy_walk_active(&self) -> bool {

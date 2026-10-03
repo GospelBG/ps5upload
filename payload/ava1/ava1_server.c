@@ -557,7 +557,7 @@ static void *rpc_worker(void *arg) {
         out_len = 0;
         status = AVA1_ERR_INTERNAL;
     }
-    (void)send_status(&j->k->io, j->ch, (uint16_t)status, out, status == AVA1_STATUS_OK ? out_len : 0);
+    (void)send_status(&j->k->io, j->ch, (uint16_t)status, out, out_len); /* an error carries its cause as UTF-8 text */
     pthread_mutex_lock(&mu);
     if (sess_is_locked(j->idx, j->sid)) S.sessions[j->idx].rpc_inflight--;
     pthread_mutex_unlock(&mu);
