@@ -1128,6 +1128,8 @@ pub async fn run_upload(
     let (rtx, mut rrx) = mpsc::unbounded_channel();
     let stop = Arc::new(AtomicBool::new(false));
     let seq_retries = Arc::new(crate::seq::Retries::default());
+    let budget_wait: Arc<crate::seq::BudgetWait> = Arc::default();
+    let mut budget_wait_seen = 0u64;
     let mut readers = if let Some(seq) = opts.seq.clone() {
         // One decode thread for a forward-only source (SPEC.md §17).
         let chunk_sh = sh.clone();
@@ -1138,6 +1140,7 @@ pub async fn run_upload(
             cutoff: opts.cutoff,
             persist: opts.persist.clone(),
             budget: sh.bytes_budget.clone(),
+            budget_wait: budget_wait.clone(),
             chunk: Box::new(move || {
                 // I2: never larger than the credit already granted (see the large reader).
                 let grant = chunk_sh.window.lock().unwrap().available();
@@ -1483,7 +1486,11 @@ pub async fn run_upload(
                         lanes: lanes_now,
                         stalls: std::mem::take(&mut s.stalls),
                         credit_starved: std::mem::take(&mut s.credit_starved),
-                        source_starved: std::mem::take(&mut s.source_starved) && s.requeue.is_empty(),
+                        // A decode thread parked on the read-ahead budget means the lanes
+                        // are the limit (SPEC.md 17.4): an empty queue is not the source.
+                        source_starved: std::mem::take(&mut s.source_starved)
+                            && s.requeue.is_empty()
+                            && !budget_wait.waited_since(&mut budget_wait_seen),
                         receiver_bottleneck: receiver_bn,
                         small_durable: std::mem::take(&mut s.small_durable_tick),
                         large_durable: std::mem::take(&mut s.large_durable_tick),
