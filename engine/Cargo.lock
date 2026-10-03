@@ -2200,6 +2200,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ps5upload-ava1"
+version = "5.41.0"
+dependencies = [
+ "anyhow",
+ "ava1",
+ "ava1-chaos",
+ "ps5upload-core",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "ps5upload-bench"
 version = "5.41.0"
 dependencies = [

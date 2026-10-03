@@ -1,0 +1,17 @@
+[package]
+name = "ps5upload-ava1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ava1 = { path = "../ava1" }
+ps5upload-core = { path = "../ps5upload-core" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
+
+[dev-dependencies]
+ava1-chaos = { path = "../ava1-chaos" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
