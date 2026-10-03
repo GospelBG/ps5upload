@@ -10,6 +10,7 @@ ava1 = { path = "../ava1" }
 ps5upload-core = { path = "../ps5upload-core" }
 serde_json.workspace = true
 thiserror.workspace = true
+zip = { version = "8", default-features = false, features = ["deflate"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
 
 [dev-dependencies]

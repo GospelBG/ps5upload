@@ -1398,6 +1398,136 @@ struct TransferZipReq {
 }
 
 #[derive(Deserialize)]
+struct Ps5ToPs5Req {
+    from: String,
+    src: String,
+    to: String,
+    dest: String,
+    tx_id: Option<String>,
+}
+
+async fn ps5_to_ps5_handler(
+    State(state): State<AppState>,
+    Json(req): Json<Ps5ToPs5Req>,
+) -> impl IntoResponse {
+    let tx_id = match parse_or_random_tx_id(req.tx_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return json_err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let job_id = Uuid::new_v4();
+    let started_at_ms = now_ms();
+    set_job(
+        &state.jobs,
+        &state.events_tx,
+        job_id,
+        JobState::Running {
+            stage: None,
+            started_at_ms,
+            bytes_sent: 0,
+            total_bytes: 0,
+            files: vec![],
+            skipped_files: 0,
+            skipped_bytes: 0,
+            files_processing: 0,
+            files_finalized: 0,
+            files_finalizing_total: 0,
+            bytes_finalized: 0,
+        },
+    );
+    let jobs = Arc::clone(&state.jobs);
+    let events_tx = state.events_tx.clone();
+    let cancel = register_transfer_cancel(job_id);
+    let progress = Arc::new(ava1::send::Progress::default());
+    let bytes = Arc::new(AtomicU64::new(0));
+    let files = Arc::new(AtomicU64::new(0));
+    let durable_bytes = Arc::new(AtomicU64::new(0));
+    let total = Arc::new(AtomicU64::new(0));
+    let stop_ticker = spawn_progress_ticker(
+        Arc::clone(&jobs),
+        events_tx.clone(),
+        job_id,
+        TickerContext {
+            started_at_ms,
+            total_bytes: 0,
+            dynamic_total_bytes: Some(total.clone()),
+            skipped_files: 0,
+            skipped_bytes: 0,
+        },
+        bytes.clone(),
+        files.clone(),
+        files.clone(),
+        durable_bytes.clone(),
+    );
+    let mirror_stop = stop_ticker.clone();
+    let mirror_progress = progress.clone();
+    tokio::spawn(async move {
+        while !mirror_stop.load(Ordering::Acquire) {
+            bytes.store(
+                mirror_progress.bytes_sent.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            files.store(
+                mirror_progress.files_durable.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            durable_bytes.store(
+                mirror_progress.bytes_durable.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            total.store(
+                mirror_progress.bytes_total.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    });
+    tokio::task::spawn_blocking(move || {
+        let _stop_guard = TickerStopGuard::new(stop_ticker.clone());
+        let mut fail_guard =
+            JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
+        let result = ps5upload_ava1::relay::ps5_to_ps5(
+            &req.from,
+            &req.src,
+            &req.to,
+            &req.dest,
+            tx_id,
+            progress.clone(),
+            cancel,
+        );
+        let completed_at_ms = now_ms();
+        let state = match result {
+            Ok(r) => JobState::Done {
+                started_at_ms,
+                completed_at_ms,
+                elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
+                tx_id_hex: ava1::hex::encode(&tx_id),
+                shards_sent: r.files as u64,
+                bytes_sent: progress.bytes_sent.load(Ordering::Relaxed),
+                dest: req.dest,
+                files_sent: r.files as u64,
+                skipped_files: 0,
+                skipped_bytes: 0,
+                commit_ack: Some(serde_json::json!({
+                    "protocol": "ava1", "files": r.files, "bytes": r.bytes,
+                    "resent": r.resent, "max_lanes": r.max_lanes,
+                })),
+            },
+            Err(e) => job_failed_from_err(started_at_ms, completed_at_ms, &e),
+        };
+        stop_ticker.store(true, Ordering::Release);
+        set_job(&jobs, &events_tx, job_id, state);
+        fail_guard.mark_succeeded();
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(JobCreated {
+            job_id: job_id.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
 struct ZipInspectReq {
     zip_path: String,
 }
@@ -5726,15 +5856,44 @@ async fn transfer_zip_handler(
         // blip, or the payload's serial accept loop still draining the dropped
         // connection) burned both retries inside the first 1.5 s of backoff
         // and surfaced as "transfer_zip gave up after 2 retries".
-        let result = transfer_zip_resumable(
-            &cfg,
-            tx_id,
-            &req.dest_root,
-            std::path::Path::new(&req.zip_path),
-            ram_threshold,
-            DEFAULT_RESUME_RETRIES,
-            initial_flags,
-        );
+        let ftx2 = |reason: Option<&str>| {
+            let mut r = transfer_zip_resumable(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                std::path::Path::new(&req.zip_path),
+                ram_threshold,
+                DEFAULT_RESUME_RETRIES,
+                initial_flags,
+            )?;
+            let mut body = serde_json::from_str::<serde_json::Value>(&r.commit_ack_body)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            body["protocol"] = serde_json::json!("ftx2");
+            if let Some(reason) = reason {
+                body["fallback_reason"] = serde_json::json!(reason);
+            }
+            r.commit_ack_body = body.to_string();
+            Ok::<_, anyhow::Error>(r)
+        };
+        let result = if ps5upload_ava1::route::use_ava1(&addr) {
+            match ps5upload_ava1::upload::upload_zip(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                std::path::Path::new(&req.zip_path),
+            ) {
+                Err(e)
+                    if e.downcast_ref::<ps5upload_ava1::upload::ZipTooLarge>()
+                        .is_some() =>
+                {
+                    crate::log_info!("transfer_zip: AVA1 fallback to FTX2: {e}");
+                    ftx2(Some("zip_entry_too_large"))
+                }
+                other => other,
+            }
+        } else {
+            ftx2(Some("ava1_unavailable"))
+        };
         match result {
             Ok(r) => {
                 let completed_at_ms = now_ms();
@@ -9440,6 +9599,7 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         .route("/api/transfer/file", post(transfer_file_handler))
         .route("/api/transfer/dir", post(transfer_dir_handler))
         .route("/api/transfer/zip", post(transfer_zip_handler))
+        .route("/api/transfer/ps5-to-ps5", post(ps5_to_ps5_handler))
         .route("/api/local/path-kind", get(local_path_kind_handler))
         .route(
             "/api/local/inspect-folder",

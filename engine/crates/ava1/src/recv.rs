@@ -38,6 +38,11 @@ pub trait Sink: Send + Sync {
     fn sync(&self, ids: &[u32]) -> io::Result<()>;
     /// The resume check's read (SPEC.md §13.4).
     fn read_at(&self, id: u32, off: u64, buf: &mut [u8]) -> io::Result<usize>;
+    /// A relay keeps no durable bytes. Its need hint comes from the destination
+    /// receiver, which verifies the complete file; this receiver only forwards.
+    fn transient_relay(&self) -> bool {
+        false
+    }
     /// A complete file: part → final, same directory.
     fn commit(&self, id: u32) -> io::Result<()>;
     /// The whole job: staging → final.
@@ -574,6 +579,13 @@ async fn run_loop(
         .await
         .map_err(proto)??;
 
+    if sink.transient_relay() {
+        if let Some(hint) = &need_hint {
+            st.done = hint.done.clone();
+            st.ranges = hint.partial.clone();
+        }
+    }
+
     // Resume check (SPEC.md §13.4): every durable group of every partial file is re-hashed
     // against the sink and the outboard; a mismatch resets the file before the map.
     let mut large: HashMap<u32, Large> = HashMap::new();
@@ -590,6 +602,10 @@ async fn run_loop(
         let mut ob = Outboard::open(&dir.join(format!("{id}.ob")), verify::groups(size)).ok();
         let mut good = RangeSet::new();
         for (s, e) in r.iter() {
+            if sink.transient_relay() {
+                good.insert(s, e);
+                continue;
+            }
             let mut g = s / GROUP;
             while g * GROUP < e {
                 let len = (size - g * GROUP).min(GROUP) as usize;
@@ -623,6 +639,11 @@ async fn run_loop(
     }
     // What the job still needs: the relay's hint when given (Task 24), else the replayed
     // state after the resume check (ruling 4: build it here; never change journal.rs).
+    let ordered_skip = if sink.transient_relay() {
+        need_hint.clone()
+    } else {
+        None
+    };
     let need = match need_hint {
         Some(n) => n,
         None => Need {
@@ -885,6 +906,28 @@ async fn run_loop(
                                 || zero.contains(&cursor.0))
                         {
                             cursor = (cursor.0 + 1, 0);
+                        }
+                        // A relay's source sender omits groups B already has and
+                        // whose CV the engine retained. Advance over those gaps;
+                        // otherwise the ordered cursor waits forever at offset 0
+                        // while later chunks accumulate in `reorder`.
+                        if let Some(end) = ordered_skip
+                            .as_ref()
+                            .and_then(|skip| skip.partial.get(&cursor.0))
+                            .and_then(|ranges| {
+                                ranges
+                                    .iter()
+                                    .find(|(start, end)| *start <= cursor.1 && cursor.1 < *end)
+                            })
+                            .map(|(_, end)| end)
+                        {
+                            let size = m.entry(cursor.0).map_or(0, |e| e.size);
+                            cursor = if end >= size {
+                                (cursor.0 + 1, 0)
+                            } else {
+                                (cursor.0, end)
+                            };
+                            continue;
                         }
                         let Some((whole, data)) = reorder.remove(&cursor) else {
                             break;
@@ -1259,7 +1302,11 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
         if !durable.is_full(l.size) {
             continue;
         }
-        let actual = if verify::groups(l.size) >= 2 {
+        let actual = if sink.transient_relay() {
+            // B owns durability and checks the complete root. A's skipped bytes
+            // exist only on B, so its transient sink cannot reread them here.
+            Some(root)
+        } else if verify::groups(l.size) >= 2 {
             let ob = l
                 .ob
                 .as_ref()

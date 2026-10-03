@@ -160,6 +160,50 @@ pub fn pieces(
     out
 }
 
+/// Bytes a relay can withhold from its source: the destination has them durably
+/// and this sender already has their CV. This is the complement of the bytes
+/// `run_upload` reads. If A withholds a byte B reads, B waits forever; if A
+/// sends a byte B never reads, the bounded relay buffer can fill and stall A.
+/// A fresh relay has no outboards and therefore rereads all unfinished files.
+pub fn skip_set(m: &Manifest, durable: &Need, persist: Option<&std::path::Path>) -> Need {
+    let mut skip = Need::default();
+    for (i, e) in m.entries.iter().enumerate() {
+        if e.kind != gen::ENTRY_FILE {
+            continue;
+        }
+        let id = i as u32;
+        if durable.done.contains(&id) {
+            skip.done.insert(id);
+            continue;
+        }
+        // Small files are sent whole. Only large files have group outboards.
+        if e.size < gen::LARGE_CUTOFF as u64 {
+            continue;
+        }
+        let Some(ranges) = durable.partial.get(&id) else {
+            continue;
+        };
+        let ob = persist.and_then(|dir| {
+            Outboard::open(&dir.join(format!("{id}.ob")), verify::groups(e.size)).ok()
+        });
+        let Some(ob) = ob else { continue };
+        let mut known = RangeSet::new();
+        for g in 0..verify::groups(e.size) {
+            let off = g * GROUP;
+            let end = off + (e.size - off).min(GROUP);
+            if ranges.covers(off, end) && ob.get(g).is_some() {
+                known.insert(off, end);
+            }
+        }
+        if known.is_full(e.size) {
+            skip.done.insert(id);
+        } else if known.covered() > 0 {
+            skip.partial.insert(id, known);
+        }
+    }
+    skip
+}
+
 type LaneFrames = HashMap<u16, (u64, BTreeMap<u32, u64>)>;
 
 /// Credit and per-lane in-flight accounting (SPEC.md §12.3–§12.5). All arithmetic is
@@ -1484,6 +1528,61 @@ mod tests {
     use crate::wire::SplitMix;
     use std::io;
     use tokio::io::{duplex, split};
+
+    #[test]
+    fn skip_set_is_the_complement_of_the_read_set() {
+        let dir = std::env::temp_dir().join(format!(
+            "ava1-skip-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let size = gen::LARGE_CUTOFF as u64 + 3 * GROUP;
+        let m = Manifest {
+            entries: vec![
+                Entry {
+                    kind: gen::ENTRY_FILE,
+                    mode: 0o644,
+                    size,
+                    mtime: 0,
+                    path: "partial".into(),
+                    root: None,
+                },
+                Entry {
+                    kind: gen::ENTRY_FILE,
+                    mode: 0o644,
+                    size: 3,
+                    mtime: 0,
+                    path: "done".into(),
+                    root: None,
+                },
+            ],
+        };
+        let mut durable = Need::default();
+        durable.done.insert(1);
+        durable.partial.entry(0).or_default().insert(0, 2 * GROUP);
+        let mut ob = Outboard::open(&dir.join("0.ob"), verify::groups(size)).unwrap();
+        ob.put(0, &[1; 32]).unwrap();
+        ob.sync().unwrap();
+        let skip = skip_set(&m, &durable, Some(&dir));
+        assert!(skip.done.contains(&1));
+        assert_eq!(
+            skip.partial[&0].iter().collect::<Vec<_>>(),
+            vec![(0, GROUP)]
+        );
+        for chunk in [GROUP, 4 * GROUP] {
+            let plan = pieces(size, &durable.partial[&0], &|g| g == 0, chunk);
+            for g in 0..verify::groups(size) {
+                let off = g * GROUP;
+                let skipped = skip.partial[&0].covers(off, off + (size - off).min(GROUP));
+                let read = plan
+                    .iter()
+                    .any(|p| p.offset <= off && off < p.offset + p.len);
+                assert_ne!(skipped, read, "group {g}, chunk {chunk}");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     const G: u64 = crate::verify::GROUP;
 

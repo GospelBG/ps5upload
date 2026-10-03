@@ -19,6 +19,53 @@ use ps5upload_core::transfer::{FileListEntry, TransferConfig, TransferResult};
 use crate::pool::{pool, Pool};
 use crate::progress::{bottleneck_name, Bridge};
 use crate::source::{FsSource, ListSource};
+use crate::zip_source::ZipSource;
+
+/// `ZipEntryReader::read_at` inflates from the beginning for every read. Above
+/// this size its repeated work grows quadratically; FTX2 streams those entries.
+#[derive(Debug, thiserror::Error)]
+#[error("zip entry {0} is larger than 256 MiB: AVA1 sends this archive with FTX2")]
+pub struct ZipTooLarge(pub String);
+
+pub const ZIP_MAX_ENTRY: u64 = 256 << 20;
+
+pub fn zip_too_large(m: &Manifest) -> Option<&str> {
+    m.entries
+        .iter()
+        .find(|e| e.kind == gen::ENTRY_FILE && e.size > ZIP_MAX_ENTRY)
+        .map(|e| e.path.as_str())
+}
+
+pub fn upload_zip_in(
+    pool: &Pool,
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    dest_root: &str,
+    zip_path: &Path,
+) -> Result<TransferResult> {
+    let (manifest, source) = ZipSource::open(zip_path, &cfg.excludes)?;
+    if let Some(path) = zip_too_large(&manifest) {
+        return Err(ZipTooLarge(path.to_owned()).into());
+    }
+    upload_with_in(
+        pool,
+        &cfg.addr,
+        job_id,
+        manifest,
+        Arc::new(source),
+        SendOptions::upload(dest_root),
+        cfg,
+    )
+}
+
+pub fn upload_zip(
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    dest_root: &str,
+    zip_path: &Path,
+) -> Result<TransferResult> {
+    upload_zip_in(pool(), cfg, job_id, dest_root, zip_path)
+}
 
 /// Why the console refused a transfer whose data it had already received (a
 /// post-commit failure). The upload must never be retried: the destination is taken

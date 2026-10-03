@@ -997,6 +997,9 @@ fn usage() -> ! {
         "                                ratio (single-threaded; a 223k-file corpus takes minutes)"
     );
     eprintln!("  ava1-calibrate CONSOLE DIR [FILES=2000] [SIZE=4096] [--out FILE]");
+    eprintln!(
+        "  ava1-relay FROM SRC TO DEST [TX_ID_HEX]   relay a console tree through this computer"
+    );
     eprintln!("                                five disk points; FILES ≤ 20000, SIZE ≤ 1 MiB");
     eprintln!("Usage: ps5upload-lab [ADDR] COMMAND [ARGS...]");
     eprintln!("  Default ADDR: {DEFAULT_ADDR}");
@@ -1410,6 +1413,34 @@ fn main() -> Result<()> {
         "ava1-calibrate" => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(do_ava1_calibrate(&rest[1..]))
+        }
+        "ava1-relay" => {
+            if rest.len() < 5 || rest.len() > 6 {
+                bail!("ava1-relay needs FROM SRC TO DEST [TX_ID_HEX]");
+            }
+            let id = match rest.get(5) {
+                Some(hex) => parse_tx_id(hex)?,
+                None => *uuid::Uuid::new_v4().as_bytes(),
+            };
+            let progress = std::sync::Arc::new(ava1::send::Progress::default());
+            let report = ps5upload_ava1::relay::ps5_to_ps5(
+                &rest[1],
+                &rest[2],
+                &rest[3],
+                &rest[4],
+                id,
+                progress,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?;
+            println!(
+                "job={} files={} bytes={} resent={} lanes={}",
+                ava1::hex::encode(&id),
+                report.files,
+                report.bytes,
+                report.resent,
+                report.max_lanes
+            );
+            Ok(())
         }
         cmd => bail!("unknown command: {cmd}"),
     }

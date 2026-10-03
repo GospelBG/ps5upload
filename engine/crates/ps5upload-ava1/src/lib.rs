@@ -9,9 +9,11 @@
 
 pub mod pool;
 pub mod progress;
+pub mod relay;
 pub mod route;
 pub mod source;
 pub mod upload;
+pub mod zip_source;
 
 pub use pool::{pool, Pool};
 pub use upload::{PostCommitError, PostCommitKind};
