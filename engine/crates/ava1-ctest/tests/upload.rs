@@ -226,13 +226,38 @@ async fn resume_after_server_restart_resends_no_durable_byte() {
     assert_eq!(r.status, 0);
     assert!(sessions >= 2);
     let resent = progress.resent_bytes.load(Ordering::Relaxed);
-    // Only bytes that were sent but NOT durable at the kill may come again. Everything the
-    // receiver had already made durable must never be resent — that is Review Focus 3.
+    // R1 (kept as an additional check): `resent_bytes` counts only frames whose `resend`
+    // flag was set, and that flag is set only when a dead lane's frames are requeued. The
+    // resumed session reads its frames fresh from the source (resend=false), so this is ~0
+    // after a payload restart no matter what session 2 sends — it cannot carry the claim
+    // on its own. The honest oracle is R2 below.
     assert!(
         resent <= acked_not_durable + 8 * MIB,
         "resent {resent}, acked-not-durable at kill {acked_not_durable}"
     );
     assert!(durable_at_kill >= size / 2);
+    // R2: the honest oracle for session 2. `bytes_sent` counts acked payload bytes, so
+    // `acked_end - acked_at_kill` is exactly what the resumed session delivered. The job
+    // may legitimately still owe everything that was not durable at the kill (the sender
+    // resumes at the durable frontier and reads the rest fresh), plus 8 MiB of slack for
+    // the frame at the frontier and the snapshot race — nothing more. A sender that
+    // ignored the journal and re-sent every durable byte would ack ~size in session 2;
+    // the bound is strictly below size (durable_at_kill >= size/2), so that re-send fails
+    // it.
+    let acked_end = progress.bytes_sent.load(Ordering::Relaxed);
+    let session2_acked = acked_end - sent_at_kill;
+    let owed = size - durable_at_kill;
+    let bound = owed + 8 * MIB;
+    assert!(
+        bound < size,
+        "R2 bound {bound} must stay strictly below the file size {size}, or a full re-send \
+         would pass it (durable at kill {durable_at_kill})"
+    );
+    assert!(
+        session2_acked <= bound,
+        "session 2 acked {session2_acked} > owed {owed} + 8 MiB slack: the sender re-sent \
+         durable bytes (acked at kill {sent_at_kill}, acked at end {acked_end})"
+    );
     assert_eq!(std::fs::read(&dest).unwrap().len() as u64, size);
 }
 
