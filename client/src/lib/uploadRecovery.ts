@@ -127,6 +127,15 @@ export function isAutoRecoverable(
   const r = (reason ?? "").toLowerCase();
   if (FATAL_REASON_SUBSTRINGS.some((s) => r.includes(s))) return false;
 
+  // AVA1 landed every byte and the console refused the commit/rename
+  // (engine error_reason ava1_commit_exists / ava1_commit_cross_device,
+  // the ps5upload_ava1::PostCommitKind pair). Re-running the item would
+  // re-upload a file that is already on the console — the exact waste
+  // this list exists to prevent. Matched as a PREFIX, not a substring:
+  // a bare "ava1_commit" substring would also catch a future unrelated
+  // reason and silently classify it as post-commit.
+  if (r.startsWith("ava1_commit_")) return false;
+
   // Only consult the raw message for fatality when there's no structured
   // reason — a payload that gave us a (non-fatal) reason has already told us
   // the real category; the message may incidentally contain a fatal-looking

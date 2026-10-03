@@ -33,6 +33,22 @@ describe("isAutoRecoverable", () => {
     expect(isAutoRecoverable("direct_tx_corrupt", "")).toBe(false);
   });
 
+  it("never auto-recovers a post-commit failure", () => {
+    // Every byte landed and the console refused the commit/rename. Both
+    // typed reasons travel from ps5upload_ava1::PostCommitKind and are
+    // terminal: the destination is taken, so re-running re-uploads bytes
+    // that are already durable.
+    expect(isAutoRecoverable("ava1_commit_exists", "")).toBe(false);
+    expect(isAutoRecoverable("ava1_commit_cross_device", "")).toBe(false);
+  });
+
+  it("still auto-recovers an unknown AVA1 reason", () => {
+    // The post-commit entry is a prefix on ava1_commit_, not a blanket
+    // ban on the ava1_ prefix — a future unrelated reason must keep the
+    // default (recoverable, bounded by the attempt cap).
+    expect(isAutoRecoverable("ava1_something_new", "")).toBe(true);
+  });
+
   it("does NOT recover fatal LOCAL errors (no payload reason)", () => {
     expect(isAutoRecoverable(null, "No such file or directory (os error 2)"))
       .toBe(false);

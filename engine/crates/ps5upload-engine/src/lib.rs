@@ -338,6 +338,23 @@ pub(crate) enum JobState {
 /// parseable. Single call site for every transfer handler's `Err(e)`
 /// branch so the structured-field plumbing stays consistent.
 fn job_failed_from_err(started_at_ms: u64, completed_at_ms: u64, err: &anyhow::Error) -> JobState {
+    // A post-commit refusal (Task 22's typed error) must be matched before
+    // `extract_payload_error`: every byte is already durable on the console,
+    // the destination is taken, and nothing about sending it again changes
+    // that — so the reason is terminal and the client never auto-recovers it
+    // (C2). The reason is built from the typed `PostCommitKind` (`as_str()` is
+    // the crate's single mapping), never parsed out of the Display (C1/A2).
+    if let Some(pce) = err.downcast_ref::<ps5upload_ava1::PostCommitError>() {
+        log_error!("transfer job failed after every byte was durable: {err:#}");
+        return JobState::Failed {
+            started_at_ms,
+            completed_at_ms,
+            elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
+            error: format!("{err:#}"),
+            error_reason: Some(pce.kind.as_str().into()),
+            error_detail: Some(pce.detail.clone()), // the console's message
+        };
+    }
     let (reason, detail) = extract_payload_error(err);
     // Central choke point for ALL async transfer-job failures (file, dir,
     // reconcile, download). Logging here means a mid-transfer death — the
@@ -4847,14 +4864,28 @@ async fn transfer_file_handler(
         // failure modes that can look like OOM on Windows/Linux with
         // 50-100 GiB game images.
         cfg.source_fs = source_fs;
-        let result = transfer_file_path_resumable(
-            &cfg,
-            tx_id,
-            &req.dest,
-            &src_path,
-            DEFAULT_RESUME_RETRIES,
-            initial_flags,
+        // AVA1 (Task 22) or FTX2 for this job. The probe may take up to
+        // ~3 s on the first AUTO job per console; it runs here, on the
+        // blocking thread, and its session is reused by the transfer.
+        let use_ava1 = ps5upload_ava1::route::use_ava1(&addr);
+        crate::log_info!(
+            "transfer_file: job={job_id} protocol={}",
+            if use_ava1 { "ava1" } else { "ftx2" }
         );
+        let result = if use_ava1 {
+            // Resume is by job_id (the sender reopens with JobOpen); retries
+            // live in the adapter's loop, so no flags/retry count here (C3).
+            ps5upload_ava1::upload::upload_file(&cfg, tx_id, &req.dest, &src_path)
+        } else {
+            transfer_file_path_resumable(
+                &cfg,
+                tx_id,
+                &req.dest,
+                &src_path,
+                DEFAULT_RESUME_RETRIES,
+                initial_flags,
+            )
+        };
         let files_sent_count: u64 = 1;
         let skipped_files_count: u64 = 0;
         let skipped_bytes_count: u64 = 0;
@@ -5139,14 +5170,28 @@ async fn transfer_dir_handler(
         // draining the dropped connection) killed a multi-hour folder upload.
         // Now on equal footing with single-file + headroom. See
         // DEFAULT_RESUME_RETRIES.
-        let result = transfer_dir_resumable(
-            &cfg,
-            tx_id,
-            &req.dest_root,
-            &src_path,
-            DEFAULT_RESUME_RETRIES,
-            initial_flags,
+        // AVA1 (Task 22) or FTX2 for this job. The probe may take up to
+        // ~3 s on the first AUTO job per console; it runs here, on the
+        // blocking thread, and its session is reused by the transfer.
+        let use_ava1 = ps5upload_ava1::route::use_ava1(&addr);
+        crate::log_info!(
+            "transfer_dir: job={job_id} protocol={}",
+            if use_ava1 { "ava1" } else { "ftx2" }
         );
+        let result = if use_ava1 {
+            // Resume is by job_id (the sender reopens with JobOpen); retries
+            // live in the adapter's loop, so no flags/retry count here (C3).
+            ps5upload_ava1::upload::upload_dir(&cfg, tx_id, &req.dest_root, &src_path)
+        } else {
+            transfer_dir_resumable(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                &src_path,
+                DEFAULT_RESUME_RETRIES,
+                initial_flags,
+            )
+        };
         let skipped_files_count: u64 = 0;
         let skipped_bytes_count: u64 = 0;
         match result {
@@ -7600,14 +7645,28 @@ async fn transfer_file_list_handler(
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // All transfer endpoints share the same 3-attempt resume policy
         // (1 fresh + 2 resumes). See `transfer_dir_handler` for rationale.
-        let result = transfer_file_list_resumable(
-            &cfg,
-            tx_id,
-            &req.dest_root,
-            &entries,
-            DEFAULT_RESUME_RETRIES,
-            initial_flags,
+        // AVA1 (Task 22) or FTX2 for this job. The probe may take up to
+        // ~3 s on the first AUTO job per console; it runs here, on the
+        // blocking thread, and its session is reused by the transfer.
+        let use_ava1 = ps5upload_ava1::route::use_ava1(&addr);
+        crate::log_info!(
+            "transfer_file_list: job={job_id} protocol={}",
+            if use_ava1 { "ava1" } else { "ftx2" }
         );
+        let result = if use_ava1 {
+            // Resume is by job_id (the sender reopens with JobOpen); retries
+            // live in the adapter's loop, so no flags/retry count here (C3).
+            ps5upload_ava1::upload::upload_list(&cfg, tx_id, &req.dest_root, &entries)
+        } else {
+            transfer_file_list_resumable(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                &entries,
+                DEFAULT_RESUME_RETRIES,
+                initial_flags,
+            )
+        };
         let skipped_files_count: u64 = 0;
         let skipped_bytes_count: u64 = 0;
         match result {
@@ -8542,15 +8601,36 @@ async fn transfer_dir_reconcile_handler(
         // payload advertises support), the orchestrator splits `entries` across
         // parallel connections. With streams<=1 it delegates to the exact
         // single-stream path above, so this is a no-op when disabled.
-        let result = transfer_file_list_multistream(
-            &cfg,
-            tx_id,
-            &req.dest_root,
-            &entries,
-            streams,
-            DEFAULT_RESUME_RETRIES,
-            initial_flags,
+        // AVA1 (Task 22) or FTX2 for this job. The probe may take up to
+        // ~3 s on the first AUTO job per console; it runs here, on the
+        // blocking thread, and its session is reused by the transfer.
+        let use_ava1 = ps5upload_ava1::route::use_ava1(&addr);
+        crate::log_info!(
+            "reconcile: job={job_id} protocol={}{}",
+            if use_ava1 { "ava1" } else { "ftx2" },
+            if use_ava1 {
+                format!(" streams={streams} (ignored: AVA1 spreads over its lanes)")
+            } else {
+                String::new()
+            }
         );
+        let result = if use_ava1 {
+            // Resume is by job_id (the sender reopens with JobOpen); retries
+            // live in the adapter's loop, and `streams` has no AVA1 analogue
+            // (the log line above says it is ignored), so no flags/retry
+            // count here (C3).
+            ps5upload_ava1::upload::upload_list(&cfg, tx_id, &req.dest_root, &entries)
+        } else {
+            transfer_file_list_multistream(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                &entries,
+                streams,
+                DEFAULT_RESUME_RETRIES,
+                initial_flags,
+            )
+        };
         match result {
             Ok(r) => {
                 let completed_at_ms = now_ms();
@@ -9071,6 +9151,29 @@ pub struct EngineConfig {
 async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
     // Convert (and the package viewer) read games on saved servers and the console in place.
     fpkg_remote::register();
+    // AVA1 cutover (Task 23, controller A4): one line at startup naming the
+    // resolved transfer mode, its source (the environment or the default), and
+    // the ava data dir when the mode can use AVA1. The benchmark phase compares
+    // AVA1 against FTX2 and a mis-set PS5UPLOAD_TRANSFER would silently measure
+    // the wrong protocol; this is how a bug report proves the mode. The
+    // per-transfer `protocol=` line (C8) stays per transfer.
+    let transfer_mode = ps5upload_ava1::route::mode();
+    let mode_name = match transfer_mode {
+        ps5upload_ava1::route::Mode::Auto => "auto",
+        ps5upload_ava1::route::Mode::Ava1 => "ava1",
+        ps5upload_ava1::route::Mode::Ftx2 => "ftx2",
+    };
+    let mode_source = match std::env::var("PS5UPLOAD_TRANSFER") {
+        Ok(v) if v.trim().is_empty() => "default".to_string(),
+        Ok(v) => format!("env PS5UPLOAD_TRANSFER={v}"),
+        Err(_) => "default".to_string(),
+    };
+    let ava_dir = if transfer_mode == ps5upload_ava1::route::Mode::Ftx2 {
+        String::new()
+    } else {
+        format!(" ava_dir={}", ps5upload_ava1::pool().ava_dir().display())
+    };
+    crate::log_info!("transfer mode={mode_name} ({mode_source}){ava_dir}");
     if cfg.parent_watch {
         spawn_parent_watcher();
     }
@@ -10366,6 +10469,100 @@ mod helpers_tests {
             } => {
                 assert_eq!(error_reason, None);
                 assert_eq!(error_detail, None);
+            }
+            _ => panic!("expected Failed state"),
+        }
+    }
+
+    // ── AVA1 post-commit mapping — the reason pair the client keys on (A1) ────
+
+    #[test]
+    fn a_post_commit_failure_has_its_own_reason() {
+        let pce = ps5upload_ava1::PostCommitError {
+            kind: ps5upload_ava1::PostCommitKind::Exists,
+            detail: "the destination already exists on the console".to_string(),
+        };
+        let e = anyhow::Error::from(pce);
+        let state = job_failed_from_err(1000, 2000, &e);
+        match state {
+            JobState::Failed {
+                error,
+                error_reason,
+                error_detail,
+                ..
+            } => {
+                assert_eq!(error_reason.as_deref(), Some("ava1_commit_exists"));
+                assert_eq!(
+                    error_detail.as_deref(),
+                    Some("the destination already exists on the console"),
+                    "error_detail carries the console's own message"
+                );
+                // The raw chain is still there for the UI's raw view.
+                assert!(error.contains("the console refused to commit the transfer"));
+            }
+            _ => panic!("expected Failed state"),
+        }
+    }
+
+    #[test]
+    fn a_post_commit_cross_device_failure_has_its_own_reason() {
+        // The second half of the pair the client keys on: one test per reason
+        // (A1 pins the exact strings in both directions).
+        let pce = ps5upload_ava1::PostCommitError {
+            kind: ps5upload_ava1::PostCommitKind::CrossDevice,
+            detail: "the destination is on another storage device".to_string(),
+        };
+        let e = anyhow::Error::from(pce);
+        let state = job_failed_from_err(1000, 2000, &e);
+        match state {
+            JobState::Failed { error_reason, .. } => {
+                assert_eq!(error_reason.as_deref(), Some("ava1_commit_cross_device"))
+            }
+            _ => panic!("expected Failed state"),
+        }
+    }
+
+    #[test]
+    fn a_post_commit_error_is_not_retryable() {
+        // The queue re-run guarantee: every byte is durable and the
+        // destination is taken, so nothing may retry this failure.
+        let pce = ps5upload_ava1::PostCommitError {
+            kind: ps5upload_ava1::PostCommitKind::Exists,
+            detail: "destination taken".to_string(),
+        };
+        let e = anyhow::Error::from(pce);
+        assert!(
+            !ps5upload_core::transfer::is_retryable_transfer_error(&e),
+            "a post-commit refusal carries no retryable io::Error"
+        );
+        // Wrapped the way a handler might pass it down, the classifier
+        // must still say no.
+        let wrapped = e.context("upload pipeline failed");
+        assert!(!ps5upload_core::transfer::is_retryable_transfer_error(
+            &wrapped
+        ));
+    }
+
+    #[test]
+    fn the_post_commit_branch_does_not_swallow_payload_json() {
+        // Regression: the new typed branch must only fire on the typed
+        // error — a payload JSON body that is NOT a PostCommitError still
+        // takes the extract_payload_error path.
+        let inner = anyhow::anyhow!(
+            "CommitTx rejected: {{\"error\":\"preflight_insufficient_space\",\"detail\":\"/mnt/ext0 short by 28 GiB\"}}"
+        );
+        let state = job_failed_from_err(1000, 2000, &inner);
+        match state {
+            JobState::Failed {
+                error_reason,
+                error_detail,
+                ..
+            } => {
+                assert_eq!(
+                    error_reason.as_deref(),
+                    Some("preflight_insufficient_space")
+                );
+                assert_eq!(error_detail.as_deref(), Some("/mnt/ext0 short by 28 GiB"));
             }
             _ => panic!("expected Failed state"),
         }
