@@ -3,7 +3,6 @@
 //! for a local folder, a remote (NAS) source that reports mtimes, and one that does not
 //! (SPEC.md §11.4). Each run is a new job (a new upload), as the engine's resume
 //! strategy makes it.
-#![cfg(unix)]
 mod common;
 
 use std::collections::BTreeMap;
@@ -53,6 +52,11 @@ fn rig(tag: &str) -> Rig {
 struct Run {
     sent: u64,
     resent: u64,
+    files_sent: u64,
+    skipped_files: u64,
+    skipped_bytes: u64,
+    /// The engine's progress counter when the upload returned (sent plus skipped).
+    progress: u64,
 }
 
 fn cfg(fs: Option<Arc<dyn SourceFs>>) -> (TransferConfig, Arc<AtomicU64>) {
@@ -79,8 +83,12 @@ fn run(r: &Rig, fs: Option<Arc<dyn SourceFs>>, src: &Path, dest: &Path, mode: Sk
         .unwrap_or_else(|e| panic!("upload failed: {e:#}"));
     let body: serde_json::Value = serde_json::from_str(&res.commit_ack_body).unwrap();
     Run {
-        sent: sent.load(Ordering::Relaxed),
+        sent: res.bytes_sent,
         resent: body["resent"].as_u64().unwrap(),
+        files_sent: body["files_sent"].as_u64().unwrap(),
+        skipped_files: body["skipped_files"].as_u64().unwrap(),
+        skipped_bytes: body["skipped_bytes"].as_u64().unwrap(),
+        progress: sent.load(Ordering::Relaxed),
     }
 }
 
@@ -109,9 +117,22 @@ fn local_source_second_run_skips_everything_and_a_changed_file_is_resent() {
         big(200_000, 2)
     );
 
+    assert_eq!((first.files_sent, first.skipped_files), (2, 0));
+
     let second = run(&r, None, &src, &dest, SkipMode::Fast);
     assert_eq!(second.sent, 0, "identical tree: nothing re-sent");
     assert_eq!(second.resent, 0);
+    // Everything skipped: filesSent 0 and skippedFiles N is the client's "already up to
+    // date", and the bar (sent + skipped) reaches the whole 500 000 bytes.
+    assert_eq!(
+        (
+            second.files_sent,
+            second.skipped_files,
+            second.skipped_bytes
+        ),
+        (0, 2, 500_000)
+    );
+    assert_eq!(second.progress, 500_000);
 
     // A size change is re-sent, and only that file.
     write(&src.join("d/b.bin"), &big(210_000, 3));
@@ -129,15 +150,73 @@ fn local_source_second_run_skips_everything_and_a_changed_file_is_resent() {
     drop(r.srv);
 }
 
+#[test]
+fn local_same_size_new_mtime_is_resent_by_fast_mode() {
+    let r = rig("nas-mtime-change");
+    let src = r.t.join("src");
+    let dest = r.t.join("dest");
+    write(&src.join("a.bin"), &big(100_000, 1));
+    write(&src.join("b.bin"), &big(100_000, 2));
+    run(&r, None, &src, &dest, SkipMode::Fast);
+    // Same size, other bytes, a later mtime (an editor saved over it).
+    write(&src.join("b.bin"), &big(100_000, 7));
+    let f = std::fs::File::options()
+        .write(true)
+        .open(src.join("b.bin"))
+        .unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
+        .unwrap();
+    let again = run(&r, None, &src, &dest, SkipMode::Fast);
+    assert_eq!((again.files_sent, again.skipped_files), (1, 1));
+    assert_eq!(std::fs::read(dest.join("b.bin")).unwrap(), big(100_000, 7));
+    drop(r.srv);
+}
+
 /// A one-level in-memory share; `with_mtime` decides whether the backend can report times.
 #[derive(Debug)]
 struct Nas {
     files: Mutex<BTreeMap<String, Vec<u8>>>,
     with_mtime: bool,
+    /// Every `open` waits this long (a slow share).
+    open_delay_ms: u64,
+    /// Every opened path, in order.
+    opened: Mutex<Vec<String>>,
+    /// Paths from here on block in `open` until the gate opens.
+    gate_from: Option<String>,
+    gate: (Mutex<bool>, std::sync::Condvar),
+}
+
+impl Nas {
+    fn new(files: BTreeMap<String, Vec<u8>>, with_mtime: bool) -> Nas {
+        Nas {
+            files: Mutex::new(files),
+            with_mtime,
+            open_delay_ms: 0,
+            opened: Mutex::default(),
+            gate_from: None,
+            gate: (Mutex::new(true), std::sync::Condvar::new()),
+        }
+    }
+
+    fn open_gate(&self) {
+        *self.gate.0.lock().unwrap() = true;
+        self.gate.1.notify_all();
+    }
 }
 
 impl SourceFs for Nas {
     fn open(&self, p: &Path) -> std::io::Result<Box<dyn ReadSeek>> {
+        if self.open_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.open_delay_ms));
+        }
+        let path = p.to_str().unwrap();
+        if self.gate_from.as_deref().is_some_and(|g| path >= g) {
+            let mut open = self.gate.0.lock().unwrap();
+            while !*open {
+                open = self.gate.1.wait(open).unwrap();
+            }
+        }
+        self.opened.lock().unwrap().push(path.to_string());
         let f = self.files.lock().unwrap();
         let b = f
             .get(p.to_str().unwrap())
@@ -177,10 +256,7 @@ fn nas(with_mtime: bool) -> Arc<Nas> {
     let mut files = BTreeMap::new();
     files.insert("/share/a".to_string(), big(300_000, 5));
     files.insert("/share/b".to_string(), big(200_000, 6));
-    Arc::new(Nas {
-        files: Mutex::new(files),
-        with_mtime,
-    })
+    Arc::new(Nas::new(files, with_mtime))
 }
 
 fn remote_flow(tag: &str, with_mtime: bool) {
@@ -268,4 +344,124 @@ fn remote_source_with_mtimes_skips_by_size_and_time() {
 #[test]
 fn remote_source_without_mtimes_verifies_and_resends_only_what_changed() {
     remote_flow("nas-nomtime", false);
+}
+
+/// `n` 50 000-byte files `f00..` on a share without mtimes.
+fn many(n: usize, with_mtime: bool) -> Nas {
+    let files = (0..n)
+        .map(|i| (format!("/share/f{i:02}"), big(50_000, i as u8)))
+        .collect();
+    Nas::new(files, with_mtime)
+}
+
+fn waited(what: &str, mut ok: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !ok() {
+        assert!(
+            std::time::Instant::now() < end,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn hashing_reports_progress_and_cancel_stops_it_promptly() {
+    let r = rig("nas-hash");
+    let dest = r.t.join("dest");
+    let mut nas = many(40, false);
+    nas.open_delay_ms = 50; // 2 s to hash the share
+    let fs: Arc<dyn SourceFs> = Arc::new(nas);
+
+    // Progress advances while hashing: a watcher sees a value strictly inside (0, total).
+    let (mut c, _) = cfg(Some(fs.clone()));
+    let verify = Arc::new(AtomicU64::new(0));
+    c.progress_verify = Some(verify.clone());
+    let cancel = c.cancel.clone().unwrap();
+    let seen_mid = AtomicBool::new(false);
+    let started = std::time::Instant::now();
+    let res = std::thread::scope(|sc| {
+        let h = sc.spawn(|| {
+            upload_dir_skip_existing_in(
+                &r.pool,
+                &c,
+                [0x51; 16],
+                dest.to_str().unwrap(),
+                Path::new("/share"),
+                SkipMode::Fast,
+            )
+        });
+        // Cancel once some, but not all, of the 2 000 000 bytes are hashed.
+        waited("hashing to start", || verify.load(Ordering::Relaxed) > 0);
+        let v = verify.load(Ordering::Relaxed);
+        seen_mid.store(v > 0 && v < 2_000_000, Ordering::Relaxed);
+        cancel.store(true, Ordering::Relaxed);
+        h.join().unwrap()
+    });
+    assert!(
+        seen_mid.load(Ordering::Relaxed),
+        "progress advanced during hashing"
+    );
+    let e = res.unwrap_err();
+    assert!(e.to_string().contains("transfer_cancelled"), "{e:#}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1800),
+        "cancel did not wait for the whole hash: {:?}",
+        started.elapsed()
+    );
+    assert!(!dest.exists(), "nothing was sent");
+    drop(r.srv);
+}
+
+#[test]
+fn nas_upload_resume_after_a_drop() {
+    let mut r = rig("nas-drop");
+    let dest = r.t.join("dest");
+    let mut nas = many(40, true);
+    nas.gate_from = Some("/share/f20".into());
+    *nas.gate.0.lock().unwrap() = false; // f20.. wait until released
+    let nas = Arc::new(nas);
+    let fs: Arc<dyn SourceFs> = nas.clone();
+    let (c, _) = cfg(Some(fs));
+    let done = c.progress_files.clone().unwrap();
+    let Rig { pool, srv, .. } = &mut r;
+    let res = std::thread::scope(|sc| {
+        let h = sc.spawn(|| {
+            upload_dir_skip_existing_in(
+                pool,
+                &c,
+                [0x52; 16],
+                dest.to_str().unwrap(),
+                Path::new("/share"),
+                SkipMode::Fast,
+            )
+        });
+        // f00..f19 are on the console's journal; then the console restarts (session
+        // killed, memory gone, journal kept) while the rest is still being read.
+        waited("10 durable files", || done.load(Ordering::Relaxed) >= 10);
+        srv.restart_data();
+        nas.open_gate();
+        h.join().unwrap()
+    });
+    let res = res.unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+    for i in 0..40 {
+        assert_eq!(
+            std::fs::read(dest.join(format!("f{i:02}"))).unwrap(),
+            big(50_000, i as u8),
+            "f{i:02}"
+        );
+    }
+    assert_eq!(res.shards_sent, 40);
+    // Only the missing files were read again: f00..f19 reached the console's journal
+    // before the drop and were opened exactly once. (f20.. may be opened twice: the
+    // first attempt's readers were released into the dead session.)
+    let opened = nas.opened.lock().unwrap().clone();
+    for i in 0..20 {
+        let name = format!("/share/f{i:02}");
+        assert_eq!(
+            opened.iter().filter(|p| **p == name).count(),
+            1,
+            "{name} was read again after it was durable: {opened:?}"
+        );
+    }
 }

@@ -1058,6 +1058,67 @@ fn spawn_progress_ticker(
     stop
 }
 
+/// `(skipped files, skipped bytes, files sent)` from an AVA1 commit ack, when it has them.
+fn ava1_skip_counts(ack: &str) -> Option<(u64, u64, u64)> {
+    let v: serde_json::Value = serde_json::from_str(ack).ok()?;
+    Some((
+        v["skipped_files"].as_u64()?,
+        v["skipped_bytes"].as_u64()?,
+        v["files_sent"].as_u64()?,
+    ))
+}
+
+/// While an AVA1 skip-existing job reads the whole source up front (the `verify` policy),
+/// shows it as a "verify" stage with the bytes hashed so far. The upload bar itself stays
+/// at 0 meanwhile; the existing Upload screen does not render `stage`, so this is carried
+/// in the job snapshot for any client that wants it. Ends when hashing completes or `stop`.
+fn spawn_verify_stage(
+    jobs: Arc<Mutex<HashMap<Uuid, JobState>>>,
+    events_tx: broadcast::Sender<String>,
+    job_id: Uuid,
+    hashed: Arc<AtomicU64>,
+    total: u64,
+    stop: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut last = u64::MAX;
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let done = hashed.load(Ordering::Relaxed).min(total);
+            if done == last {
+                continue;
+            }
+            last = done;
+            let finished = done >= total;
+            let snapshot = {
+                let mut g = jobs.lock().unwrap_or_else(|e| e.into_inner());
+                match g.get_mut(&job_id) {
+                    Some(JobState::Running { stage, .. }) => {
+                        *stage = (!finished).then(|| JobStage {
+                            id: "verify".into(),
+                            index: 1,
+                            count: 2,
+                            done,
+                            total,
+                        });
+                        g.get(&job_id).cloned()
+                    }
+                    _ => None,
+                }
+            };
+            let Some(state) = snapshot else { break };
+            let msg = serde_json::json!({ "job_id": job_id.to_string(), "job": state });
+            let _ = events_tx.send(msg.to_string());
+            if finished {
+                break;
+            }
+        }
+    });
+}
+
 /// RAII guard that flips the ticker's stop flag when dropped, so a
 /// panic between `spawn_progress_ticker` and the handler's manual
 /// `stop_ticker.store(true)` doesn't leak the spawned tokio task
@@ -5094,8 +5155,18 @@ async fn transfer_file_handler(
             )
         };
         let files_sent_count: u64 = 1;
-        let skipped_files_count: u64 = 0;
-        let skipped_bytes_count: u64 = 0;
+        let mut skipped_files_count: u64 = 0;
+        let mut skipped_bytes_count: u64 = 0;
+        let mut files_sent_count = files_sent_count;
+        // An AVA1 job reports what the console already had (skip policies, SPEC §11.4)
+        // and the files actually sent; an all-skipped resume is "already up to date".
+        if let Some((sf, sb, fs)) = result
+            .as_ref()
+            .ok()
+            .and_then(|r| ava1_skip_counts(&r.commit_ack_body))
+        {
+            (skipped_files_count, skipped_bytes_count, files_sent_count) = (sf, sb, fs);
+        }
         match result {
             Ok(r) => {
                 let completed_at_ms = now_ms();
@@ -5399,6 +5470,18 @@ async fn transfer_dir_handler(
             "transfer_dir: job={job_id} protocol={}",
             if use_ava1 { "ava1" } else { "ftx2" }
         );
+        if use_ava1 && skip_existing.is_some() {
+            let hashed = Arc::new(AtomicU64::new(0));
+            cfg.progress_verify = Some(Arc::clone(&hashed));
+            spawn_verify_stage(
+                Arc::clone(&jobs),
+                events_tx.clone(),
+                job_id,
+                hashed,
+                total_bytes,
+                Arc::clone(&_stop_guard.0),
+            );
+        }
         let result = if use_ava1 {
             // Resume is by job_id (the sender reopens with JobOpen); retries
             // live in the adapter's loop, so no flags/retry count here (C3).
@@ -10707,6 +10790,15 @@ mod helpers_tests {
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn an_all_skipped_ack_reports_nothing_sent() {
+        let ack =
+            r#"{"protocol":"ava1","files":5,"skipped_files":5,"skipped_bytes":900,"files_sent":0}"#;
+        assert_eq!(ava1_skip_counts(ack), Some((5, 900, 0)));
+        assert_eq!(ava1_skip_counts(r#"{"protocol":"ftx2"}"#), None);
+        assert_eq!(ava1_skip_counts("not json"), None);
     }
 
     #[tokio::test]

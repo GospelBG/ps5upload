@@ -76,6 +76,12 @@ pub struct Progress {
     pub lanes: AtomicU8,
     pub bottleneck: AtomicU8,
     pub sequential: AtomicBool,
+    /// Files and bytes the receiver already had when the job first opened (its map's
+    /// done files): "skipped", not sent. Recorded by the first attempt only, so a
+    /// reconnect that finds the earlier attempt's files done does not call them skipped.
+    pub skipped_files: AtomicU64,
+    pub skipped_bytes: AtomicU64,
+    pub skip_recorded: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -1078,6 +1084,16 @@ pub async fn run_upload(
         .map(|i| manifest.entry(*i).map_or(0, |e| e.size))
         .sum::<u64>()
         + need.partial.values().map(|r| r.covered()).sum::<u64>();
+    if !pg.skip_recorded.swap(true, Ordering::Relaxed) {
+        let done_files = need
+            .done
+            .iter()
+            .filter_map(|i| manifest.entry(*i))
+            .filter(|e| e.kind == gen::ENTRY_FILE);
+        let (n, b) = done_files.fold((0u64, 0u64), |(n, b), e| (n + 1, b + e.size));
+        pg.skipped_files.store(n, Ordering::Relaxed);
+        pg.skipped_bytes.store(b, Ordering::Relaxed);
+    }
     pg.bytes_durable.store(done_bytes, Ordering::Relaxed);
     pg.files_durable
         .store(durable_files.len() as u64, Ordering::Relaxed);
