@@ -1248,9 +1248,19 @@ AVA1_C_CODEC := $(AVA1_C)/ava1_wire.c $(AVA1_C)/ava1_frame.c $(AVA1_C)/gen/ava1_
 # AVX2 path (x86-64 natively, or under Rosetta 2 on an arm64 Mac).
 test-ava1:
 	scripts/ava1-aead-test.sh
-	cd engine && cargo test -p ava1 -p ava1-gen -p ava1-ctest -p ava1-chaos
+	cd engine && cargo test -p ava1 -p ava1-gen -p ava1-chaos
+	# The C server and the data layer are process-wide singletons
+	# (one CServer at a time, one ava1_data_start): serial, not two shells.
+	cd engine && cargo test -p ava1-ctest -- --test-threads=1
 
 ava1-fuzz-c:
 	$${CC:-clang} -g -O1 -fsanitize=fuzzer,address,undefined -DAVA1_AEAD_PORTABLE -I$(AVA1_C) -I$(AVA1_C)/gen -Ipayload/third_party/monocypher \
 		-o /tmp/ava1-fuzz-decode $(AVA1_C)/fuzz/fuzz_decode.c $(AVA1_C_CODEC)
 	/tmp/ava1-fuzz-decode -max_total_time=$${AVA1_FUZZ_SECONDS:-60} -max_len=65536
+	$${CC:-clang} -g -O1 -fsanitize=fuzzer,address,undefined -I$(AVA1_C) -I$(AVA1_C)/gen -Ipayload/third_party/blake3 \
+		-DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0 \
+		-o /tmp/ava1-fuzz-data $(AVA1_C)/fuzz/fuzz_data.c $(AVA1_C)/ava1_manifest.c $(AVA1_C)/ava1_journal.c \
+		$(AVA1_C)/ava1_ranges.c $(AVA1_C)/ava1_wire.c $(AVA1_C)/ava1_frame.c $(AVA1_C)/gen/ava1_gen.c \
+		payload/third_party/blake3/blake3.c payload/third_party/blake3/blake3_dispatch.c \
+		payload/third_party/blake3/blake3_portable.c
+	/tmp/ava1-fuzz-data -max_total_time=$${AVA1_FUZZ_SECONDS:-60} -max_len=65536

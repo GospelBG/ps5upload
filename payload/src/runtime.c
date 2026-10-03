@@ -666,7 +666,7 @@ int is_path_allowed(const char *p);
  * access to system partitions. Destructive ops never honor it.
  * Defined alongside handle_fs_read. */
 static int is_unsafe_read_request(const char *request_body);
-static int is_safe_unsafe_read_path(const char *p);
+int is_safe_unsafe_read_path(const char *p);
 /* JSON-escape helper. Used by ACK builders that embed user-controlled
  * paths/strings into JSON bodies. Defined alongside FS_LIST_VOLUMES. */
 static size_t json_escape_into(const char *src, char *dst, size_t dst_cap);
@@ -7771,7 +7771,7 @@ static int is_unsafe_read_root_allowed(const char *p) {
     if (strcmp(p, "/system_ex") == 0) return 1;
     return 0;
 }
-static int is_safe_unsafe_read_path(const char *p) {
+int is_safe_unsafe_read_path(const char *p) {
     if (!p || p[0] != '/') return 0;
     if (path_has_dotdot_component(p)) return 0;
     if (!is_unsafe_read_root_allowed(p)) return 0;

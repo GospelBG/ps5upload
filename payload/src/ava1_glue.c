@@ -13,17 +13,40 @@
 #include <time.h>
 
 #include "ava1_aead.h"
+#include "ava1_data.h"
 #include "ava1_gen.h"
+#include "ava1_journal.h"
 #include "ava1_noise.h"
 #include "ava1_server.h"
 #include "ava1_store.h"
 #include "ava1_trust.h"
 #include "config.h"
+#include "cross_device.h" /* payload/include, not next to the AVA1 sources */
 #include "monocypher.h"
 #include "ps5_firmware.h"
 #include "runtime.h"
 
 #define AVA1_DIR "/data/ps5upload/ava"
+#define AVA1_JOBS AVA1_DIR "/jobs"
+
+/* Set once, before the server starts (so before any rpc call): the data layer is running.
+ * Without it the data plane's methods are unknown here, matching the missing CAP. */
+static int g_data_on;
+
+static int may_write(const char *p) { return is_path_allowed(p); }
+
+/* The same rule the FTX2 read handlers use (runtime.c): the writable allowlist, or a system
+ * partition read when the peer asked for an unsafe read. */
+static int may_read(const char *p, int unsafe_read) {
+    return is_path_allowed(p) || (unsafe_read && is_safe_unsafe_read_path(p));
+}
+
+/* 1 same device, 0 crosses (refuse: a cross-device rename panics this kernel), -1 unknown. */
+static int same_device(const char *from, const char *to_dir) {
+    unsigned long long a, b;
+    if (xdev_stat_dev(from, &a) != 0 || xdev_stat_dev(to_dir, &b) != 0) return -1;
+    return a == b ? 1 : 0;
+}
 
 static void on_pair_request(const char *peer_name, uint32_t code) {
     char msg[160];
@@ -112,6 +135,11 @@ static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t 
     ava1_node_info_t ni;
     ava1_w_t w;
     char firmware[64];
+    /* First, so the data plane's methods win over the fallbacks below. */
+    if (g_data_on) {
+        int rc = ava1_data_rpc(method, body, body_len, out, cap, out_len);
+        if (rc != -1) return rc;
+    }
     if (method == AVA1_METHOD_CRYPTO_BENCH) return crypto_bench(body, body_len, out, cap, out_len);
     if (method != AVA1_METHOD_NODE_INFO) return AVA1_ERR_UNKNOWN_METHOD;
     read_firmware(firmware, sizeof firmware);
@@ -148,6 +176,36 @@ int ava1_payload_start(void) {
     cfg.on_pair_request = on_pair_request;
     cfg.rpc = rpc;
     cfg.log = on_log;
+    {
+        ava1_data_cfg_t dc;
+        int rc;
+        memset(&dc, 0, sizeof dc);
+        snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "%s", AVA1_JOBS);
+        dc.may_write = may_write;
+        dc.may_read = may_read;
+        dc.same_device = same_device;
+        if (mkdir(AVA1_JOBS, 0755) != 0 && errno != EEXIST) {
+            /* Not fatal: the server and FTX2 keep working without the data plane. */
+            on_log("ava1: cannot create the jobs folder; transfers stay on FTX2");
+        } else {
+            /* Wall time only here: GC compares file mtimes, which are wall-clock. */
+            rc = ava1_jobs_gc(AVA1_JOBS, (int64_t)time(NULL), 7 * 86400);
+            if (rc < 0)
+                /* A GC failure is logged and ignored, never returned: a stale jobs
+                 * folder must not stop the payload from starting (the data layer is
+                 * its own gate). Runs once, here, on the start path. */
+                fprintf(stderr, "ava1: idle-job GC failed (%d); the data layer starts anyway\n", rc);
+            else if (rc > 0)
+                fprintf(stderr, "ava1: removed %d idle job directories\n", rc);
+            if ((rc = ava1_data_start(&dc)) != 0)
+                fprintf(stderr, "ava1: data layer did not start (%d); transfers stay on FTX2\n", rc);
+            else {
+                cfg.data = ava1_data_hooks();
+                cfg.caps = AVA1_CAP_DATA_PLANE;
+                g_data_on = 1;
+            }
+        }
+    }
     if (ava1_trust_slot_key(launcher) == 0) {
         /* Heap: ava1_peers_t is a few KB, more than this thread's stack should carry. */
         ava1_peers_t *peers = malloc(sizeof *peers);

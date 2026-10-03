@@ -290,6 +290,11 @@ extern volatile int g_ucred_elevation_rc;
  * (there's no symlink to follow yet). */
 int is_path_allowed(const char *p);
 
+/* The read half of the unsafe-read rule: `/system*` paths the hard-coded FTX2 handlers
+ * may read when the request asks for it. `is_path_allowed` OR this is the pair every
+ * unsafe read must satisfy — the same expression runtime.c uses. */
+int is_safe_unsafe_read_path(const char *p);
+
 /* The FTX2 frame type this thread is currently dispatching, or 0 when it is
  * not inside a request. Thread-local and written only by its own thread, so
  * the fatal-signal handler can read it without a lock.

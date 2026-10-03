@@ -352,6 +352,61 @@ under `<data dir>/ava/jobs/`. Each holds `journal`, `manifest` and one `<file_id
 per large file. A directory is removed 7 days after its last write (directory or journal mtime),
 on start.
 
+## 15. Apply (receivers)
+
+15.1 Directories first: every directory entry of the manifest is created before any file data
+is applied, and the directories a batch created are fsynced before that batch is journaled. A
+file whose parent is not a manifest entry still gets its parents created when it is opened.
+
+15.2 Small files (a `BundleRecord` chunk): `open(O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW)` → write →
+mode → mtime. The descriptor stays open until a sync batch covers the file; a duplicate record
+for a file that is already durable or already pending is dropped without truncating it. A
+record whose length disagrees with the manifest is answered with `FileRetry` reason
+`RETRY_CHANGED`, and one whose BLAKE3 disagrees with the root it carries with `RETRY_VERIFY`;
+the record is not applied and the job continues.
+
+15.3 Large files: `pwrite` at the chunk's offset into the part file (preallocated when new),
+group CVs into the outboard. Bytes are durable after a sync batch. When every byte is durable
+and the root merged from the outboard equals the sender's `FileRoot`, the file commits: mode →
+truncate to size → mtime → fsync → a same-device check (§12.6) → a rename in the same directory
+→ an fsync of that directory. The part file of a single-file job is `<root>.ava-part`; in a
+merge it is `<path>.ava-part` beside the final file; in a staged tree (§15.5) it is the file's
+final relative path inside the staging tree, so the file's own commit renames nothing. A part file or
+outboard that is missing at commit time is a reset (`FileRetry` `RETRY_IO`), never a new empty
+file.
+
+15.4 Sync batches: every 250 ms, or after `batch_max` small files (tuned 16–512, starting 256:
+halved when a batch takes over 1.5 s, doubled when under 0.5 s) or 64 MiB of large-file bytes.
+Data fsyncs run in parallel on the workers, then the new directories are fsynced, then the
+batch (`JnlBatch`) is appended and the durable ranges are reported. A stop in the middle of a
+sync journals and acknowledges nothing.
+
+15.5 Staging and merge: a new destination is staged — the tree is written to `<root>.ava-part`,
+a sibling of the destination, while `<root>` itself is created as an empty lock folder; at the
+end the finished tree is renamed over that empty folder (never over content). If the
+destination appeared in the meantime the job ends `ERR_EXISTS` and the files stay in
+`<root>.ava-part`. A merge into an existing folder refuses a manifest directory that is a
+symbolic link or not a directory (`ERR_PATH`), and a file already where one must go ends the
+job with `ERR_EXISTS`.
+
+Version 1 has two walk modes and they are deliberately different. The sender/download mode
+follows directory symlinks (the engine walks the same tree the same way); a symlink cycle is
+an error, never a spin, and a dangling link — the link's target cannot be stat'd — is an error
+in both modes. The console-local copy/move mode skips directory symlinks: the copy writes into
+a namespace it must not be able to be led out of by the source tree. Both are contracts, not
+bugs; the sender's descend behaviour is not normative for the copy path.
+
+A copy (`job.copy`) is a receiver job whose sender is the in-process reader, so this section
+applies to it unchanged. A finished local job stays listed for the park age, so `job.status`
+keeps answering for it.
+
+`job.copy` uses the source and destination paths, a stable job id, and flags including
+`JF_OVERWRITE` and `JF_MOVE`. Without `JF_OVERWRITE`, an existing destination root is refused
+with `ERR_EXISTS`; with it, colliding files are replaced and destination-only files remain.
+A move deletes source entries only after the destination rename, parent directory sync and
+successful Done journal append. It checks each source file against the manifest before unlinking
+and reports any paths left behind as a failed job; `job.status` stays running during deletion.
+
 ## 16. Governor
 
 The sender and the receiver each keep one small control loop; both are pure functions of the
@@ -387,3 +442,8 @@ and bytes done, durable bytes, its own bottleneck (`BN_DISK` when workers are at
 or adding one did not help, `BN_WORKERS` while it is still adding, `BN_NETWORK` when its queue
 ran dry), workers, lanes, and whether it runs sequential. The engine shows the sender's
 bottleneck, which already folds in the receiver's.
+
+16.10 disk.calibrate: method 19 accepts `DiskCalibrate` and returns `DiskCalibrateResult` with
+measurements at 1, 2, 4, 8 and 16 workers. The request allows at most 20,000 files of at most
+1 MiB each, and `dir` must pass the node's write policy. The answer is a hint for the engine's
+starting worker count, never a contract. The node deletes every file and directory it created.

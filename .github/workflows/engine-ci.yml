@@ -108,12 +108,21 @@ jobs:
         working-directory: engine
         env:
           RUST_BACKTRACE: 1
-        run: cargo test --workspace -- --nocapture
+        run: cargo test --workspace --exclude ava1-ctest -- --nocapture
+
+      # The C server and the data layer are process-wide singletons: the C interop suite
+      # runs one test at a time so a test that holds the server cannot starve the others.
+      - name: cargo test (ava1 C interop, serial)
+        working-directory: engine
+        env:
+          RUST_BACKTRACE: 1
+        run: cargo test -p ava1-ctest -- --test-threads=1
 
   # ─────────────────────────────────────────────────────────────────────
   # AVA1: C/Rust conformance + interop runs in rust-engine (cargo test
-  # --workspace). This job adds what that one cannot: fuzzing the C decoders
-  # under ASan/UBSan and the Rust decoders with cargo-fuzz.
+  # --workspace, then ava1-ctest serially). This job adds what that one cannot:
+  # fuzzing the C decoders and data-plane parsers under ASan/UBSan and the
+  # Rust decoders with cargo-fuzz.
   # ─────────────────────────────────────────────────────────────────────
   ava1:
     name: ava1 (fuzz C + Rust decoders)
@@ -128,7 +137,7 @@ jobs:
       - name: C frame AEAD (RFC 8439 + Monocypher differential, AVX2 and portable paths)
         run: scripts/ava1-aead-test.sh
 
-      - name: Fuzz C decoders (60 s)
+      - name: Fuzz C decoders + data-plane parsers (60 s each)
         env:
           AVA1_FUZZ_SECONDS: 60
         run: make ava1-fuzz-c
