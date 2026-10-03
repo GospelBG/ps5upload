@@ -276,9 +276,13 @@ with `ERR_PROTOCOL` on a `Chunk` for a small file or a `BundleRecord` for a larg
 
 12.3 `Received{lane, seq}` is sent as soon as the receiver has a lane frame in memory,
 before any disk work. A sender requeues, on any lane, the frames of a lane that closed
-before they were `Received`. Applying a frame twice is harmless. A lane's death does not
-release window credit: the requeued frames' bytes stay charged until the receiver
-accounts for them (its `Credit` after the apply) or the job ends.
+before they were `Received`. Applying a frame twice is harmless. A lane's death releases
+window credit only for frames that provably never left the sender: frames the lane's writer
+never dequeued (still queued when the writer is confirmed dead) are dropped and their bytes
+returned to the window. A frame the writer may have put on the wire stays charged until the
+receiver accounts for it (its `Credit` after the apply) or the job ends — releasing those
+would let the sender spend the same window twice, and the receiver's `ERR_CREDIT` (12.4)
+would fail a healthy job.
 
 12.4 Credit: `JobOpenAck.credit` (uploads) or `JobOpen.ext credit` (downloads) is the
 number of lane-frame body bytes the sender may have outstanding; `Credit{bytes}` returns
