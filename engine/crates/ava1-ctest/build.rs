@@ -57,6 +57,7 @@ fn main() {
             ava1.join("ava1_b3.c"),
             ava1.join("platform_posix.c"),
             ava1.join("gen/ava1_gen.c"),
+            p.join("src/mgmt_rpc.c"),
             here.join("csrc/sizes.c"),
             here.join("csrc/test_shim.c"),
             here.join("csrc/firmware_shim.c"),
@@ -94,6 +95,14 @@ fn main() {
         println!("cargo:rustc-link-lib=pthread");
     }
     println!("cargo:rerun-if-changed={}", ava1.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("src/mgmt_rpc.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("include/mgmt_rpc.h").display()
+    );
     println!("cargo:rerun-if-changed={}", mono.display());
     println!("cargo:rerun-if-changed={}", b3.display());
     println!(

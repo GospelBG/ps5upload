@@ -157,7 +157,7 @@ SRCS := src/main.c src/runtime.c src/shell_builtin.c src/takeover.c src/register
         src/backup.c src/remoteplay.c src/fan_curve.c src/notif.c \
         src/wake_watchdog.c src/cheats.c src/xml_encoding.c src/activity.c src/sdk_changer.c src/fakelib_overlay.c \
         src/tmdb.c src/fw_spoof.c src/ftp_server.c src/focus_probe.c \
-        src/content_db.c \
+        src/content_db.c src/mgmt_rpc.c \
         third_party/tiny_aes/aes.c \
         $(BLAKE3_SRCS)
 

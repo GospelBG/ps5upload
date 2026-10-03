@@ -21,6 +21,7 @@
 #include "ava1_store.h"
 #include "ava1_trust.h"
 #include "config.h"
+#include "mgmt_rpc.h"
 #include "cross_device.h" /* payload/include, not next to the AVA1 sources */
 #include "monocypher.h"
 #include "ps5_firmware.h"
@@ -141,7 +142,9 @@ static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t 
         if (rc != -1) return rc;
     }
     if (method == AVA1_METHOD_CRYPTO_BENCH) return crypto_bench(body, body_len, out, cap, out_len);
-    if (method != AVA1_METHOD_NODE_INFO) return AVA1_ERR_UNKNOWN_METHOD;
+    /* The management methods (4 and up): the FTX2 handlers behind the capture sink. An
+     * unknown method answers ERR_UNKNOWN_METHOD from there. */
+    if (method != AVA1_METHOD_NODE_INFO) return mgmt_rpc_dispatch(method, body, body_len, out, cap, out_len);
     read_firmware(firmware, sizeof firmware);
     memset(&ni, 0, sizeof ni);
     ni.version = (const uint8_t *)version;

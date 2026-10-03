@@ -61,6 +61,7 @@
 #include "proc_identity.h"
 #include "smp_meta.h"
 #include "blake3.h"
+#include "mgmt_rpc.h"
 
 /* PS5 SDK's `<fcntl.h>` hides `posix_fadvise` and its POSIX_FADV_* constants
  * behind `__POSIX_VISIBLE >= 200112`, but defining `_POSIX_C_SOURCE` to unlock
@@ -2384,6 +2385,9 @@ static int send_full(int fd, const void *buf, size_t len) {
 static int send_frame(int fd, uint16_t frame_type, uint32_t flags,
                       uint64_t trace_id, const void *body, uint64_t body_len) {
     unsigned char hdr[FTX2_HEADER_LEN];
+    /* An AVA1 management call runs this handler with no socket: the frame is
+     * captured and becomes the RpcResponse (mgmt_rpc.c). */
+    if (mgmt_capture_active()) return mgmt_capture_frame(frame_type, body, body_len);
     write_le32(hdr + 0, FTX2_MAGIC);
     write_le16(hdr + 4, FTX2_VERSION);
     write_le16(hdr + 6, frame_type);
@@ -5900,7 +5904,7 @@ static uint64_t runtime_tx_allocated_bytes(const runtime_tx_entry_t *entry) {
 
 static int handle_fs_list_volumes(runtime_state_t *state, int client_fd,
                                    uint64_t trace_id) {
-    const size_t RESP_CAP = 16u * 1024u;
+    const size_t RESP_CAP = 64u * 1024u; /* heap; ~330 B per mount, was 16 KiB */
     char *resp = NULL;
     size_t off = 0;
     struct statfs *mnts = NULL;
@@ -6058,9 +6062,15 @@ static int handle_fs_list_volumes(runtime_state_t *state, int client_fd,
                      writable ? "true" : "false",
                      source_esc);
         if (n < 0 || (size_t)n >= RESP_CAP - off) {
+            /* Never answer with a clipped list (SPEC.md §7.3): the old `break`
+             * sent the volumes that fit as a success and silently dropped the
+             * rest. */
             fprintf(stderr, "[payload2] fs_list_volumes: response buffer full at %d/%d mounts\n",
                     i, nmnts);
-            break;
+            free(resp);
+            free(mnts);
+            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                              "fs_list_volumes_reply_truncated", 31);
         }
         off += (size_t)n;
         /* Defensive belt-and-braces clamp. The check above already
@@ -15804,6 +15814,9 @@ abort_done:
 
 
 __thread volatile unsigned int g_inflight_frame_type = 0;
+
+/* The AVA1 management table (mgmt_table.def) and its thread environment. */
+#include "mgmt_install.inc"
 
 static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
                                     int is_transfer_port,

@@ -297,6 +297,16 @@ pub mod ffi {
         pub fn ava1_test_page_next(out: *mut i64);
         pub fn ava1_test_data_clamp(start: u8, min: u8, max: u8, out: *mut c_int);
         pub fn ava1_test_set_same_device(v: c_int);
+        pub fn ava1_test_mgmt_install() -> c_int;
+        pub fn ava1_test_mgmt_install_duplicate() -> c_int;
+        pub fn ava1_test_mgmt_set_apps(n: u32);
+        pub fn ava1_test_mgmt_stats(
+            enters: *mut u32,
+            leaves: *mut u32,
+            last_frame: *mut u32,
+            sony_peak: *mut c_int,
+        );
+        pub fn ava1_test_mgmt_last_path(out: *mut u8, cap: usize) -> usize;
         pub fn ava1_test_set_allow_read(v: c_int);
         pub fn ava1_test_apply_begin(
             jobs: *const c_char,
@@ -1594,4 +1604,34 @@ pub fn c_recv_open_status(jobs: &Path, root: &Path, a: OpenArgs) -> i32 {
     let rc = recv_open_raw(jobs, root, a.flags, a.policy, a.entries, 0);
     unsafe { ffi::ava1_test_recv_args(ava1::gen::JOB_UPLOAD) };
     rc
+}
+
+/// The management dispatcher's stub table (P3 Task 2): installs it for the C server's RPC.
+pub mod mgmt {
+    use super::ffi;
+
+    /// Installs the stub table. 0 on success.
+    pub fn install() -> i32 {
+        unsafe { ffi::ava1_test_mgmt_install() }
+    }
+    /// What a table with a repeated method does at install (-1 expected).
+    pub fn install_duplicate() -> i32 {
+        unsafe { ffi::ava1_test_mgmt_install_duplicate() }
+    }
+    /// How many entries the stub `app.list` handler produces.
+    pub fn set_apps(n: u32) {
+        unsafe { ffi::ava1_test_mgmt_set_apps(n) }
+    }
+    /// (enter calls, leave calls, last legacy frame, peak concurrent Sony-lock holders).
+    pub fn stats() -> (u32, u32, u32, i32) {
+        let (mut e, mut l, mut f, mut p) = (0, 0, 0, 0);
+        unsafe { ffi::ava1_test_mgmt_stats(&mut e, &mut l, &mut f, &mut p) };
+        (e, l, f, p)
+    }
+    /// The path the stub `fs.mkdir` handler last received.
+    pub fn last_path() -> String {
+        let mut b = [0u8; 256];
+        let n = unsafe { ffi::ava1_test_mgmt_last_path(b.as_mut_ptr(), b.len()) };
+        String::from_utf8_lossy(&b[..n]).into_owned()
+    }
 }

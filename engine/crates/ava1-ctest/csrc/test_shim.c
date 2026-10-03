@@ -27,8 +27,10 @@
 #include "ava1_send.h"
 #include "ava1_server.h"
 #include "ava1_thread.h"
+#include "mgmt_rpc.h"
 
 static uint32_t g_pair_requests, g_last_code, g_logs;
+
 
 static void on_log(const char *msg) {
     (void)msg;
@@ -39,6 +41,210 @@ static void on_pair(const char *name, uint32_t code) {
     (void)name;
     __atomic_add_fetch(&g_pair_requests, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_last_code, code, __ATOMIC_SEQ_CST);
+}
+
+
+/* ---------------------------------------------------------------------------
+ * P3 Task 2: the management dispatcher over stub handlers. The real table lives in
+ * payload/src/mgmt_table.def and is built into runtime.c (not compiled on the host); the
+ * stubs below answer through the same capture sink runtime.c's send_frame feeds.
+ */
+
+#define STUB_FRAME_ERROR 3u
+
+/* What runtime.c's send_frame does with fd == -1 under a management call. */
+static int stub_send_frame(uint16_t type, const void *body, uint64_t len) {
+    if (mgmt_capture_active()) return mgmt_capture_frame(type, body, len);
+    return -1;
+}
+
+static size_t stack_size_now(void) {
+    size_t sz = 0;
+#if defined(__APPLE__)
+    sz = pthread_get_stacksize_np(pthread_self());
+#else
+    pthread_attr_t a;
+    if (pthread_getattr_np(pthread_self(), &a) == 0) {
+        pthread_attr_getstacksize(&a, &sz);
+        pthread_attr_destroy(&a);
+    }
+#endif
+    return sz;
+}
+
+static __thread unsigned g_stub_marker;
+static uint32_t g_stub_enters, g_stub_leaves, g_stub_last_frame;
+static char g_stub_last_path[256];
+static uint32_t g_stub_apps;
+static pthread_mutex_t g_stub_sony = PTHREAD_MUTEX_INITIALIZER;
+static int g_stub_sony_in, g_stub_sony_peak;
+
+static void stub_enter(uint16_t legacy_frame) {
+    g_stub_marker = legacy_frame;
+    __atomic_add_fetch(&g_stub_enters, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_stub_last_frame, legacy_frame, __ATOMIC_SEQ_CST);
+}
+
+static void stub_leave(void) {
+    g_stub_marker = 0;
+    __atomic_add_fetch(&g_stub_leaves, 1, __ATOMIC_SEQ_CST);
+}
+
+/* fs.volumes: a fixed list. */
+static int stub_volumes(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    static const char body[] = "{\"volumes\":[{\"path\":\"/data\"}]}";
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    return stub_send_frame(35, body, sizeof body - 1);
+}
+
+/* fs.mkdir: the legacy {"path":...} request, the legacy tokens. */
+static int stub_mkdir(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    const char *p = strstr(b, "\"path\":\"");
+    size_t n = 0;
+    (void)st; (void)fd; (void)t; (void)l;
+    g_stub_last_path[0] = '\0';
+    if (p) {
+        size_t i = 8;
+        while (p[i] && p[i] != '"' && n + 2 < sizeof g_stub_last_path) {
+            if (p[i] == '\\' && p[i + 1]) g_stub_last_path[n++] = p[i++]; /* an escape: keep both bytes */
+            g_stub_last_path[n++] = p[i++];
+        }
+        g_stub_last_path[n] = '\0';
+    }
+    if (strcmp(g_stub_last_path, "/denied") == 0) return stub_send_frame(STUB_FRAME_ERROR, "fs_mkdir_path_not_allowed", 25);
+    if (strcmp(g_stub_last_path, "/fail") == 0) return stub_send_frame(STUB_FRAME_ERROR, "fs_mkdir_failed", 15);
+    return stub_send_frame(47, NULL, 0);
+}
+
+/* app.launch (a Sony-lock method): holds a stand-in for sony_api_lock while it works, and
+ * answers a successful frame carrying {"ok":false} for a title the stub refuses. */
+static int stub_launch(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st; (void)fd; (void)t; (void)l;
+    pthread_mutex_lock(&g_stub_sony);
+    {
+        int in = ++g_stub_sony_in;
+        if (in > g_stub_sony_peak) g_stub_sony_peak = in;
+    }
+    usleep(20 * 1000);
+    g_stub_sony_in--;
+    pthread_mutex_unlock(&g_stub_sony);
+    if (strstr(b, "NOPE")) return stub_send_frame(61, "{\"ok\":false,\"err\":\"launch_failed\"}", 33);
+    if (!strstr(b, "title_id")) return stub_send_frame(STUB_FRAME_ERROR, "launch_title_id_missing", 23);
+    return stub_send_frame(61, NULL, 0);
+}
+
+/* app.list: g_stub_apps entries in the legacy {"apps":[...]} shape (the handler's own buffer
+ * is 512 KiB, so it may be larger than a reply can be). */
+static int stub_app_list(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    size_t cap = 1u << 20, off = 0;
+    uint32_t i;
+    char *buf = malloc(cap);
+    int rc;
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    if (!buf) return -1;
+    off += (size_t)snprintf(buf + off, cap - off, "{\"apps\":[");
+    for (i = 0; i < g_stub_apps; i++)
+        off += (size_t)snprintf(buf + off, cap - off,
+                                "%s{\"title_id\":\"PPSA%05u\",\"title_name\":\"Game \\\"%u\\\", [x]\",\"src\":\"/mnt/a/%u\",\"image_backed\":false}",
+                                i ? "," : "", i, i, i);
+    off += (size_t)snprintf(buf + off, cap - off, "]}");
+    rc = stub_send_frame(63, buf, off);
+    free(buf);
+    return rc;
+}
+
+/* proc.process_list: a reply of the requested size ({"n":N} in the request). */
+static int stub_big(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    const char *p = strstr(b, "\"n\":");
+    size_t n = p ? (size_t)strtoul(p + 4, NULL, 10) : 0;
+    char *buf = malloc(n + 1);
+    int rc;
+    (void)st; (void)fd; (void)t; (void)l;
+    if (!buf) return -1;
+    memset(buf, 'x', n);
+    buf[n] = '\0';
+    rc = stub_send_frame(163, buf, n);
+    free(buf);
+    return rc;
+}
+
+/* fs.mount: reports the environment the dispatcher gave this thread. */
+static int stub_env(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    char body[160];
+    int n = snprintf(body, sizeof body, "{\"stack\":%zu,\"marker\":%u}", stack_size_now(), g_stub_marker);
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    return stub_send_frame(41, body, (uint64_t)n);
+}
+
+/* fs.unmount: sends two frames, the second an error (the first error wins; a later OK must not hide it). */
+static int stub_two_frames(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    stub_send_frame(STUB_FRAME_ERROR, "fs_unmount_failed", 17);
+    return stub_send_frame(55, "{\"ok\":true}", 11);
+}
+
+/* fs.mount_pkg: returns without sending anything. */
+static int stub_silent(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    return 0;
+}
+
+#define STUB_RUN(name, helper) \
+    static int run_##name(const uint8_t *q, uint32_t n, mgmt_ctx_t *cx) { return helper(q, n, cx, name); }
+STUB_RUN(stub_volumes, mgmt_call_text)
+STUB_RUN(stub_mkdir, mgmt_call_fs_mkdir)
+STUB_RUN(stub_launch, mgmt_call_text)
+STUB_RUN(stub_app_list, mgmt_call_paged)
+STUB_RUN(stub_big, mgmt_call_text)
+STUB_RUN(stub_env, mgmt_call_text)
+STUB_RUN(stub_two_frames, mgmt_call_text)
+STUB_RUN(stub_silent, mgmt_call_text)
+
+static const mgmt_entry_t k_stub_table[] = {
+    {AVA1_METHOD_FS_VOLUMES, 34, 35, 0, run_stub_volumes},
+    {AVA1_METHOD_FS_MKDIR, 46, 47, 0, run_stub_mkdir},
+    {AVA1_METHOD_APP_LAUNCH, 60, 61, MGMT_SONY, run_stub_launch},
+    {AVA1_METHOD_APP_LIST, 62, 63, 0, run_stub_app_list},
+    {AVA1_METHOD_PROC_PROCESS_LIST, 162, 163, 0, run_stub_big},
+    {AVA1_METHOD_FS_MOUNT, 52, 53, 0, run_stub_env},
+    {AVA1_METHOD_FS_UNMOUNT, 54, 55, 0, run_stub_two_frames},
+    {AVA1_METHOD_FS_MOUNT_PKG, 124, 125, 0, run_stub_silent},
+};
+
+int ava1_test_mgmt_install(void) {
+    __atomic_store_n(&g_stub_enters, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_stub_leaves, 0, __ATOMIC_SEQ_CST);
+    return mgmt_rpc_install(k_stub_table, sizeof k_stub_table / sizeof k_stub_table[0], NULL, stub_enter, stub_leave);
+}
+
+/* A table with the same method twice: the install must refuse it. */
+int ava1_test_mgmt_install_duplicate(void) {
+    mgmt_entry_t dup[2];
+    dup[0] = k_stub_table[0];
+    dup[1] = k_stub_table[0];
+    return mgmt_rpc_install(dup, 2, NULL, NULL, NULL);
+}
+
+void ava1_test_mgmt_set_apps(uint32_t n) { g_stub_apps = n; }
+void ava1_test_mgmt_stats(uint32_t *enters, uint32_t *leaves, uint32_t *last_frame, int *sony_peak) {
+    *enters = __atomic_load_n(&g_stub_enters, __ATOMIC_SEQ_CST);
+    *leaves = __atomic_load_n(&g_stub_leaves, __ATOMIC_SEQ_CST);
+    *last_frame = __atomic_load_n(&g_stub_last_frame, __ATOMIC_SEQ_CST);
+    *sony_peak = g_stub_sony_peak;
+}
+/* The path fs.mkdir's handler received (after the adapter escaped and the stub read it). */
+size_t ava1_test_mgmt_last_path(char *out, size_t cap) {
+    size_t n = strlen(g_stub_last_path);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, g_stub_last_path, n);
+    out[n] = '\0';
+    return n;
+}
+
+static int stack_probe(uint8_t *out, size_t cap, size_t *out_len) {
+    int n = snprintf((char *)out, cap, "%zu", stack_size_now());
+    *out_len = (size_t)n;
+    return AVA1_STATUS_OK;
 }
 
 static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap,
@@ -59,7 +265,8 @@ static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t 
     if (method == 0x7703) { /* ava1_rpc_text into a 16-byte window: "%s" of the request body */
         return ava1_rpc_text(out, 16, out_len, "%.*s", (int)body_len, (const char *)body);
     }
-    if (method != AVA1_METHOD_NODE_INFO) return AVA1_ERR_UNKNOWN_METHOD;
+    if (method == 19) return stack_probe(out, cap, out_len); /* a 256 KiB-class method (the data plane's number) */
+    if (method != AVA1_METHOD_NODE_INFO) return mgmt_rpc_dispatch(method, body, body_len, out, cap, out_len);
     memset(&ni, 0, sizeof ni);
     ni.version = (const uint8_t *)"test";
     ni.version_len = 4;
