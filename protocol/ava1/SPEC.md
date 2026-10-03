@@ -81,7 +81,9 @@ six digits. A man in the middle yields different h, so different codes.
    (version range, caps 0).
 2. Server: no common version → `Error(ERR_UNSUPPORTED_VERSION)` unsealed, close.
    Else → `Hs2{noise}`: message 2, payload `ServerInfo` (version, caps, random
-   session_id, name).
+   session_id, name). `caps` bit 0 is `CAP_DATA_PLANE` (1): the node hosts the jobs
+   of §11–§16. A client sends no data-plane frame and no method 16–19 request to a
+   node that did not advertise it.
 3. Client → `Hs3{noise}`: message 3, payload `ClientInfo` (name). Both sides
    now key lane 0 (§4.3) and every further frame is sealed. A client that expects
    a particular device (it knows the key it paired with at this address) compares
@@ -176,8 +178,52 @@ ends a session; `Error` reports why and ends the connection.
 `RpcRequest{method, body}` on the control connection, channel = request id
 (chosen by the client, unique among its outstanding requests). The server
 answers `RpcResponse{status, body}` on the same channel; a request that does not
-decode is answered `Error(ERR_PROTOCOL)` and closes the connection. status 0 = OK; error
-statuses are the `ERR_*` constants. Methods: 1 = node.info → body `NodeInfo`.
+decode is answered `Error(ERR_PROTOCOL)` and closes the connection. status 0 (`STATUS_OK`) = OK;
+error statuses are the `ERR_*` constants, and an error response's body is the cause as
+UTF-8 text (not an encoded message). An unpaired session's RPCs answer `ERR_NOT_PAIRED`; a
+session has at most 4 requests in flight and the next one answers `ERR_BUSY`. Only
+`pairing.open` is answered on the reader; every other method runs on a worker, so a slow method never
+delays liveness.
+
+7.1 Methods:
+
+| # | name | request body | response body (status 0) |
+|---|------|--------------|--------------------------|
+| 1 | `node.info` | empty | `NodeInfo{version, platform, name}`, ext `firmware` |
+| 2 | `pairing.open` | `PairingOpen{seconds}` (≤ 600) | empty (§5.6) |
+| 3 | `crypto.bench` | `CryptoBench{mib}` | `CryptoBenchResult{bytes, micros}`, ext `open_micros`, `backend` (a diagnostic) |
+| 16 | `job.copy` | `JobCopy{job_id, src, dest, flags}` | `Status` (§16.9), ext `state` |
+| 17 | `job.status` | `JobRef{job_id}` | `Status`, ext `state` |
+| 18 | `job.cancel` | `JobRef{job_id}` | empty |
+| 19 | `disk.calibrate` | `DiskCalibrate{dir, files, size}` | `DiskCalibrateResult` (§16.10) |
+
+`Status.state` is 0 while the job runs, 1 when it finished OK and 2 when it failed (the cause is
+in ext `current`). Methods 16–19 are the version 1 data-plane RPCs and exist only on a node that
+advertises `CAP_DATA_PLANE`; version 1 defines no others (management RPCs replacing FTX2 are
+project 3, §10). The behaviour of 16–18 is §15.5; of 19, §16.10.
+
+7.2 Error codes. The numbers below are generated from `schema/ava1.toml`, whose constants are the
+normative table; the second column names the constant in the generated code.
+
+| code | name | sent when |
+|------|------|-----------|
+| 1 | `ERR_NOT_PAIRED` | an RPC or a lane join from a session whose pairing is not accepted (§5) |
+| 2 | `ERR_PAIRING_CLOSED` | an unknown client while the pairing window is closed; an unconfirmed session whose window or 60 s ended |
+| 3 | `ERR_UNSUPPORTED_VERSION` | the version ranges of the two peers do not overlap (unsealed, §5) |
+| 4 | `ERR_PROTOCOL` | a frame or body that does not decode, a frame type not allowed where it arrived, a `JobOpen` with an unknown kind, policy or flags, a `Chunk` for a small file or a `BundleRecord` for a large one (§12.2), a window that cannot hold one group (§12.4) |
+| 5 | `ERR_BAD_JOIN` | an unknown session, lane id outside 1..=8, wrong tag or replayed nonce (§9) |
+| 6 | `ERR_UNKNOWN_METHOD` | `RpcResponse` status for a method the node does not implement, including methods 16–19 on a node without the data plane |
+| 7 | `ERR_INTERNAL` | the node could not do what the peer asked for a reason that is neither the peer's nor the disk's: out of memory, a thread that would not start |
+| 8 | `ERR_BUSY` | a limit of §8 or §11.7: connections, sessions, an unconfirmed-session slot, in-flight RPCs (4 per session), jobs, a destination another job is writing, no buffer budget left for another job |
+| 9 | `ERR_PATH` | a manifest or RPC path that breaks §11.2, a root the node's write or read policy refuses, a source that cannot be stat'd or a staging parent that is not a directory |
+| 10 | `ERR_NO_SPACE` | the destination drive is full (`ENOSPC` while writing) |
+| 11 | `ERR_UNKNOWN_JOB` | `Resume`, `job.status` or `job.cancel` for a job the node does not list, or lists for another peer key (the two are not told apart) |
+| 12 | `ERR_IO` | a disk or filesystem failure on the node's side: write, fsync, rename, journal append, reading a source, a failed `disk.calibrate` |
+| 13 | `ERR_VERIFY` | a file or copy whose bytes do not match their root and that a `FileRetry` cannot fix |
+| 14 | `ERR_EXISTS` | a destination that is already there and may not be replaced: the root without `JF_OVERWRITE`, a staging root that appeared meanwhile, a file where one must go in a merge |
+| 15 | `ERR_CANCELLED` | the job was cancelled (`job.cancel`, or a `JobCancel` carrying this reason) |
+| 16 | `ERR_CROSS_DEVICE` | a staged or part-file rename whose two sides are on different devices (`st_dev`); never attempted, because a cross-device `rename` panics the console's kernel |
+| 17 | `ERR_CREDIT` | a lane frame larger than the credit the receiver granted (§12.4) |
 
 ## 8. Limits
 A server accepts at most 64 connections, 12 from one source address, and 16
@@ -205,24 +251,59 @@ supersedes the older connection, but only once the new connection's first sealed
 frame has opened under the new lane key (within the handshake timeout): a replayed
 Join cannot prove the key and leaves the live lane alone. Lanes end with their
 session.
-In version 1 project 1, lanes carry only heartbeats; any other frame without the
-IGNORABLE flag is answered `Error(ERR_PROTOCOL)` and closes the lane.
+A lane carries heartbeats and, on a node with `CAP_DATA_PLANE`, the lane data frames `Chunk`
+and `Bundle` (§12) and `Error`; any other frame without the IGNORABLE flag is answered
+`Error(ERR_PROTOCOL)` and closes the lane.
 
 ## 10. Version 1 scope
-Project 1 (this spec): framing, codecs, keys, handshake, pairing, trust slot,
-heartbeats, RPC `node.info`, data lanes carrying heartbeats only. Not yet in
-version 1: data frames, jobs, journals, resume, bundles (project 2); Ed25519
-signing keys and tickets, cross-network encryption, session parking (project 2);
-management RPCs replacing FTX2 (project 3). Unknown frame types on a control
-connection are a protocol error; new frame types require a version bump or a
-negotiated `caps` bit.
+Version 1 is what this document specifies; the sections below say what that is and what it is
+not. Unknown frame types on a control connection are a protocol error; new frame types require a
+version bump or a negotiated `caps` bit.
+
+In version 1:
+- Project 1 (§1–§9): framing, codecs, keys, handshake, pairing, the trust slot and launch
+  token, heartbeats, RPC `node.info` (and `pairing.open`, `crypto.bench`).
+- Project 2 (§11–§16): jobs and manifests, chunks and bundles on lanes, credit, verification
+  groups and outboards, journals, resume, staging, apply and the governor; uploads
+  (folders, single files, file lists, zip archives read as sources, local and NAS sources),
+  downloads (to a folder or to a zip), console-local copy and move, and PS5 → PS5 through
+  an engine relay (the engine downloads from one console while it uploads to the other,
+  with a bounded in-memory hand-off); the data RPCs `job.copy`, `job.status`, `job.cancel`
+  and `disk.calibrate`.
+
+Not in version 1, each with its reason:
+- Direct PS5 → PS5 (tickets, Ed25519 signing, cross-network encryption): the relay is the only
+  PS5 → PS5 path; direct transfer needs a trust model between two consoles. PS5 → PS5 has
+  engine support but no UI wiring (project 3).
+- Engine ↔ engine sharing: `host::FolderHost` exists as the receiving half, the sharing
+  policy and the feature are deferred.
+- Zstd bundles and small-file deduplication: ruled out of project 2.
+- Zip entries larger than 256 MiB (`ZIP_MAX_ENTRY`) as AVA1 sources: entries are inflated
+  on demand and there is no streaming entry reader yet, so an archive with a larger entry stays
+  on FTX2.
+- 7z and RAR sources: their decoders are forward-only, so there is no random-access `Source`
+  for them; they stay on FTX2 until project 3.
+- Full re-verification of durable groups on resume: §13.4 re-hashes only the last durable
+  batch of each partial file and trusts older groups to the journal.
+- Sources of unknown length, and skip-existing for NAS sources: every file's size must be known
+  when the manifest is built, and the engine's remote source file system (NAS) reports no mtime,
+  which `skip-existing` needs (§11.4).
+- Auto-tuning of the small/large cutoff (the design spec's 64 KiB–4 MiB range): the cutoff
+  is the protocol constant `LARGE_CUTOFF`, §12.2.
+- Resuming a zip download within a run: a dropped zip download restarts the archive with a
+  fresh job per attempt (progress stays monotonic). FTX2 resumes mid-entry, so this is a
+  regression against FTX2 and is listed as one in `CUTOVER.md`.
+- Resuming a download whose remote manifest changed: the engine restarts that job.
+- A same-drive `fs.move` over AVA1 (a rename, with the `st_dev` guard): the engine still asks the
+  FTX2 management port for it; only a cross-mount move (copy, verify, delete) is an AVA1 job.
+- Management RPCs that replace FTX2's :9114 frames (project 3).
 
 ## 11. Jobs and manifest
 
 11.1 Every transfer is a job with a 16-byte `job_id`, chosen by the node that opens it
 (the engine uses the HTTP API's `tx_id`). A job is bound to the static key of the peer
 that opened it; only that key may resume or cancel it. Every data-plane message
-(types 0x20–0x3F) has `job_id` as its first field.
+(types 0x20–0x3F) has `job_id` as its first field, so a router reads it from body[0..16].
 
 11.2 Paths in a manifest are relative to the job root: UTF-8, '/'-separated, at most
 1024 bytes, no empty, "." or ".." component, no NUL, no leading '/'. A receiver refuses
@@ -251,9 +332,11 @@ manifest: the receiver answers `JobMap`, or `JobMap{status = ERR_UNKNOWN_JOB}` a
 sender falls back to `JobOpen`. A map larger than one control frame is sent as several
 `JobMap` pages; `last = 1` marks the final one. `Durable` is never paged: each is complete.
 Engines reopen with `JobOpen` after any interruption; `Resume` is optional for senders that
-keep their manifest and credit state. Either way the sender's credit starts again from the
-grant in that session's answer (`JobOpenAck.credit`); nothing outstanding carries across a
-reconnect.
+keep their manifest and credit state, and the engine's own receiving host does not implement it.
+Credit restarts after any interruption and nothing outstanding carries across a reconnect: the
+grant in a `JobOpenAck` is an absolute number that sets the sender's window (a `Credit` that
+arrives later adds to it), and a `Resume` restarts the window the same way — the receiver resets
+the job's outstanding-credit count to its current grant and re-sends that grant as `Credit`.
 
 11.6 Staging: when the job root does not exist, the receiver writes the whole tree under
 `<root>.ava-part/` and, after the last file, renames it to `<root>` (same parent, `st_dev`
@@ -262,6 +345,54 @@ checked). When the root exists, files are written in place; large files through
 receiver takes `<root>` with `mkdir` before it journals the job (an existing `<root>` then
 refuses it, `ERR_EXISTS`) and records that in `JnlOpen.staged` bit 1, so on resume the empty
 `<root>` is its own; the final rename replaces only that empty folder (not empty: `ERR_EXISTS`).
+
+11.7 Limits and lifetime. A node lists at most 32 jobs; past that, or when it has no buffer budget
+left for another job (§12.4), a `JobOpen` is answered `ERR_BUSY`. A manifest has at most 4,000,000
+entries (a receiver refuses growth past that), and its pages are sized to fit a control frame (the
+console writes at most 60 KiB per page). At most one running job writes a destination: a `JobOpen`
+or `job.copy` whose root is, or lies inside or around, the root of another job that has not ended
+(and, for a move, its source) is answered `ERR_BUSY`; parked jobs count, because they can resume.
+When a session ends its jobs are parked, not ended: they stay listed, detached, for 10 minutes
+and then leave the table; their journal stays on disk (§14.3), so a later `JobOpen` resumes them.
+A finished upload or download leaves the table 10 s after its session lets go of it; a finished local job
+(`job.copy`) stays listed for the full park age so `job.status` can still answer. Either peer ends a
+job with `JobCancel{job_id, reason}`, where `reason` is the `ERR_*` code the ender wants reported
+(`ERR_CANCELLED` for a user's cancel, `ERR_IO` or `ERR_VERIFY` when a sender's source fails); the
+receiver then ends the job with that status in `JobDone` and keeps the journal.
+
+11.8 Job flags (`JobOpen.flags`, `JobCopy.flags`, `JnlOpen.flags`). A receiver answers
+`ERR_PROTOCOL` to a flag it does not know.
+
+| flag | value | meaning |
+|------|-------|---------|
+| `JF_SINGLE_FILE` | 1 | the root is a file path and the manifest has one file entry; the part file is `<root>.ava-part` (§11.6). On `job.copy` the node derives it from the source, and passing it for a directory source is `ERR_PROTOCOL` |
+| `JF_ORDERED` | 2 | the receiver consumes the files in manifest order (a download written into a zip, a relay); the sender then reads with one reader |
+| `JF_UNSAFE_READ` | 4 | a sender may read outside the roots its read policy allows (system files); the engine sets it only for a download the user marked unsafe |
+| `JF_MOVE` | 8 | `job.copy`: delete each source file after its destination is durable (§12.6, §15.5) |
+| `JF_OVERWRITE` | 16 | `job.copy`: replace destination files that already exist; unset, an existing destination root is refused with `ERR_EXISTS`. Not valid on `JobOpen` |
+
+11.9 Messages. All are data-plane messages (§11.1). "Sender" and "receiver" are the roles of the two
+peers for the job (§11.3), not who opened it.
+
+| type | message | direction | where |
+|------|---------|-----------|-------|
+| 0x20 | `JobOpen` | opener → peer | control |
+| 0x21 | `JobOpenAck{status, credit, staged, workers}` | answerer → opener | control |
+| 0x22, 0x23 | `ManifestPage`, `ManifestEnd{files, bytes, manifest_hash}` | sender → receiver | control |
+| 0x24 | `JobMap` | receiver → sender | control |
+| 0x25 | `Resume` | sender → receiver | control |
+| 0x26, 0x27 | `Chunk`, `Bundle` | sender → receiver | a lane |
+| 0x28 | `Received{lane, seq}` | receiver → sender | control |
+| 0x29 | `Credit` | receiver → sender | control |
+| 0x2A | `Durable` | receiver → sender | control |
+| 0x2B | `FileRoot` | sender → receiver | control |
+| 0x2C | `FileRetry{file_id, reason}` | receiver → sender | control |
+| 0x2D | `Status` | receiver → sender (IGNORABLE) | control |
+| 0x2E | `JobDone{status, files, bytes}` | receiver → sender | control |
+| 0x2F | `JobCancel` | either | control |
+
+`FileRetry.reason` is `RETRY_VERIFY` (1, the root did not match), `RETRY_IO` (2, the receiver lost
+the part file or outboard) or `RETRY_CHANGED` (3, the record's length disagrees with the manifest).
 
 ## 12. Data frames and credit
 
@@ -272,7 +403,10 @@ The header `channel` of a lane data frame is the sender's per-job sequence numbe
 a multiple of 1 MiB unless the chunk ends the file. A file is a *large* file when its
 size is at least `LARGE_CUTOFF` (256 KiB), a protocol constant both sides use (`JobOpen`
 carries no cutoff); smaller files travel whole, as `BundleRecord`s. A receiver ends the job
-with `ERR_PROTOCOL` on a `Chunk` for a small file or a `BundleRecord` for a large one.
+with `ERR_PROTOCOL` on a `Chunk` for a small file or a `BundleRecord` for a large one. A piece is
+never larger than the credit the receiver granted (§12.4): the sender caps a piece at the smaller of
+the chunk size and the granted window, floored to whole verification groups, and a grant below
+one group fails the job loudly instead of stalling.
 
 12.3 `Received{lane, seq}` is sent as soon as the receiver has a lane frame in memory,
 before any disk work. A sender requeues, on any lane, the frames of a lane that closed
@@ -285,15 +419,20 @@ would let the sender spend the same window twice, and the receiver's `ERR_CREDIT
 would fail a healthy job.
 
 12.4 Credit: `JobOpenAck.credit` (uploads) or `JobOpen.ext credit` (downloads) is the
-number of lane-frame body bytes the sender may have outstanding; `Credit{bytes}` returns
-space as the receiver frees buffers. A receiver that sees its credit exceeded sends a
-sealed `Error{ERR_CREDIT}` on the offending lane and ends the job: the C receiver closes
-that one lane itself, and a transport without a server-side lane close lets the session's
-own lifecycle end it — the sender observes the same either way: its lane dies. A sender
-never sends a piece larger than the credit already granted: pieces are sized at read time
-to fit the window (whole verification groups, one group minimum; a file's final piece
-keeps the whole-file rule), and a window that cannot hold one group ends the job
-(`ERR_PROTOCOL`) instead of stalling.
+number of lane-frame body bytes the sender may have outstanding — the window counts the whole
+body, so a `Chunk` costs its data plus 34 bytes of framing; `Credit{bytes}` returns space as the
+receiver frees buffers. A version 1 receiver grants 64 MiB, and never less than 8 MiB: a node whose
+global buffer budget cannot cover 8 MiB refuses the job with `ERR_BUSY`. A receiver that sees a
+lane frame exceed the credit still outstanding sends a sealed `Error{ERR_CREDIT}` on the offending
+lane and ends the session: it is a violation by the peer, not by the link. Nothing of the frame is
+buffered or acknowledged, and the sender observes ERR_CREDIT on its lane or its control
+connection. A sender never sends a piece larger than the credit already granted: pieces are sized at
+read time to fit the window (whole verification groups, one group minimum; a file's final piece keeps
+the whole-file rule), and a window that cannot hold one group — or whose smallest queued frame fits
+no lane for 10 s with nothing sent, received or credited — ends the job (`ERR_PROTOCOL`) instead of
+stalling. A lane's death does not refund window credit that the receiver has not accounted for
+(§12.3): its un-received frames are requeued with their bytes still charged, and the charge is
+released only when the receiver accounts for them (its `Credit` after the apply) or the job ends.
 
 12.5 Per lane, the sender keeps at most `max(chunk size, lane rate × 2 s)` bytes sent
 and not yet `Received`.
@@ -304,7 +443,13 @@ A failure after every byte is durable (`ERR_EXISTS`, `ERR_CROSS_DEVICE` on the f
 rename) is reported in `JobDone` and never causes a resend. A rename is durable only once its
 directory is synced: the receiver fsyncs the parent directory after every commit or staging
 rename, before it journals that commit. Likewise for new names: before a batch is journaled, every directory
-that gained a file in it is synced once, after the file data.
+that gained a file in it is synced once, after the file data. Where fsync does not reach stable
+storage (macOS), a receiver flushes the drive's cache once per batch after the per-file fsyncs.
+
+The console-local copy and move (§15.5) use the same standard in memory: a copy is a receiver job
+fed by an in-process reader, with no read-back of the destination; a move deletes a source file only
+after every destination group of that file is verified in memory, the file and its directory are
+fsynced and the destination's `Done` is journaled; a copy that fails deletes nothing.
 
 ## 13. Verification
 
@@ -324,10 +469,12 @@ resume, once all group CVs are known from the sender's outboard).
 outboard (32 bytes per group, in the job directory). At commit the root merged from the
 outboard must equal the sender's root; otherwise the file is reset and `FileRetry` sent.
 
-13.4 Resume verification: before answering a resumed job's map, the receiver re-hashes
-each partial file's groups from its last durable batch and compares them with the
-outboard; a mismatch drops those ranges from the map. Older durable groups are trusted
-from the journal. The verify policy re-hashes whole files.
+13.4 Resume verification: before answering a resumed job's map, the receiver re-hashes the groups
+of each partial file that its last durable batch covers and compares them with the outboard; a
+mismatch drops those ranges from the map. The console re-hashes only that batch and trusts older
+durable groups to the journal — version 1 never re-verifies every durable group of a console
+partial file. A receiver may check more: the engine's receiver re-hashes every durable group of
+every partial file and resets a file on any mismatch. The verify policy re-hashes whole files.
 
 ## 14. Journal and resume
 
@@ -349,8 +496,8 @@ durable ranges of the others), after the check in §13.4.
 
 14.3 Location: the console keeps job directories under `/data/ps5upload/ava/jobs/`, an engine
 under `<data dir>/ava/jobs/`. Each holds `journal`, `manifest` and one `<file_id>.ob` outboard
-per large file. A directory is removed 7 days after its last write (directory or journal mtime),
-on start.
+per large file. A node removes a directory 7 days after its last write (directory or journal mtime), on
+start. A job whose session ended is parked for 10 minutes first (§11.7).
 
 ## 15. Apply (receivers)
 
@@ -397,7 +544,12 @@ a namespace it must not be able to be led out of by the source tree. Both are co
 bugs; the sender's descend behaviour is not normative for the copy path.
 
 A copy (`job.copy`) is a receiver job whose sender is the in-process reader, so this section
-applies to it unchanged. A finished local job stays listed for the park age, so `job.status`
+applies to it unchanged. The job is owned by the peer key that issued it: `job.status` and
+`job.cancel` from another key answer `ERR_UNKNOWN_JOB`. A `job.copy` for an id the node already
+lists, from the same owner with the same parameters, answers with that job's `Status` instead of
+starting a second one — which makes re-issuing after a lost connection safe; a failed job is retired
+and restarted by a re-issue. `job.cancel` stops a job and unlists it (the journal stays), so a
+caller never cancels a job whose terminal status it still needs. A finished local job stays listed for the park age, so `job.status`
 keeps answering for it.
 
 `job.copy` uses the source and destination paths, a stable job id, and flags including
@@ -405,13 +557,26 @@ keeps answering for it.
 with `ERR_EXISTS`; with it, colliding files are replaced and destination-only files remain.
 A move deletes source entries only after the destination rename, parent directory sync and
 successful Done journal append. It checks each source file against the manifest before unlinking
-and reports any paths left behind as a failed job; `job.status` stays running during deletion.
+and reports any paths left behind as a failed job; `job.status` stays running (`state` 0, `current` =
+"deleting source") during deletion, so `state` 1 is the only point at which a move is done.
+
+15.6 Open files. The number of descriptors a process may hold open is a resource, and on the
+console it is smaller than `RLIMIT_NOFILE` says: the measured ceiling on firmware 13.60 is about
+619 open files while the limit reads about 13,952. At data-plane start a node therefore probes
+(it opens `/dev/null` until the system refuses, bounded at 4096), and its open-file budget is the
+smaller of the raised limit and the probed count, each less 128 descriptors held back for sockets
+and the other services. Half of the budget is the share of pending small-file descriptors (§15.2) all
+jobs together may hold, never fewer than 4; a worker that finds the share used up runs queued sync
+work or waits, and the job thread syncs early so that the batch frees slots. A single job holds at
+most 512 pending small files regardless of the budget. `disk.calibrate` (§16.10) works within the same
+budget instead of opening every file at once.
 
 ## 16. Governor
 
 The sender and the receiver each keep one small control loop; both are pure functions of the
 numbers they are fed, so both are tested against models rather than sockets.
 
+- Start: 2 lanes, a 4 MiB chunk and a 1 MiB bundle target; receiver workers start at 4.
 - Lanes: add one while the bottleneck is the network and the last addition raised throughput by
   ≥ 10 %; otherwise revert it and hold for 30 s. A tick with a lane death or requeue drops one
   lane (min 1) and halves the chunk. At most 8 lanes: on a link that scales past that the count
