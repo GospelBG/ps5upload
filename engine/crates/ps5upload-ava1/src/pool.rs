@@ -50,6 +50,10 @@ pub struct Pool {
     /// Job directories (hex job ids) of the jobs running in this process, with a count each:
     /// the journal sweep never touches them (SPEC.md §14.3).
     live: Mutex<HashMap<String, usize>>,
+    /// One connect at a time per console: the console keeps one session per identity, so a
+    /// second concurrent connect would end the first one's session (SPEC.md §8). Callers that
+    /// find no session wait here and then find the winner's.
+    connecting: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Sessions that ended under us this many times within `Churn::window` mean something else
@@ -183,6 +187,7 @@ impl Pool {
             addr: None,
             attempts: AtomicUsize::new(0),
             live: Mutex::default(),
+            connecting: Mutex::default(),
         }
     }
 
@@ -208,6 +213,7 @@ impl Pool {
             addr: None,
             attempts: AtomicUsize::new(0),
             live: Mutex::default(),
+            connecting: Mutex::default(),
         }
     }
 
@@ -319,6 +325,14 @@ impl Pool {
     /// at 12 connections per IP, so a leaked session is not free.
     pub async fn session(&self, console: &str) -> Result<Arc<Session>, Ava1Error> {
         let host = host_of(console);
+        let one_at_a_time = self
+            .connecting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(host.clone())
+            .or_default()
+            .clone();
+        let _connecting = one_at_a_time.lock().await;
         {
             let mut map = self.sessions.lock().await;
             if let Some(c) = map.get(&host) {

@@ -9794,6 +9794,10 @@ pub struct EngineConfig {
 async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
     // Convert (and the package viewer) read games on saved servers and the console in place.
     fpkg_remote::register();
+    // Every management call (hardware, filesystem, apps, ...) goes through one transport
+    // seam in the core crate; this registers the AVA1 implementation over the shared pool.
+    // A console without AVA1 management keeps the FTX2 path inside the seam.
+    ps5upload_ava1::mgmt::install();
     // SPEC.md §14.3: expire old AVA1 job directories at start and then daily.
     ava1_api::spawn_journal_gc();
     // AVA1 cutover (Task 23, controller A4): one line at startup naming the

@@ -7,6 +7,7 @@ use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
 use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 /// Read up to `max_bytes` of currently-buffered kernel log. Empty
 /// response = nothing in the buffer (poll again later).
@@ -459,19 +460,10 @@ pub fn fs_write_bytes(
         "mode": if create_only { "create" } else { "overwrite" },
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::FsWriteBytes, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_WRITE_BYTES: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::FsWriteBytesAck {
-        bail!("expected FS_WRITE_BYTES_ACK, got {ft:?}");
-    }
+    // The AVA1 payload answers a refusal with an error status and the legacy token as its
+    // cause; `call_legacy_ok` turns that back into the `{"ok":false,"err":..}` body this
+    // function has always parsed, so the caller-visible text does not change.
+    let resp = mgmt::call_legacy_ok(addr, m::FS_WRITE, "FS_WRITE_BYTES", &body)?;
     let parsed: WriteBytesResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(
