@@ -115,6 +115,8 @@ pub struct RarSource {
     ordinal: HashMap<String, u64>,
     /// Archive-order paths (the inverse), to detect a listing/extraction mismatch.
     order: Vec<String>,
+    /// Sizes in archive order (measured when the header's was unknown).
+    sizes: Vec<u64>,
     /// Manifest id -> path.
     by_id: Vec<String>,
 }
@@ -131,10 +133,20 @@ impl RarSource {
         let layout =
             rar_layout(path, password, excludes).map_err(|e| RarOpenError::Plan(plan_error(&e)))?;
         let mut files: BTreeMap<String, u64> = BTreeMap::new();
+        // Console filesystems may fold case: two entries that differ only in case
+        // would overwrite each other there.
+        let mut folded: HashMap<String, String> = HashMap::new();
         let mut ordinal = HashMap::new();
         let mut order = Vec::new();
         for (i, (p, size)) in layout.files.iter().enumerate() {
             manifest::check_path(p).map_err(|e| RarOpenError::Unsupported(format!("{p}: {e}")))?;
+            if let Some(other) = folded.insert(p.to_lowercase(), p.clone()) {
+                if other != *p {
+                    return Err(RarOpenError::Unsupported(format!(
+                        "{other} and {p} differ only in case"
+                    )));
+                }
+            }
             if files.insert(p.clone(), *size).is_some() {
                 return Err(RarOpenError::Unsupported(format!(
                     "{p} appears more than once in the archive"
@@ -196,6 +208,7 @@ impl RarSource {
                 solid: layout.solid,
                 ordinal,
                 order,
+                sizes: layout.files.iter().map(|(_, s)| *s).collect(),
                 by_id,
             },
         ))
@@ -242,7 +255,14 @@ impl RarWalkSink for Adapter<'_> {
         }
     }
 
-    fn want(&mut self, _ordinal: u64, path: &str, size: u64) -> bool {
+    fn want(&mut self, ordinal: u64, path: &str, size: u64) -> bool {
+        // An unknown-size header carries a sentinel; the layout measured the real one.
+        let size = self
+            .src
+            .sizes
+            .get(ordinal as usize)
+            .copied()
+            .unwrap_or(size);
         !matches!((self.want)(path, size), Keep::Skip)
     }
 

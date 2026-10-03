@@ -74,8 +74,12 @@ pub fn upload_zip(
     upload_zip_in(pool(), cfg, job_id, dest_root, zip_path)
 }
 
-/// The archive cannot be an AVA1 source (a duplicate or unsafe entry path): FTX2 reads
-/// RAR its own way.
+/// The archive cannot be an AVA1 source because its entries cannot be carried by the
+/// manifest as listed: a duplicate path, or two paths that differ only in case
+/// (console filesystems may fold case). The engine falls back to FTX2 for these
+/// (`rar_unsupported_by_ava1`). An *unsafe* path (`../x`, absolute) is different: it
+/// fails planning with the terminal reason `ava1_rar_failed` and does not fall back,
+/// because FTX2 refuses the same archive with the same zip-slip rule.
 #[cfg(not(target_os = "android"))]
 #[derive(Debug, thiserror::Error)]
 #[error("rar is not usable as an AVA1 source: {0}")]

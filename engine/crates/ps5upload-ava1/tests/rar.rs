@@ -55,6 +55,8 @@ fn block(body: &[u8]) -> Vec<u8> {
 
 pub enum Ent<'a> {
     File(&'a str, &'a [u8]),
+    /// A file whose header says "unpacked size unknown" (flag 0x8).
+    Unknown(&'a str, &'a [u8]),
     Dir(&'a str),
 }
 
@@ -67,9 +69,10 @@ fn rar5(entries: &[Ent], solid: bool) -> Vec<u8> {
     vint(if solid { 4 } else { 0 }, &mut main);
     out.extend(block(&main));
     for (i, e) in entries.iter().enumerate() {
-        let (name, data, is_dir) = match e {
-            Ent::File(n, d) => (*n, *d, false),
-            Ent::Dir(n) => (*n, &[][..], true),
+        let (name, data, is_dir, unknown) = match e {
+            Ent::File(n, d) => (*n, *d, false, false),
+            Ent::Unknown(n, d) => (*n, *d, false, true),
+            Ent::Dir(n) => (*n, &[][..], true, false),
         };
         let mut h = Vec::new();
         vint(2, &mut h); // file header
@@ -78,8 +81,17 @@ fn rar5(entries: &[Ent], solid: bool) -> Vec<u8> {
             vint(data.len() as u64, &mut h); // data size
         }
         // file flags: 1 = directory, 4 = data CRC32 present
-        vint(if is_dir { 1 } else { 4 }, &mut h);
-        vint(data.len() as u64, &mut h); // unpacked size
+        vint(
+            if is_dir {
+                1
+            } else if unknown {
+                4 | 8
+            } else {
+                4
+            },
+            &mut h,
+        );
+        vint(if unknown { 0 } else { data.len() as u64 }, &mut h); // unpacked size
         vint(0o644, &mut h); // attributes
         if !is_dir {
             h.extend_from_slice(&crc32(data).to_le_bytes());
@@ -538,4 +550,122 @@ fn a_duplicate_entry_is_unsupported() {
         Err(RarOpenError::Unsupported(m)) => assert!(m.contains("more than once"), "{m}"),
         other => panic!("{:?}", other.err()),
     }
+}
+
+#[test]
+fn rar_cancel_ends_a_long_excluded_solid_skip_promptly() {
+    // An excluded entry in a solid archive is still decoded (to stay aligned); that
+    // decode must poll the stop flag like any other skip.
+    struct Stopper(std::sync::Arc<AtomicBool>);
+    impl EntrySink for Stopper {
+        fn begin(&mut self, _: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn data(&mut self, _: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn end(&mut self) -> std::io::Result<()> {
+            // Stop 1 ms into the excluded entry's decode (which follows).
+            let c = self.0.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1));
+                c.store(true, Ordering::Relaxed);
+            });
+            Ok(())
+        }
+    }
+    let d = temp("rar-cancel-excl");
+    let big = vec![7u8; 256 << 20];
+    let ents = [
+        Ent::File("a-first", b"head"),
+        Ent::File("skipme/big", &big),
+        Ent::File("z-last", b"tail"),
+    ];
+    write(&d.join("a.rar"), &rar5(&ents, true));
+    let excl = vec!["skipme".to_string()];
+    let (_m, src) = RarSource::open(&d.join("a.rar"), None, &excl).unwrap();
+    let run = |stop_early: bool| {
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let mut want = |_: &str, _: u64| Keep::All;
+        let t = std::time::Instant::now();
+        let r = if stop_early {
+            src.pass(
+                Restart::START,
+                &mut want,
+                &mut Stopper(cancel.clone()),
+                &cancel,
+            )
+        } else {
+            src.pass(Restart::START, &mut want, &mut Rec::default(), &cancel)
+        };
+        (r, t.elapsed())
+    };
+    let (full, t_full) = run(false);
+    full.unwrap();
+    let (stopped, t_stop) = run(true);
+    assert_eq!(stopped.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+    assert!(
+        t_stop < t_full / 2,
+        "stopping took {t_stop:?}, a full decode {t_full:?}: the excluded decode did not poll"
+    );
+}
+
+#[test]
+fn an_entry_with_unknown_unpacked_size_is_measured_and_uploaded() {
+    let d = temp("rar-unknown-size");
+    let body = pattern(5, 0, 70_000);
+    let ents = [
+        Ent::File("a", b"known"),
+        Ent::Unknown("b/unknown", &body),
+        Ent::File("empty", b""),
+    ];
+    write(&d.join("a.rar"), &rar5(&ents, false));
+    let (m, src) = RarSource::open(&d.join("a.rar"), None, &[]).unwrap();
+    let e = m.entries.iter().find(|e| e.path == "b/unknown").unwrap();
+    assert_eq!(e.size, 70_000, "the size was measured, not trusted");
+    let mut want = |_: &str, _: u64| Keep::All;
+    let mut rec = Rec::default();
+    src.pass(Restart::START, &mut want, &mut rec, &AtomicBool::new(false))
+        .unwrap();
+    let got: std::collections::HashMap<_, _> = rec.got.into_iter().collect();
+    assert_eq!(got["b/unknown"], body);
+    assert_eq!(got["a"], b"known");
+    assert!(got["empty"].is_empty());
+}
+
+#[test]
+fn duplicate_detection_ignores_case() {
+    let d = temp("rar-dup-case");
+    write(
+        &d.join("a.rar"),
+        &rar5(
+            &[Ent::File("Data/File", b"1"), Ent::File("data/file", b"2")],
+            false,
+        ),
+    );
+    match RarSource::open(&d.join("a.rar"), None, &[]) {
+        Err(RarOpenError::Unsupported(m)) => assert!(m.contains("differ only in case"), "{m}"),
+        other => panic!("{:?}", other.err()),
+    }
+}
+
+#[test]
+fn a_cancelled_job_does_not_open_the_archive() {
+    let d = temp("rar-precancel");
+    // The path does not exist: opening would be an error, not Interrupted.
+    let (_m, src) = {
+        write(&d.join("a.rar"), &archive_of(&sample(3), false, &[]));
+        RarSource::open(&d.join("a.rar"), None, &[]).unwrap()
+    };
+    std::fs::remove_file(d.join("a.rar")).unwrap();
+    let mut want = |_: &str, _: u64| Keep::All;
+    let e = src
+        .pass(
+            Restart::START,
+            &mut want,
+            &mut Rec::default(),
+            &AtomicBool::new(true),
+        )
+        .unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "{e}");
 }

@@ -4619,7 +4619,9 @@ mod rar_support {
             {
                 continue;
             }
-            total += e.unpacked_size;
+            if !rar_size_unknown(e.unpacked_size) {
+                total += e.unpacked_size;
+            }
             files.push((rel, e.unpacked_size));
         }
         Ok((total, files))
@@ -4823,7 +4825,83 @@ mod rar_support {
             }
             files.push((rel, e.unpacked_size));
         }
+        if files.iter().any(|(_, s)| rar_size_unknown(*s)) {
+            measure_unknown_sizes(&path_str, password, solid, &mut files)?;
+        }
         Ok(RarLayout { files, dirs, solid })
+    }
+
+    /// UnRAR reports a header whose unpacked size is unknown (a RAR5 flag, written
+    /// by streaming archivers) as a huge sentinel (`INT64NDF`, about 2^63), never as
+    /// a real size.
+    pub(crate) fn rar_size_unknown(size: u64) -> bool {
+        size >= 1 << 62
+    }
+
+    /// Learn the real size of every unknown-size entry by decoding it once (the
+    /// stream's own end and CRC define it). Decodes the whole archive when it is
+    /// solid; a non-solid archive only decodes the unknown entries.
+    fn measure_unknown_sizes(
+        path_str: &str,
+        password: Option<&str>,
+        solid: bool,
+        files: &mut [(String, u64)],
+    ) -> Result<()> {
+        let mut open = match password {
+            Some(pw) => Archive::with_password(path_str, pw).open_for_processing(),
+            None => Archive::new(path_str).open_for_processing(),
+        }
+        .map_err(|e| map_rar_open_err(path_str, "open rar", e))?;
+        let mut idx = 0usize; // next file in header order (excluded files included)
+                              // `files` holds only non-excluded files, so match by path.
+        let wanted: std::collections::HashMap<String, usize> = files
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, s))| rar_size_unknown(*s))
+            .map(|(i, (p, _))| (p.clone(), i))
+            .collect();
+        let mut left = wanted.len();
+        while left > 0 {
+            let Some(header) = open
+                .read_header()
+                .map_err(|e| map_rar_err("read rar header", e))?
+            else {
+                break;
+            };
+            let target = sanitize_rar_entry(&header.entry().filename)
+                .filter(|_| !header.entry().is_directory())
+                .and_then(|r| wanted.get(&r).copied());
+            let encrypted = header.entry().is_encrypted();
+            match target {
+                Some(i) => {
+                    let mut n = 0u64;
+                    open = header
+                        .read_to_fn(&mut |b: &[u8]| {
+                            n += b.len() as u64;
+                            true
+                        })
+                        .map_err(|e| {
+                            map_rar_err("measure rar entry", e)
+                                .context(format!("encrypted={}", encrypted && password.is_some()))
+                        })?;
+                    files[i].1 = n;
+                    left -= 1;
+                }
+                None if solid && !header.entry().is_directory() => {
+                    open = header
+                        .read_to_fn(&mut |_: &[u8]| true)
+                        .map_err(|e| map_rar_err("measure rar entry", e))?;
+                }
+                None => {
+                    open = header
+                        .skip()
+                        .map_err(|e| map_rar_err("skip rar entry", e))?;
+                }
+            }
+            idx += 1;
+        }
+        let _ = idx;
+        Ok(())
     }
 
     /// Why a RAR could not be read, in terms a caller can act on.
@@ -4866,8 +4944,15 @@ mod rar_support {
         match e.code {
             RarCode::MissingPassword => RarFailKind::PasswordRequired,
             RarCode::BadPassword => RarFailKind::PasswordWrong,
-            // UnRAR reports a wrong password on a content-encrypted entry as a
-            // CRC error; with a password given that is what it means.
+            // UnRAR reports a wrong password on a content-encrypted entry as a CRC
+            // error (BadData) when the archive carries no password-check value;
+            // with one it answers BadPassword instead, which is matched above and
+            // is exact. So this arm is a heuristic only for archives without a
+            // check value (old RAR4-style or stripped RAR5): a genuinely corrupt
+            // encrypted entry there is indistinguishable from a wrong password
+            // (the header CRC cannot tell them apart without the key). The message
+            // `rar_password_wrong` is the safer prompt: the user retries the
+            // password, and a truly damaged archive fails again, typed.
             RarCode::BadData if encrypted_with_password => RarFailKind::PasswordWrong,
             RarCode::BadData
             | RarCode::BadArchive
@@ -4920,6 +5005,9 @@ mod rar_support {
         use std::sync::atomic::Ordering;
         let path_str = archive_path.to_string_lossy().into_owned();
         let cancelled = || cancel.load(Ordering::Relaxed);
+        if cancelled() {
+            return Err(RarWalkError::Cancelled);
+        }
         let opened = match password {
             Some(pw) => Archive::with_password(&path_str, pw).open_for_processing(),
             None => Archive::new(&path_str).open_for_processing(),
@@ -4937,7 +5025,11 @@ mod rar_support {
                 Err(e) => return Err(walk_fail(&path_str, "read rar header", e, false)),
             };
             let name = header.entry().filename.clone();
-            let size = header.entry().unpacked_size;
+            let declared = header.entry().unpacked_size;
+            // An unknown-size entry is read to its end; the sender checks the
+            // delivered length against the size `rar_layout` measured.
+            let size_known = !rar_size_unknown(declared);
+            let size = if size_known { declared } else { u64::MAX };
             let is_dir = header.entry().is_directory();
             let encrypted = header.entry().is_encrypted();
             let Some(rel) = sanitize_rar_entry(&name) else {
@@ -4948,10 +5040,28 @@ mod rar_support {
             };
             let excluded = !excludes.is_empty()
                 && crate::excludes::is_excluded_strings(Path::new(&rel), excludes);
-            if is_dir || excluded {
+            if is_dir || (excluded && !solid) {
                 open = header
                     .skip()
                     .map_err(|e| walk_fail(&path_str, "skip rar entry", e, false))?;
+                continue;
+            }
+            if excluded {
+                // Solid: the entry must be decoded to keep the stream aligned, and
+                // RAR_SKIP never calls back, so stop could not be polled. Decode it
+                // through a discarding callback that does.
+                let r = header.read_to_fn(&mut |_: &[u8]| !cancelled());
+                if cancelled() {
+                    return Err(RarWalkError::Cancelled);
+                }
+                open = r.map_err(|e| {
+                    walk_fail(
+                        &path_str,
+                        "skip rar entry",
+                        e,
+                        encrypted && password.is_some(),
+                    )
+                })?;
                 continue;
             }
             let this = ordinal;
@@ -4962,7 +5072,7 @@ mod rar_support {
                     message: format!("rar entry {rel:?} is out of the listed order"),
                 });
             }
-            let deliver = this >= start && sink.want(this, &rel, size);
+            let deliver = this >= start && sink.want(this, &rel, declared);
             if !deliver && !solid {
                 open = header
                     .skip()
@@ -5014,7 +5124,7 @@ mod rar_support {
                     encrypted && password.is_some(),
                 )
             })?;
-            if got != size {
+            if size_known && got != size {
                 return Err(RarWalkError::Failed {
                     kind: RarFailKind::Corrupt,
                     message: format!(
