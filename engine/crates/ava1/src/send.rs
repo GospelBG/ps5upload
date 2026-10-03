@@ -22,7 +22,7 @@ use crate::gen::{
 use crate::governor::{self, Class, Governor, Mode, Sample};
 use crate::manifest::Manifest;
 use crate::ranges::{from_runs, Need, RangeSet};
-use crate::router::{Inbound, JobLink, LaneTx};
+use crate::router::{ConnTx, Inbound, JobLink, LaneTx};
 use crate::source::{read_full_at, Source};
 use crate::verify::{self, FileHasher, Outboard, GROUP};
 use crate::wire::{FrameMessage, Message};
@@ -168,10 +168,16 @@ pub struct Window {
     credit: u64,
     /// lane -> (unreceived bytes, seq -> frame length)
     lanes: LaneFrames,
-    /// seq -> len, frames of dead lanes whose bytes stay charged (I3): a lane's death
+    /// seq -> len, frames of dead lanes whose charge is held (I3): a lane's death
     /// releases no window credit — the receiver may still charge these frames if it
-    /// admitted them — so the bytes are held here until the receiver accounts for them
-    /// (its `Credit` after the apply) or the job ends.
+    /// admitted them — so their bytes stay charged in `credit` until they are
+    /// accounted for. An entry is removed by a late `Received` (the receiver's books
+    /// confirm the frame; its bytes return with the receiver's `Credit` after its
+    /// apply), by `release` (the frame provably never left this process — the writer
+    /// died without taking it), or the job's end (the whole window dies with the
+    /// job). A `Credit` removes nothing: it enlarges the window, which is where the
+    /// charge lives. Frames that did leave the process but are never confirmed stay
+    /// held until the job ends — SPEC §12.3's accepted tradeoff.
     refunded: HashMap<u32, u64>,
 }
 
@@ -227,12 +233,23 @@ impl Window {
         let Some((_, frames)) = self.lanes.remove(&lane) else {
             return Vec::new();
         };
-        let mut seqs = Vec::new();
-        for (seq, len) in frames {
-            self.refunded.insert(seq, len);
-            seqs.push(seq);
-        }
-        seqs
+        frames
+            .into_iter()
+            .map(|(seq, len)| {
+                self.refunded.insert(seq, len);
+                seq
+            })
+            .collect()
+    }
+    /// Releases a dead lane's held charge for a frame the writer provably never took
+    /// (its queue died with the writer): the receiver's window was never charged for
+    /// it, so the bytes return to this window here. Frames that may have reached the
+    /// receiver stay held until their `Received`/`Credit` or the job's end. `lane_down`
+    /// must have run first (the seq is in `refunded`). Returns the length released.
+    pub fn release(&mut self, seq: u32) -> Option<u64> {
+        let len = self.refunded.remove(&seq)?;
+        self.credit = self.credit.saturating_add(len);
+        Some(len)
     }
     pub fn available(&self) -> u64 {
         self.credit
@@ -254,6 +271,11 @@ struct OutFrame {
     /// Read-ahead permits (correction 1). Never read: the drop is the accounting — the
     /// permits are released when the frame is finally disposed of.
     _budget: Vec<OwnedSemaphorePermit>,
+    /// The take-marker (I3's precise form), set at pick: the lane's writer flips it
+    /// the moment it takes the frame out of its queue. Un-taken at the writer's death,
+    /// the frame provably never left this process, so a lane death releases its window
+    /// charge instead of holding it.
+    taken: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Default)]
@@ -286,6 +308,14 @@ struct Sched {
 /// larger than its cap, or a frame charged before its rate warmed — is ordinary
 /// backpressure and never marks a stall: the `Received` for those bytes unblocks the
 /// lane by itself.
+///
+/// That in-flight-cap clause is an accepted tradeoff: a receiver that keeps the link
+/// alive (pings, SPEC §6 — liveness only fires on total silence) but never sends
+/// `Received` or `Credit` can park the job indefinitely, because such a lane is never
+/// marked stalled. SPEC §12.3 obliges the receiver to acknowledge every frame the
+/// moment it has it in memory, so a receiver that breaks that obligation is outside
+/// the protocol; the sender's failure mode for it is a parked job, not a false stall.
+/// Recorded here so a future reader does not mistake the hang for a missing rule.
 #[derive(Clone, Copy)]
 struct Stall {
     since: Instant,
@@ -356,7 +386,15 @@ const STALL_FATAL: Duration = Duration::from_secs(10);
 pub(crate) async fn next_ctl(link: &mut JobLink) -> Result<Frame, SendError> {
     loop {
         match link.rx.recv().await {
-            Some(Inbound::Control(f)) if f.ty == Status::TYPE => continue,
+            // M6: a Status is skipped by type, but only after its decode succeeds — a
+            // malformed Status in the open window is the same protocol error as one
+            // mid-transfer (the control loop decodes and errors), not something to
+            // shrug off.
+            Some(Inbound::Control(f)) if f.ty == Status::TYPE => {
+                f.decode::<Status>()
+                    .map_err(|e| SendError::Protocol(e.to_string()))?;
+                continue;
+            }
             Some(Inbound::Control(f)) => return Ok(f),
             Some(Inbound::Closed(why)) => return Err(SendError::Disconnected(why)),
             None => return Err(SendError::Disconnected("the session ended".into())),
@@ -636,6 +674,7 @@ fn bundle_frame(job_id: [u8; 16], recs: Vec<(BundleRecord, OwnedSemaphorePermit)
         payload,
         resend: false,
         _budget: budget,
+        taken: None,
     }
 }
 
@@ -662,6 +701,7 @@ fn chunk_frame(
         payload,
         resend: false,
         _budget: vec![budget],
+        taken: None,
     }
 }
 
@@ -743,7 +783,7 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
             let rate = s.lane_rate.get(&lane.id).copied().unwrap_or(0.0);
             let cap = governor::inflight_cap(chunk, rate);
             match pick_any(&mut s, lane.id, &w, cap) {
-                Some(f) => {
+                Some(mut f) => {
                     let len = f.body.len() as u64;
                     s.next_seq += 1;
                     let seq = s.next_seq;
@@ -753,12 +793,16 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
                         s.bundles_inflight += 1;
                     }
                     assert!(w.sent(lane.id, seq, len), "can_send passed");
+                    // The take-marker: the writer flips it the moment it takes the
+                    // frame out of its queue (see `LaneDown` in `run_upload`).
+                    let taken = Arc::new(AtomicBool::new(false));
+                    f.taken = Some(taken.clone());
                     s.inflight.insert(seq, (lane.id, f));
                     drop(w);
                     drop(s);
                     // Progress: a stall another lane observed is not a deadlock.
                     *sh.stall.lock().unwrap() = None;
-                    Some((seq, ty, body))
+                    Some((seq, ty, body, taken))
                 }
                 None => {
                     let pending =
@@ -791,7 +835,11 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
                             // The Received for those bytes — or another lane's send —
                             // moves the job by itself; it must never mark a stall, and
                             // a stale mark from a window that has since changed is
-                            // cleared here.
+                            // cleared here. Accepted tradeoff (see `Stall`): a receiver
+                            // that keeps the link alive but never acknowledges can
+                            // park such a lane forever — SPEC §12.3 obliges the
+                            // receiver to acknowledge promptly, so the parking receiver
+                            // is the one outside the protocol.
                             *stall = None;
                         }
                     } else {
@@ -801,7 +849,7 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
                 }
             }
         };
-        let Some((seq, ty, body)) = next else {
+        let Some((seq, ty, body, taken)) = next else {
             if wake.changed().await.is_err() {
                 return;
             }
@@ -815,8 +863,15 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
             }
         }
         // Queued whole or not at all (the outbox), so this task may be cancelled here
-        // without leaving half a sealed frame on the lane.
-        if lane.tx.send_raw(ty, 0, seq, body).await.is_err() {
+        // without leaving half a sealed frame on the lane. A failed send is not
+        // accounted here: the lane's death holds or releases the charge through the
+        // take-marker (a send that failed was never taken).
+        if lane
+            .tx
+            .send_raw_marked(ty, 0, seq, body, taken)
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -896,27 +951,34 @@ pub async fn run_upload(
         stop.clone(),
     );
 
-    // Lanes: open the governor's starting count (client side); adopt any already up.
+    // Lanes: the governor's starting count is opened at the top of the loop below
+    // (client side), so an open failure breaks into the teardown like every other
+    // exit (I1); tasks adopt any already up. Each lane has its own stop flag (a lane
+    // death stops only its own task) and keeps its outbox clone so the control loop
+    // can learn when the dead lane's writer has ended (I3's precise form).
     let mut lane_tasks: HashMap<u16, tokio::task::JoinHandle<()>> = HashMap::new();
-    if let Some(op) = link.opener().cloned() {
-        while link.lanes().len() < first.lanes as usize {
-            op.open()
-                .await
-                .map_err(|e| SendError::Disconnected(e.to_string()))?;
+    let mut lane_links: HashMap<u16, (Arc<AtomicBool>, ConnTx)> = HashMap::new();
+    let spawn_lane = |id: u16,
+                      tasks: &mut HashMap<u16, tokio::task::JoinHandle<()>>,
+                      links: &mut HashMap<u16, (Arc<AtomicBool>, ConnTx)>,
+                      link: &JobLink| {
+        if tasks.contains_key(&id) {
+            return;
         }
-    }
-    let spawn_lane =
-        |id: u16, tasks: &mut HashMap<u16, tokio::task::JoinHandle<()>>, link: &JobLink| {
-            if tasks.contains_key(&id) {
-                return;
-            }
-            if let Some(l) = link.lane(id) {
-                let h = tokio::spawn(lane_task(l, sh.clone(), opts.bandwidth_cap, stop.clone()));
-                tasks.insert(id, h);
-            }
-        };
+        if let Some(l) = link.lane(id) {
+            let stop = Arc::new(AtomicBool::new(false));
+            let h = tokio::spawn(lane_task(
+                l.clone(),
+                sh.clone(),
+                opts.bandwidth_cap,
+                stop.clone(),
+            ));
+            tasks.insert(id, h);
+            links.insert(id, (stop, l.tx.clone()));
+        }
+    };
     for l in link.lanes() {
-        spawn_lane(l.id, &mut lane_tasks, link);
+        spawn_lane(l.id, &mut lane_tasks, &mut lane_links, link);
     }
 
     let mut pending: Vec<(BundleRecord, OwnedSemaphorePermit)> = Vec::new();
@@ -928,7 +990,15 @@ pub async fn run_upload(
     let (mut max_lanes, mut receiver_bn, mut sequential) = (0u8, gen::BN_NONE, false);
     let mut last_bn = gen::BN_NONE;
     let mut root_next: VecDeque<(u32, [u8; 32])> = VecDeque::new();
-    let result = loop {
+    // A reader failure: the first error wins; its JobCancel is sent on the dedicated
+    // arm below (awaiting it inline deadlocks against the receiver's backpressure).
+    let mut io_fail: Option<std::io::Error> = None;
+    // The starting lane count is opened once, on the first pass (the tick below owns
+    // every later open/close against the governor's live target — re-opening here on
+    // every pass would fight a target the governor has since lowered, one open and one
+    // close per tick).
+    let mut opened_start = false;
+    let result = 'job: loop {
         if opts.cancel.load(Ordering::Relaxed) {
             let _ = link
                 .control
@@ -938,6 +1008,21 @@ pub async fn run_upload(
                 })
                 .await;
             break Err(SendError::Cancelled);
+        }
+        if !opened_start {
+            opened_start = true;
+            // Open the governor's starting lane count (client side). A failure here must
+            // break into the teardown below like every other exit (I1): a `?` return
+            // from `run_upload` skips the stop flag, the budget close and the reader
+            // joins, so a reader parked on the read-ahead semaphore would stay parked
+            // forever and the readers would keep reading the source.
+            if let Some(op) = link.opener().cloned() {
+                while link.lanes().len() < first.lanes as usize {
+                    if let Err(e) = op.open().await {
+                        break 'job Err(SendError::Disconnected(e.to_string()));
+                    }
+                }
+            }
         }
         tokio::select! {
             r = rrx.recv() => match r {
@@ -968,10 +1053,16 @@ pub async fn run_upload(
                     // the file count (the roots already waiting in `rtx`).
                     root_next.push_back((file_id, root));
                 }
-                Some(Read::Failed(e)) => {
-                    let _ = link.control.send(&gen::JobCancel { job_id, reason: gen::ERR_IO }).await;
-                    break Err(SendError::Source(e));
+                Some(Read::Failed(e)) if io_fail.is_none() => {
+                    // Queued like the roots: awaiting the JobCancel inline stops the
+                    // loop's drain of the inbox while the control outbox is full, and
+                    // the sender's and the receiver's backpressure then deadlock
+                    // against each other — both sides awaiting room on full control
+                    // queues (the shape the FileRoot fix removed). The cancel is sent
+                    // on the dedicated arm below; the first failure wins.
+                    io_fail = Some(e);
                 }
+                Some(Read::Failed(_)) => {} // a failure is already queued: it wins
                 // The retry path holds `rtx` alive, so the channel never closes mid-job.
                 None => {}
             },
@@ -987,27 +1078,111 @@ pub async fn run_upload(
                 }
                 root_next.pop_front();
             },
+            cancel_sent = async {
+                link.control
+                    .send(&gen::JobCancel { job_id, reason: gen::ERR_IO })
+                    .await
+            }, if io_fail.is_some() => {
+                // The JobCancel is on the wire (or the connection refused it, which
+                // the inline version ignored too): end the job with the reader's
+                // error.
+                let _ = cancel_sent;
+                break Err(SendError::Source(
+                    io_fail.take().expect("guarded by `if io_fail.is_some()`"),
+                ));
+            },
             ev = link.rx.recv() => match ev {
                 None => break Err(SendError::Disconnected("the session ended".into())),
                 Some(Inbound::Closed(why)) => break Err(SendError::Disconnected(why)),
-                Some(Inbound::LaneUp(id)) => spawn_lane(id, &mut lane_tasks, link),
+                Some(Inbound::LaneUp(id)) => {
+                    spawn_lane(id, &mut lane_tasks, &mut lane_links, link)
+                }
                 Some(Inbound::LaneDown(id)) => {
-                    if let Some(h) = lane_tasks.remove(&id) {
-                        h.abort();
-                    }
-                    let seqs = sh.window.lock().unwrap().lane_down(id);
-                    let mut s = sh.sched.lock().unwrap();
-                    for seq in seqs {
-                        if let Some((_, mut f)) = s.inflight.remove(&seq) {
-                            if f.class == Class::Bundle {
-                                s.bundles_inflight -= 1;
+                    // I3's precise form: the dead lane's frames are requeued with
+                    // their charge held — but a frame whose take-marker is still
+                    // unset provably never left this process (it was still in the
+                    // writer's queue when the writer died), so the receiver's window
+                    // was never charged for it and its charge is released here.
+                    // Holding the charge of every killed frame instead — the blunt
+                    // rule — leaks window credit forever on frames the receiver
+                    // never saw, and after enough churn the window cannot hold the
+                    // smallest queued frame: the stall detector then fails a healthy
+                    // job. See `a_dead_lane_releases_only_frames_the_writer_never_took`
+                    // and `lane_churn_never_wedges_the_window`.
+                    if let Some((stop, tx)) = lane_links.remove(&id) {
+                        // Stop (never abort) the lane's task: a send already in
+                        // flight must resolve against the closed queue so its marker
+                        // is final. The task is detached here so the id can be
+                        // re-joined; it exits at its next check or failed send.
+                        stop.store(true, Ordering::Relaxed);
+                        lane_tasks.remove(&id);
+                        let seqs = sh.window.lock().unwrap().lane_down(id);
+                        // The sched guard is scoped: it must not live across the
+                        // bounded wait below (the job's future is spawned and Send).
+                        let never_taken: Vec<u32> = {
+                            let mut s = sh.sched.lock().unwrap();
+                            let mut never_taken = Vec::new();
+                            for seq in seqs {
+                                if let Some((_, mut f)) = s.inflight.remove(&seq) {
+                                    if f.class == Class::Bundle {
+                                        s.bundles_inflight -= 1;
+                                    }
+                                    f.resend = true;
+                                    let taken = f
+                                        .taken
+                                        .as_ref()
+                                        .is_some_and(|t| t.load(Ordering::SeqCst));
+                                    if !taken {
+                                        never_taken.push(seq);
+                                    }
+                                    s.requeue.push_back(f);
+                                }
                             }
-                            f.resend = true;
-                            s.requeue.push_back(f);
+                            s.stalls += 1;
+                            never_taken
+                        };
+                        // The writer must have ended before the markers are final —
+                        // a frame still queued when it ends was never taken. Wait
+                        // (bounded) for its end; a writer that lingers leaves the
+                        // charge held (the conservative I3 rule).
+                        let deadline = Instant::now() + Duration::from_millis(250);
+                        while !tx.writer_dead() && Instant::now() < deadline {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        if tx.writer_dead() {
+                            let mut w = sh.window.lock().unwrap();
+                            for seq in never_taken {
+                                let _ = w.release(seq);
+                            }
+                        }
+                        // A pick that slipped past the stop flag after the sweep
+                        // charged a frame to this dead lane; its send fails against
+                        // the closed queue (the writer has ended), so it would sit
+                        // charged in `inflight` forever — lost bytes, not just a
+                        // leak. Sweep once more now that the markers are final: the
+                        // straggler is requeued like the rest, and its charge is
+                        // released too (its send failed, so it was never taken).
+                        let strays = sh.window.lock().unwrap().lane_down(id);
+                        if !strays.is_empty() {
+                            let mut s = sh.sched.lock().unwrap();
+                            for seq in strays {
+                                if let Some((_, mut f)) = s.inflight.remove(&seq) {
+                                    if f.class == Class::Bundle {
+                                        s.bundles_inflight -= 1;
+                                    }
+                                    f.resend = true;
+                                    let taken = f
+                                        .taken
+                                        .as_ref()
+                                        .is_some_and(|t| t.load(Ordering::SeqCst));
+                                    if !taken {
+                                        let _ = sh.window.lock().unwrap().release(seq);
+                                    }
+                                    s.requeue.push_back(f);
+                                }
+                            }
                         }
                     }
-                    s.stalls += 1;
-                    drop(s);
                     sh.wake();
                 }
                 Some(Inbound::Lane { .. }) => {} // an uploader receives nothing on lanes
@@ -1174,11 +1349,12 @@ pub async fn run_upload(
             }
         }
     };
-    // Every exit: stop the lanes, wake the sleepers, cancel and join every lane task
-    // (correction 5) — and then the readers (I1): close the read-ahead budget so a
-    // reader parked on it wakes, drain the queues so the frames' permits are released,
-    // and join every reader thread before the job's future returns. Nothing of this job
-    // keeps running after the return.
+    // Every exit: stop the readers' flag, wake the sleepers, cancel and join every
+    // lane task still held (correction 5; a dead lane's task was detached at its
+    // LaneDown and exits on its own) — and then the readers (I1): close the read-ahead
+    // budget so a reader parked on it wakes, drain the queues so the frames' permits
+    // are released, and join every reader thread before the job's future returns.
+    // Nothing of this job keeps running after the return.
     stop.store(true, Ordering::Relaxed);
     sh.wake();
     for (_, h) in lane_tasks.drain() {
@@ -1288,7 +1464,7 @@ mod tests {
     use super::*;
     use crate::conn::{FrameReader, FrameWriter};
     use crate::manifest::Entry;
-    use crate::router::{is_data_type, ConnTx, Router};
+    use crate::router::{is_data_type, BoxFut, ConnTx, LaneOpener, Router};
     use crate::session::Timing;
     use crate::source::SourceMeta;
     use crate::wire::SplitMix;
@@ -1363,22 +1539,93 @@ mod tests {
         w.sent(1, 7, 60);
         assert!(!w.can_send(2, 60, 1000), "credit");
         w.lane_down(1); // frame 7 never acknowledged: the charge stays
-        assert_eq!(w.available(), 40, "a lane death released window credit");
+        assert_eq!(w.refunded.len(), 1, "the dead frame is held");
+        assert_eq!(w.available(), 40, "a lane death releases no window credit");
         assert!(
             !w.can_send(2, 60, 1000),
             "the dead lane's bytes could be spent twice"
         );
+        w.credit(60); // the receiver applied it and returned the space
+        assert_eq!(
+            w.refunded.len(),
+            1,
+            "a Credit closes nothing out: the charge lives in the window"
+        );
         w.received(7); // ...but it had arrived after all: the receiver did charge it
         assert_eq!(
+            w.refunded.len(),
+            0,
+            "the late Received closed the frame out"
+        );
+        assert_eq!(
             w.available(),
-            40,
+            100,
             "a late Received double-charged the sender"
         );
-        w.credit(60); // the receiver applied it and returned the space
+        w.received(7); // a duplicated Received closes nothing out...
+        assert_eq!(w.refunded.len(), 0, "a duplicated Received changes nothing");
         assert!(w.can_send(2, 60, 1000));
         w.sent(2, 8, 60);
         assert!(!w.can_send(2, 30, 70), "the lane's in-flight cap");
         assert_eq!(w.received(8), Some(60));
+    }
+
+    #[test]
+    fn a_dead_lane_releases_only_frames_the_writer_never_took() {
+        // I3's precise form: the kill holds the charge of frames that may have
+        // reached the receiver (the writer took them) and releases the rest — the
+        // blunt rule held everything, and frames the receiver never saw could never
+        // be credited back, so the window shrank with every kill until the stall
+        // detector failed a healthy job.
+        let mut w = Window::new(8 << 20);
+        assert!(w.sent(1, 1, 4 << 20)); // written: the receiver may have it
+        assert!(w.sent(1, 2, 4 << 20)); // still in the writer's queue: never left
+        assert_eq!(w.lane_down(1), vec![1, 2]);
+        assert_eq!(
+            w.available(),
+            0,
+            "a lane death must not release credit itself"
+        );
+        // The writer died without taking frame 2: its charge is released here —
+        // the receiver's window was never charged for it.
+        assert_eq!(w.release(2), Some(4 << 20));
+        assert_eq!(w.available(), 4 << 20);
+        assert_eq!(w.release(2), None, "released twice");
+        // Frame 1's charge stays held until the receiver accounts for it.
+        assert_eq!(w.received(1), None);
+        assert_eq!(w.available(), 4 << 20, "a late Received releases nothing");
+        w.credit(4 << 20); // the receiver applied it and returned the bytes
+        assert_eq!(w.available(), 8 << 20);
+        assert_eq!(
+            w.received(2),
+            None,
+            "a late Received for a released frame is nothing"
+        );
+        assert_eq!(w.available(), 8 << 20);
+    }
+
+    #[test]
+    fn lane_churn_never_wedges_the_window_when_the_untaken_frames_are_released() {
+        // The wedge, pinned: each round kills a lane with one written frame (whose
+        // bytes the receiver returns with a Credit after its apply) and one frame
+        // the writer never took (released at the kill). The window returns to its
+        // full grant every round. Under the blunt rule — no `release` — every round
+        // leaks the untaken frame's charge and the window is empty after two rounds:
+        // nothing fits, and the stall detector fails a healthy job.
+        for _ in 0..200 {
+            let mut w = Window::new(8 << 20);
+            assert!(w.sent(1, 1, 4 << 20)); // written
+            assert!(w.sent(1, 2, 4 << 20)); // never left the writer's queue
+            w.lane_down(1);
+            w.release(2);
+            assert_eq!(w.received(1), None); // the receiver confirms the written frame
+            w.credit(4 << 20); // ...and returns its bytes after the apply
+            assert_eq!(
+                w.available(),
+                8 << 20,
+                "the window shrank: an untaken frame's charge leaked"
+            );
+        }
     }
 
     #[test]
@@ -1530,6 +1777,7 @@ mod tests {
             payload,
             resend: false,
             _budget: Vec::new(),
+            taken: None,
         }
     }
 
@@ -2013,6 +2261,7 @@ mod tests {
     /// tasks alive (dropping the link drives closes the session).
     fn fake_link(
         rcv: FakeReceiver,
+        opener: Option<Arc<dyn LaneOpener>>,
     ) -> (
         JobLink,
         Arc<std::sync::atomic::AtomicUsize>,
@@ -2042,7 +2291,7 @@ mod tests {
         let keep: Vec<crate::link::Link> = vec![clink, llink];
         let router = Arc::new(Router::default());
         router.lane_up(1, loutbox);
-        let link = JobLink::new(job, router.clone(), ConnTx::new(coutbox), None);
+        let link = JobLink::new(job, router.clone(), ConnTx::new(coutbox), opener);
         // Route the control connection's frames into the job, like the session dispatcher.
         let r2 = router.clone();
         tokio::spawn(async move {
@@ -2140,10 +2389,13 @@ mod tests {
         data: Arc<Vec<u8>>,
         reads: Arc<std::sync::atomic::AtomicUsize>,
         active: Arc<std::sync::atomic::AtomicUsize>,
+        slow: bool,
     }
     impl crate::source::ReadAt for CountingRead {
         fn read_at(&mut self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
-            std::thread::sleep(Duration::from_millis(5)); // a slow source: reads are observable
+            if self.slow {
+                std::thread::sleep(Duration::from_millis(5)); // a slow source: reads are observable
+            }
             let n = buf
                 .len()
                 .min(64 * 1024)
@@ -2164,6 +2416,7 @@ mod tests {
         data: Arc<Vec<u8>>,
         reads: Arc<std::sync::atomic::AtomicUsize>,
         active: Arc<std::sync::atomic::AtomicUsize>,
+        slow: bool,
     }
     impl Source for CountingSource {
         fn open(&self, _rel: &str) -> io::Result<Box<dyn crate::source::ReadAt>> {
@@ -2172,6 +2425,7 @@ mod tests {
                 data: self.data.clone(),
                 reads: self.reads.clone(),
                 active: self.active.clone(),
+                slow: self.slow,
             }))
         }
         fn list(&self, _rel: &str) -> io::Result<Vec<(String, SourceMeta)>> {
@@ -2195,20 +2449,24 @@ mod tests {
         // iteration. Against the unfixed sender the reader keeps reading for seconds
         // after the return and then leaks, parked on the budget.
         let size = 160usize << 20;
-        let (mut link, _lane_seen, _keep) = fake_link(FakeReceiver {
-            credit: 4 << 20,
-            credit_on_apply: true,
-            done_when_complete: false,
-            credit_after_ack: None,
-            malformed_status: false,
-            retry_unknown: false,
-        });
+        let (mut link, _lane_seen, _keep) = fake_link(
+            FakeReceiver {
+                credit: 4 << 20,
+                credit_on_apply: true,
+                done_when_complete: false,
+                credit_after_ack: None,
+                malformed_status: false,
+                retry_unknown: false,
+            },
+            None,
+        );
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let src: Arc<dyn Source> = Arc::new(CountingSource {
             data: Arc::new(vec![0x5a; size]),
             reads: reads.clone(),
             active: active.clone(),
+            slow: true,
         });
         let m = Arc::new(Manifest {
             entries: vec![Entry {
@@ -2251,20 +2509,425 @@ mod tests {
         assert_eq!(active.load(Ordering::Relaxed), 0, "a reader thread leaked");
     }
 
+    /// An opener whose `open()` waits for the test's signal and then fails: the
+    /// deterministic lane-open failure for the I1 open-failure path. The test fires the
+    /// signal only once a reader is parked on the read-ahead budget, so the failure
+    /// lands exactly while a reader is parked — the leak the teardown must clean up.
+    struct FailOpenOnSignal(Arc<tokio::sync::Notify>);
+    impl LaneOpener for FailOpenOnSignal {
+        fn open(&self) -> BoxFut<'_, Result<u16, crate::Ava1Error>> {
+            let n = self.0.clone();
+            Box::pin(async move {
+                n.notified().await;
+                Err(crate::Ava1Error::Io(std::io::Error::other(
+                    "the test opener refuses the lane",
+                )))
+            })
+        }
+        fn close(&self, _id: u16) {}
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lane_open_failure_still_runs_the_teardown_and_joins_the_readers() {
+        // I1's other exit: the lane-open failure must break into the teardown like any
+        // other exit — the unfixed `?` returns from `run_upload` before the stop flag,
+        // the budget close and the reader joins, so a reader parked on the read-ahead
+        // semaphore stays parked (holding its source session) forever after the job's
+        // future has already returned.
+        let size = 160usize << 20;
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let (mut link, _lane_seen, _keep) = fake_link(
+            FakeReceiver {
+                credit: 4 << 20,
+                credit_on_apply: true,
+                done_when_complete: false,
+                credit_after_ack: None,
+                malformed_status: false,
+                retry_unknown: false,
+            },
+            Some(Arc::new(FailOpenOnSignal(signal.clone())) as Arc<dyn LaneOpener>),
+        );
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let src: Arc<dyn Source> = Arc::new(CountingSource {
+            data: Arc::new(vec![0x5b; size]),
+            reads: reads.clone(),
+            active: active.clone(),
+            slow: true,
+        });
+        let m = Arc::new(Manifest {
+            entries: vec![Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: size as u64,
+                mtime: 1,
+                path: "big".into(),
+                root: None,
+            }],
+        });
+        let job_task =
+            tokio::spawn(
+                async move { send_job(&mut link, m, src, SendOptions::upload("dest")).await },
+            );
+        // Deterministic failure: wait until a reader is parked on the read-ahead budget
+        // — its reads stop advancing while it still holds its source session — and only
+        // then let the opener fail, so the failure lands with a reader parked.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let a = reads.load(Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                if a > 0 && reads.load(Ordering::Relaxed) == a && active.load(Ordering::Relaxed) > 0
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a reader parked on the budget within the bound");
+        // `notify_one` stores a permit if the opener is not yet waiting, so the failure
+        // lands however the two interleave.
+        signal.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(15), job_task)
+            .await
+            .expect("the job ended promptly after the open failure")
+            .expect("the sender task did not panic");
+        assert!(
+            matches!(result, Err(SendError::Disconnected(_))),
+            "{result:?}"
+        );
+        // The teardown ran: no reader keeps reading...
+        let at = reads.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            at,
+            "a reader kept reading after the job returned"
+        );
+        // ...and no reader thread is still parked inside the source.
+        assert_eq!(active.load(Ordering::Relaxed), 0, "a reader thread leaked");
+    }
+
+    /// An opener whose `open()` asks the lane factory (the test) for a new lane: each
+    /// request is answered by spinning up a fresh lane over an in-memory pipe.
+    struct LaneFactory {
+        reqs: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<u16>>,
+    }
+    impl LaneOpener for LaneFactory {
+        fn open(&self) -> BoxFut<'_, Result<u16, crate::Ava1Error>> {
+            let reqs = self.reqs.clone();
+            Box::pin(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if reqs.send(tx).is_err() {
+                    return Err(crate::Ava1Error::Io(std::io::Error::other(
+                        "the test's lane factory ended",
+                    )));
+                }
+                rx.await
+                    .map_err(|_| crate::Ava1Error::Lost("the test's lane factory ended".into()))
+            })
+        }
+        fn close(&self, _id: u16) {}
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_lane_kills_with_frames_stuck_in_the_outbox_never_wedge_the_window() {
+        // The wedge (I3's blunt form), pinned end to end. The source is fast and the
+        // acks are throttled, so the warm-up runs the pipeline at a controlled
+        // ~40 MiB/s: the governor's per-lane rate settles around 15 MB/s, which sizes
+        // each warm lane's in-flight cap at ~30 MiB — seven 4 MiB frames — and the
+        // 32 MiB grant then charges the whole window across the two warm lanes. The
+        // peer stops reading, so each lane's writer blocks on the 1 MiB pipe mid-frame
+        // with the lane's later frames still queued in its outbox — frames the writer
+        // never took and the receiver never saw. The blunt rule held every dead lane's
+        // charge forever (the receiver credits only what it applied), so after enough
+        // kills the whole grant was held and nothing could be charged: the stall
+        // detector failed a healthy job. The refined rule releases exactly the
+        // never-taken frames' charge at each kill, so three kills must still complete.
+        // The kill is deterministic: dropping the lane's `Link` ends its connection
+        // (its writer aborts, so the take-markers are final) — and the stall
+        // detector's 10 s bound is never near.
+        let size = 256usize << 20;
+        let credit: u64 = 32 << 20;
+        let reads_on = Arc::new(AtomicBool::new(true));
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<(u32, u64, u32, u64, u64)>();
+        let timing = Timing {
+            ping_every: Duration::from_secs(3600),
+            dead_after: Duration::from_secs(3600),
+            handshake: Duration::from_secs(5),
+            min_frame_rate: crate::link::MIN_FRAME_RATE,
+        };
+        let job = [0x7eu8; 16];
+        // The control connection.
+        let (ca, cb) = duplex(1 << 20);
+        let (car, caw) = split(ca);
+        let (cbr, cbw) = split(cb);
+        let (ctx, mut crx) = mpsc::channel(crate::link::DELIVER_DEPTH);
+        let (clink, coutbox) =
+            crate::link::drive(FrameReader::new(car), FrameWriter::new(caw), timing, ctx);
+        let router = Arc::new(Router::default());
+        // Lane 1, up before the job; the test holds its Link for the first kill. Its
+        // peer reader is gated on `reads_on` (off: the lane backs up).
+        let (la, lb) = duplex(1 << 20);
+        let (lar, law) = split(la);
+        let (lbr, _lbw) = split(lb);
+        let (ltx, mut lrx) = mpsc::channel(crate::link::DELIVER_DEPTH);
+        let (llink1, loutbox) =
+            crate::link::drive(FrameReader::new(lar), FrameWriter::new(law), timing, ltx);
+        let gen1 = router.lane_up(1, loutbox);
+        let r1 = router.clone();
+        tokio::spawn(async move {
+            while lrx.recv().await.is_some() {}
+            r1.lane_down(1, gen1);
+        });
+        {
+            let reads_on = reads_on.clone();
+            let ack_tx = ack_tx.clone();
+            tokio::spawn(async move {
+                let mut peer = FrameReader::new(lbr);
+                peer.set_max_body(crate::frame::MAX_BODY);
+                loop {
+                    while !reads_on.load(Ordering::Relaxed) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    match peer.recv().await {
+                        Ok(f) if is_data_type(f.ty) => {
+                            let c: Chunk = f.decode().unwrap();
+                            let _ = ack_tx.send((
+                                f.channel,
+                                f.body.len() as u64,
+                                c.file_id,
+                                c.offset,
+                                c.data.len() as u64,
+                            ));
+                        }
+                        Ok(_) => {} // the lane's heartbeat Ping
+                        Err(_) => return,
+                    }
+                }
+            });
+        }
+        // The fake receiver: answers the open and the map, turns every forwarded lane
+        // frame into Received + Credit (what the C receiver does on apply), and ends
+        // the job once the received ranges cover the file (re-sent frames overlap).
+        tokio::spawn(async move {
+            let mut peer = FrameReader::new(cbr);
+            peer.set_max_body(crate::frame::MAX_BODY);
+            let mut peer_w = FrameWriter::new(cbw);
+            let (mut manifest_bytes, mut manifest_files) = (0u64, 0u32);
+            let mut covered = RangeSet::new();
+            loop {
+                tokio::select! {
+                    f = peer.recv() => match f {
+                        Ok(f) if f.ty == JobOpen::TYPE => {
+                            let open: JobOpen = f.decode().unwrap();
+                            peer_w.send_msg(0, &JobOpenAck {
+                                job_id: open.job_id,
+                                status: 0,
+                                credit,
+                                staged: 1,
+                                workers: 4,
+                                message: None,
+                            }).await.unwrap();
+                        }
+                        Ok(f) if f.ty == ManifestEnd::TYPE => {
+                            let me: ManifestEnd = f.decode().unwrap();
+                            manifest_bytes = me.bytes;
+                            manifest_files = me.files;
+                            peer_w.send_msg(0, &JobMap {
+                                job_id: job,
+                                status: 0,
+                                last: 1,
+                                done: vec![],
+                                partial: vec![],
+                                message: None,
+                            }).await.unwrap();
+                        }
+                        Ok(_) => {}
+                        Err(_) => return,
+                    },
+                    ack = ack_rx.recv() => match ack {
+                        Some((seq, len, _file_id, offset, data_len)) => {
+                            // The ack throttle: one apply every 100 ms paces the whole
+                            // pipeline at ~40 MiB/s, so the governor's per-lane rate
+                            // settles near 15 MB/s during the warm-up — the wedge
+                            // needs each warm lane's in-flight cap at ~seven frames.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            let _ = peer_w.send_msg(0, &Received { job_id: job, lane: 1, seq }).await;
+                            let _ = peer_w.send_msg(0, &Credit { job_id: job, bytes: len }).await;
+                            covered.insert(offset, offset + data_len);
+                            if manifest_bytes > 0 && covered.covered() >= manifest_bytes {
+                                let _ = peer_w.send_msg(0, &JobDone {
+                                    job_id: job,
+                                    status: 0,
+                                    files: manifest_files,
+                                    bytes: manifest_bytes,
+                                    message: None,
+                                }).await;
+                            }
+                        }
+                        None => return,
+                    },
+                }
+            }
+        });
+        // Route the control connection's frames into the job, like the session dispatcher.
+        let r2 = router.clone();
+        tokio::spawn(async move {
+            while let Some(f) = crx.recv().await {
+                if is_data_type(f.ty) {
+                    let _ = r2.route_control(f).await;
+                }
+            }
+            r2.close("the session ended");
+        });
+        // The opener asks the lane factory for a new lane on demand; the factory spins
+        // one up (peer reader gated on `reads_on`) and hands its Link to the test as
+        // the kill switch — dropping the Link ends the lane's connection.
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<u16>>();
+        let (new_tx, mut new_rx) = mpsc::unbounded_channel::<(u16, crate::link::Link)>();
+        let opener = Arc::new(LaneFactory { reqs: req_tx }) as Arc<dyn LaneOpener>;
+        let mut link = JobLink::new(job, router.clone(), ConnTx::new(coutbox), Some(opener));
+        let (reads_on_f, ack_tx_f) = (reads_on.clone(), ack_tx.clone());
+        tokio::spawn(async move {
+            let mut next_id = 2u16;
+            while let Some(tx) = req_rx.recv().await {
+                let id = next_id;
+                next_id += 1;
+                let (la, lb) = duplex(1 << 20);
+                let (lar, law) = split(la);
+                let (lbr, _lbw) = split(lb);
+                let (ltx, mut lrx) = mpsc::channel(crate::link::DELIVER_DEPTH);
+                let (llink, loutbox) =
+                    crate::link::drive(FrameReader::new(lar), FrameWriter::new(law), timing, ltx);
+                let gen = router.lane_up(id, loutbox);
+                let r3 = router.clone();
+                tokio::spawn(async move {
+                    while lrx.recv().await.is_some() {}
+                    r3.lane_down(id, gen);
+                });
+                tokio::spawn({
+                    let reads_on = reads_on_f.clone();
+                    let ack_tx = ack_tx_f.clone();
+                    async move {
+                        let mut peer = FrameReader::new(lbr);
+                        peer.set_max_body(crate::frame::MAX_BODY);
+                        loop {
+                            while !reads_on.load(Ordering::Relaxed) {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            match peer.recv().await {
+                                Ok(f) if is_data_type(f.ty) => {
+                                    let c: Chunk = f.decode().unwrap();
+                                    let _ = ack_tx.send((
+                                        f.channel,
+                                        f.body.len() as u64,
+                                        c.file_id,
+                                        c.offset,
+                                        c.data.len() as u64,
+                                    ));
+                                }
+                                Ok(_) => {} // the lane's heartbeat Ping
+                                Err(_) => return,
+                            }
+                        }
+                    }
+                });
+                let _ = new_tx.send((id, llink));
+                let _ = tx.send(id);
+            }
+        });
+        // The job over a fast source; the kill driver runs alongside. The source
+        // keeps up with anything, so the credit is what throttles the pieces — the
+        // whole grant is charged while the writers block, exactly the wedge state.
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let src: Arc<dyn Source> = Arc::new(CountingSource {
+            data: Arc::new(vec![0x5c; size]),
+            reads: reads.clone(),
+            active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            slow: false,
+        });
+        let m = Arc::new(Manifest {
+            entries: vec![Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: size as u64,
+                mtime: 1,
+                path: "big".into(),
+                root: None,
+            }],
+        });
+        let job_task =
+            tokio::spawn(
+                async move { send_job(&mut link, m, src, SendOptions::upload("dest")).await },
+            );
+        // Warm-up: the peer reads, so each lane's rate (and the seven-frame in-flight
+        // cap that follows it) is established. The wait also spans at least two
+        // governor ticks — the EWMA needs both to reach the cap the wedge relies on.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let start = Instant::now();
+            while reads.load(Ordering::Relaxed) < 24 * (1 << 20)
+                || start.elapsed() < Duration::from_secs(3)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the job warmed up within the bound");
+        // The wedge state: the peer stops reading, so each lane's writer blocks on the
+        // 1 MiB pipe while the pieces keep arriving — the lanes keep charging them
+        // until the whole grant is out (the source is fast, so this takes moments and
+        // each open lane is left holding several queued frames the writer never took).
+        reads_on.store(false, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        // Three kills: lane 1 (held above), then lane 2's and lane 3's Links as the
+        // factory hands them over — lane 3 (the replacement) backs up too before it
+        // dies.
+        drop(llink1);
+        let (_, kill2) = tokio::time::timeout(Duration::from_secs(15), new_rx.recv())
+            .await
+            .expect("lane 2's Link arrived within the bound")
+            .expect("the lane factory is alive");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        drop(kill2);
+        let (_, kill3) = tokio::time::timeout(Duration::from_secs(15), new_rx.recv())
+            .await
+            .expect("a replacement lane came up within the bound")
+            .expect("the lane factory is alive");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        drop(kill3);
+        // The readers come on: the job must complete.
+        reads_on.store(true, Ordering::Relaxed);
+        let report = tokio::time::timeout(Duration::from_secs(90), job_task)
+            .await
+            .expect("the job completed within the bound")
+            .expect("the sender task did not panic")
+            .expect("the upload completed");
+        assert_eq!(report.status, 0, "{:?}", report.message);
+        assert_eq!(report.bytes, size as u64);
+        assert!(
+            report.resent > 0,
+            "the dead lanes' frames were requeued and re-sent"
+        );
+        let _keep_control = clink;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_job_completes_when_the_grant_is_smaller_than_the_chunk() {
         // I2: the receiver grants less than the sender's chunk. The unfixed sender reads
         // chunk-sized pieces that can never fit the grant — the bounded wait here fails
         // by hanging. With the read-time grant cap every piece fits and the job completes.
         let size = 12usize << 20;
-        let (mut link, _lane_seen, _keep) = fake_link(FakeReceiver {
-            credit: 3 << 20,
-            credit_on_apply: true,
-            done_when_complete: true,
-            credit_after_ack: None,
-            malformed_status: false,
-            retry_unknown: false,
-        });
+        let (mut link, _lane_seen, _keep) = fake_link(
+            FakeReceiver {
+                credit: 3 << 20,
+                credit_on_apply: true,
+                done_when_complete: true,
+                credit_after_ack: None,
+                malformed_status: false,
+                retry_unknown: false,
+            },
+            None,
+        );
         let dir = std::env::temp_dir().join(format!("ava1-send-grant-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2302,14 +2965,17 @@ mod tests {
         // (one group) can never fit and no Credit can arrive — the job must fail with a
         // Protocol error naming the grant, not park forever.
         let size = 8usize << 20;
-        let (mut link, _lane_seen, _keep) = fake_link(FakeReceiver {
-            credit: 512 << 10,
-            credit_on_apply: true,
-            done_when_complete: true,
-            credit_after_ack: None,
-            malformed_status: false,
-            retry_unknown: false,
-        });
+        let (mut link, _lane_seen, _keep) = fake_link(
+            FakeReceiver {
+                credit: 512 << 10,
+                credit_on_apply: true,
+                done_when_complete: true,
+                credit_after_ack: None,
+                malformed_status: false,
+                retry_unknown: false,
+            },
+            None,
+        );
         let dir = std::env::temp_dir().join(format!("ava1-send-tinygrant-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2349,14 +3015,17 @@ mod tests {
         // unfixed open_upload discards it, leaving the window empty forever (the bounded
         // wait here fails); folded in, the window is usable and the job completes.
         let size = 8usize << 20;
-        let (mut link, _lane_seen, _keep) = fake_link(FakeReceiver {
-            credit: 0,
-            credit_on_apply: true,
-            done_when_complete: true,
-            credit_after_ack: Some(4 << 20),
-            malformed_status: false,
-            retry_unknown: false,
-        });
+        let (mut link, _lane_seen, _keep) = fake_link(
+            FakeReceiver {
+                credit: 0,
+                credit_on_apply: true,
+                done_when_complete: true,
+                credit_after_ack: Some(4 << 20),
+                malformed_status: false,
+                retry_unknown: false,
+            },
+            None,
+        );
         let dir =
             std::env::temp_dir().join(format!("ava1-send-earlycredit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2394,14 +3063,17 @@ mod tests {
         // M6: like every other control frame, a Status whose decode fails ends the job
         // with a Protocol error — the unfixed sender shrugs it off and completes.
         let size = 4usize << 20;
-        let (mut link, _lane_seen, _keep) = fake_link(FakeReceiver {
-            credit: 64 << 20,
-            credit_on_apply: true,
-            done_when_complete: true,
-            credit_after_ack: None,
-            malformed_status: true,
-            retry_unknown: false,
-        });
+        let (mut link, _lane_seen, _keep) = fake_link(
+            FakeReceiver {
+                credit: 64 << 20,
+                credit_on_apply: true,
+                done_when_complete: true,
+                credit_after_ack: None,
+                malformed_status: true,
+                retry_unknown: false,
+            },
+            None,
+        );
         let dir = std::env::temp_dir().join(format!("ava1-send-badstatus-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2438,14 +3110,17 @@ mod tests {
         // sender silently queues it for the large reader, which exits, and the job
         // completes without the retried file.
         let size = 4usize << 20;
-        let (mut link, _lane_seen, _keep) = fake_link(FakeReceiver {
-            credit: 64 << 20,
-            credit_on_apply: true,
-            done_when_complete: true,
-            credit_after_ack: None,
-            malformed_status: false,
-            retry_unknown: true,
-        });
+        let (mut link, _lane_seen, _keep) = fake_link(
+            FakeReceiver {
+                credit: 64 << 20,
+                credit_on_apply: true,
+                done_when_complete: true,
+                credit_after_ack: None,
+                malformed_status: false,
+                retry_unknown: true,
+            },
+            None,
+        );
         let dir = std::env::temp_dir().join(format!("ava1-send-badretry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

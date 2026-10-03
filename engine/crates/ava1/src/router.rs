@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -60,6 +60,28 @@ impl ConnTx {
         body: Vec<u8>,
     ) -> Result<(), Ava1Error> {
         self.outbox.send_frame(ty, flags, channel, body).await
+    }
+
+    /// `send_raw` with a take-marker: the writer flips it the moment it takes the
+    /// frame out of its queue — un-taken at the writer's death, the frame provably
+    /// never left this process (the sender releases its window charge, I3).
+    pub async fn send_raw_marked(
+        &self,
+        ty: u8,
+        flags: u8,
+        channel: u32,
+        body: Vec<u8>,
+        taken: Arc<AtomicBool>,
+    ) -> Result<(), Ava1Error> {
+        self.outbox
+            .send_frame_marked(ty, flags, channel, body, Some(taken))
+            .await
+    }
+
+    /// True once the connection's writer has ended: a frame still un-taken then
+    /// provably never left this process.
+    pub fn writer_dead(&self) -> bool {
+        self.outbox.writer_dead()
     }
 
     pub async fn send<M: FrameMessage>(&self, m: &M) -> Result<(), Ava1Error> {

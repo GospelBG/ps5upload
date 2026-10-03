@@ -5,7 +5,7 @@
 //! Every frame goes out through one writer task fed by a bounded queue (`Outbox`), so
 //! no reader ever waits on a socket write, and enqueueing is cancel-safe: a frame is
 //! either queued whole or not at all, and only the writer task touches the stream.
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,6 +38,11 @@ enum Out {
         flags: u8,
         channel: u32,
         body: Vec<u8>,
+        /// The writer flips it the moment it takes the frame out of the queue, before
+        /// the write. Un-taken when the writer dies (the queue died with it), the
+        /// frame provably never left this process — the data plane uses that to
+        /// release the frame's window charge on a lane death (I3's precise form).
+        taken: Option<Arc<AtomicBool>>,
     },
     /// A heartbeat. Its `t_us` is stamped when it is written, so time spent queued
     /// behind other frames never counts as round-trip time.
@@ -54,6 +59,18 @@ pub(crate) struct Outbox {
     /// Frames queued or being written right now. The queue's own length is not enough:
     /// the frame the writer has taken out is still on its way.
     unwritten: Arc<AtomicUsize>,
+    /// True once the writer has ended, however it ended (the connection died, or the
+    /// link was dropped): a frame still un-taken then never left this process.
+    writer_dead: Arc<AtomicBool>,
+}
+
+/// Sets the flag when the writer task ends, however it ends (it is dropped when the
+/// task is aborted or returns): after that nothing further can leave the process.
+struct DeadOnDrop(Arc<AtomicBool>);
+impl Drop for DeadOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Counts a frame as unwritten until it is queued; uncounts it if it never was (the
@@ -106,6 +123,20 @@ impl Outbox {
         channel: u32,
         body: Vec<u8>,
     ) -> Result<(), Ava1Error> {
+        self.send_frame_marked(ty, flags, channel, body, None).await
+    }
+
+    /// `send_frame` with a take-marker: the writer flips it the moment it takes the
+    /// frame out of the queue (before the write). Un-taken at the writer's death, the
+    /// frame provably never left this process.
+    pub(crate) async fn send_frame_marked(
+        &self,
+        ty: u8,
+        flags: u8,
+        channel: u32,
+        body: Vec<u8>,
+        taken: Option<Arc<AtomicBool>>,
+    ) -> Result<(), Ava1Error> {
         let counted = Counted::new(&self.unwritten);
         self.tx
             .send(Out::Frame {
@@ -113,6 +144,7 @@ impl Outbox {
                 flags,
                 channel,
                 body,
+                taken,
             })
             .await
             .map_err(|_| Ava1Error::Lost("the connection has ended".into()))?;
@@ -128,6 +160,7 @@ impl Outbox {
             flags: 0,
             channel,
             body,
+            taken: None,
         })
     }
 
@@ -144,6 +177,12 @@ impl Outbox {
         })?;
         counted.queued();
         Ok(())
+    }
+
+    /// True once the connection's writer has ended (the queue died with it): a frame
+    /// still un-taken then provably never left this process.
+    pub(crate) fn writer_dead(&self) -> bool {
+        self.writer_dead.load(Ordering::SeqCst)
     }
 
     /// Nothing is waiting to be written and nothing is being written.
@@ -237,9 +276,11 @@ where
     writer.set_pace(pace);
     let (out_tx, mut out_rx) = mpsc::channel::<Out>(OUTBOX_DEPTH);
     let unwritten = Arc::new(AtomicUsize::new(0));
+    let writer_dead = Arc::new(AtomicBool::new(false));
     let outbox = Outbox {
         tx: out_tx,
         unwritten: unwritten.clone(),
+        writer_dead: writer_dead.clone(),
     };
 
     // Ends the connection: every task is aborted, which drops both socket halves.
@@ -264,7 +305,9 @@ where
 
     let writer_task = {
         let close = close.clone();
+        let writer_dead = writer_dead.clone();
         tokio::spawn(async move {
+            let _dead = DeadOnDrop(writer_dead);
             while let Some(o) = out_rx.recv().await {
                 let sent = match o {
                     Out::Frame {
@@ -272,7 +315,16 @@ where
                         flags,
                         channel,
                         body,
-                    } => writer.send_with_flags(ty, flags, channel, &body).await,
+                        taken,
+                    } => {
+                        // Taken by the writer: from here on the frame may reach the
+                        // peer, so its window charge must be held even if the write
+                        // then fails (the peer may have part of it).
+                        if let Some(t) = &taken {
+                            t.store(true, Ordering::SeqCst);
+                        }
+                        writer.send_with_flags(ty, flags, channel, &body).await
+                    }
                     Out::Ping { seq } => {
                         let ping = Ping {
                             seq,
