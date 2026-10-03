@@ -160,7 +160,6 @@ pub(crate) fn run(c: DecodeCtx) {
 }
 
 fn run_passes(c: &DecodeCtx, abort: &AtomicBool) {
-    let c = c;
     let mut by_path: HashMap<String, u32> = HashMap::new();
     for (i, e) in c.manifest.entries.iter().enumerate() {
         if e.kind == gen::ENTRY_FILE {
@@ -211,7 +210,7 @@ fn run_passes(c: &DecodeCtx, abort: &AtomicBool) {
         // Wait for a retry (the receiver may report a file that failed verification
         // at any time before the job ends).
         let ids = loop {
-            if gone(&c) {
+            if gone(c) {
                 return;
             }
             let ids = c.retries.take(Duration::from_millis(50));
