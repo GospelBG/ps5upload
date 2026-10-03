@@ -238,6 +238,15 @@ control connection and lanes are closed and their per-address counts given back
 before the new session's limits are checked. A client reconnecting after its link
 died silently is therefore never refused for its own dead connections.
 
+The key is the identity, not the process: two engines (two processes, two computers, a
+desktop app and a Docker engine) that share one identity file are one device to the
+console, and each new handshake ends the other's session and its jobs' lanes. They keep
+evicting each other, and each sees its session end for no visible reason. Every engine
+therefore needs its own identity (its own data directory). A client can recognise the
+condition but not prove it: the session simply ends. The engine logs a warning naming
+this cause when a console's session ends on its own 3 times within 120 s (at most once
+per window per console).
+
 ## 9. Data lanes
 A client opens lane n (1..=8) by connecting and sending, unsealed,
 `Join{session_id, lane_id, client_nonce, tag}` with a fresh random client_nonce

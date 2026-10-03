@@ -1,11 +1,15 @@
 //! One AVA1 session per console, shared by every job (SPEC.md §6 limits a peer to 12
 //! connections per IP; one control connection plus at most 8 lanes is one session).
+//!
+//! A console keeps one session per identity (SPEC.md §8): two engine processes sharing an
+//! identity evict each other. `Churn` notices the symptom and says so.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use ava1::keys::Identity;
 use ava1::peers::PeerStore;
@@ -34,7 +38,9 @@ pub struct Pool {
     /// both fall back to FTX2 under Auto, so the honest error wins.
     me: Result<Arc<Identity>, String>,
     peers: Arc<Mutex<PeerStore>>,
-    sessions: tokio::sync::Mutex<HashMap<String, Arc<Session>>>,
+    sessions: Arc<tokio::sync::Mutex<HashMap<String, Cached>>>,
+    /// Sessions that ended under us, for the one-session-per-identity warning.
+    churn: Arc<Churn>,
     /// Test/lab override: every console resolves to this address (A1). Never set in
     /// the engine.
     addr: Option<String>,
@@ -44,6 +50,103 @@ pub struct Pool {
     /// Job directories (hex job ids) of the jobs running in this process, with a count each:
     /// the journal sweep never touches them (SPEC.md §14.3).
     live: Mutex<HashMap<String, usize>>,
+}
+
+/// Sessions that ended under us this many times within `Churn::window` mean something else
+/// keeps taking them: almost always a second engine using the same identity.
+const CHURN_DEATHS: usize = 3;
+const CHURN_WINDOW: Duration = Duration::from_secs(120);
+/// A session that ends this soon after `forget` is the engine's own doing, not an eviction.
+const CHURN_FORGET_GRACE: Duration = Duration::from_secs(5);
+
+/// The shared message, also quoted by SPEC.md §8 and CUTOVER.md.
+pub const SUPERSEDED_WARNING: &str = "another ps5upload engine using the same identity is connected to this console; the console keeps one session per identity, so the two engines keep evicting each other (give each engine its own data directory, i.e. its own identity)";
+
+/// A cached session and whether its end has been counted yet (the watcher and the lookup
+/// that finds it closed both may see it first).
+struct Cached {
+    session: Arc<Session>,
+    counted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct Churn {
+    deaths_to_warn: usize,
+    window: Duration,
+    deaths: Mutex<HashMap<String, VecDeque<Instant>>>,
+    forgotten: Mutex<HashMap<String, Instant>>,
+    warned: Mutex<HashMap<String, Instant>>,
+    warnings: AtomicUsize,
+}
+
+impl Default for Churn {
+    fn default() -> Self {
+        Self::new(CHURN_DEATHS, CHURN_WINDOW)
+    }
+}
+
+impl Churn {
+    fn new(deaths_to_warn: usize, window: Duration) -> Self {
+        Churn {
+            deaths_to_warn,
+            window,
+            deaths: Mutex::default(),
+            forgotten: Mutex::default(),
+            warned: Mutex::default(),
+            warnings: AtomicUsize::new(0),
+        }
+    }
+
+    fn forgot(&self, host: &str) {
+        let mut f = self.forgotten.lock().unwrap_or_else(|e| e.into_inner());
+        f.insert(host.to_string(), Instant::now());
+    }
+
+    /// A cached session for `host` ended on its own (`why` is what the link reported).
+    fn died(&self, host: &str, why: &str) {
+        let now = Instant::now();
+        let ours = self
+            .forgotten
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(host)
+            .is_some_and(|t| now.duration_since(*t) < CHURN_FORGET_GRACE);
+        if ours {
+            return;
+        }
+        let n = {
+            let mut d = self.deaths.lock().unwrap_or_else(|e| e.into_inner());
+            let q = d.entry(host.to_string()).or_default();
+            q.push_back(now);
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > self.window)
+            {
+                q.pop_front();
+            }
+            q.len()
+        };
+        if n < self.deaths_to_warn {
+            return;
+        }
+        {
+            // At most once per window per console: the warning must not become the spam.
+            let mut w = self.warned.lock().unwrap_or_else(|e| e.into_inner());
+            if w.get(host)
+                .is_some_and(|t| now.duration_since(*t) < self.window)
+            {
+                return;
+            }
+            w.insert(host.to_string(), now);
+        }
+        self.warnings.fetch_add(1, Ordering::Relaxed);
+        use std::io::Write;
+        // Never `eprintln!`: a closed stderr panics it.
+        let _ = writeln!(
+            std::io::stderr(),
+            "ava1: warning: {SUPERSEDED_WARNING} (console {host}: its session ended {n} times in {}s; last reason: {why})",
+            self.window.as_secs()
+        );
+    }
 }
 
 /// A job running in this process (see `Pool::live_job`).
@@ -75,7 +178,8 @@ impl Pool {
             dir: PathBuf::new(),
             me: Err("no PS5Upload data directory; AVA1 identity unavailable".into()),
             peers: Arc::new(Mutex::new(PeerStore::in_memory())),
-            sessions: tokio::sync::Mutex::default(),
+            sessions: Arc::default(),
+            churn: Arc::new(Churn::default()),
             addr: None,
             attempts: AtomicUsize::new(0),
             live: Mutex::default(),
@@ -99,7 +203,8 @@ impl Pool {
             dir,
             me,
             peers: Arc::new(Mutex::new(peers)),
-            sessions: tokio::sync::Mutex::default(),
+            sessions: Arc::default(),
+            churn: Arc::new(Churn::default()),
             addr: None,
             attempts: AtomicUsize::new(0),
             live: Mutex::default(),
@@ -216,11 +321,14 @@ impl Pool {
         let host = host_of(console);
         {
             let mut map = self.sessions.lock().await;
-            if let Some(s) = map.get(&host) {
-                if s.is_closed() {
-                    map.remove(&host);
+            if let Some(c) = map.get(&host) {
+                if c.session.is_closed() {
+                    let c = map.remove(&host).expect("just seen");
+                    if !c.counted.swap(true, Ordering::SeqCst) {
+                        self.churn.died(&host, "connection closed");
+                    }
                 } else {
-                    return Ok(s.clone());
+                    return Ok(c.session.clone());
                 }
             }
         }
@@ -256,7 +364,7 @@ impl Pool {
         let s = Arc::new(s);
         let mut map = self.sessions.lock().await;
         let kept = match map.get(&host) {
-            Some(kept) if !kept.is_closed() => Some(kept.clone()),
+            Some(kept) if !kept.session.is_closed() => Some(kept.session.clone()),
             _ => None,
         };
         if let Some(kept) = kept {
@@ -266,7 +374,33 @@ impl Pool {
             }
             Ok(kept)
         } else {
-            map.insert(host, s.clone());
+            let counted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            map.insert(
+                host.clone(),
+                Cached {
+                    session: s.clone(),
+                    counted: counted.clone(),
+                },
+            );
+            drop(map);
+            // Count how often this session ends on its own, so a second engine on the same
+            // identity (which the console resolves by ending the older session) is named.
+            // Polls through a `Weak`: a watcher must not keep a session (and its console
+            // connections) alive once every user has dropped it.
+            let (watched, churn) = (Arc::downgrade(&s), self.churn.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let Some(s) = watched.upgrade() else { return };
+                    if s.is_closed() {
+                        let why = s.closed().await;
+                        if !counted.swap(true, Ordering::SeqCst) {
+                            churn.died(&host, &why);
+                        }
+                        return;
+                    }
+                }
+            });
             Ok(s)
         }
     }
@@ -274,7 +408,20 @@ impl Pool {
     /// Drops the cached session (async: it takes the sessions lock — C2). Whether to
     /// `close()` the session is the caller's decision.
     pub async fn forget(&self, console: &str) {
-        self.sessions.lock().await.remove(&host_of(console));
+        let host = host_of(console);
+        self.churn.forgot(&host);
+        self.sessions.lock().await.remove(&host);
+    }
+
+    /// Test seam: warn after `deaths` unexpected session ends within `window`.
+    pub fn with_churn(mut self, deaths: usize, window: Duration) -> Pool {
+        self.churn = Arc::new(Churn::new(deaths, window));
+        self
+    }
+
+    /// How many times the one-session-per-identity warning was logged (test seam).
+    pub fn superseded_warnings(&self) -> usize {
+        self.churn.warnings.load(Ordering::Relaxed)
     }
 
     /// Connection attempts so far (test seam, A4).

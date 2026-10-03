@@ -94,6 +94,11 @@ kept.
       not reports unknown), carried into the manifest. `upload::apply_existing_policy` picks
       `skip-existing` when every file has an mtime and `verify` (roots in the manifest) otherwise
       (`SPEC.md` §11.4). The engine does not expose a skip-existing option yet; call it when it does.
+- [x] One session per identity (`SPEC.md` §8): two engines sharing an identity file (a copied
+      `<data dir>/ava/identity`, a shared data directory, a Docker engine mounted on the
+      desktop's directory) evict each other's console session. Give each engine its own data
+      directory. The engine warns ("another ps5upload engine using the same identity is
+      connected to this console") when a session is superseded 3 times in 120 s.
 - [ ] Zip downloads restart the archive from zero on a reconnect (a fresh job per attempt; the
       reported progress stays monotonic). FTX2 resumes mid-entry, so this is a measured regression:
       implement an in-run resume, or accept it explicitly in the release notes.
