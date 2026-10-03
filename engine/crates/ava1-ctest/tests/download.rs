@@ -715,8 +715,14 @@ async fn two_thousand_tiny_files_download_fast() {
     );
 }
 
-/// Measured on a Mac (wired to nothing, loopback): the debug build (what `cargo test`
-/// runs; blake3 and the AEAD are unoptimised) does ~430 files/s, `--release` ~1,100; the
-/// per-file full-drive-flush bug measured 56. The floors sit at roughly half of healthy,
-/// far above the bug.
-const FLOOR_FILES_PER_S: f64 = if cfg!(debug_assertions) { 200.0 } else { 600.0 };
+/// Measured on a Mac (loopback): the debug build (what `cargo test` runs; blake3 and the
+/// AEAD are unoptimised) does ~1,400 files/s, `--release` ~4,500-5,000. The history this
+/// floor guards: the per-file full-drive flush measured 56; after the batched sync, 430 debug
+/// and ~2,500-3,000 release (serial per-file writes, a 250 ms wait before the final sync);
+/// the parallel bundle writes and the immediate final sync took it to today's numbers. The
+/// floors sit at ~70% of healthy, above everything the earlier pipeline reached.
+const FLOOR_FILES_PER_S: f64 = if cfg!(debug_assertions) {
+    700.0
+} else {
+    3500.0
+};

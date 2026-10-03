@@ -468,6 +468,18 @@ rename, before it journals that commit. Likewise for new names: before a batch i
 that gained a file in it is synced once, after the file data. Where fsync does not reach stable
 storage (macOS), a receiver flushes the drive's cache once per batch after the per-file fsyncs.
 
+12.7 Download pipeline (receiver on the engine, informative; §12.6 is what binds). The pipeline is
+tuned so a download is bound by the wire, not by the receiver: (a) a job with nothing to resume sends
+its (empty) `JobMap` before the journal and the destination folders are made durable, so the sender's
+turnaround to its first data frame overlaps that setup; (b) the files of one `Bundle` are root-checked
+and written on a blocking task of their own, several bundles at once, while the receiver goes on
+draining the inbox; a bundle's `Credit` is returned when its files are written, not when its frame
+arrived; (c) the sync batch is due every 250 ms and at once when every file of the job has been
+written (waiting for the next tick there only adds latency). None of this weakens §12.6: a file is
+reported durable, and `JobDone` sent, only after its data, its names and its journal record are
+synced. A sender starts its reader and writers when the map arrives, not at the next 25 ms tick, and
+its walk stats each path once (`lstat`; `stat` only for a symlink).
+
 A transient `fsync` error does not fail the job at once. A receiver retries a failed `fsync` (file
 data, directory, journal append, final commit sync) up to four more times, waiting 20, 60, 200 and
 600 ms, when the error is one a drive can recover from: `EINTR`, `EAGAIN`, `EBUSY`, `ETIMEDOUT`,
