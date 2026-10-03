@@ -6582,7 +6582,7 @@ static int fsop_cancelled_cb(void *arg) { return fs_op_cancel_pending((int)(intp
 static void fsop_file_cb(void *arg, uint64_t bytes) { fs_op_progress((int)(intptr_t)arg, bytes); }
 
 static int rm_rf_op(const char *path, int depth, int op_idx) {
-    fsj_hooks_t h = { fsop_cancelled_cb, fsop_file_cb, (void *)(intptr_t)op_idx };
+    fsj_hooks_t h = { fsop_cancelled_cb, fsop_file_cb, (void *)(intptr_t)op_idx, NULL };
     return fsj_rm_rf(path, depth, op_idx >= 0 ? &h : NULL);
 }
 
@@ -6822,7 +6822,7 @@ static int fs_op_set_cancel(uint64_t op_id) {
 #define RECURSIVE_SIZE_MAX_DEPTH 64
 
 static int recursive_size_op(const char *path, uint64_t *out, int op_idx) {
-    fsj_hooks_t h = { fsop_cancelled_cb, NULL, (void *)(intptr_t)op_idx };
+    fsj_hooks_t h = { fsop_cancelled_cb, NULL, (void *)(intptr_t)op_idx, NULL };
     return fsj_tree_size(path, out, NULL, 0, op_idx >= 0 ? &h : NULL);
 }
 
