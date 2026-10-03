@@ -13,10 +13,15 @@ BLAKE3_DIR := third_party/blake3
 # Use the SIMD dispatcher + all x86-64 assembly backends (SSE2/SSE4.1/AVX2/AVX512).
 # Zen 2 (PS5) supports through AVX2; dispatcher picks best at runtime.
 # Portable falls back on unsupported hardware.
-BLAKE3_SRCS := $(BLAKE3_DIR)/blake3.c \
-               $(BLAKE3_DIR)/blake3_portable.c \
-               $(BLAKE3_DIR)/blake3_dispatch.c \
-               $(BLAKE3_DIR)/blake3_sse2_x86-64_unix.S \
+BLAKE3_C_SRCS := $(BLAKE3_DIR)/blake3.c \
+                 $(BLAKE3_DIR)/blake3_portable.c \
+                 $(BLAKE3_DIR)/blake3_dispatch.c
+# The C files are built as separate objects at -O2 (review P5): the rest of the payload is
+# compiled without -O, which left the BLAKE3 dispatcher, chunk state and parent merges at
+# -O0 on every hashed byte (the assembly kernels were unaffected). Third-party code is
+# not held to -Werror, like SQLite and Monocypher. The assembly stays in SRCS.
+BLAKE3_OBJS := $(patsubst %.c,build/%.o,$(BLAKE3_C_SRCS))
+BLAKE3_SRCS := $(BLAKE3_DIR)/blake3_sse2_x86-64_unix.S \
                $(BLAKE3_DIR)/blake3_sse41_x86-64_unix.S \
                $(BLAKE3_DIR)/blake3_avx2_x86-64_unix.S \
                $(BLAKE3_DIR)/blake3_avx512_x86-64_unix.S
@@ -188,8 +193,12 @@ $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h:
 # without this a change to either printed "Built" while leaving the previous
 # link in place. Adding -lSceIpmi did exactly that — the stale ELF had no
 # libSceIpmi in DT_NEEDED until the sources were touched.
-$(ELF): $(SRCS) $(HEADERS) $(SQLITE_OBJ) $(MONO_OBJ) $(AVA1_OBJS) Makefile
-	$(CC) $(CFLAGS) -o $@ $(SRCS) $(AVA1_OBJS) $(SQLITE_OBJ) $(MONO_OBJ) $(LIBS)
+$(ELF): $(SRCS) $(HEADERS) $(SQLITE_OBJ) $(MONO_OBJ) $(BLAKE3_OBJS) $(AVA1_OBJS) Makefile
+	$(CC) $(CFLAGS) -o $@ $(SRCS) $(BLAKE3_OBJS) $(AVA1_OBJS) $(SQLITE_OBJ) $(MONO_OBJ) $(LIBS)
+
+build/$(BLAKE3_DIR)/%.o: $(BLAKE3_DIR)/%.c $(HEADERS) Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -Werror,$(CFLAGS)) -O2 -c -o $@ $<
 
 build/ava1/%.o: %.c $(HEADERS) Makefile
 	@mkdir -p $(dir $@)

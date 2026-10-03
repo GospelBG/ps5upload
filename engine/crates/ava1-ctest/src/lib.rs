@@ -380,6 +380,7 @@ pub mod ffi {
         pub fn ava1_test_copy_put_decode_failure() -> c_int;
         pub fn ava1_test_copy_retry_changed_message() -> c_int;
         pub fn ava1_test_send_chunk_bytes() -> u64;
+        pub fn ava1_send_timing_enabled() -> c_int;
         pub fn ava1_send_test_begin(credit: u64);
         pub fn ava1_send_test_end();
         pub fn ava1_send_test_put(len: u64) -> c_int;

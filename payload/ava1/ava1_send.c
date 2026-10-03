@@ -689,6 +689,17 @@ static int on_frame(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len
     }
 }
 
+/* The stage-timer line is opt-in (review L2), like the Rust side's PS5UPLOAD_AVA1_TIMING: the
+ * console has no environment to set, so a flag file in the debug directory turns it on (the host
+ * build, which runs this code in ava1-ctest, also honours the environment variable). Read once per
+ * job. */
+#ifndef AVA1_TIMING_FLAG
+#define AVA1_TIMING_FLAG "/data/ps5upload/debug/ava1-timing"
+#endif
+int ava1_send_timing_enabled(void) {
+    return getenv("PS5UPLOAD_AVA1_TIMING") != NULL || access(AVA1_TIMING_FLAG, F_OK) == 0;
+}
+
 static void role_free(ava1_job_t *j) {
     snd_t *s = S_(j);
     sframe_t *f;
@@ -701,7 +712,7 @@ static void role_free(ava1_job_t *j) {
     if (s->reader_started) pthread_join(s->reader, NULL);
     for (i = 1; i <= AVA1_MAX_LANES; i++)
         if (s->writer_started[i]) pthread_join(s->writer[i], NULL); /* each exits on stop */
-    if (s->sent_frames) {
+    if (s->sent_frames && ava1_send_timing_enabled()) {
         uint64_t t0 = s->t_open;
         fprintf(stderr,
                 "ava1 send: walk=%llums first_send=+%llums last_send=+%llums reader_end=+%llums files=%u "
