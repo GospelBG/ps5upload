@@ -375,17 +375,30 @@ async fn eight_calls_run_in_flight_and_the_ninth_is_busy() {
 }
 
 #[tokio::test]
-async fn a_56_kib_reply_goes_through_and_a_larger_one_is_refused_not_clipped() {
-    // SPEC.md §7.4: a reply body is at most 56 KiB; a handler that exceeds it gets
-    // ERR_INTERNAL, never a clipped `ok`.
-    assert_eq!(ava1::server::RPC_REPLY_MAX, 56 * 1024);
+async fn a_256_kib_reply_goes_through_and_a_larger_one_is_refused_not_clipped() {
+    // SPEC.md §7.4: a reply body is at most 256 KiB; a handler that exceeds it gets
+    // ERR_INTERNAL with a cause, never a clipped `ok`.
+    assert_eq!(ava1::server::RPC_REPLY_MAX, 256 * 1024);
     let (s, _release) = gated_server().await;
     let ask = |n: u32| n.to_le_bytes()[..3].to_vec();
-    let r = s.rpc(78, &ask(56 * 1024)).await.unwrap();
-    assert_eq!((r.status, r.body.len()), (gen::STATUS_OK, 56 * 1024));
-    let r = s.rpc(78, &ask(56 * 1024 + 1)).await.unwrap();
+    let r = s.rpc(78, &ask(256 * 1024)).await.unwrap();
+    assert_eq!((r.status, r.body.len()), (gen::STATUS_OK, 256 * 1024));
+    let r = s.rpc(78, &ask(256 * 1024 + 1)).await.unwrap();
     assert_eq!(r.status, gen::ERR_INTERNAL);
-    assert!(r.body.len() < 200, "the cause text, not the payload");
+    assert_eq!(r.body, b"reply exceeds the 256 KiB RPC cap");
+}
+
+#[tokio::test]
+async fn a_request_over_56_kib_is_refused_with_a_cause() {
+    // SPEC.md §7.4: a request body is at most 56 KiB.
+    assert_eq!(ava1::server::RPC_REQUEST_MAX, 56 * 1024);
+    let (s, _release) = gated_server().await;
+    let r = s.rpc(5, &vec![0u8; 56 * 1024]).await.unwrap();
+    assert_eq!(r.status, gen::STATUS_OK);
+    let r = s.rpc(5, &vec![0u8; 56 * 1024 + 1]).await.unwrap();
+    assert_eq!(r.status, gen::ERR_PROTOCOL);
+    assert_eq!(r.body, b"request exceeds the 56 KiB RPC cap");
+    assert!(!s.is_closed());
 }
 
 #[test]

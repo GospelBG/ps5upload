@@ -29,7 +29,8 @@
 #define CTRL_MAX 65536u
 #define NONCES 64
 #define RPC_WORKERS 8
-#define RPC_OUT_MAX (56u * 1024u)
+#define RPC_OUT_MAX (256u * 1024u) /* SPEC.md §7.4: the largest reply body */
+#define RPC_REQ_MAX (56u * 1024u)  /* ... and the largest request body */
 #define MAX_PAIRING_WINDOW_S 600u
 #define MAX_CONNS_PER_IP 12u
 #define MAX_UNPAIRED 2u
@@ -554,8 +555,13 @@ static void *rpc_worker(void *arg) {
     else if (out) status = AVA1_ERR_UNKNOWN_METHOD;
     /* A handler that claims more than the buffer holds must not make us read past it. */
     if (out_len > RPC_OUT_MAX) {
+        static const char cause[] = "reply exceeds the 256 KiB RPC cap";
         out_len = 0;
         status = AVA1_ERR_INTERNAL;
+        if (out) {
+            memcpy(out, cause, sizeof cause - 1);
+            out_len = sizeof cause - 1;
+        }
     }
     if (status != AVA1_STATUS_OK)
         fprintf(stderr, "[ava1] rpc method %u -> status %d, %zu byte cause: %.*s\n", (unsigned)j->method, status, out_len,
@@ -587,6 +593,15 @@ static int do_rpc(conn_t *k, int idx, const uint8_t sid[16], uint32_t ch, const 
     if (slot) S.sessions[idx].rpc_inflight++;
     pthread_mutex_unlock(&mu);
     if (!paired) return send_status(&k->io, ch, AVA1_ERR_NOT_PAIRED, NULL, 0) != 0;
+    if (q.body_len > RPC_REQ_MAX) {
+        static const char cause[] = "request exceeds the 56 KiB RPC cap";
+        if (slot) {
+            pthread_mutex_lock(&mu);
+            S.sessions[idx].rpc_inflight--;
+            pthread_mutex_unlock(&mu);
+        }
+        return send_status(&k->io, ch, AVA1_ERR_PROTOCOL, (const uint8_t *)cause, sizeof cause - 1) != 0;
+    }
     if (q.method == AVA1_METHOD_PAIRING_OPEN) {
         ava1_pairing_open_t o;
         uint16_t st = AVA1_ERR_PROTOCOL;

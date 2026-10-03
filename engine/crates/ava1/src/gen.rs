@@ -166,9 +166,18 @@ pub const JOB_OP_BACKUP_SNAPSHOT: u8 = 6;
 pub const JOB_OP_BACKUP_RESTORE: u8 = 7;
 pub const JOB_OP_CLEANUP: u8 = 8;
 pub const JOB_OP_SDK_SCAN: u8 = 9;
-pub const ENTRY_OTHER: u8 = 2;
+pub const ENTRY_LINK: u8 = 2;
+pub const ENTRY_OTHER: u8 = 3;
+pub const ENTRY_UNKNOWN: u8 = 4;
+pub const RPC_TEXT_MAX: u32 = 262128;
+pub const FS_READ_MAX: u32 = 262128;
+pub const FSW_CHUNK_MAX: u32 = 49152;
 pub const FSR_UNSAFE: u32 = 1;
-pub const FSW_CREATE_ONLY: u32 = 1;
+pub const FSW_APPEND: u32 = 1;
+pub const FSW_AT_OFFSET: u32 = 2;
+pub const FSW_COMMIT: u32 = 4;
+pub const FSW_CREATE: u32 = 8;
+pub const FSW_OVERWRITE: u32 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Hs1 {
@@ -2600,9 +2609,10 @@ impl Message for FsReadResult {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FsWrite {
     pub path: String,
-    pub mode: u32,
+    pub offset: u64,
     pub flags: u32,
     pub data: Vec<u8>,
+    pub mode: Option<u32>,
 }
 
 impl Message for FsWrite {
@@ -2610,10 +2620,13 @@ impl Message for FsWrite {
 
     fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.str(&self.path)?;
-        w.u32(self.mode);
+        w.u64(self.offset);
         w.u32(self.flags);
         w.bytes(&self.data)?;
-        w.u16(0);
+        let mut ext_n: u16 = 0;
+        if self.mode.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.mode { w.ext(1, |w| { w.u32(*v); Ok(()) })?; }
         Ok(())
     }
 
@@ -2621,7 +2634,7 @@ impl Message for FsWrite {
         let mut r = Reader::new(b);
         let mut m = Self::default();
         m.path = r.str()?;
-        m.mode = r.u32()?;
+        m.offset = r.u64()?;
         m.flags = r.u32()?;
         m.data = r.bytes()?;
         let ext_n = r.u16()?;
@@ -2629,7 +2642,15 @@ impl Message for FsWrite {
             let tag = r.u16()?;
             let len = r.u32()? as usize;
             let v = r.take(len)?;
-            let _ = (tag, v);
+            match tag {
+                1 => {
+                    if m.mode.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.mode = Some(vr.u32()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
         }
         r.finish()?;
         Ok(m)
@@ -2992,7 +3013,7 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "FsChmod" => FsChmod { path: rng.ascii(20), mode: rng.next_u64() as u32, }.to_bytes().ok(),
         "FsRead" => FsRead { path: rng.ascii(20), offset: rng.next_u64(), len: rng.next_u64() as u32, flags: rng.next_u64() as u32, }.to_bytes().ok(),
         "FsReadResult" => FsReadResult { data: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, eof: rng.next_u64() as u8, }.to_bytes().ok(),
-        "FsWrite" => FsWrite { path: rng.ascii(20), mode: rng.next_u64() as u32, flags: rng.next_u64() as u32, data: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
+        "FsWrite" => FsWrite { path: rng.ascii(20), offset: rng.next_u64(), flags: rng.next_u64() as u32, data: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, mode: if rng.below(2) == 1 { Some(rng.next_u64() as u32) } else { None }, }.to_bytes().ok(),
         "JobRun" => JobRun { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, op: rng.next_u64() as u8, args: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
         "JobEntry" => JobEntry { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, kind: rng.next_u64() as u8, state: rng.next_u64() as u8, files_done: rng.next_u64() as u32, files_total: rng.next_u64() as u32, bytes_done: rng.next_u64(), bytes_total: rng.next_u64(), }.to_bytes().ok(),
         "JobListResult" => JobListResult { jobs: vec![JobEntry::default(); rng.below(3) as usize], }.to_bytes().ok(),

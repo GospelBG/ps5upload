@@ -27,9 +27,7 @@ pub const MAX_CONNS: usize = 64;
 pub const MAX_SESSIONS: usize = 16;
 /// Calls in flight per session; more are answered `ERR_BUSY`.
 pub const RPC_WORKERS: usize = 8;
-/// The largest RPC reply body (SPEC.md §7.4): what fits a control frame with room for
-/// framing. A handler that returns more is answered `ERR_INTERNAL`, never clipped.
-pub const RPC_REPLY_MAX: usize = 56 * 1024;
+pub use crate::frame::{RPC_REPLY_MAX, RPC_REQUEST_MAX};
 /// The longest window `pairing.open` may ask for.
 pub const MAX_PAIRING_WINDOW_S: u16 = 600;
 /// Connections one source address may hold (a session is 1 control + up to 8 lanes).
@@ -609,6 +607,16 @@ async fn control(
                     }
                     continue;
                 }
+                if q.body.len() > RPC_REQUEST_MAX {
+                    let r = RpcResponse {
+                        status: gen::ERR_PROTOCOL,
+                        body: b"request exceeds the 56 KiB RPC cap".to_vec(),
+                    };
+                    if outbox.try_send(channel, &r).is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 if q.method == gen::METHOD_PAIRING_OPEN {
                     let status = match gen::PairingOpen::decode(&q.body) {
                         Ok(o) => {
@@ -642,7 +650,7 @@ async fn control(
                     let reply = if reply.body.len() > RPC_REPLY_MAX {
                         RpcReply {
                             status: gen::ERR_INTERNAL,
-                            body: b"reply exceeds the 56 KiB RPC cap".to_vec(),
+                            body: b"reply exceeds the 256 KiB RPC cap".to_vec(),
                         }
                     } else {
                         reply

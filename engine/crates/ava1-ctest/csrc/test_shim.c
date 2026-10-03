@@ -56,6 +56,9 @@ static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t 
         *out_len = n;
         return AVA1_STATUS_OK;
     }
+    if (method == 0x7703) { /* ava1_rpc_text into a 16-byte window: "%s" of the request body */
+        return ava1_rpc_text(out, 16, out_len, "%.*s", (int)body_len, (const char *)body);
+    }
     if (method != AVA1_METHOD_NODE_INFO) return AVA1_ERR_UNKNOWN_METHOD;
     memset(&ni, 0, sizeof ni);
     ni.version = (const uint8_t *)"test";

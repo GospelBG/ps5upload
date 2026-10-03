@@ -1014,20 +1014,58 @@ value = 8
 name = "JOB_OP_SDK_SCAN"
 ty = "u8"
 value = 9
-# fs.* entry kinds: ENTRY_FILE (0) and ENTRY_DIR (1) above, plus this for anything else.
+# fs.* entry kinds (FsEntry.kind, FsStat.kind): ENTRY_FILE (0) and ENTRY_DIR (1) above, plus:
 [[const]]
-name = "ENTRY_OTHER"
+name = "ENTRY_LINK"       # a symbolic link (not followed)
 ty = "u8"
 value = 2
-# FsRead.flags / FsWrite.flags
 [[const]]
-name = "FSR_UNSAFE"
+name = "ENTRY_OTHER"      # a device, socket, fifo, ...
+ty = "u8"
+value = 3
+[[const]]
+name = "ENTRY_UNKNOWN"    # the node could not stat the entry
+ty = "u8"
+value = 4
+# Size constants of the management methods (SPEC.md §7.3-§7.5).
+[[const]]
+name = "RPC_TEXT_MAX"     # largest MgmtText text in a reply: RPC_REPLY_MAX (256 KiB) minus 16
+ty = "u32"
+value = 262128
+[[const]]
+name = "FS_READ_MAX"      # largest FsRead.len
+ty = "u32"
+value = 262128
+[[const]]
+name = "FSW_CHUNK_MAX"    # largest FsWrite.data in one chunk (request cap 56 KiB minus path and header)
+ty = "u32"
+value = 49152
+# FsRead.flags
+[[const]]
+name = "FSR_UNSAFE"       # read outside the writable roots (the engine sets it only for an unsafe read)
+ty = "u32"
+value = 1
+# FsWrite.flags (SPEC.md §7.3, chunked write protocol)
+[[const]]
+name = "FSW_APPEND"      # write at the end of path.ps5upload.tmp (offset is ignored)
 ty = "u32"
 value = 1
 [[const]]
-name = "FSW_CREATE_ONLY"
+name = "FSW_AT_OFFSET"   # write at `offset` of path.ps5upload.tmp (created empty if absent)
 ty = "u32"
-value = 1
+value = 2
+[[const]]
+name = "FSW_COMMIT"      # after this chunk: fsync the tmp file, then rename it over path (same directory)
+ty = "u32"
+value = 4
+[[const]]
+name = "FSW_CREATE"      # at commit, fail with ERR_EXISTS if path already exists
+ty = "u32"
+value = 8
+[[const]]
+name = "FSW_OVERWRITE"   # at commit, replace path if it exists (the default when neither is set)
+ty = "u32"
+value = 16
 
 # Management bodies. Most methods carry the payload handler's existing text/JSON in MgmtText;
 # the filesystem, node and job methods are typed.
@@ -1050,7 +1088,7 @@ fields = [
   { name = "fan_threshold", ty = "u16" },
   { name = "fan_reapply_sec", ty = "u16" },
 ]
-ext = [{ tag = 1, name = "prior_instance", ty = "str" }]   # "clean" | "killed_externally" | "wedged" | "stale"
+ext = [{ tag = 1, name = "prior_instance", ty = "str" }]   # "clean" | "killed_externally" | "wedged" | "stale" | "replaced"
 
 [[struct]]
 name = "FsList"
@@ -1109,13 +1147,14 @@ name = "FsReadResult"
 fields = [{ name = "data", ty = "bytes" }, { name = "eof", ty = "u8" }]
 
 [[struct]]
-name = "FsWrite"
+name = "FsWrite"          # fs.write; see SPEC.md §7.3 for the chunked protocol
 fields = [
   { name = "path", ty = "str" },
-  { name = "mode", ty = "u32" },
+  { name = "offset", ty = "u64" },
   { name = "flags", ty = "u32" },
   { name = "data", ty = "bytes" },
 ]
+ext = [{ tag = 1, name = "mode", ty = "u32" }]   # permission bits applied at commit; absent = 0644
 
 [[struct]]
 name = "JobRun"

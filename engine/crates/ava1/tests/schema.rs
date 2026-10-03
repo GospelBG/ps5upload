@@ -185,6 +185,16 @@ fn fs_list_result() -> FsListResult {
     }
 }
 
+fn fs_write_chunk() -> FsWrite {
+    FsWrite {
+        path: "/data/a".into(),
+        offset: 49_152,
+        flags: FSW_AT_OFFSET | FSW_COMMIT | FSW_OVERWRITE,
+        data: vec![1, 2, 3],
+        mode: Some(0o600),
+    }
+}
+
 fn job_run() -> JobRun {
     JobRun {
         job_id: J,
@@ -279,12 +289,7 @@ fn management_structs_round_trip() {
         eof: 1,
     };
     assert_eq!(FsReadResult::decode(&rr.to_bytes().unwrap()).unwrap(), rr);
-    let w = FsWrite {
-        path: "/data/a".into(),
-        mode: 0o600,
-        flags: FSW_CREATE_ONLY,
-        data: vec![1, 2, 3],
-    };
+    let w = fs_write_chunk();
     assert_eq!(FsWrite::decode(&w.to_bytes().unwrap()).unwrap(), w);
     let j = job_run();
     assert_eq!(JobRun::decode(&j.to_bytes().unwrap()).unwrap(), j);
@@ -343,7 +348,57 @@ fn every_method_constant_is_unique_and_below_65535() {
 fn the_rpc_limits_are_in_the_spec_and_the_code() {
     let spec = include_str!("../../../../protocol/ava1/SPEC.md");
     assert!(spec.contains("at most 8 requests in flight"));
-    assert!(spec.contains("56 KiB"));
+    assert!(spec.contains("256 KiB") && spec.contains("56 KiB"));
     assert_eq!(ava1::server::RPC_WORKERS, 8);
-    assert_eq!(ava1::server::RPC_REPLY_MAX, 56 * 1024);
+    assert_eq!(ava1::server::RPC_REPLY_MAX, 256 * 1024);
+    assert_eq!(ava1::server::RPC_REQUEST_MAX, 56 * 1024);
+}
+
+#[test]
+fn fs_write_flags_are_distinct_bits() {
+    let f = [
+        FSW_APPEND,
+        FSW_AT_OFFSET,
+        FSW_COMMIT,
+        FSW_CREATE,
+        FSW_OVERWRITE,
+    ];
+    for (i, a) in f.iter().enumerate() {
+        assert_eq!(a.count_ones(), 1);
+        for b in &f[i + 1..] {
+            assert_eq!(a & b, 0);
+        }
+    }
+}
+
+#[test]
+fn the_size_constants_agree_with_the_rpc_caps() {
+    // MgmtText overhead is 6 bytes, 13 with `more`; FsReadResult is data + 7.
+    assert_eq!(RPC_TEXT_MAX as usize, ava1::server::RPC_REPLY_MAX - 16);
+    assert_eq!(FS_READ_MAX, RPC_TEXT_MAX);
+    let worst = MgmtText {
+        body: vec![b'x'; RPC_TEXT_MAX as usize],
+        more: Some(1),
+    }
+    .to_bytes()
+    .unwrap();
+    assert!(worst.len() <= ava1::server::RPC_REPLY_MAX);
+    let r = FsReadResult {
+        data: vec![0; FS_READ_MAX as usize],
+        eof: 1,
+    }
+    .to_bytes()
+    .unwrap();
+    assert!(r.len() <= ava1::server::RPC_REPLY_MAX);
+    // The largest chunk plus a maximal path and header fits the 56 KiB request cap.
+    let w = FsWrite {
+        path: "p".repeat(1024),
+        offset: u64::MAX,
+        flags: u32::MAX,
+        data: vec![0; FSW_CHUNK_MAX as usize],
+        mode: Some(0o644),
+    }
+    .to_bytes()
+    .unwrap();
+    assert!(w.len() <= ava1::server::RPC_REQUEST_MAX);
 }

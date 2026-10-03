@@ -170,9 +170,18 @@
 #define AVA1_JOB_OP_BACKUP_RESTORE 7ULL
 #define AVA1_JOB_OP_CLEANUP 8ULL
 #define AVA1_JOB_OP_SDK_SCAN 9ULL
-#define AVA1_ENTRY_OTHER 2ULL
+#define AVA1_ENTRY_LINK 2ULL
+#define AVA1_ENTRY_OTHER 3ULL
+#define AVA1_ENTRY_UNKNOWN 4ULL
+#define AVA1_RPC_TEXT_MAX 262128ULL
+#define AVA1_FS_READ_MAX 262128ULL
+#define AVA1_FSW_CHUNK_MAX 49152ULL
 #define AVA1_FSR_UNSAFE 1ULL
-#define AVA1_FSW_CREATE_ONLY 1ULL
+#define AVA1_FSW_APPEND 1ULL
+#define AVA1_FSW_AT_OFFSET 2ULL
+#define AVA1_FSW_COMMIT 4ULL
+#define AVA1_FSW_CREATE 8ULL
+#define AVA1_FSW_OVERWRITE 16ULL
 
 #define AVA1_TYPE_HS1 0x01u
 #define AVA1_TYPE_HS2 0x02u
@@ -629,10 +638,12 @@ int ava1_fs_read_result_count(const uint8_t *p, uint32_t len, uint32_t *count);
 typedef struct {
     const uint8_t *path;
     uint16_t path_len;
-    uint32_t mode;
+    uint64_t offset;
     uint32_t flags;
     const uint8_t *data;
     uint32_t data_len;
+    int has_mode;
+    uint32_t mode;
 } ava1_fs_write_t;
 
 int ava1_fs_write_encode(const ava1_fs_write_t *m, ava1_w_t *w);

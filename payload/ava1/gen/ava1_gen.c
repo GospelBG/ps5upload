@@ -1846,11 +1846,18 @@ int ava1_fs_read_result_count(const uint8_t *p, uint32_t len, uint32_t *count) {
 }
 
 int ava1_fs_write_encode(const ava1_fs_write_t *m, ava1_w_t *w) {
+    uint16_t ext_n = 0;
     ava1_w_str(w, m->path, m->path_len);
-    ava1_w_u32(w, m->mode);
+    ava1_w_u64(w, m->offset);
     ava1_w_u32(w, m->flags);
     ava1_w_bytes(w, m->data, m->data_len);
-    ava1_w_u16(w, 0);
+    if (m->has_mode) ext_n++;
+    ava1_w_u16(w, ext_n);
+    if (m->has_mode) {
+        size_t at = ava1_w_ext_begin(w, 1);
+        ava1_w_u32(w, m->mode);
+        ava1_w_ext_end(w, at);
+    }
     return w->err;
 }
 
@@ -1860,15 +1867,29 @@ int ava1_fs_write_decode(const uint8_t *buf, size_t len, ava1_fs_write_t *m) {
     memset(m, 0, sizeof(*m));
     ava1_r_init(&r, buf, len);
     m->path = ava1_r_str(&r, &m->path_len);
-    m->mode = ava1_r_u32(&r);
+    m->offset = ava1_r_u64(&r);
     m->flags = ava1_r_u32(&r);
     m->data = ava1_r_bytes(&r, &m->data_len);
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {
-        uint32_t vlen;
-        (void)ava1_r_u16(&r);
-        vlen = ava1_r_u32(&r);
-        (void)ava1_r_take(&r, vlen);
+        uint16_t tag = ava1_r_u16(&r);
+        uint32_t vlen = ava1_r_u32(&r);
+        const uint8_t *v = ava1_r_take(&r, vlen);
+        ava1_r_t vr;
+        int rc;
+        if (r.err) break;
+        ava1_r_init(&vr, v, vlen);
+        switch (tag) {
+        case 1:
+            if (m->has_mode) return AVA1_E_DUP_EXT;
+            m->has_mode = 1;
+            m->mode = ava1_r_u32(&vr);
+            break;
+        default:
+            continue;
+        }
+        rc = ava1_r_finish(&vr);
+        if (rc != 0) return rc;
     }
     return ava1_r_finish(&r);
 }
