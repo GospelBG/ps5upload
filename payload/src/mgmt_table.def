@@ -1,6 +1,7 @@
 /* The AVA1 management table: one line per method (P3 Task 2; Tasks 4-9 add the rest).
  *
  *   MGMT_H0(method, ftx2_frame, ftx2_ack, flags, handler, runner)   handler(state, fd, trace_id)
+ *   MGMT_HS(method, ftx2_frame, ftx2_ack, flags, handler, runner)   handle_status_frame(state, fd, hdr, scratch, cap)
  *   MGMT_H1(method, ftx2_frame, ftx2_ack, flags, handler, runner)   handler(state, fd, trace_id, body, len)
  *
  * `method` is the AVA1_METHOD_* name (it names the generated wrapper, so use the bare
@@ -19,3 +20,4 @@ MGMT_H1(AVA1_METHOD_FS_MKDIR, FTX2_FRAME_FS_MKDIR, FTX2_FRAME_FS_MKDIR_ACK, 0, h
 MGMT_H1(AVA1_METHOD_APP_LAUNCH, FTX2_FRAME_APP_LAUNCH, FTX2_FRAME_APP_LAUNCH_ACK, MGMT_SONY, handle_app_launch, mgmt_call_text)
 MGMT_H1(AVA1_METHOD_APP_LIST, FTX2_FRAME_APP_LIST_REGISTERED, FTX2_FRAME_APP_LIST_REGISTERED_ACK, MGMT_SONY, handle_app_list_registered, mgmt_call_paged)
 MGMT_H0(AVA1_METHOD_PROC_PROCESS_LIST, FTX2_FRAME_PROCESS_LIST, FTX2_FRAME_PROCESS_LIST_ACK, 0, handle_process_list, mgmt_call_text)
+MGMT_HS(AVA1_METHOD_NODE_STATUS, FTX2_FRAME_STATUS, FTX2_FRAME_STATUS_ACK, 0, handle_status_frame, mgmt_call_node_status)

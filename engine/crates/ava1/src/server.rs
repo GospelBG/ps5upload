@@ -136,6 +136,8 @@ pub struct ServerCtx {
     rpc: RpcHandler,
     /// Hosts data-plane jobs (SPEC.md §11); its presence advertises CAP_DATA_PLANE.
     jobs: Option<Arc<dyn JobHost>>,
+    /// Serves the management methods (SPEC.md §7.3); advertises CAP_MGMT.
+    mgmt: bool,
     pub(crate) sessions: Mutex<HashMap<[u8; 16], Arc<SessionEntry>>>,
     conns: AtomicUsize,
     per_ip: Mutex<HashMap<IpAddr, usize>>,
@@ -160,6 +162,7 @@ impl ServerCtx {
             approve: Box::new(|_| true),
             rpc,
             jobs: None,
+            mgmt: false,
             sessions: Mutex::default(),
             conns: AtomicUsize::new(0),
             per_ip: Mutex::default(),
@@ -206,6 +209,12 @@ impl ServerCtx {
 
     pub fn with_timing(mut self, t: Timing) -> Self {
         self.timing = t;
+        self
+    }
+
+    /// Serves the management methods through the rpc handler and advertises CAP_MGMT.
+    pub fn with_mgmt(mut self) -> Self {
+        self.mgmt = true;
         self
     }
 
@@ -525,11 +534,11 @@ async fn control(
                     }
                 }
             },
-            if ctx.jobs.is_some() {
+            (if ctx.jobs.is_some() {
                 gen::CAP_DATA_PLANE
             } else {
                 0
-            },
+            }) | (if ctx.mgmt { gen::CAP_MGMT } else { 0 }),
         ),
     )
     .await

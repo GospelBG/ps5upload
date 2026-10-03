@@ -71,6 +71,8 @@ void mgmt_reply_free(mgmt_reply_t *r);
  * method, an entry without a runner, or a NULL table. */
 int mgmt_rpc_install(const mgmt_entry_t *table, size_t n, void *state, void (*enter)(uint16_t legacy_frame),
                      void (*leave)(void));
+/* 1 when a table is installed (the server then advertises CAP_MGMT). */
+int mgmt_rpc_installed(void);
 /* 1 when `method` has a table entry. */
 int mgmt_rpc_handles(uint16_t method);
 
@@ -112,10 +114,13 @@ int mgmt_call_text(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_f
 int mgmt_call_paged(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);  /* MgmtText, offset/limit/more */
 int mgmt_call_fs_mkdir(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn); /* FsMkdir -> empty */
 
+int mgmt_call_node_status(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn); /* -> NodeStatus */
+
 /* JSON string escaping for building a legacy request. Returns the length written (without
  * the NUL), or -1 when it does not fit. */
 int mgmt_json_escape(const char *s, size_t n, char *out, size_t cap);
-/* The unsigned integer after `"key":` in a JSON object; 0 when absent, 1 when found. */
+/* The unsigned integer after `"key":` in a JSON object: 1 found, 0 absent, -1 present but not an
+ * unsigned integer (negative, fractional, a word) or too large for 64 bits. */
 int mgmt_json_u64(const char *json, const char *key, uint64_t *out);
 
 /* Pages the one JSON array in `json` ({"apps":[a,b,c]}): the prefix up to '[' and the suffix

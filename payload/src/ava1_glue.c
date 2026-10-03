@@ -209,6 +209,9 @@ int ava1_payload_start(void) {
             }
         }
     }
+    /* The management methods are served when the FTX2 handlers' table is installed (main.c does it
+     * before this): a client routes management by this bit, not by probing for ERR_UNKNOWN_METHOD. */
+    if (mgmt_rpc_installed()) cfg.caps |= AVA1_CAP_MGMT;
     if (ava1_trust_slot_key(launcher) == 0) {
         /* Heap: ava1_peers_t is a few KB, more than this thread's stack should carry. */
         ava1_peers_t *peers = malloc(sizeof *peers);

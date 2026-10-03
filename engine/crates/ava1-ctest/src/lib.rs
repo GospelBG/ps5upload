@@ -299,6 +299,8 @@ pub mod ffi {
         pub fn ava1_test_set_same_device(v: c_int);
         pub fn ava1_test_mgmt_install() -> c_int;
         pub fn ava1_test_mgmt_install_duplicate() -> c_int;
+        pub fn ava1_test_mgmt_uninstall();
+        pub fn ava1_test_mgmt_status_for_token(t: *const c_char) -> c_int;
         pub fn ava1_test_mgmt_set_apps(n: u32);
         pub fn ava1_test_mgmt_stats(
             enters: *mut u32,
@@ -1617,6 +1619,15 @@ pub mod mgmt {
     /// What a table with a repeated method does at install (-1 expected).
     pub fn install_duplicate() -> i32 {
         unsafe { ffi::ava1_test_mgmt_install_duplicate() }
+    }
+    /// Removes the table (the server then advertises no CAP_MGMT when it starts).
+    pub fn uninstall() {
+        unsafe { ffi::ava1_test_mgmt_uninstall() }
+    }
+    /// `mgmt_status_for_token`.
+    pub fn status_for_token(t: &str) -> i32 {
+        let c = std::ffi::CString::new(t).unwrap();
+        unsafe { ffi::ava1_test_mgmt_status_for_token(c.as_ptr()) }
     }
     /// How many entries the stub `app.list` handler produces.
     pub fn set_apps(n: u32) {

@@ -224,6 +224,10 @@ name = "CAP_DATA_PLANE"
 ty = "u64"
 value = 1
 [[const]]
+name = "CAP_MGMT"        # the node serves the management methods 4 and up (SPEC.md §7.3)
+ty = "u64"
+value = 2
+[[const]]
 name = "METHOD_JOB_COPY"
 ty = "u16"
 value = 16

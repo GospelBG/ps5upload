@@ -103,7 +103,10 @@ int mgmt_status_for_token(const char *t) {
     if (!t) return AVA1_ERR_INTERNAL;
     /* Order matters: the first rule that matches wins. */
     if (has(t, "cross_mount") || has(t, "cross_device")) return AVA1_ERR_CROSS_DEVICE;
-    if (has(t, "path") || has(t, "not_allowed") || has(t, "denied")) return AVA1_ERR_PATH;
+    /* A path the node's policy refuses (the allowlist) is ERR_PATH; an OS permission refusal is not
+     * a path problem. The schema has no permission code, so it is ERR_IO ("the filesystem refused"). */
+    if (has(t, "path") || has(t, "not_allowed")) return AVA1_ERR_PATH;
+    if (has(t, "denied") || has(t, "permission") || has(t, "eacces") || has(t, "eperm")) return AVA1_ERR_IO;
     if (has(t, "no_space") || has(t, "enospc") || has(t, "disk_full")) return AVA1_ERR_NO_SPACE;
     if (has(t, "already_running") || has(t, "busy") || has(t, "in_progress")) return AVA1_ERR_BUSY;
     if (has(t, "exists") || has(t, "eexist") || has(t, "already")) return AVA1_ERR_EXISTS;
@@ -257,7 +260,7 @@ int mgmt_call_paged(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_
     mgmt_reply_t rep;
     char *page;
     size_t page_len = 0, cap = text_cap(cx);
-    int rc, more = 0;
+    int rc, more = 0, o_rc, l_rc;
     if ((rc = text_request(cx, req, n, &b, &bl)) != AVA1_STATUS_OK) return rc;
     {
         /* The window is read from a C string: the body is not NUL-terminated here. */
@@ -265,9 +268,11 @@ int mgmt_call_paged(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_
         if (!z) return mgmt_reply_error(cx, AVA1_ERR_INTERNAL, "out of memory");
         memcpy(z, b, bl);
         z[bl] = '\0';
-        (void)mgmt_json_u64(z, "offset", &offset);
-        (void)mgmt_json_u64(z, "limit", &limit);
+        o_rc = mgmt_json_u64(z, "offset", &offset);
+        l_rc = mgmt_json_u64(z, "limit", &limit);
         free(z);
+        if (o_rc < 0) return mgmt_reply_error(cx, AVA1_ERR_PROTOCOL, "bad offset");
+        if (l_rc < 0) return mgmt_reply_error(cx, AVA1_ERR_PROTOCOL, "bad limit");
     }
     rc = mgmt_legacy_call(cx, fn, b, bl, MGMT_PAGED_CAPTURE_MAX, &rep);
     if (rc != AVA1_STATUS_OK) return rc;
@@ -315,6 +320,69 @@ int mgmt_call_fs_mkdir(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_lega
     return AVA1_STATUS_OK;
 }
 
+/* node.status: NodeStatus (SPEC.md section 7.3) built from the legacy handler's JSON. The legacy
+ * keys the typed body drops (runtime_port, shutdown, takeover_requested and the FTX2 transaction
+ * counters) are ignored. An absent number is 0, as an older payload's missing field was to the client. */
+static int json_bool(const char *json, const char *key) {
+    char needle[40];
+    const char *p, *end = json + strlen(json);
+    if (snprintf(needle, sizeof needle, "\"%s\"", key) >= (int)sizeof needle) return 0;
+    p = strstr(json, needle);
+    if (!p) return 0;
+    p = skip_ws(p + strlen(needle), end);
+    if (p >= end || *p != ':') return 0;
+    p = skip_ws(p + 1, end);
+    return p < end && *p == 't';
+}
+
+static uint64_t json_num(const char *json, const char *key) {
+    uint64_t v = 0;
+    return mgmt_json_u64(json, key, &v) == 1 ? v : 0;
+}
+
+int mgmt_call_node_status(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn) {
+    mgmt_reply_t rep;
+    ava1_node_status_t st;
+    ava1_w_t w;
+    char version[96], kernel[320], prior[40];
+    uint64_t v;
+    int rc;
+    (void)req;
+    (void)n;
+    rc = mgmt_legacy_call(cx, fn, "", 0, 4096, &rep);
+    if (rc != AVA1_STATUS_OK) return rc;
+    memset(&st, 0, sizeof st);
+    version[0] = kernel[0] = prior[0] = '\0';
+    (void)json_string_value((const char *)rep.body, rep.len, "version", version, sizeof version);
+    (void)json_string_value((const char *)rep.body, rep.len, "ps5_kernel", kernel, sizeof kernel);
+    st.version = (const uint8_t *)version;
+    st.version_len = (uint16_t)strlen(version);
+    st.ps5_kernel = (const uint8_t *)kernel;
+    st.ps5_kernel_len = (uint16_t)strlen(kernel);
+    st.instance_id = json_num((const char *)rep.body, "instance_id");
+    st.started_at_unix = json_num((const char *)rep.body, "started_at_unix");
+    st.command_count = json_num((const char *)rep.body, "command_count");
+    v = json_num((const char *)rep.body, "startup_reason");
+    st.startup_reason = (uint16_t)(v > 0xffff ? 0xffff : v);
+    st.ucred_elevated = (uint8_t)json_bool((const char *)rep.body, "ucred_elevated");
+    v = json_num((const char *)rep.body, "max_transfer_streams");
+    st.max_transfer_streams = (uint8_t)(v > 0xff ? 0xff : v);
+    v = json_num((const char *)rep.body, "fan_threshold");
+    st.fan_threshold = (uint16_t)(v > 0xffff ? 0xffff : v);
+    v = json_num((const char *)rep.body, "fan_reapply_sec");
+    st.fan_reapply_sec = (uint16_t)(v > 0xffff ? 0xffff : v);
+    if (json_string_value((const char *)rep.body, rep.len, "prior_instance", prior, sizeof prior)) {
+        st.has_prior_instance = 1;
+        st.prior_instance = (const uint8_t *)prior;
+        st.prior_instance_len = (uint16_t)strlen(prior);
+    }
+    mgmt_reply_free(&rep);
+    ava1_w_init(&w, cx->out, cx->cap);
+    if (ava1_node_status_encode(&st, &w) != 0) return mgmt_reply_error(cx, AVA1_ERR_INTERNAL, "bad status reply");
+    cx->out_len = w.len;
+    return AVA1_STATUS_OK;
+}
+
 /* ---- JSON helpers ---- */
 
 int mgmt_json_escape(const char *s, size_t n, char *out, size_t cap) {
@@ -349,21 +417,24 @@ int mgmt_json_u64(const char *json, const char *key, uint64_t *out) {
     const char *p, *end;
     uint64_t v = 0;
     int digits = 0;
-    if (snprintf(needle, sizeof needle, "\"%s\"", key) >= (int)sizeof needle) return 0;
+    if (snprintf(needle, sizeof needle, "\"%s\"", key) >= (int)sizeof needle) return -1;
     p = strstr(json, needle);
     if (!p) return 0;
     end = json + strlen(json);
     p = skip_ws(p + strlen(needle), end);
-    if (p >= end || *p != ':') return 0;
+    if (p >= end || *p != ':') return -1;
     p = skip_ws(p + 1, end);
     while (p < end && *p >= '0' && *p <= '9') {
         uint64_t d = (uint64_t)(*p - '0');
-        if (v > (UINT64_MAX - d) / 10) return 0;
+        if (v > (UINT64_MAX - d) / 10) return -1; /* overflow */
         v = v * 10 + d;
         p++;
         digits++;
     }
-    if (!digits) return 0;
+    if (!digits) return -1;
+    /* an integer: not 1.5, 1e3 or a bare word glued on */
+    if (p < end && (*p == '.' || *p == 'e' || *p == 'E' || *p == '_' || (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')))
+        return -1;
     *out = v;
     return 1;
 }
@@ -481,6 +552,8 @@ static const mgmt_entry_t *find_entry(uint16_t method) {
         if (G.table[i].method == method) return &G.table[i];
     return NULL;
 }
+
+int mgmt_rpc_installed(void) { return G.n > 0; }
 
 int mgmt_rpc_handles(uint16_t method) { return find_entry(method) != NULL; }
 

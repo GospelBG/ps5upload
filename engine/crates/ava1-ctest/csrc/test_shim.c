@@ -176,6 +176,18 @@ static int stub_env(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
     return stub_send_frame(41, body, (uint64_t)n);
 }
 
+/* node.status: the legacy handler's JSON (every key, escapes in the kernel string). */
+static int stub_status(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    static const char body[] =
+        "{\"version\":\"9.9.9\",\"ps5_kernel\":\"FreeBSD \\\"11\\\" test\","
+        "\"instance_id\":18446744073709551000,\"runtime_port\":9113,\"shutdown\":0,\"startup_reason\":2,"
+        "\"takeover_requested\":0,\"started_at_unix\":1700000000,\"prior_instance\":\"killed_externally\","
+        "\"command_count\":5,\"active_transactions\":0,\"last_tx_seq\":0,\"recovered_transactions\":0,"
+        "\"ucred_elevated\":true,\"max_transfer_streams\":4,\"fan_threshold\":70,\"fan_reapply_sec\":30}";
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    return stub_send_frame(21, body, sizeof body - 1);
+}
+
 /* fs.unmount: sends two frames, the second an error (the first error wins; a later OK must not hide it). */
 static int stub_two_frames(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
     (void)st; (void)fd; (void)t; (void)b; (void)l;
@@ -199,8 +211,10 @@ STUB_RUN(stub_big, mgmt_call_text)
 STUB_RUN(stub_env, mgmt_call_text)
 STUB_RUN(stub_two_frames, mgmt_call_text)
 STUB_RUN(stub_silent, mgmt_call_text)
+STUB_RUN(stub_status, mgmt_call_node_status)
 
 static const mgmt_entry_t k_stub_table[] = {
+    {AVA1_METHOD_NODE_STATUS, 20, 21, 0, run_stub_status},
     {AVA1_METHOD_FS_VOLUMES, 34, 35, 0, run_stub_volumes},
     {AVA1_METHOD_FS_MKDIR, 46, 47, 0, run_stub_mkdir},
     {AVA1_METHOD_APP_LAUNCH, 60, 61, MGMT_SONY, run_stub_launch},
@@ -216,6 +230,9 @@ int ava1_test_mgmt_install(void) {
     __atomic_store_n(&g_stub_leaves, 0, __ATOMIC_SEQ_CST);
     return mgmt_rpc_install(k_stub_table, sizeof k_stub_table / sizeof k_stub_table[0], NULL, stub_enter, stub_leave);
 }
+
+void ava1_test_mgmt_uninstall(void) { (void)mgmt_rpc_install(NULL, 0, NULL, NULL, NULL); }
+int ava1_test_mgmt_status_for_token(const char *t) { return mgmt_status_for_token(t); }
 
 /* A table with the same method twice: the install must refuse it. */
 int ava1_test_mgmt_install_duplicate(void) {
@@ -324,6 +341,7 @@ int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, con
      * server must mask it off; `a_server_without_hooks_advertises_no_data_plane_cap`
      * pins that. */
     cfg.caps = AVA1_CAP_DATA_PLANE;
+    if (mgmt_rpc_installed()) cfg.caps |= AVA1_CAP_MGMT; /* what ava1_glue.c does */
     cfg.on_pair_request = on_pair;
     cfg.log = on_log;
     cfg.rpc = rpc;

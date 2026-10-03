@@ -84,6 +84,11 @@ six digits. A man in the middle yields different h, so different codes.
    session_id, name). `caps` bit 0 is `CAP_DATA_PLANE` (1): the node hosts the jobs
    of §11–§16. A client sends no data-plane frame and no method 16–19 request to a
    node that did not advertise it.
+   Bit 1 is `CAP_MGMT` (2): the node serves the management methods of §7.3 (numbers 4 and
+   up other than 16–19). A client routes management calls by this bit instead of probing
+   for `ERR_UNKNOWN_METHOD`; a node that does not advertise it answers
+   `ERR_UNKNOWN_METHOD` to them. The payload advertises it when its management table is
+   installed (`mgmt_rpc_installed()`); the Rust `Session::has_mgmt()` reads it.
 3. Client → `Hs3{noise}`: message 3, payload `ClientInfo` (name). Both sides
    now key lane 0 (§4.3) and every further frame is sealed. A client that expects
    a particular device (it knows the key it paired with at this address) compares
@@ -202,7 +207,7 @@ delays liveness.
 
 `Status.state` is 0 while the job runs, 1 when it finished OK and 2 when it failed (the cause is
 in ext `current`). Methods 16–19 are the version 1 data-plane RPCs and exist only on a node that
-advertises `CAP_DATA_PLANE`; the management methods are §7.3. The behaviour of 16–18 is §15.5; of
+advertises `CAP_DATA_PLANE`; the management methods are §7.3 and exist on a node that advertises `CAP_MGMT`. The behaviour of 16–18 is §15.5; of
 19, §16.10.
 
 7.2 Error codes. The numbers below are generated from `schema/ava1.toml`, whose constants are the
@@ -287,7 +292,7 @@ after. A ported handler still keeps stack buffers small: **no stack array of 16 
 a table handler**, enforced by `payload/tools/mgmt_audit.py stack` (run by the `ava1-ctest` test
 `c_mgmt_handlers_never_read_the_socket_and_keep_small_stacks`), and the handler must not read `client_fd`
 (it is called with -1 behind a capture sink, `payload/src/mgmt_rpc.c`). `mgmt_audit.py report` lists every
-array of 2 KiB or more per handler; Tasks 5 and 7 must heap-allocate the 64 KiB buffers it shows in
+array of 2 KiB or more per handler (it is a tripwire, not a proof: it reads C text, follows calls and function-pointer arguments by name, sizes struct elements as a lower bound and unknown element types at 8 bytes, and cannot see calls through tables or dlsym; `mgmt_audit.py selftest` pins the shapes it must catch); Tasks 5 and 7 must heap-allocate the 64 KiB buffers it shows in
 `handle_crc32_file`, `handle_shell_builtin` and `copy_file` before routing those handlers.
 
 7.4 RPC limits. A session has at most **8** requests in flight; the ninth answers `ERR_BUSY`

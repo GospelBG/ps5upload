@@ -34,6 +34,16 @@ fn dir(tag: &str) -> PathBuf {
 
 /// A started C server with the stub table installed and a paired client.
 async fn rig(tag: &str) -> (CServer, Session) {
+    rig_with(tag, true).await
+}
+
+/// `install = false`: the server starts with no management table (no CAP_MGMT).
+async fn rig_with(tag: &str, install: bool) -> (CServer, Session) {
+    if install {
+        assert_eq!(mgmt::install(), 0);
+    } else {
+        mgmt::uninstall();
+    }
     let d = dir(tag);
     let me = Arc::new(Identity::generate().unwrap());
     PeerStore::load(&d.join("peers"))
@@ -44,7 +54,6 @@ async fn rig(tag: &str) -> (CServer, Session) {
     mine.add(Identity::from_secret(SECRET).public(), "C test server")
         .unwrap();
     let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 2000, 500);
-    assert_eq!(mgmt::install(), 0);
     let s = connect(
         &srv.addr(),
         me,
@@ -87,6 +96,7 @@ const APP_LIST: u16 = gen::METHOD_APP_LIST;
 const BIG: u16 = gen::METHOD_PROC_PROCESS_LIST;
 const ENV: u16 = gen::METHOD_FS_MOUNT;
 const TWO: u16 = gen::METHOD_FS_UNMOUNT;
+const NODE_STATUS: u16 = gen::METHOD_NODE_STATUS;
 const SILENT: u16 = gen::METHOD_FS_MOUNT_PKG;
 
 // ---- the table ----
@@ -162,7 +172,8 @@ fn c_mgmt_handlers_never_read_the_socket_and_keep_small_stacks() {
 #[tokio::test(flavor = "multi_thread")]
 async fn c_mgmt_unknown_method_is_err_unknown_method() {
     let (_srv, s) = rig("unknown").await;
-    for m in [0x7fffu16, 141, 4, 100] {
+    // 97 and 99 are unassigned in the schema (backup snapshot/restore run as job.run ops)
+    for m in [97u16, 99, 0x7fff] {
         let r = s.rpc(m, &[]).await.unwrap();
         assert_eq!(r.status, gen::ERR_UNKNOWN_METHOD, "method {m}");
         assert_eq!(r.body, b"unknown method");
@@ -395,4 +406,152 @@ async fn c_mgmt_app_list_pages_cover_every_entry() {
     mgmt::set_apps(0);
     let r = s.rpc(APP_LIST, &[]).await.unwrap();
     assert_eq!(untext(&r.body).body, br#"{"apps":[]}"#);
+}
+
+// ---- node.status (typed) ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c_mgmt_node_status_is_typed() {
+    let (_srv, s) = rig("status").await;
+    let r = s.rpc(NODE_STATUS, &[]).await.unwrap();
+    assert_eq!(r.status, OK, "{}", String::from_utf8_lossy(&r.body));
+    let n = gen::NodeStatus::decode(&r.body).expect("a NodeStatus reply");
+    assert_eq!(n.version, "9.9.9");
+    assert_eq!(n.ps5_kernel, "FreeBSD \"11\" test"); // the legacy JSON escape is undone
+    assert_eq!(n.instance_id, 18_446_744_073_709_551_000);
+    assert_eq!(n.started_at_unix, 1_700_000_000);
+    assert_eq!(n.command_count, 5);
+    assert_eq!(n.startup_reason, 2);
+    assert_eq!(n.ucred_elevated, 1);
+    assert_eq!(n.max_transfer_streams, 4);
+    assert_eq!(n.fan_threshold, 70);
+    assert_eq!(n.fan_reapply_sec, 30);
+    assert_eq!(n.prior_instance.as_deref(), Some("killed_externally"));
+    // a request body is ignored; the reply is the same shape
+    assert_eq!(s.rpc(NODE_STATUS, &[1, 2]).await.unwrap().status, OK);
+}
+
+// ---- CAP_MGMT ----
+
+#[test]
+fn cap_mgmt_is_bit_one() {
+    assert_eq!(gen::CAP_MGMT, 2);
+    assert_eq!(gen::CAP_MGMT & gen::CAP_DATA_PLANE, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c_server_advertises_cap_mgmt_only_with_the_dispatcher() {
+    let (srv, s) = rig_with("capoff", false).await;
+    assert!(!s.has_mgmt(), "no table installed: no CAP_MGMT");
+    assert_eq!(s.peer_caps() & gen::CAP_MGMT, 0);
+    drop((s, srv));
+    let (_srv, s) = rig_with("capon", true).await;
+    assert!(s.has_mgmt());
+    assert_eq!(s.peer_caps() & gen::CAP_MGMT, gen::CAP_MGMT);
+    // the data-plane bit is independent (this server has no data hooks)
+    assert_eq!(s.peer_caps() & gen::CAP_DATA_PLANE, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rust_server_advertises_cap_mgmt_with_with_mgmt() {
+    use ava1::server::{self, ServerCtx};
+    use ava1::session::RpcReply;
+    for with in [false, true] {
+        let me = Arc::new(Identity::generate().unwrap());
+        let mut peers = PeerStore::in_memory();
+        peers.add(me.public(), "client").unwrap();
+        let rpc: server::RpcHandler = Box::new(|_, _| RpcReply {
+            status: OK,
+            body: Vec::new(),
+        });
+        let mut ctx = ServerCtx::new(Identity::generate().unwrap(), "host", peers, rpc);
+        if with {
+            ctx = ctx.with_mgmt();
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let task = tokio::spawn(server::serve(l, Arc::new(ctx)));
+        // connecting adds the host's key to our store, so one store serves the whole test
+        let mine = Arc::new(Mutex::new(PeerStore::in_memory()));
+        let s = connect(&addr, me, mine, "c", fast()).await.unwrap();
+        assert_eq!(s.has_mgmt(), with);
+        task.abort();
+    }
+}
+
+// ---- minors ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c_mgmt_bad_or_overflowing_page_arguments_are_protocol_errors() {
+    let (_srv, s) = rig("badpage").await;
+    mgmt::set_apps(10);
+    for body in [
+        r#"{"offset":"x"}"#,
+        r#"{"offset":-1}"#,
+        r#"{"offset":99999999999999999999999}"#,
+        r#"{"offset":1.5}"#,
+        r#"{"limit":-2}"#,
+        r#"{"limit":"all"}"#,
+        r#"{"offset":}"#,
+    ] {
+        let r = s.rpc(APP_LIST, &text(body)).await.unwrap();
+        assert_eq!(r.status, gen::ERR_PROTOCOL, "{body}");
+        assert!(
+            r.body == b"bad offset" || r.body == b"bad limit",
+            "{body}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+    }
+    // absent is fine, and so is a spaced valid number
+    assert_eq!(s.rpc(APP_LIST, &text("{}")).await.unwrap().status, OK);
+    assert_eq!(
+        s.rpc(APP_LIST, &text(r#"{"offset" : 3, "limit" : 2}"#))
+            .await
+            .unwrap()
+            .status,
+        OK
+    );
+    mgmt::set_apps(0);
+}
+
+#[test]
+fn legacy_tokens_map_to_the_closest_status() {
+    let cases = [
+        ("fs_move_cross_mount", gen::ERR_CROSS_DEVICE),
+        // policy refusals of a path stay ERR_PATH...
+        ("fs_list_dir_path_denied", gen::ERR_PATH),
+        ("cleanup_path_denied", gen::ERR_PATH),
+        ("fs_mkdir_path_not_allowed", gen::ERR_PATH),
+        // ...an OS permission refusal is not a path problem (the schema has no permission code: ERR_IO)
+        ("permission_denied", gen::ERR_IO),
+        ("access_denied", gen::ERR_IO),
+        ("eacces", gen::ERR_IO),
+        ("eperm", gen::ERR_IO),
+        ("fs_write_failed_errno_28", gen::ERR_IO),
+        ("disk_full", gen::ERR_NO_SPACE),
+        ("already_running", gen::ERR_BUSY),
+        ("launch_title_id_missing", gen::ERR_PROTOCOL),
+        ("something_else", gen::ERR_INTERNAL),
+    ];
+    for (tok, want) in cases {
+        assert_eq!(mgmt::status_for_token(tok), want as i32, "{tok}");
+    }
+}
+
+#[test]
+fn the_environment_hook_counts_no_command() {
+    // runtime.c's handlers bump command_count themselves (as they did under FTX2); the hook that
+    // runs around them must not add a second count.
+    let inc = std::fs::read_to_string(payload().join("src/mgmt_install.inc")).unwrap();
+    assert!(
+        !inc.contains("command_count"),
+        "mgmt_install.inc must not touch command_count"
+    );
+}
+
+// ---- the audit script is a tripwire, and these are the shapes it must see ----
+
+#[test]
+fn mgmt_audit_sees_struct_2d_pointer_and_function_pointer_cases() {
+    audit("selftest");
 }
