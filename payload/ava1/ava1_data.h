@@ -51,6 +51,11 @@ void ava1_pend_peak_reset(void);
 extern uint32_t ava1_data_test_cal_peak; /* most fds disk.calibrate held at once */
 /* Writes a failure's cause into an RPC reply body (sent with the error status). */
 void ava1_rpc_msg(uint8_t *out, size_t cap, size_t *out_len, const char *fmt, ...);
+/* The truncation-safe way for a ported management handler to produce a text reply (SPEC.md §7.3):
+ * formats into `out`, sets *out_len and returns AVA1_STATUS_OK, or, when the text does not fit `cap`
+ * (snprintf returned >= cap) or cannot be formatted, returns AVA1_ERR_INTERNAL with the cause
+ * "reply truncated" in `out`. A reply is never `ok` with a clipped body. */
+int ava1_rpc_text(uint8_t *out, size_t cap, size_t *out_len, const char *fmt, ...);
 
 /* Runs fn(arg) on a short-lived detached thread that ava1_data_stop waits for. 0 or -1. */
 int ava1_data_spawn(void *(*fn)(void *), void *arg);

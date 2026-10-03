@@ -15,6 +15,7 @@ The CHANGELOG keeps its FTX2 entries: they describe releases that shipped FTX2.
 - [ ] `tests/lab/README.md` — `:9113`/`:9114`, `ftx2_control.py`, `ftx2_probe.py`
 - [ ] `bench/README.md` — `run-ftx2-upload.mjs`, `check-ftx2-baseline.mjs`, `ftx2-upload-main.json` baselines, `--ps5-addr=…:9113`
 - [ ] `FAQ.md` — `FTX2_ZIP_RAM_THRESHOLD_MB` and `FTX2_ARCHIVE_STAGE_MB` environment variables (rename to `PS5UPLOAD_*` and accept the old names for one release)
+- [ ] `MGMT_METHODS.md` — every row `hw-verified` (or `n/a` for a retired frame) on both consoles
 - [ ] In-app strings (`client/src/i18n/locales/*.ts`) that mention FTX2, ports 9113/9114 or "transfer port"
 
 Release gate: the engine's `auto` mode must not ship before the Task 28 hardware pass.
@@ -88,12 +89,16 @@ kept.
       FTX2 (`ZipTooLarge`); they need a streaming entry reader.
 - [ ] Management RPCs: every :9114 FTX2 frame the engine core sends (list above) needs an AVA1
       method. `SPEC.md` §7.1 defines only 1–3 and 16–19. This is project 3's main work.
+- [ ] A failed multi-chunk `fs.write` (`ps5upload-ava1/src/mgmt.rs`, `write_chunks`) leaves `<path>.ps5upload.tmp` behind until the next
+  write of that path (offset 0 truncates it). Needs `job.run` DELETE (Task 5) for a best-effort cleanup; `TODO(Task 5)` marks the spot.
 - [ ] `ps5_fs_move`'s same-drive rename moves to an AVA1 RPC with the `st_dev` guard (never an
       unguarded `rename()` across mounts: that panics the console's kernel).
 - [x] NAS sources: `SourceFs` now has an `mtime` (SMB, FTP and SFTP report one; a backend that does
       not reports unknown), carried into the manifest. `upload::apply_existing_policy` picks
       `skip-existing` when every file has an mtime and `verify` (roots in the manifest) otherwise
-      (`SPEC.md` §11.4). The engine does not expose a skip-existing option yet; call it when it does.
+      (`SPEC.md` §11.4). The engine's Resume strategy (`/api/transfer/dir-reconcile`, mode `fast`/`safe`) on an AVA1 console now runs
+      the folder upload with that choice (`upload_dir_skip_existing`; `fast` = size+mtime or the verify fallback,
+      `safe` = always verify), local or remote source; tests: `ava1-ctest/tests/nas_skip.rs`.
 - [x] One session per identity (`SPEC.md` §8): two engines sharing an identity file (a copied
       `<data dir>/ava/identity`, a shared data directory, a Docker engine mounted on the
       desktop's directory) evict each other's console session. Give each engine its own data

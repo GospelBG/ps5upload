@@ -710,6 +710,7 @@ int main(void) {
     }
     state.mgmt_thread_started = 1;
     {
+        if (runtime_mgmt_install(&state) != 0) fprintf(stderr, "ava1: management table not installed\n");
         int ava1_rc = ava1_payload_start();
         if (ava1_rc != 0) fprintf(stderr, "ava1: server did not start (%d); FTX2 continues\n", ava1_rc);
     }

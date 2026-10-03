@@ -135,8 +135,8 @@ async fn a_max_size_frame_slower_than_dead_after_keeps_the_session() {
     let s = connect(&proxy.addr.to_string(), me, peers, "c", t)
         .await
         .unwrap();
-    // The largest control frame: 65,000 bytes of body + RpcRequest framing + MAC < 64 KiB.
-    let big = vec![0x5a; 65_000];
+    // The largest control frame: 56 KiB of body + RpcRequest framing + MAC < 64 KiB.
+    let big = vec![0x5a; 56 * 1024];
     let start = Instant::now();
     let r = s.rpc(gen::METHOD_NODE_INFO, &big).await.unwrap();
     assert_eq!(r.status, gen::STATUS_OK);

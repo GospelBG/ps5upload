@@ -9,10 +9,15 @@
 
 pub mod copy;
 pub mod download;
+pub mod mgmt;
+pub mod mgmt_convert;
 pub mod pool;
 pub mod progress;
+#[cfg(not(target_os = "android"))]
+pub mod rar_source;
 pub mod relay;
 pub mod route;
+pub mod seq;
 pub mod source;
 pub mod upload;
 pub mod zip_source;

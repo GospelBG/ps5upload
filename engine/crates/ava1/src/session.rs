@@ -153,6 +153,8 @@ pub async fn connect_expecting(
         // holds — and the token pairs the next session too until it expires.
         let _ = peers.lock().unwrap().add(est.peer_key, &est.peer_name);
     }
+    // Replies up to `RPC_REPLY_MAX` arrive on this connection (SPEC.md §7.4).
+    r.set_max_body((crate::frame::RPC_REPLY_MAX + crate::frame::RPC_FRAME_SLACK) as u32);
     let (tx, mut rx) = mpsc::channel(DELIVER_DEPTH);
     let (link, outbox) = drive(r, w, timing, tx);
     let router = Arc::new(Router::default());
@@ -552,6 +554,17 @@ impl Session {
 
     pub fn peer_caps(&self) -> u64 {
         self.est.peer_caps
+    }
+
+    /// True when the node advertised `CAP_MGMT`: it serves the management methods (4 and up),
+    /// so the engine routes management through AVA1 without probing for ERR_UNKNOWN_METHOD.
+    pub fn has_mgmt(&self) -> bool {
+        self.est.peer_caps & gen::CAP_MGMT != 0
+    }
+
+    /// True when the node advertised `CAP_DATA_PLANE`.
+    pub fn has_data_plane(&self) -> bool {
+        self.est.peer_caps & gen::CAP_DATA_PLANE != 0
     }
 
     /// True when the other device has not accepted us yet: a person must compare codes.

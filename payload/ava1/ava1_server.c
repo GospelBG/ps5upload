@@ -28,14 +28,16 @@
 #define MAX_CONNS 64
 #define CTRL_MAX 65536u
 #define NONCES 64
-#define RPC_WORKERS 4
-#define RPC_OUT_MAX 16384u
+#define RPC_WORKERS 8
+#define RPC_OUT_MAX (256u * 1024u) /* SPEC.md §7.4: the largest reply body */
+#define RPC_REQ_MAX (56u * 1024u)  /* ... and the largest request body */
 #define MAX_PAIRING_WINDOW_S 600u
 #define MAX_CONNS_PER_IP 12u
 #define MAX_UNPAIRED 2u
 #define PAIR_CONFIRM_MS 60000u
 #define NOTIFY_EVERY_MS 10000u
 #define THREAD_STACK (256u * 1024u)
+#define MGMT_STACK (512u * 1024u) /* = AVA1_MGMT_STACK; the thread test pins both */
 
 static const uint8_t PROLOGUE[] = { 'A', 'V', 'A', '1', ' ', 'v', '1' };
 
@@ -129,16 +131,24 @@ static void set_timeouts(int fd, uint32_t ms) {
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 }
 
-static int spawn_detached(void *(*fn)(void *), void *arg) {
+static int spawn_detached_stack(void *(*fn)(void *), void *arg, size_t stack) {
     pthread_attr_t attr;
     pthread_t t;
     int rc;
     if (pthread_attr_init(&attr) != 0) return -1;
-    (void)pthread_attr_setstacksize(&attr, THREAD_STACK);
+    (void)pthread_attr_setstacksize(&attr, stack);
     (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     rc = pthread_create(&t, &attr, fn, arg);
     pthread_attr_destroy(&attr);
     return rc == 0 ? 0 : -1;
+}
+
+static int spawn_detached(void *(*fn)(void *), void *arg) { return spawn_detached_stack(fn, arg, THREAD_STACK); }
+
+/* Management methods (4 and up, except the data plane's 16-19) call handlers written for the
+ * FTX2 management thread, which had 512 KiB; everything else keeps the 256 KiB rule. */
+static size_t rpc_stack(uint16_t method) {
+    return (method >= 4 && !(method >= 16 && method <= 19)) ? MGMT_STACK : THREAD_STACK;
 }
 
 static void conn_get(conn_t *k) {
@@ -554,8 +564,13 @@ static void *rpc_worker(void *arg) {
     else if (out) status = AVA1_ERR_UNKNOWN_METHOD;
     /* A handler that claims more than the buffer holds must not make us read past it. */
     if (out_len > RPC_OUT_MAX) {
+        static const char cause[] = "reply exceeds the 256 KiB RPC cap";
         out_len = 0;
         status = AVA1_ERR_INTERNAL;
+        if (out) {
+            memcpy(out, cause, sizeof cause - 1);
+            out_len = sizeof cause - 1;
+        }
     }
     if (status != AVA1_STATUS_OK)
         fprintf(stderr, "[ava1] rpc method %u -> status %d, %zu byte cause: %.*s\n", (unsigned)j->method, status, out_len,
@@ -587,6 +602,15 @@ static int do_rpc(conn_t *k, int idx, const uint8_t sid[16], uint32_t ch, const 
     if (slot) S.sessions[idx].rpc_inflight++;
     pthread_mutex_unlock(&mu);
     if (!paired) return send_status(&k->io, ch, AVA1_ERR_NOT_PAIRED, NULL, 0) != 0;
+    if (q.body_len > RPC_REQ_MAX) {
+        static const char cause[] = "request exceeds the 56 KiB RPC cap";
+        if (slot) {
+            pthread_mutex_lock(&mu);
+            S.sessions[idx].rpc_inflight--;
+            pthread_mutex_unlock(&mu);
+        }
+        return send_status(&k->io, ch, AVA1_ERR_PROTOCOL, (const uint8_t *)cause, sizeof cause - 1) != 0;
+    }
     if (q.method == AVA1_METHOD_PAIRING_OPEN) {
         ava1_pairing_open_t o;
         uint16_t st = AVA1_ERR_PROTOCOL;
@@ -622,7 +646,7 @@ static int do_rpc(conn_t *k, int idx, const uint8_t sid[16], uint32_t ch, const 
     j->ch = ch;
     j->method = q.method;
     conn_get(k);
-    if (spawn_detached(rpc_worker, j) != 0) {
+    if (spawn_detached_stack(rpc_worker, j, rpc_stack(q.method)) != 0) {
         conn_put(k);
         free(j->body);
         free(j);

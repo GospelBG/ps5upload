@@ -26,7 +26,8 @@ use crate::Ava1Error;
 pub const MAX_CONNS: usize = 64;
 pub const MAX_SESSIONS: usize = 16;
 /// Calls in flight per session; more are answered `ERR_BUSY`.
-pub const RPC_WORKERS: usize = 4;
+pub const RPC_WORKERS: usize = 8;
+pub use crate::frame::{RPC_REPLY_MAX, RPC_REQUEST_MAX};
 /// The longest window `pairing.open` may ask for.
 pub const MAX_PAIRING_WINDOW_S: u16 = 600;
 /// Connections one source address may hold (a session is 1 control + up to 8 lanes).
@@ -135,6 +136,8 @@ pub struct ServerCtx {
     rpc: RpcHandler,
     /// Hosts data-plane jobs (SPEC.md §11); its presence advertises CAP_DATA_PLANE.
     jobs: Option<Arc<dyn JobHost>>,
+    /// Serves the management methods (SPEC.md §7.3); advertises CAP_MGMT.
+    mgmt: bool,
     pub(crate) sessions: Mutex<HashMap<[u8; 16], Arc<SessionEntry>>>,
     conns: AtomicUsize,
     per_ip: Mutex<HashMap<IpAddr, usize>>,
@@ -159,6 +162,7 @@ impl ServerCtx {
             approve: Box::new(|_| true),
             rpc,
             jobs: None,
+            mgmt: false,
             sessions: Mutex::default(),
             conns: AtomicUsize::new(0),
             per_ip: Mutex::default(),
@@ -205,6 +209,12 @@ impl ServerCtx {
 
     pub fn with_timing(mut self, t: Timing) -> Self {
         self.timing = t;
+        self
+    }
+
+    /// Serves the management methods through the rpc handler and advertises CAP_MGMT.
+    pub fn with_mgmt(mut self) -> Self {
+        self.mgmt = true;
         self
     }
 
@@ -524,11 +534,11 @@ async fn control(
                     }
                 }
             },
-            if ctx.jobs.is_some() {
+            (if ctx.jobs.is_some() {
                 gen::CAP_DATA_PLANE
             } else {
                 0
-            },
+            }) | (if ctx.mgmt { gen::CAP_MGMT } else { 0 }),
         ),
     )
     .await
@@ -606,6 +616,16 @@ async fn control(
                     }
                     continue;
                 }
+                if q.body.len() > RPC_REQUEST_MAX {
+                    let r = RpcResponse {
+                        status: gen::ERR_PROTOCOL,
+                        body: b"request exceeds the 56 KiB RPC cap".to_vec(),
+                    };
+                    if outbox.try_send(channel, &r).is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 if q.method == gen::METHOD_PAIRING_OPEN {
                     let status = match gen::PairingOpen::decode(&q.body) {
                         Ok(o) => {
@@ -636,6 +656,14 @@ async fn control(
                             status: gen::ERR_INTERNAL,
                             body: Vec::new(),
                         });
+                    let reply = if reply.body.len() > RPC_REPLY_MAX {
+                        RpcReply {
+                            status: gen::ERR_INTERNAL,
+                            body: b"reply exceeds the 256 KiB RPC cap".to_vec(),
+                        }
+                    } else {
+                        reply
+                    };
                     // Waits for room (bounded: a stuck peer ends the link, which fails this).
                     let _ = outbox
                         .send(

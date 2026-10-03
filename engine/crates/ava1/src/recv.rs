@@ -8,6 +8,7 @@
 //! started and vice versa.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -433,7 +434,15 @@ pub async fn download_job(
     mut o: RecvOptions,
 ) -> Result<RecvReport, SendError> {
     let credit = o.credit;
+    let t0 = Instant::now();
     let m = download_open(link, src_root, flags, credit).await?;
+    if std::env::var_os("PS5UPLOAD_AVA1_TIMING").is_some() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "ava1 download open (lanes, JobOpen, manifest): {:.0}ms",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     o.flags = flags; // ruling 12: `run` reads only `o.flags`
     download_run(link, m, None, sink, o).await
 }
@@ -610,6 +619,17 @@ async fn run(
     outcome
 }
 
+/// Sends the receiver's map (what it already has) to the sender.
+async fn send_need(link: &mut JobLink, job_id: [u8; 16], need: &Need) -> Result<(), SendError> {
+    for p in need.to_pages(job_id, gen::STATUS_OK) {
+        link.control
+            .send(&p)
+            .await
+            .map_err(|e| SendError::Disconnected(e.to_string()))?;
+    }
+    Ok(())
+}
+
 async fn run_loop(
     link: &mut JobLink,
     m: Arc<Manifest>,
@@ -619,6 +639,7 @@ async fn run_loop(
     batch_handle: &mut Option<tokio::task::JoinHandle<Result<BatchDone, SendError>>>,
 ) -> Result<RecvReport, SendError> {
     let job_id = link.job_id;
+    let mut tm = StageTimes::new();
     let dir = journal::job_dir(&o.jobs_dir, &job_id);
     std::fs::create_dir_all(&dir)?;
     // The destination root and the staging decision go into the journal's Open, exactly as
@@ -634,6 +655,13 @@ async fn run_loop(
         root: dest_root.clone(),
     };
     let mut st = State::default();
+    // A fresh job (no journal to replay, no relay hint) needs nothing from the sender's
+    // map, so the (empty) map goes out BEFORE the journal and the sink's directories are
+    // made durable: the sender's turnaround to its first data frame then overlaps that
+    // setup (several drive-cache flushes on a Mac) instead of waiting behind it. Data that
+    // arrives meanwhile waits in the inbox, which the credit window already bounds.
+    let early_map = need_hint.is_none() && !sink.transient_relay();
+    let mut need_sent = false;
     let (mut jnl, open_rec) = match Journal::open(&dir) {
         Ok((j, recs)) => {
             for r in &recs {
@@ -649,6 +677,10 @@ async fn run_loop(
                 None => {
                     drop(j); // one writer per directory (ruling 19): a different job
                     st = State::default(); // start over
+                    if early_map {
+                        send_need(link, job_id, &Need::default()).await?;
+                        need_sent = true;
+                    }
                     journal::write_manifest(&dir, &m)?;
                     let j = Journal::create(&dir, &fresh)?;
                     st.apply(&Record::Open(fresh.clone()));
@@ -657,6 +689,10 @@ async fn run_loop(
             }
         }
         Err(_) => {
+            if early_map {
+                send_need(link, job_id, &Need::default()).await?;
+                need_sent = true;
+            }
             journal::write_manifest(&dir, &m)?;
             let j = Journal::create(&dir, &fresh)?;
             st.apply(&Record::Open(fresh.clone()));
@@ -746,12 +782,10 @@ async fn run_loop(
                 .collect(),
         },
     };
-    for p in need.to_pages(job_id, gen::STATUS_OK) {
-        link.control
-            .send(&p)
-            .await
-            .map_err(|e| SendError::Disconnected(e.to_string()))?;
+    if !need_sent {
+        send_need(link, job_id, &need).await?;
     }
+    tm.setup_done();
     // Progress: the totals, and the durable counters seeded from the replay so a resumed
     // run reports what the journal already knows (preflight row 21; Task 18's resume test
     // asserts bytes_durable on the resumed run).
@@ -821,6 +855,12 @@ async fn run_loop(
     // when no batch is in flight.
     let mut jnl = Some(jnl);
     let mut st = Some(st);
+    // Small files inside the batch that is running (not yet in `done`).
+    let mut inflight_small = 0usize;
+    // Bundle writes in flight (unordered downloads): at most WRITE_PAR touch the disk at once.
+    let mut writes: tokio::task::JoinSet<Result<BundleWritten, SendError>> =
+        tokio::task::JoinSet::new();
+    let write_gate = Arc::new(tokio::sync::Semaphore::new(WRITE_PAR));
     loop {
         if o.cancel.load(Ordering::Relaxed) {
             let _ = link
@@ -840,18 +880,37 @@ async fn run_loop(
         let ev = tokio::select! {
             ev = next(link) => Some(ev?),
             _ = tick.tick() => None,
+            w = writes.join_next(), if !writes.is_empty() => {
+                let w = w.expect("guarded by `!is_empty`").map_err(proto)??;
+                tm.write_time += w.took;
+                credit_back += w.credit;
+                for id in w.ok {
+                    pending_small.push(id);
+                }
+                for (id, why) in w.retry {
+                    link.control
+                        .send(&gen::FileRetry { job_id, file_id: id, reason: why })
+                        .await
+                        .map_err(|e| SendError::Disconnected(e.to_string()))?;
+                }
+                None
+            }
             joined = join_batch(batch_handle), if batch_handle.is_some() => {
                 let b = joined.expect("guarded by `is_some`");
                 *batch_handle = None;
+                tm.batch_done();
                 match b {
                     Ok(out) => {
                         fold_batch(&mut done, &mut large, &pg, &m, &out);
+                        inflight_small = 0;
                         jnl = Some(out.jnl);
                         st = Some(out.st);
                     }
                     Err(e) => return Err(e),
                 }
-                continue;
+                // Fall through (as an idle turn): the batch check below may start the next
+                // batch, or finish the job, right now instead of on the next 50 ms tick.
+                None
             }
         };
         // Ruling 2: `ev` is matched below and read by `is_none` — bind first.
@@ -859,6 +918,7 @@ async fn run_loop(
         match ev {
             Some(Inbound::Lane { lane, frame }) => {
                 let len = frame.body.len() as u64;
+                tm.frame();
                 // SPEC.md §12.4 (ledger row 19): a frame that exceeds the credit this job
                 // still has outstanding is refused with ERR_CREDIT on that lane; nothing of
                 // it is buffered or acknowledged. `outstanding` = granted − received +
@@ -906,6 +966,7 @@ async fn run_loop(
                     }
                     Bundle::TYPE => {
                         let b: Bundle = frame.decode().map_err(proto)?;
+                        let mut jobs: Vec<(u32, [u8; 32], Vec<u8>)> = Vec::new();
                         for r in b.records {
                             let Some(e) = m.entry(r.file_id) else {
                                 return Err(SendError::Protocol(format!(
@@ -937,28 +998,37 @@ async fn run_loop(
                                     .map_err(|e| SendError::Disconnected(e.to_string()))?;
                                 continue;
                             }
-                            if *blake3::hash(&r.data).as_bytes() != r.root {
-                                link.control
-                                    .send(&gen::FileRetry {
-                                        job_id,
-                                        file_id: r.file_id,
-                                        reason: gen::RETRY_VERIFY,
-                                    })
-                                    .await
-                                    .map_err(|e| SendError::Disconnected(e.to_string()))?;
-                                continue;
-                            }
                             if o.ordered {
+                                if *blake3::hash(&r.data).as_bytes() != r.root {
+                                    link.control
+                                        .send(&gen::FileRetry {
+                                            job_id,
+                                            file_id: r.file_id,
+                                            reason: gen::RETRY_VERIFY,
+                                        })
+                                        .await
+                                        .map_err(|e| SendError::Disconnected(e.to_string()))?;
+                                    continue;
+                                }
                                 reorder.insert((r.file_id, 0), (true, r.data));
                             } else {
-                                let s2 = sink.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    s2.write_whole(r.file_id, &r.data)
-                                })
-                                .await
-                                .map_err(proto)??;
-                                pending_small.push(r.file_id);
+                                jobs.push((r.file_id, r.root, r.data));
                             }
+                        }
+                        if !jobs.is_empty() {
+                            // Hash-check and write the whole bundle on a blocking task of its
+                            // own, concurrently with the bundles before it: one hop per bundle
+                            // instead of per file, and the loop goes on draining the inbox.
+                            // The bundle's credit returns when its files are on disk (the
+                            // backpressure the window exists for), not when it arrived.
+                            let (s2, gate) = (sink.clone(), write_gate.clone());
+                            writes.spawn(async move {
+                                let _permit = gate.acquire_owned().await.map_err(proto)?;
+                                tokio::task::spawn_blocking(move || write_bundle(&*s2, jobs, len))
+                                    .await
+                                    .map_err(proto)?
+                            });
+                            continue;
                         }
                     }
                     _ => {}
@@ -1074,7 +1144,8 @@ async fn run_loop(
             credit_back = 0;
         }
         if batch_handle.is_none() {
-            let finished = done.len() >= total_files && pending_small.is_empty();
+            let finished =
+                done.len() >= total_files && pending_small.is_empty() && writes.is_empty();
             if finished {
                 let mut jnl = jnl.take().expect("a finished job has no batch in flight");
                 let mut st = st.take().expect("a finished job has no batch in flight");
@@ -1120,13 +1191,22 @@ async fn run_loop(
                     })
                     .await
                     .map_err(|e| SendError::Disconnected(e.to_string()))?;
+                tm.report(m.files());
                 return Ok(RecvReport {
                     files: m.files(),
                     bytes: m.bytes(),
                     manifest: m,
                 });
-            } else if last_batch.elapsed() >= Duration::from_millis(250) {
+            } else if sync_due(
+                last_batch.elapsed(),
+                // Every file is accounted for (written, or in a batch): nothing more will
+                // arrive, so the sync is the only thing left — never wait a tick for it.
+                done.len() + pending_small.len() + inflight_small >= total_files
+                    && !pending_small.is_empty(),
+            ) {
                 last_batch = Instant::now();
+                inflight_small = pending_small.len();
+                tm.batch_start();
                 let snap = snapshot_batch(
                     job_id,
                     link.control.clone(),
@@ -1142,6 +1222,126 @@ async fn run_loop(
                 *batch_handle = Some(tokio::task::spawn(batch_task(snap)));
             }
         }
+    }
+}
+
+/// Concurrent bundle writes. The Mac's file creation scales to a few threads; more only
+/// adds contention.
+const WRITE_PAR: usize = 4;
+
+/// What one bundle's write task hands back to the loop.
+struct BundleWritten {
+    /// Written (and root-checked) files, awaiting the next sync batch.
+    ok: Vec<u32>,
+    /// Files whose bytes did not hash to their root: FileRetry, reason.
+    retry: Vec<(u32, u16)>,
+    /// The bundle frame's credit, returned now that its files are on disk.
+    credit: u64,
+    took: Duration,
+}
+
+fn write_bundle(
+    sink: &dyn Sink,
+    files: Vec<(u32, [u8; 32], Vec<u8>)>,
+    credit: u64,
+) -> Result<BundleWritten, SendError> {
+    let t = Instant::now();
+    let mut out = BundleWritten {
+        ok: Vec::with_capacity(files.len()),
+        retry: Vec::new(),
+        credit,
+        took: Duration::ZERO,
+    };
+    for (id, root, data) in files {
+        if *blake3::hash(&data).as_bytes() != root {
+            out.retry.push((id, gen::RETRY_VERIFY));
+            continue;
+        }
+        sink.write_whole(id, &data)?;
+        out.ok.push(id);
+    }
+    out.took = t.elapsed();
+    Ok(out)
+}
+
+/// Batch cadence. A batch is due on the regular interval, and at once when every file
+/// has arrived (the tail of the job: nothing more will come, so waiting a tick only adds
+/// latency). A shorter interval (60-120 ms) measured no better on a console download
+/// (wire-bound, ~40 ms final batch either way) and slower on loopback, where the fsyncs
+/// contend with the writes for the drive.
+fn sync_due(since_last: Duration, all_in: bool) -> bool {
+    since_last >= SYNC_EVERY || all_in
+}
+
+const SYNC_EVERY: Duration = Duration::from_millis(250);
+
+/// Opt-in stage timers (`PS5UPLOAD_AVA1_TIMING=1`): one stderr line per finished job, so a
+/// slow download can be attributed to the data phase, the write loop or the sync tail.
+struct StageTimes {
+    on: bool,
+    start: Instant,
+    setup: Option<Duration>,
+    first: Option<Instant>,
+    last: Option<Instant>,
+    batch_at: Option<Instant>,
+    batches: u32,
+    batch_total: Duration,
+    frames: u32,
+    write_time: Duration,
+}
+
+impl StageTimes {
+    fn new() -> Self {
+        Self {
+            on: std::env::var_os("PS5UPLOAD_AVA1_TIMING").is_some(),
+            start: Instant::now(),
+            setup: None,
+            first: None,
+            last: None,
+            batch_at: None,
+            batches: 0,
+            batch_total: Duration::ZERO,
+            frames: 0,
+            write_time: Duration::ZERO,
+        }
+    }
+    fn setup_done(&mut self) {
+        self.setup = Some(self.start.elapsed());
+    }
+    fn frame(&mut self) {
+        let now = Instant::now();
+        self.first.get_or_insert(now);
+        self.last = Some(now);
+        self.frames += 1;
+    }
+    fn batch_start(&mut self) {
+        self.batch_at = Some(Instant::now());
+    }
+    fn batch_done(&mut self) {
+        if let Some(t) = self.batch_at.take() {
+            self.batches += 1;
+            self.batch_total += t.elapsed();
+        }
+    }
+    fn report(&self, files: u32) {
+        if !self.on {
+            return;
+        }
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let first = self.first.map_or(0.0, |t| ms(t - self.start));
+        let last = self.last.map_or(0.0, |t| ms(t - self.start));
+        let _ = writeln!(
+            std::io::stderr(),
+            "ava1 recv timing: files={files} setup={:.0}ms frames={} first_frame={first:.0}ms last_frame={last:.0}ms \
+             total={:.0}ms tail={:.0}ms batches={} batch_time={:.0}ms write_time={:.0}ms",
+            self.setup.map_or(0.0, ms),
+            self.frames,
+            ms(self.start.elapsed()),
+            ms(self.start.elapsed()) - last,
+            self.batches,
+            ms(self.batch_total),
+            ms(self.write_time),
+        );
     }
 }
 
@@ -1717,5 +1917,64 @@ mod tests {
         }
         assert_eq!(st2, st, "a compaction loses no state");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_final_sync_does_not_wait_for_the_tick() {
+        let soon = Duration::from_millis(5);
+        // Mid-stream: not due before the interval.
+        assert!(!sync_due(soon, false));
+        // Every file is in: due at once, whatever the interval says.
+        assert!(sync_due(soon, true));
+        // And the regular cadence still fires.
+        assert!(sync_due(SYNC_EVERY, false));
+    }
+
+    #[test]
+    fn a_bundle_write_retries_a_bad_root_and_writes_the_rest() {
+        use std::sync::Mutex as M;
+        #[derive(Default)]
+        struct Rec(M<Vec<u32>>);
+        impl Sink for Rec {
+            fn prepare(&self, _m: &Manifest) -> io::Result<()> {
+                Ok(())
+            }
+            fn write_at(&self, _i: u32, _o: u64, _d: &[u8]) -> io::Result<()> {
+                Ok(())
+            }
+            fn write_whole(&self, id: u32, _d: &[u8]) -> io::Result<()> {
+                self.0.lock().unwrap().push(id);
+                Ok(())
+            }
+            fn sync(&self, _ids: &[u32]) -> io::Result<()> {
+                Ok(())
+            }
+            fn read_at(&self, _i: u32, _o: u64, _b: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+            fn commit(&self, _i: u32) -> io::Result<()> {
+                Ok(())
+            }
+            fn finish(&self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Rec::default();
+        let good = b"abc".to_vec();
+        let root = *blake3::hash(&good).as_bytes();
+        let out = write_bundle(
+            &sink,
+            vec![
+                (1, root, good.clone()),
+                (2, [0u8; 32], good.clone()),
+                (3, root, good),
+            ],
+            777,
+        )
+        .unwrap();
+        assert_eq!(out.ok, vec![1, 3]);
+        assert_eq!(out.retry, vec![(2, gen::RETRY_VERIFY)]);
+        assert_eq!(out.credit, 777);
+        assert_eq!(*sink.0.lock().unwrap(), vec![1, 3]); // the bad one was never written
     }
 }

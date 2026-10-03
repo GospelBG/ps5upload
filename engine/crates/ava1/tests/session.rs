@@ -307,6 +307,100 @@ async fn a_slow_call_does_not_stop_liveness_or_other_calls() {
     assert!(!s.is_closed(), "liveness held through the slow call");
 }
 
+/// A paired client and a server whose handler holds method 77 until `release` is set and
+/// answers method 78 with `len` bytes (len = the request's first two bytes, LE).
+async fn gated_server() -> (
+    Arc<ava1::session::Session>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (s_id, c_id) = (
+        Identity::generate().unwrap(),
+        Arc::new(Identity::generate().unwrap()),
+    );
+    let mut sp = PeerStore::in_memory();
+    sp.add(c_id.public(), "c").unwrap();
+    let mut cp = PeerStore::in_memory();
+    cp.add(s_id.public(), "s").unwrap();
+    let release = Arc::new(AtomicBool::new(false));
+    let r2 = release.clone();
+    let rpc: ava1::server::RpcHandler = Box::new(move |method, body| {
+        if method == 77 {
+            while !r2.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        if method == 78 {
+            let n = u32::from_le_bytes([body[0], body[1], body[2], 0]) as usize;
+            return ava1::session::RpcReply {
+                status: gen::STATUS_OK,
+                body: vec![0xAB; n],
+            };
+        }
+        ava1::session::RpcReply {
+            status: gen::STATUS_OK,
+            body: vec![method as u8],
+        }
+    });
+    let (addr, _ctx) = start(ServerCtx::new(s_id, "s", sp, rpc).with_timing(fast())).await;
+    let s = connect(
+        &addr.to_string(),
+        c_id,
+        Arc::new(Mutex::new(cp)),
+        "c",
+        fast(),
+    )
+    .await
+    .unwrap();
+    (Arc::new(s), release)
+}
+
+#[tokio::test]
+async fn eight_calls_run_in_flight_and_the_ninth_is_busy() {
+    // SPEC.md §7.4: a session has at most 8 requests in flight.
+    assert_eq!(ava1::server::RPC_WORKERS, 8);
+    let (s, release) = gated_server().await;
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let s2 = s.clone();
+        held.push(tokio::spawn(async move { s2.rpc(77, &[]).await }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(s.rpc(5, &[]).await.unwrap().status, gen::ERR_BUSY);
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+    for h in held {
+        assert_eq!(h.await.unwrap().unwrap().status, gen::STATUS_OK);
+    }
+    assert_eq!(s.rpc(5, &[]).await.unwrap().status, gen::STATUS_OK);
+}
+
+#[tokio::test]
+async fn a_256_kib_reply_goes_through_and_a_larger_one_is_refused_not_clipped() {
+    // SPEC.md §7.4: a reply body is at most 256 KiB; a handler that exceeds it gets
+    // ERR_INTERNAL with a cause, never a clipped `ok`.
+    assert_eq!(ava1::server::RPC_REPLY_MAX, 256 * 1024);
+    let (s, _release) = gated_server().await;
+    let ask = |n: u32| n.to_le_bytes()[..3].to_vec();
+    let r = s.rpc(78, &ask(256 * 1024)).await.unwrap();
+    assert_eq!((r.status, r.body.len()), (gen::STATUS_OK, 256 * 1024));
+    let r = s.rpc(78, &ask(256 * 1024 + 1)).await.unwrap();
+    assert_eq!(r.status, gen::ERR_INTERNAL);
+    assert_eq!(r.body, b"reply exceeds the 256 KiB RPC cap");
+}
+
+#[tokio::test]
+async fn a_request_over_56_kib_is_refused_with_a_cause() {
+    // SPEC.md §7.4: a request body is at most 56 KiB.
+    assert_eq!(ava1::server::RPC_REQUEST_MAX, 56 * 1024);
+    let (s, _release) = gated_server().await;
+    let r = s.rpc(5, &vec![0u8; 56 * 1024]).await.unwrap();
+    assert_eq!(r.status, gen::STATUS_OK);
+    let r = s.rpc(5, &vec![0u8; 56 * 1024 + 1]).await.unwrap();
+    assert_eq!(r.status, gen::ERR_PROTOCOL);
+    assert_eq!(r.body, b"request exceeds the 56 KiB RPC cap");
+    assert!(!s.is_closed());
+}
+
 #[test]
 fn identity_file_of_wrong_length_is_an_error_not_a_new_key() {
     // Review focus 4 (covered in keys.rs too; pinned here at the integration boundary).

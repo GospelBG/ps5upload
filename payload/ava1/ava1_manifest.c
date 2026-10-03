@@ -257,10 +257,36 @@ static void fill_entry(ava1_manifest_entry_t *w, uint32_t id, const char *rel, c
     w->path_len = (uint16_t)strlen(rel);
 }
 
+/* A discovered entry with the stat fields the manifest needs, so the walk stats each path
+ * once. `path` stays the first member: path_cmp sorts the records directly. */
+typedef struct {
+    char *path;
+    uint32_t mode;
+    uint64_t size, mtime;
+    int dir;
+} frec_t;
+
+static int frec_push(frec_t **v, uint32_t *n, uint32_t *cap, const char *p, const struct stat *st) {
+    char *c = strdup(p);
+    if (!c || grow((void **)v, sizeof **v, cap, *n + 1) != 0) {
+        free(c);
+        return -1;
+    }
+    (*v)[*n].path = c;
+    (*v)[*n].mode = (uint32_t)(st->st_mode & 07777);
+    (*v)[*n].dir = S_ISDIR(st->st_mode) ? 1 : 0;
+    (*v)[*n].size = S_ISDIR(st->st_mode) ? 0 : (uint64_t)st->st_size;
+    (*v)[*n].mtime = (uint64_t)st->st_mtime;
+    (*n)++;
+    return 0;
+}
+
 /* One implementation for both modes (ruling C1). The walk follows the path order Rust's
  * walk produces; the entries are sorted by `path_cmp` afterwards either way. */
 int ava1_mstore_walk_ex(ava1_mstore_t *m, const char *root, unsigned flags) {
-    strv_t dirs = { 0 }, found = { 0 };
+    strv_t dirs = { 0 };
+    frec_t *found = NULL;
+    uint32_t found_n = 0, found_cap = 0;
     char *abs = malloc(2 * (AVA1_MAX_PATH + 2) + 512);
     int rc = 0;
     uint32_t i;
@@ -287,34 +313,47 @@ int ava1_mstore_walk_ex(ava1_mstore_t *m, const char *root, unsigned flags) {
             /* A stat failure on a discovered entry is fatal in both modes: Rust's walk
              * fails on a dangling link, and a silent skip would produce a manifest that
              * does not match the source tree (ruling C1). */
-            if (lstat(abs, &lst) != 0 || stat(abs, &st) != 0) {
+            if (lstat(abs, &lst) != 0) {
                 rc = AVA1_E_IO;
                 break;
+            }
+            /* One stat per file: only a symlink needs its target's stat too. */
+            if (S_ISLNK(lst.st_mode)) {
+                if (stat(abs, &st) != 0) {
+                    rc = AVA1_E_IO;
+                    break;
+                }
+            } else {
+                st = lst;
             }
             /* Default mode skips directory symlinks (no loops); AVA1_WALK_FOLLOW pushes
              * them like directories and walks them. A cycle then ends in ELOOP (a fatal
              * stat) or a path-length error — an error, never a spin. */
             if (!(flags & AVA1_WALK_FOLLOW) && S_ISLNK(lst.st_mode) && S_ISDIR(st.st_mode)) continue;
             if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) continue;
-            if (strv_push(&found, child) != 0 || (S_ISDIR(st.st_mode) && strv_push(&dirs, child) != 0)) rc = AVA1_E_IO;
+            if (frec_push(&found, &found_n, &found_cap, child, &st) != 0 ||
+                (S_ISDIR(st.st_mode) && strv_push(&dirs, child) != 0))
+                rc = AVA1_E_IO;
         }
         if (d) closedir(d);
         free(rel);
     }
-    if (rc == 0) qsort(found.v, found.n, sizeof *found.v, path_cmp);
-    for (i = 0; rc == 0 && i < found.n; i++) {
+    if (rc == 0) qsort(found, found_n, sizeof *found, path_cmp);
+    for (i = 0; rc == 0 && i < found_n; i++) {
         ava1_manifest_entry_t w;
-        struct stat st;
-        snprintf(abs, 2 * (AVA1_MAX_PATH + 2) + 512, "%s/%s", root, found.v[i]);
-        if (stat(abs, &st) != 0) {
-            rc = AVA1_E_IO;
-            break;
-        }
-        fill_entry(&w, m->n, found.v[i], &st);
+        memset(&w, 0, sizeof w);
+        w.file_id = m->n;
+        w.kind = found[i].dir ? AVA1_ENTRY_DIR : AVA1_ENTRY_FILE;
+        w.mode = found[i].mode;
+        w.size = found[i].size;
+        w.mtime = found[i].mtime;
+        w.path = (const uint8_t *)found[i].path;
+        w.path_len = (uint16_t)strlen(found[i].path);
         rc = ava1_mstore_add(m, &w);
     }
     strv_free(&dirs);
-    strv_free(&found);
+    for (i = 0; i < found_n; i++) free(found[i].path);
+    free(found);
     free(abs);
     return rc;
 }

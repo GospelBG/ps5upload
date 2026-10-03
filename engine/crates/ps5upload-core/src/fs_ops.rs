@@ -15,6 +15,7 @@ use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
 use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 // ─── FS_LIST_DIR ─────────────────────────────────────────────────────────────
 
@@ -91,30 +92,19 @@ pub fn list_dir_with_timeout(
     opts: ListDirOptions,
     io_timeout: Option<std::time::Duration>,
 ) -> Result<DirListing> {
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .context("applying reconcile I/O timeout")?;
-    }
     let body = serde_json::to_vec(&serde_json::json!({
         "path": path,
         "offset": opts.offset,
         "limit": opts.limit,
     }))
     .context("serialize list_dir body")?;
-    c.send_frame(FrameType::FsListDir, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_LIST_DIR({}): {}",
-            path,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::FsListDirAck {
-        bail!("expected FS_LIST_DIR_ACK, got {:?}", ft);
-    }
+    let resp = mgmt::call_with(
+        addr,
+        m::FS_LIST,
+        &format!("FS_LIST_DIR({path})"),
+        &body,
+        io_timeout,
+    )?;
     let parsed: DirListing =
         serde_json::from_slice(&resp).context("decode FS_LIST_DIR_ACK body as JSON")?;
     Ok(parsed)
@@ -206,11 +196,6 @@ pub fn fs_read_with_timeout(
     io_timeout: Option<std::time::Duration>,
     unsafe_read: bool,
 ) -> Result<Vec<u8>> {
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .context("applying fs_read I/O timeout")?;
-    }
     let body = serde_json::to_vec(&serde_json::json!({
         "path": path,
         "offset": offset,
@@ -218,19 +203,15 @@ pub fn fs_read_with_timeout(
         "unsafe": unsafe_read,
     }))
     .context("serialize fs_read body")?;
-    c.send_frame(FrameType::FsRead, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_READ({}): {}",
-            path,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::FsReadAck {
-        bail!("expected FS_READ_ACK, got {:?}", ft);
-    }
+    // The AVA1 transport loops `fs.read` on `eof` until `limit` bytes (at most the FTX2
+    // ceiling) have arrived, so the caller sees one call as before.
+    let resp = mgmt::call_with(
+        addr,
+        m::FS_READ,
+        &format!("FS_READ({path})"),
+        &body,
+        io_timeout,
+    )?;
     Ok(resp)
 }
 
@@ -921,13 +902,8 @@ pub fn fs_chmod_with_timeout(
 pub fn fs_mkdir(addr: &str, path: &str) -> Result<()> {
     let body =
         serde_json::to_vec(&serde_json::json!({ "path": path })).context("serialize fs_mkdir")?;
-    send_empty_ack_op(
-        addr,
-        FrameType::FsMkdir,
-        &body,
-        FrameType::FsMkdirAck,
-        "FS_MKDIR",
-    )
+    mgmt::call(addr, m::FS_MKDIR, &body)?;
+    Ok(())
 }
 
 // ─── App lifecycle (register / unregister / launch / list) ─────────────────

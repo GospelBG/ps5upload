@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ava1_apply.h"
@@ -16,6 +17,12 @@
 #include "ava1_thread.h"
 
 #define READ_AHEAD (32u << 20)
+
+static uint64_t now_us(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+}
 
 uint32_t ava1_send_test_fail_sends;
 uint32_t ava1_send_test_fail_writer_starts;
@@ -205,6 +212,11 @@ typedef struct {
     int writer_started[AVA1_MAX_LANES + 1]; /* a joinable thread exists */
     uint32_t gen[AVA1_MAX_LANES + 1];       /* bumped by every death of the lane id */
     uint8_t wsid[AVA1_MAX_LANES + 1][16];   /* the session the lane belongs to */
+    /* Stage timers (microseconds, CLOCK_MONOTONIC), printed once when the job is freed:
+     * where a download's time goes. The sums are across the job's lanes. */
+    pthread_mutex_t pump_mu; /* serialises the tick's and the map's thread starts and page emission */
+    uint64_t t_open, walk_us, t_first_send, t_last_send, reader_end, reader_wait_us;
+    uint64_t send_us, idle_us, sent_frames, sent_bytes;
 } snd_t;
 
 static snd_t *S_(ava1_job_t *j) { return (snd_t *)j->role; }
@@ -221,7 +233,11 @@ static int put_frame(void *ctx, uint8_t type, uint8_t *msg, size_t len) {
     f->len = len;
     f->type = type;
     pthread_mutex_lock(&j->mu);
-    while (s->queued >= READ_AHEAD && !s->stop && !j->stopping) pthread_cond_wait(&j->cv, &j->mu);
+    if (s->queued >= READ_AHEAD) {
+        uint64_t w0 = now_us();
+        while (s->queued >= READ_AHEAD && !s->stop && !j->stopping) pthread_cond_wait(&j->cv, &j->mu);
+        s->reader_wait_us += now_us() - w0;
+    }
     if (s->stop || j->stopping) { /* the job is ending: the read-ahead bound holds to the end */
         pthread_mutex_unlock(&j->mu);
         free(msg);
@@ -271,6 +287,7 @@ static void *reader_main(void *arg) {
     r.ctx = j;
     r.stop = &s->stop;
     rc = ava1_read_files(&r, NULL, 0);
+    s->reader_end = now_us();
     /* FileRetry: the engine asked for whole files again. */
     while (rc == 0 && !s->stop && !j->stopping) {
         uint32_t *ids = NULL, n = 0;
@@ -389,17 +406,31 @@ static void *writer_main(void *arg) {
     for (;;) {
         sframe_t *f = NULL;
         int rc, k;
+        uint64_t w0, t1;
+        w0 = now_us();
         while (!s->stop && !j->stopping && s->writer_up[lane] == 1 && s->gen[lane] == c.gen &&
                !(f = pick_locked(s, lane)))
             pthread_cond_wait(&j->cv, &j->mu);
+        s->idle_us += now_us() - w0;
         if (!f) break;
         pthread_cond_broadcast(&j->cv); /* the reader may continue */
         pthread_mutex_unlock(&j->mu);
         /* The copying send keeps f->msg as plaintext, so a requeued frame can go out again
          * on another lane under that lane's keys. */
+        t1 = now_us();
         rc = take_one(&ava1_send_test_fail_sends) ? AVA1_E_IO
                                                    : ava1_server_send(c.sid, lane, f->type, 0, f->seq, f->msg, f->len);
         pthread_mutex_lock(&j->mu);
+        {
+            uint64_t t2 = now_us();
+            s->send_us += t2 - t1;
+            if (rc == 0) {
+                if (!s->t_first_send) s->t_first_send = t1;
+                s->t_last_send = t2;
+                s->sent_frames++;
+                s->sent_bytes += f->len;
+            }
+        }
         k = settle_locked(s, f, rc);
         pthread_cond_broadcast(&j->cv); /* a requeued frame or returned credit: any lane may go */
         if (k < 0) {
@@ -486,17 +517,14 @@ static void emit_page_or_end(ava1_job_t *j) {
     free(out);
 }
 
-static void on_tick(ava1_job_t *j) {
+/* Starts the reader (once the map is in) and every writer marked "start me". The job
+ * tick does it (25 ms granularity) and so does the arrival of the map, so the first data
+ * frame does not wait for the next tick. `may_join` is the tick's: a lane id whose previous
+ * writer is still to be joined is left to it (the connection thread never waits on a job).
+ * Caller holds pump_mu. */
+static void start_threads(ava1_job_t *j, int may_join) {
     snd_t *s = S_(j);
     uint16_t l;
-    int attached;
-    /* C2: nothing may be emitted before the data layer attaches the job — net_emit would
-     * drop the pages while next_page advanced, and the manifest would be lost. */
-    pthread_mutex_lock(&j->cmu);
-    attached = j->attached;
-    pthread_mutex_unlock(&j->cmu);
-    if (!attached) return;
-    if (!s->pages_done) emit_page_or_end(j);
     pthread_mutex_lock(&j->mu);
     if (s->have_map && !s->reader_started) {
         s->reader_started = ava1_thread_start(reader_main, j, &s->reader) == 0;
@@ -505,6 +533,7 @@ static void on_tick(ava1_job_t *j) {
         wctx2_t *c;
         if (s->writer_up[l] != 2) continue;
         if (s->writer_started[l]) { /* the previous writer of this lane id has exited or is exiting */
+            if (!may_join) continue;
             pthread_mutex_unlock(&j->mu);
             pthread_join(s->writer[l], NULL);
             pthread_mutex_lock(&j->mu);
@@ -525,6 +554,36 @@ static void on_tick(ava1_job_t *j) {
         }
     }
     pthread_mutex_unlock(&j->mu);
+}
+
+static int attached_now(ava1_job_t *j) {
+    int attached;
+    pthread_mutex_lock(&j->cmu);
+    attached = j->attached;
+    pthread_mutex_unlock(&j->cmu);
+    return attached;
+}
+
+static void on_tick(ava1_job_t *j) {
+    snd_t *s = S_(j);
+    /* C2: nothing may be emitted before the data layer attaches the job — net_emit would
+     * drop the pages while next_page advanced, and the manifest would be lost. */
+    if (!attached_now(j)) return;
+    pthread_mutex_lock(&s->pump_mu);
+    if (!s->pages_done) emit_page_or_end(j);
+    start_threads(j, 1);
+    pthread_mutex_unlock(&s->pump_mu);
+}
+
+/* The receiver's map just arrived: start the reader and the writers now rather than at the
+ * next tick (up to 25 ms of the job's critical path). Best effort: if the tick holds
+ * pump_mu it starts them itself. */
+static void kick(ava1_job_t *j) {
+    snd_t *s = S_(j);
+    if (!attached_now(j)) return;
+    if (pthread_mutex_trylock(&s->pump_mu) != 0) return;
+    start_threads(j, 0);
+    pthread_mutex_unlock(&s->pump_mu);
 }
 
 /* A Received (caller holds mu): the frame to free, or NULL. A frame its writer is still
@@ -577,6 +636,7 @@ static int on_frame(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len
         }
         if (m.last) s->have_map = 1;
         pthread_mutex_unlock(&j->mu);
+        if (m.last) kick(j);
         return 0;
     }
     case AVA1_TYPE_RECEIVED: {
@@ -641,6 +701,18 @@ static void role_free(ava1_job_t *j) {
     if (s->reader_started) pthread_join(s->reader, NULL);
     for (i = 1; i <= AVA1_MAX_LANES; i++)
         if (s->writer_started[i]) pthread_join(s->writer[i], NULL); /* each exits on stop */
+    if (s->sent_frames) {
+        uint64_t t0 = s->t_open;
+        fprintf(stderr,
+                "ava1 send: walk=%llums first_send=+%llums last_send=+%llums reader_end=+%llums files=%u "
+                "frames=%llu bytes=%llu reader_wait=%llums send=%llums writer_idle=%llums\n",
+                (unsigned long long)(s->walk_us / 1000), (unsigned long long)((s->t_first_send - t0) / 1000),
+                (unsigned long long)((s->t_last_send - t0) / 1000),
+                (unsigned long long)(s->reader_end ? (s->reader_end - t0) / 1000 : 0), j->m.n,
+                (unsigned long long)s->sent_frames, (unsigned long long)s->sent_bytes,
+                (unsigned long long)(s->reader_wait_us / 1000), (unsigned long long)(s->send_us / 1000),
+                (unsigned long long)(s->idle_us / 1000));
+    }
     while ((f = s->ready) != NULL) {
         s->ready = f->next;
         free(f->msg);
@@ -659,6 +731,7 @@ static void role_free(ava1_job_t *j) {
     free(s->durable);
     free(s->retry);
     ava1_bits_free(&s->skip);
+    pthread_mutex_destroy(&s->pump_mu);
     free(s);
     j->role = NULL;
 }
@@ -689,11 +762,13 @@ ava1_job_t *ava1_send_open(const ava1_job_open_t *o, const uint8_t peer[32], ava
     ava1_job_free_one(o->job_id); /* a sender's state lives only in memory: start over */
     j = ava1_job_create(o->job_id, peer);
     s = j ? calloc(1, sizeof *s) : NULL;
+    if (s) pthread_mutex_init(&s->pump_mu, NULL);
     if (!j || !s) {
         if (j) {
             ava1_job_free_one(o->job_id);
             ava1_job_put(j);
         }
+        if (s) pthread_mutex_destroy(&s->pump_mu);
         free(s);
         ack->status = AVA1_ERR_BUSY;
         return NULL;
@@ -704,7 +779,9 @@ ava1_job_t *ava1_send_open(const ava1_job_open_t *o, const uint8_t peer[32], ava
     j->role = s;
     j->role_free = role_free;
     s->single = !S_ISDIR(st.st_mode);
+    s->t_open = now_us();
     rc = s->single ? ava1_mstore_single(&j->m, root) : ava1_mstore_walk_ex(&j->m, root, AVA1_WALK_FOLLOW);
+    s->walk_us = now_us() - s->t_open;
     s->credit = o->has_credit ? o->credit : (16u << 20);
     if (rc != 0 || ava1_bits_init(&s->skip, j->m.n) != 0 ||
         !(s->durable = calloc((size_t)j->m.n + 1, sizeof *s->durable)) ||
@@ -761,6 +838,7 @@ static sframe_t *g_taken[TEST_TAKEN];
 
 void ava1_send_test_begin(uint64_t credit) {
     snd_t *s = calloc(1, sizeof *s);
+    if (s) pthread_mutex_init(&s->pump_mu, NULL);
     g_tj = calloc(1, sizeof *g_tj);
     memset(g_taken, 0, sizeof g_taken);
     pthread_mutex_init(&g_tj->mu, NULL);
@@ -794,6 +872,7 @@ void ava1_send_test_end(void) {
         free(f->msg);
         free(f);
     }
+    pthread_mutex_destroy(&s->pump_mu);
     free(s);
     pthread_cond_destroy(&g_tj->cv);
     pthread_mutex_destroy(&g_tj->mu);

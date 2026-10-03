@@ -20,6 +20,7 @@ pub const ERR_UNKNOWN_METHOD: u16 = 6;
 pub const ERR_INTERNAL: u16 = 7;
 pub const ERR_BUSY: u16 = 8;
 pub const CAP_DATA_PLANE: u64 = 1;
+pub const CAP_MGMT: u64 = 2;
 pub const METHOD_JOB_COPY: u16 = 16;
 pub const METHOD_JOB_STATUS: u16 = 17;
 pub const METHOD_JOB_CANCEL: u16 = 18;
@@ -57,6 +58,127 @@ pub const BN_CREDIT: u8 = 5;
 pub const RETRY_VERIFY: u16 = 1;
 pub const RETRY_IO: u16 = 2;
 pub const RETRY_CHANGED: u16 = 3;
+pub const METHOD_NODE_STATUS: u16 = 4;
+pub const METHOD_NODE_SHUTDOWN: u16 = 5;
+pub const METHOD_NODE_CLEANUP: u16 = 6;
+pub const METHOD_LOG_KLOG: u16 = 7;
+pub const METHOD_LOG_SYSLOG: u16 = 8;
+pub const METHOD_NET_INTERFACES: u16 = 9;
+pub const METHOD_NET_REACH: u16 = 10;
+pub const METHOD_NET_SPEEDTEST: u16 = 11;
+pub const METHOD_JOB_RUN: u16 = 20;
+pub const METHOD_JOB_LIST: u16 = 21;
+pub const METHOD_FS_VOLUMES: u16 = 32;
+pub const METHOD_FS_LIST: u16 = 33;
+pub const METHOD_FS_STAT: u16 = 34;
+pub const METHOD_FS_MKDIR: u16 = 35;
+pub const METHOD_FS_RENAME: u16 = 36;
+pub const METHOD_FS_CHMOD: u16 = 37;
+pub const METHOD_FS_READ: u16 = 38;
+pub const METHOD_FS_WRITE: u16 = 39;
+pub const METHOD_FS_MOUNT: u16 = 40;
+pub const METHOD_FS_UNMOUNT: u16 = 41;
+pub const METHOD_FS_MOUNT_PKG: u16 = 42;
+pub const METHOD_FS_MOUNT_LWFS: u16 = 43;
+pub const METHOD_APP_REGISTER: u16 = 48;
+pub const METHOD_APP_UNREGISTER: u16 = 49;
+pub const METHOD_APP_LAUNCH: u16 = 50;
+pub const METHOD_APP_LIST: u16 = 51;
+pub const METHOD_APP_LAUNCH_BROWSER: u16 = 52;
+pub const METHOD_APP_LIFECYCLE: u16 = 53;
+pub const METHOD_APP_INFO_QUERY: u16 = 54;
+pub const METHOD_APP_INFO_SET: u16 = 55;
+pub const METHOD_APP_DB_QUERY: u16 = 56;
+pub const METHOD_PROC_FOCUS: u16 = 57;
+pub const METHOD_PROC_LIST: u16 = 58;
+pub const METHOD_PROC_PROCESS_LIST: u16 = 59;
+pub const METHOD_PROC_KILL: u16 = 60;
+pub const METHOD_PROC_MODULES: u16 = 61;
+pub const METHOD_SAVES_LIST: u16 = 64;
+pub const METHOD_SHOTS_LIST: u16 = 65;
+pub const METHOD_VIDEOS_LIST: u16 = 66;
+pub const METHOD_INDEX_START: u16 = 67;
+pub const METHOD_INDEX_STATUS: u16 = 68;
+pub const METHOD_INDEX_SEARCH: u16 = 69;
+pub const METHOD_INDEX_CANCEL: u16 = 70;
+pub const METHOD_HW_INFO: u16 = 72;
+pub const METHOD_HW_TEMPS: u16 = 73;
+pub const METHOD_HW_POWER: u16 = 74;
+pub const METHOD_HW_STORAGE: u16 = 75;
+pub const METHOD_HW_FAN_THRESHOLD: u16 = 76;
+pub const METHOD_HW_FAN_CURVE_SET: u16 = 77;
+pub const METHOD_HW_FAN_CURVE_GET: u16 = 78;
+pub const METHOD_HW_DRIVE_SENSORS: u16 = 79;
+pub const METHOD_POWER_CONTROL: u16 = 80;
+pub const METHOD_POWER_TELEMETRY: u16 = 81;
+pub const METHOD_TIME_GET: u16 = 82;
+pub const METHOD_TIME_SET: u16 = 83;
+pub const METHOD_TIME_STATE_GET: u16 = 84;
+pub const METHOD_TIME_STATE_SET: u16 = 85;
+pub const METHOD_PERIPH_CONTROL: u16 = 86;
+pub const METHOD_SHELL_EXEC: u16 = 87;
+pub const METHOD_PROFILE_INFO: u16 = 88;
+pub const METHOD_PROFILE_SET_USERNAME: u16 = 89;
+pub const METHOD_PROFILE_ACTIVATE: u16 = 90;
+pub const METHOD_PROFILE_APPLY_AVATAR: u16 = 91;
+pub const METHOD_PROFILE_CLEAR_SLOT: u16 = 92;
+pub const METHOD_PROFILE_SET_LOCAL_USERNAME: u16 = 93;
+pub const METHOD_USER_LIST: u16 = 94;
+pub const METHOD_USER_CREATE: u16 = 95;
+pub const METHOD_USER_DELETE: u16 = 96;
+pub const METHOD_BACKUP_LIST: u16 = 98;
+pub const METHOD_BACKUP_DELETE: u16 = 100;
+pub const METHOD_CHEATS_LIST: u16 = 104;
+pub const METHOD_CHEATS_GET: u16 = 105;
+pub const METHOD_CHEATS_TOGGLE: u16 = 106;
+pub const METHOD_CHEATS_DELETE: u16 = 107;
+pub const METHOD_CHEATS_RELOAD: u16 = 108;
+pub const METHOD_CHEATS_STATUS: u16 = 109;
+pub const METHOD_CHEATS_ENGINE_SET: u16 = 110;
+pub const METHOD_SMP_META_CONTROL: u16 = 112;
+pub const METHOD_SMP_META_STATS: u16 = 113;
+pub const METHOD_SDK_SCAN: u16 = 114;
+pub const METHOD_SDK_PATCH: u16 = 115;
+pub const METHOD_SDK_RESTORE: u16 = 116;
+pub const METHOD_TMDB_FETCH: u16 = 117;
+pub const METHOD_TMDB_STORE: u16 = 118;
+pub const METHOD_FTP_START: u16 = 119;
+pub const METHOD_FTP_STATUS: u16 = 120;
+pub const METHOD_FWSPOOF_STATUS: u16 = 121;
+pub const METHOD_NOTIF_LIST: u16 = 122;
+pub const METHOD_NOTIF_SEND: u16 = 123;
+pub const METHOD_NOTIF_CLEAR: u16 = 124;
+pub const METHOD_TOAST_SEND: u16 = 125;
+pub const METHOD_ACTIVITY_GET: u16 = 126;
+pub const METHOD_ACTIVITY_DB_QUERY: u16 = 127;
+pub const METHOD_ACTIVITY_RESET: u16 = 128;
+pub const METHOD_RP_REQUEST: u16 = 136;
+pub const METHOD_RP_STATUS: u16 = 137;
+pub const METHOD_RP_CANCEL: u16 = 138;
+pub const METHOD_RP_READINESS: u16 = 139;
+pub const METHOD_RP_ENABLE: u16 = 140;
+pub const METHOD_RP_DEVICES: u16 = 141;
+pub const JOB_OP_DELETE: u8 = 1;
+pub const JOB_OP_CHMOD_R: u8 = 2;
+pub const JOB_OP_HASH: u8 = 3;
+pub const JOB_OP_CRC32: u8 = 4;
+pub const JOB_OP_FSCK: u8 = 5;
+pub const JOB_OP_BACKUP_SNAPSHOT: u8 = 6;
+pub const JOB_OP_BACKUP_RESTORE: u8 = 7;
+pub const JOB_OP_CLEANUP: u8 = 8;
+pub const JOB_OP_SDK_SCAN: u8 = 9;
+pub const ENTRY_LINK: u8 = 2;
+pub const ENTRY_OTHER: u8 = 3;
+pub const ENTRY_UNKNOWN: u8 = 4;
+pub const RPC_TEXT_MAX: u32 = 262128;
+pub const FS_READ_MAX: u32 = 262128;
+pub const FSW_CHUNK_MAX: u32 = 49152;
+pub const FSR_UNSAFE: u32 = 1;
+pub const FSW_APPEND: u32 = 1;
+pub const FSW_AT_OFFSET: u32 = 2;
+pub const FSW_COMMIT: u32 = 4;
+pub const FSW_CREATE: u32 = 8;
+pub const FSW_OVERWRITE: u32 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Hs1 {
@@ -1164,6 +1286,8 @@ pub struct Status {
     pub sequential: u8,
     pub current: Option<String>,
     pub state: Option<u8>,
+    pub result: Option<Vec<u8>>,
+    pub code: Option<u16>,
 }
 
 impl Message for Status {
@@ -1183,9 +1307,13 @@ impl Message for Status {
         let mut ext_n: u16 = 0;
         if self.current.is_some() { ext_n += 1; }
         if self.state.is_some() { ext_n += 1; }
+        if self.result.is_some() { ext_n += 1; }
+        if self.code.is_some() { ext_n += 1; }
         w.u16(ext_n);
         if let Some(v) = &self.current { w.ext(1, |w| { w.str(v) })?; }
         if let Some(v) = &self.state { w.ext(2, |w| { w.u8(*v); Ok(()) })?; }
+        if let Some(v) = &self.result { w.ext(3, |w| { w.bytes(v) })?; }
+        if let Some(v) = &self.code { w.ext(4, |w| { w.u16(*v); Ok(()) })?; }
         Ok(())
     }
 
@@ -1218,6 +1346,18 @@ impl Message for Status {
                     if m.state.is_some() { return Err(DecodeError::DupExt(2)); }
                     let mut vr = Reader::new(v);
                     m.state = Some(vr.u8()?);
+                    vr.finish()?;
+                }
+                3 => {
+                    if m.result.is_some() { return Err(DecodeError::DupExt(3)); }
+                    let mut vr = Reader::new(v);
+                    m.result = Some(vr.bytes()?);
+                    vr.finish()?;
+                }
+                4 => {
+                    if m.code.is_some() { return Err(DecodeError::DupExt(4)); }
+                    let mut vr = Reader::new(v);
+                    m.code = Some(vr.u16()?);
                     vr.finish()?;
                 }
                 _ => {}
@@ -1979,6 +2119,660 @@ impl Message for DiskCalibrateResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MgmtText {
+    pub body: Vec<u8>,
+    pub more: Option<u8>,
+}
+
+impl Message for MgmtText {
+    const NAME: &'static str = "MgmtText";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.bytes(&self.body)?;
+        let mut ext_n: u16 = 0;
+        if self.more.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.more { w.ext(1, |w| { w.u8(*v); Ok(()) })?; }
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.body = r.bytes()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            match tag {
+                1 => {
+                    if m.more.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.more = Some(vr.u8()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NodeStatus {
+    pub version: String,
+    pub ps5_kernel: String,
+    pub instance_id: u64,
+    pub started_at_unix: u64,
+    pub command_count: u64,
+    pub startup_reason: u16,
+    pub ucred_elevated: u8,
+    pub max_transfer_streams: u8,
+    pub fan_threshold: u16,
+    pub fan_reapply_sec: u16,
+    pub prior_instance: Option<String>,
+}
+
+impl Message for NodeStatus {
+    const NAME: &'static str = "NodeStatus";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.str(&self.version)?;
+        w.str(&self.ps5_kernel)?;
+        w.u64(self.instance_id);
+        w.u64(self.started_at_unix);
+        w.u64(self.command_count);
+        w.u16(self.startup_reason);
+        w.u8(self.ucred_elevated);
+        w.u8(self.max_transfer_streams);
+        w.u16(self.fan_threshold);
+        w.u16(self.fan_reapply_sec);
+        let mut ext_n: u16 = 0;
+        if self.prior_instance.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.prior_instance { w.ext(1, |w| { w.str(v) })?; }
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.version = r.str()?;
+        m.ps5_kernel = r.str()?;
+        m.instance_id = r.u64()?;
+        m.started_at_unix = r.u64()?;
+        m.command_count = r.u64()?;
+        m.startup_reason = r.u16()?;
+        m.ucred_elevated = r.u8()?;
+        m.max_transfer_streams = r.u8()?;
+        m.fan_threshold = r.u16()?;
+        m.fan_reapply_sec = r.u16()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            match tag {
+                1 => {
+                    if m.prior_instance.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.prior_instance = Some(vr.str()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FsList {
+    pub path: String,
+    pub offset: u32,
+    pub limit: u16,
+}
+
+impl Message for FsList {
+    const NAME: &'static str = "FsList";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.str(&self.path)?;
+        w.u32(self.offset);
+        w.u16(self.limit);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.path = r.str()?;
+        m.offset = r.u32()?;
+        m.limit = r.u16()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FsEntry {
+    pub name: String,
+    pub kind: u8,
+    pub size: u64,
+    pub mtime: Option<u64>,
+    pub mode: Option<u32>,
+}
+
+impl Message for FsEntry {
+    const NAME: &'static str = "FsEntry";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.str(&self.name)?;
+        w.u8(self.kind);
+        w.u64(self.size);
+        let mut ext_n: u16 = 0;
+        if self.mtime.is_some() { ext_n += 1; }
+        if self.mode.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.mtime { w.ext(1, |w| { w.u64(*v); Ok(()) })?; }
+        if let Some(v) = &self.mode { w.ext(2, |w| { w.u32(*v); Ok(()) })?; }
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.name = r.str()?;
+        m.kind = r.u8()?;
+        m.size = r.u64()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            match tag {
+                1 => {
+                    if m.mtime.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.mtime = Some(vr.u64()?);
+                    vr.finish()?;
+                }
+                2 => {
+                    if m.mode.is_some() { return Err(DecodeError::DupExt(2)); }
+                    let mut vr = Reader::new(v);
+                    m.mode = Some(vr.u32()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FsListResult {
+    pub entries: Vec<FsEntry>,
+    pub total_scanned: u32,
+    pub more: u8,
+}
+
+impl Message for FsListResult {
+    const NAME: &'static str = "FsListResult";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.records(&self.entries)?;
+        w.u32(self.total_scanned);
+        w.u8(self.more);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.entries = r.records::<FsEntry>()?;
+        m.total_scanned = r.u32()?;
+        m.more = r.u8()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FsPath {
+    pub path: String,
+}
+
+impl Message for FsPath {
+    const NAME: &'static str = "FsPath";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.str(&self.path)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.path = r.str()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FsStat {
+    pub kind: u8,
+    pub size: u64,
+    pub mtime: u64,
+    pub mode: u32,
+    pub dev: u64,
+}
+
+impl Message for FsStat {
+    const NAME: &'static str = "FsStat";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u8(self.kind);
+        w.u64(self.size);
+        w.u64(self.mtime);
+        w.u32(self.mode);
+        w.u64(self.dev);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.kind = r.u8()?;
+        m.size = r.u64()?;
+        m.mtime = r.u64()?;
+        m.mode = r.u32()?;
+        m.dev = r.u64()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FsMkdir {
+    pub path: String,
+    pub mode: u32,
+    pub parents: u8,
+}
+
+impl Message for FsMkdir {
+    const NAME: &'static str = "FsMkdir";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.str(&self.path)?;
+        w.u32(self.mode);
+        w.u8(self.parents);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.path = r.str()?;
+        m.mode = r.u32()?;
+        m.parents = r.u8()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FsRename {
+    pub from: String,
+    pub to: String,
+    pub overwrite: u8,
+}
+
+impl Message for FsRename {
+    const NAME: &'static str = "FsRename";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.str(&self.from)?;
+        w.str(&self.to)?;
+        w.u8(self.overwrite);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.from = r.str()?;
+        m.to = r.str()?;
+        m.overwrite = r.u8()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FsChmod {
+    pub path: String,
+    pub mode: u32,
+}
+
+impl Message for FsChmod {
+    const NAME: &'static str = "FsChmod";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.str(&self.path)?;
+        w.u32(self.mode);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.path = r.str()?;
+        m.mode = r.u32()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FsRead {
+    pub path: String,
+    pub offset: u64,
+    pub len: u32,
+    pub flags: u32,
+}
+
+impl Message for FsRead {
+    const NAME: &'static str = "FsRead";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.str(&self.path)?;
+        w.u64(self.offset);
+        w.u32(self.len);
+        w.u32(self.flags);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.path = r.str()?;
+        m.offset = r.u64()?;
+        m.len = r.u32()?;
+        m.flags = r.u32()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FsReadResult {
+    pub data: Vec<u8>,
+    pub eof: u8,
+}
+
+impl Message for FsReadResult {
+    const NAME: &'static str = "FsReadResult";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.bytes(&self.data)?;
+        w.u8(self.eof);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.data = r.bytes()?;
+        m.eof = r.u8()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FsWrite {
+    pub path: String,
+    pub offset: u64,
+    pub flags: u32,
+    pub data: Vec<u8>,
+    pub mode: Option<u32>,
+}
+
+impl Message for FsWrite {
+    const NAME: &'static str = "FsWrite";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.str(&self.path)?;
+        w.u64(self.offset);
+        w.u32(self.flags);
+        w.bytes(&self.data)?;
+        let mut ext_n: u16 = 0;
+        if self.mode.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.mode { w.ext(1, |w| { w.u32(*v); Ok(()) })?; }
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.path = r.str()?;
+        m.offset = r.u64()?;
+        m.flags = r.u32()?;
+        m.data = r.bytes()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            match tag {
+                1 => {
+                    if m.mode.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.mode = Some(vr.u32()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobRun {
+    pub job_id: [u8; 16],
+    pub op: u8,
+    pub args: Vec<u8>,
+}
+
+impl Message for JobRun {
+    const NAME: &'static str = "JobRun";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u8(self.op);
+        w.bytes(&self.args)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.op = r.u8()?;
+        m.args = r.bytes()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobEntry {
+    pub job_id: [u8; 16],
+    pub kind: u8,
+    pub state: u8,
+    pub files_done: u32,
+    pub files_total: u32,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+impl Message for JobEntry {
+    const NAME: &'static str = "JobEntry";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.job_id);
+        w.u8(self.kind);
+        w.u8(self.state);
+        w.u32(self.files_done);
+        w.u32(self.files_total);
+        w.u64(self.bytes_done);
+        w.u64(self.bytes_total);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.job_id = r.fixed::<16>()?;
+        m.kind = r.u8()?;
+        m.state = r.u8()?;
+        m.files_done = r.u32()?;
+        m.files_total = r.u32()?;
+        m.bytes_done = r.u64()?;
+        m.bytes_total = r.u64()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobListResult {
+    pub jobs: Vec<JobEntry>,
+}
+
+impl Message for JobListResult {
+    const NAME: &'static str = "JobListResult";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.records(&self.jobs)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.jobs = r.records::<JobEntry>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct JnlOpen {
     pub job_id: [u8; 16],
     pub manifest_hash: [u8; 32],
@@ -2156,7 +2950,7 @@ impl Message for JnlDone {
 }
 
 /// Every message and struct, by name (conformance tests).
-pub const ALL: &[&str] = &["Hs1", "Hs2", "Hs3", "Welcome", "PairConfirm", "PairResult", "Join", "JoinAck", "Ping", "Pong", "Error", "Bye", "RpcRequest", "RpcResponse", "JobOpen", "JobOpenAck", "ManifestPage", "ManifestEnd", "JobMap", "Resume", "Chunk", "Bundle", "Received", "Credit", "Durable", "FileRoot", "FileRetry", "Status", "JobDone", "JobCancel", "NodeInfo", "HelloInfo", "ServerInfo", "ClientInfo", "PairingOpen", "CryptoBench", "CryptoBenchResult", "ManifestEntry", "FileRun", "FileRange", "BundleRecord", "RootItem", "JobCopy", "JobRef", "DiskCalibrate", "CalPoint", "DiskCalibrateResult", "JnlOpen", "JnlBatch", "JnlReset", "JnlSnapshot", "JnlDone", ];
+pub const ALL: &[&str] = &["Hs1", "Hs2", "Hs3", "Welcome", "PairConfirm", "PairResult", "Join", "JoinAck", "Ping", "Pong", "Error", "Bye", "RpcRequest", "RpcResponse", "JobOpen", "JobOpenAck", "ManifestPage", "ManifestEnd", "JobMap", "Resume", "Chunk", "Bundle", "Received", "Credit", "Durable", "FileRoot", "FileRetry", "Status", "JobDone", "JobCancel", "NodeInfo", "HelloInfo", "ServerInfo", "ClientInfo", "PairingOpen", "CryptoBench", "CryptoBenchResult", "ManifestEntry", "FileRun", "FileRange", "BundleRecord", "RootItem", "JobCopy", "JobRef", "DiskCalibrate", "CalPoint", "DiskCalibrateResult", "MgmtText", "NodeStatus", "FsList", "FsEntry", "FsListResult", "FsPath", "FsStat", "FsMkdir", "FsRename", "FsChmod", "FsRead", "FsReadResult", "FsWrite", "JobRun", "JobEntry", "JobListResult", "JnlOpen", "JnlBatch", "JnlReset", "JnlSnapshot", "JnlDone", ];
 
 #[doc(hidden)]
 pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
@@ -2188,7 +2982,7 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "Durable" => Durable { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, files: vec![FileRun::default(); rng.below(3) as usize], ranges: vec![FileRange::default(); rng.below(3) as usize], }.to_bytes().ok(),
         "FileRoot" => FileRoot { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, file_id: rng.next_u64() as u32, root: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, }.to_bytes().ok(),
         "FileRetry" => FileRetry { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, file_id: rng.next_u64() as u32, reason: rng.next_u64() as u16, }.to_bytes().ok(),
-        "Status" => Status { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, files_done: rng.next_u64() as u32, files_total: rng.next_u64() as u32, bytes_received: rng.next_u64(), bytes_durable: rng.next_u64(), bytes_total: rng.next_u64(), bottleneck: rng.next_u64() as u8, workers: rng.next_u64() as u8, lanes: rng.next_u64() as u8, sequential: rng.next_u64() as u8, current: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, state: if rng.below(2) == 1 { Some(rng.next_u64() as u8) } else { None }, }.to_bytes().ok(),
+        "Status" => Status { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, files_done: rng.next_u64() as u32, files_total: rng.next_u64() as u32, bytes_received: rng.next_u64(), bytes_durable: rng.next_u64(), bytes_total: rng.next_u64(), bottleneck: rng.next_u64() as u8, workers: rng.next_u64() as u8, lanes: rng.next_u64() as u8, sequential: rng.next_u64() as u8, current: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, state: if rng.below(2) == 1 { Some(rng.next_u64() as u8) } else { None }, result: if rng.below(2) == 1 { Some({ let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }) } else { None }, code: if rng.below(2) == 1 { Some(rng.next_u64() as u16) } else { None }, }.to_bytes().ok(),
         "JobDone" => JobDone { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, status: rng.next_u64() as u16, files: rng.next_u64() as u32, bytes: rng.next_u64(), message: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
         "JobCancel" => JobCancel { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, reason: rng.next_u64() as u16, }.to_bytes().ok(),
         "NodeInfo" => NodeInfo { version: rng.ascii(20), platform: rng.ascii(20), name: rng.ascii(20), firmware: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
@@ -2208,6 +3002,22 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "DiskCalibrate" => DiskCalibrate { dir: rng.ascii(20), files: rng.next_u64() as u32, size: rng.next_u64() as u32, }.to_bytes().ok(),
         "CalPoint" => CalPoint { workers: rng.next_u64() as u8, files_per_s: rng.next_u64() as u32, create_us: rng.next_u64() as u32, fsync_us: rng.next_u64() as u32, }.to_bytes().ok(),
         "DiskCalibrateResult" => DiskCalibrateResult { points: vec![CalPoint::default(); rng.below(3) as usize], }.to_bytes().ok(),
+        "MgmtText" => MgmtText { body: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, more: if rng.below(2) == 1 { Some(rng.next_u64() as u8) } else { None }, }.to_bytes().ok(),
+        "NodeStatus" => NodeStatus { version: rng.ascii(20), ps5_kernel: rng.ascii(20), instance_id: rng.next_u64(), started_at_unix: rng.next_u64(), command_count: rng.next_u64(), startup_reason: rng.next_u64() as u16, ucred_elevated: rng.next_u64() as u8, max_transfer_streams: rng.next_u64() as u8, fan_threshold: rng.next_u64() as u16, fan_reapply_sec: rng.next_u64() as u16, prior_instance: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
+        "FsList" => FsList { path: rng.ascii(20), offset: rng.next_u64() as u32, limit: rng.next_u64() as u16, }.to_bytes().ok(),
+        "FsEntry" => FsEntry { name: rng.ascii(20), kind: rng.next_u64() as u8, size: rng.next_u64(), mtime: if rng.below(2) == 1 { Some(rng.next_u64()) } else { None }, mode: if rng.below(2) == 1 { Some(rng.next_u64() as u32) } else { None }, }.to_bytes().ok(),
+        "FsListResult" => FsListResult { entries: vec![FsEntry::default(); rng.below(3) as usize], total_scanned: rng.next_u64() as u32, more: rng.next_u64() as u8, }.to_bytes().ok(),
+        "FsPath" => FsPath { path: rng.ascii(20), }.to_bytes().ok(),
+        "FsStat" => FsStat { kind: rng.next_u64() as u8, size: rng.next_u64(), mtime: rng.next_u64(), mode: rng.next_u64() as u32, dev: rng.next_u64(), }.to_bytes().ok(),
+        "FsMkdir" => FsMkdir { path: rng.ascii(20), mode: rng.next_u64() as u32, parents: rng.next_u64() as u8, }.to_bytes().ok(),
+        "FsRename" => FsRename { from: rng.ascii(20), to: rng.ascii(20), overwrite: rng.next_u64() as u8, }.to_bytes().ok(),
+        "FsChmod" => FsChmod { path: rng.ascii(20), mode: rng.next_u64() as u32, }.to_bytes().ok(),
+        "FsRead" => FsRead { path: rng.ascii(20), offset: rng.next_u64(), len: rng.next_u64() as u32, flags: rng.next_u64() as u32, }.to_bytes().ok(),
+        "FsReadResult" => FsReadResult { data: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, eof: rng.next_u64() as u8, }.to_bytes().ok(),
+        "FsWrite" => FsWrite { path: rng.ascii(20), offset: rng.next_u64(), flags: rng.next_u64() as u32, data: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, mode: if rng.below(2) == 1 { Some(rng.next_u64() as u32) } else { None }, }.to_bytes().ok(),
+        "JobRun" => JobRun { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, op: rng.next_u64() as u8, args: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
+        "JobEntry" => JobEntry { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, kind: rng.next_u64() as u8, state: rng.next_u64() as u8, files_done: rng.next_u64() as u32, files_total: rng.next_u64() as u32, bytes_done: rng.next_u64(), bytes_total: rng.next_u64(), }.to_bytes().ok(),
+        "JobListResult" => JobListResult { jobs: vec![JobEntry::default(); rng.below(3) as usize], }.to_bytes().ok(),
         "JnlOpen" => JnlOpen { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, manifest_hash: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, kind: rng.next_u64() as u8, flags: rng.next_u64() as u32, staged: rng.next_u64() as u8, root: rng.ascii(20), }.to_bytes().ok(),
         "JnlBatch" => JnlBatch { files: vec![FileRun::default(); rng.below(3) as usize], ranges: vec![FileRange::default(); rng.below(3) as usize], roots: vec![RootItem::default(); rng.below(3) as usize], }.to_bytes().ok(),
         "JnlReset" => JnlReset { file_id: rng.next_u64() as u32, }.to_bytes().ok(),
@@ -2270,6 +3080,22 @@ pub fn roundtrip(name: &str, bytes: &[u8]) -> Option<Result<Vec<u8>, String>> {
         "DiskCalibrate" => rt::<DiskCalibrate>(bytes),
         "CalPoint" => rt::<CalPoint>(bytes),
         "DiskCalibrateResult" => rt::<DiskCalibrateResult>(bytes),
+        "MgmtText" => rt::<MgmtText>(bytes),
+        "NodeStatus" => rt::<NodeStatus>(bytes),
+        "FsList" => rt::<FsList>(bytes),
+        "FsEntry" => rt::<FsEntry>(bytes),
+        "FsListResult" => rt::<FsListResult>(bytes),
+        "FsPath" => rt::<FsPath>(bytes),
+        "FsStat" => rt::<FsStat>(bytes),
+        "FsMkdir" => rt::<FsMkdir>(bytes),
+        "FsRename" => rt::<FsRename>(bytes),
+        "FsChmod" => rt::<FsChmod>(bytes),
+        "FsRead" => rt::<FsRead>(bytes),
+        "FsReadResult" => rt::<FsReadResult>(bytes),
+        "FsWrite" => rt::<FsWrite>(bytes),
+        "JobRun" => rt::<JobRun>(bytes),
+        "JobEntry" => rt::<JobEntry>(bytes),
+        "JobListResult" => rt::<JobListResult>(bytes),
         "JnlOpen" => rt::<JnlOpen>(bytes),
         "JnlBatch" => rt::<JnlBatch>(bytes),
         "JnlReset" => rt::<JnlReset>(bytes),

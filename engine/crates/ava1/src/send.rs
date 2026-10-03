@@ -44,6 +44,10 @@ pub struct SendOptions {
     pub cancel: Arc<AtomicBool>,
     /// Bytes/s the sender paces its lanes to, when the link itself is not the limit.
     pub bandwidth_cap: Option<u64>,
+    /// A forward-only source (7z, solid RAR; SPEC.md §17). When set, one decode thread
+    /// replaces the random-access readers and `run_upload`'s `Source` is used only for
+    /// its `close()`.
+    pub seq: Option<Arc<dyn crate::seq::SeqSource>>,
 }
 
 impl SendOptions {
@@ -59,6 +63,7 @@ impl SendOptions {
             progress: Arc::default(),
             cancel: Arc::default(),
             bandwidth_cap: None,
+            seq: None,
         }
     }
 }
@@ -76,6 +81,12 @@ pub struct Progress {
     pub lanes: AtomicU8,
     pub bottleneck: AtomicU8,
     pub sequential: AtomicBool,
+    /// Files and bytes the receiver already had when the job first opened (its map's
+    /// done files): "skipped", not sent. Recorded by the first attempt only, so a
+    /// reconnect that finds the earlier attempt's files done does not call them skipped.
+    pub skipped_files: AtomicU64,
+    pub skipped_bytes: AtomicU64,
+    pub skip_recorded: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -401,7 +412,7 @@ impl Shared {
     }
 }
 
-enum Read {
+pub(crate) enum Read {
     Record {
         file_id: u32,
         root: [u8; 32],
@@ -737,6 +748,11 @@ fn spawn_readers(
         }
     }));
     handles
+}
+
+/// The decode thread of a sequential source (SPEC.md §17).
+fn spawn_decoder(ctx: crate::seq::DecodeCtx) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || crate::seq::run(ctx))
 }
 
 /// Packs records into bundles; flushes a partial bundle when no record is waiting.
@@ -1078,6 +1094,16 @@ pub async fn run_upload(
         .map(|i| manifest.entry(*i).map_or(0, |e| e.size))
         .sum::<u64>()
         + need.partial.values().map(|r| r.covered()).sum::<u64>();
+    if !pg.skip_recorded.swap(true, Ordering::Relaxed) {
+        let done_files = need
+            .done
+            .iter()
+            .filter_map(|i| manifest.entry(*i))
+            .filter(|e| e.kind == gen::ENTRY_FILE);
+        let (n, b) = done_files.fold((0u64, 0u64), |(n, b), e| (n + 1, b + e.size));
+        pg.skipped_files.store(n, Ordering::Relaxed);
+        pg.skipped_bytes.store(b, Ordering::Relaxed);
+    }
     pg.bytes_durable.store(done_bytes, Ordering::Relaxed);
     pg.files_durable
         .store(durable_files.len() as u64, Ordering::Relaxed);
@@ -1101,16 +1127,41 @@ pub async fn run_upload(
     let large_q = Arc::new(Mutex::new(large));
     let (rtx, mut rrx) = mpsc::unbounded_channel();
     let stop = Arc::new(AtomicBool::new(false));
-    let mut readers = spawn_readers(
-        manifest.clone(),
-        source.clone(),
-        small_q.clone(),
-        large_q.clone(),
-        sh.clone(),
-        &opts,
-        rtx.clone(),
-        stop.clone(),
-    );
+    let seq_retries = Arc::new(crate::seq::Retries::default());
+    let mut readers = if let Some(seq) = opts.seq.clone() {
+        // One decode thread for a forward-only source (SPEC.md §17).
+        let chunk_sh = sh.clone();
+        vec![spawn_decoder(crate::seq::DecodeCtx {
+            seq,
+            manifest: manifest.clone(),
+            need: need.clone(),
+            cutoff: opts.cutoff,
+            persist: opts.persist.clone(),
+            budget: sh.bytes_budget.clone(),
+            chunk: Box::new(move || {
+                // I2: never larger than the credit already granted (see the large reader).
+                let grant = chunk_sh.window.lock().unwrap().available();
+                let chunk = chunk_sh.chunk.load(Ordering::Relaxed) as u64;
+                (chunk.min(grant.saturating_sub(CHUNK_HDR)) / GROUP * GROUP).max(GROUP)
+            }),
+            tx: rtx.clone(),
+            stop: stop.clone(),
+            cancel: opts.cancel.clone(),
+            retries: seq_retries.clone(),
+            rt: tokio::runtime::Handle::current(),
+        })]
+    } else {
+        spawn_readers(
+            manifest.clone(),
+            source.clone(),
+            small_q.clone(),
+            large_q.clone(),
+            sh.clone(),
+            &opts,
+            rtx.clone(),
+            stop.clone(),
+        )
+    };
 
     // Lanes: the governor's starting count is opened at the top of the loop below
     // (client side), so an open failure breaks into the teardown like every other
@@ -1354,13 +1405,18 @@ pub async fn run_upload(
                             if let Some(d) = &opts.persist {
                                 let _ = std::fs::remove_file(d.join(format!("{}.ob", r.file_id)));
                             }
-                            if entry.size < opts.cutoff {
+                            if opts.seq.is_some() {
+                                // The decode thread runs a further pass for this file.
+                                seq_retries.push(r.file_id);
+                            } else if entry.size < opts.cutoff {
                                 small_q.lock().unwrap().push_back(r.file_id);
                             } else {
                                 large_q.lock().unwrap().push_back((r.file_id, RangeSet::new()));
                             }
                             // The reader threads may have exited; start a fresh set for the retried file.
-                            readers.extend(spawn_readers(manifest.clone(), source.clone(), small_q.clone(), large_q.clone(), sh.clone(), &opts, rtx.clone(), stop.clone()));
+                            if opts.seq.is_none() {
+                                readers.extend(spawn_readers(manifest.clone(), source.clone(), small_q.clone(), large_q.clone(), sh.clone(), &opts, rtx.clone(), stop.clone()));
+                            }
                         }
                         Err(e) => break Err(SendError::Protocol(e.to_string())),
                     },
@@ -1467,6 +1523,9 @@ pub async fn run_upload(
     stop.store(true, Ordering::Relaxed);
     sh.wake();
     source.close();
+    if let Some(seq) = &opts.seq {
+        seq.close();
+    }
     for (_, h) in lane_tasks.drain() {
         h.abort();
         let _ = h.await;

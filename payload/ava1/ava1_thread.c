@@ -3,11 +3,15 @@
 #include <time.h>
 
 int ava1_thread_start(void *(*fn)(void *), void *arg, pthread_t *out) {
+    return ava1_thread_start_stack(fn, arg, out, AVA1_THREAD_STACK);
+}
+
+int ava1_thread_start_stack(void *(*fn)(void *), void *arg, pthread_t *out, size_t stack) {
     pthread_attr_t attr;
     pthread_t t;
     int rc;
     if (pthread_attr_init(&attr) != 0) return -1;
-    if (pthread_attr_setstacksize(&attr, AVA1_THREAD_STACK) != 0) {
+    if (pthread_attr_setstacksize(&attr, stack) != 0) {
         pthread_attr_destroy(&attr);
         return -1;
     }

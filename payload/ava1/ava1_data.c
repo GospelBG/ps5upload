@@ -228,6 +228,25 @@ void ava1_rpc_msg(uint8_t *out, size_t cap, size_t *out_len, const char *fmt, ..
     *out_len = (size_t)n >= cap ? cap - 1 : (size_t)n;
 }
 
+int ava1_rpc_text(uint8_t *out, size_t cap, size_t *out_len, const char *fmt, ...) {
+    static const char cause[] = "reply truncated";
+    va_list ap;
+    int n;
+    *out_len = 0;
+    if (!cap) return AVA1_ERR_INTERNAL;
+    va_start(ap, fmt);
+    n = vsnprintf((char *)out, cap, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap) {
+        size_t c = sizeof cause - 1 < cap ? sizeof cause - 1 : cap;
+        memcpy(out, cause, c);
+        *out_len = c;
+        return AVA1_ERR_INTERNAL;
+    }
+    *out_len = (size_t)n;
+    return AVA1_STATUS_OK;
+}
+
 int ava1_data_start(const ava1_data_cfg_t *cfg) {
     if (D.running) return -EBUSY; /* one housekeeping thread; a second start changes nothing */
     D.cfg = *cfg;

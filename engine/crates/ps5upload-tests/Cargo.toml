@@ -16,3 +16,4 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # feature (encoder) is test-only and pure Rust (lzma-rust2/encoder); the
 # production engine crate pins sevenz-rust2 with default-features=false.
 sevenz-rust2 = { version = "0.23", features = ["compress"] }
+crc32fast = "1"

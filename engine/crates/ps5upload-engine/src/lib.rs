@@ -1058,6 +1058,67 @@ fn spawn_progress_ticker(
     stop
 }
 
+/// `(skipped files, skipped bytes, files sent)` from an AVA1 commit ack, when it has them.
+fn ava1_skip_counts(ack: &str) -> Option<(u64, u64, u64)> {
+    let v: serde_json::Value = serde_json::from_str(ack).ok()?;
+    Some((
+        v["skipped_files"].as_u64()?,
+        v["skipped_bytes"].as_u64()?,
+        v["files_sent"].as_u64()?,
+    ))
+}
+
+/// While an AVA1 skip-existing job reads the whole source up front (the `verify` policy),
+/// shows it as a "verify" stage with the bytes hashed so far. The upload bar itself stays
+/// at 0 meanwhile; the existing Upload screen does not render `stage`, so this is carried
+/// in the job snapshot for any client that wants it. Ends when hashing completes or `stop`.
+fn spawn_verify_stage(
+    jobs: Arc<Mutex<HashMap<Uuid, JobState>>>,
+    events_tx: broadcast::Sender<String>,
+    job_id: Uuid,
+    hashed: Arc<AtomicU64>,
+    total: u64,
+    stop: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut last = u64::MAX;
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let done = hashed.load(Ordering::Relaxed).min(total);
+            if done == last {
+                continue;
+            }
+            last = done;
+            let finished = done >= total;
+            let snapshot = {
+                let mut g = jobs.lock().unwrap_or_else(|e| e.into_inner());
+                match g.get_mut(&job_id) {
+                    Some(JobState::Running { stage, .. }) => {
+                        *stage = (!finished).then(|| JobStage {
+                            id: "verify".into(),
+                            index: 1,
+                            count: 2,
+                            done,
+                            total,
+                        });
+                        g.get(&job_id).cloned()
+                    }
+                    _ => None,
+                }
+            };
+            let Some(state) = snapshot else { break };
+            let msg = serde_json::json!({ "job_id": job_id.to_string(), "job": state });
+            let _ = events_tx.send(msg.to_string());
+            if finished {
+                break;
+            }
+        }
+    });
+}
+
 /// RAII guard that flips the ticker's stop flag when dropped, so a
 /// panic between `spawn_progress_ticker` and the handler's manual
 /// `stop_ticker.store(true)` doesn't leak the spawned tokio task
@@ -1376,6 +1437,11 @@ struct TransferDirReq {
     excludes: Vec<String>,
     #[serde(default)]
     bandwidth_cap_mbps: Option<f64>,
+    /// "fast" | "safe": skip files the console already has (the Resume strategy).
+    /// Honoured on AVA1 consoles, where the receiver decides; `/api/transfer/dir-reconcile`
+    /// sets it when it hands a job to this handler.
+    #[serde(default)]
+    skip_existing: Option<String>,
 }
 
 /// Upload a `.zip`'s contents, decompressing on the host so files land
@@ -5089,8 +5155,18 @@ async fn transfer_file_handler(
             )
         };
         let files_sent_count: u64 = 1;
-        let skipped_files_count: u64 = 0;
-        let skipped_bytes_count: u64 = 0;
+        let mut skipped_files_count: u64 = 0;
+        let mut skipped_bytes_count: u64 = 0;
+        let mut files_sent_count = files_sent_count;
+        // An AVA1 job reports what the console already had (skip policies, SPEC §11.4)
+        // and the files actually sent; an all-skipped resume is "already up to date".
+        if let Some((sf, sb, fs)) = result
+            .as_ref()
+            .ok()
+            .and_then(|r| ava1_skip_counts(&r.commit_ack_body))
+        {
+            (skipped_files_count, skipped_bytes_count, files_sent_count) = (sf, sb, fs);
+        }
         match result {
             Ok(r) => {
                 let completed_at_ms = now_ms();
@@ -5156,6 +5232,20 @@ async fn transfer_dir_handler(
         TX_FLAG_RESUME
     } else {
         0
+    };
+
+    let skip_existing = match req.skip_existing.as_deref() {
+        None => None,
+        Some(m) => match ps5upload_ava1::upload::SkipMode::parse(m) {
+            Some(m) => Some(m),
+            None => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown skip_existing mode: {m}"),
+                )
+                .into_response();
+            }
+        },
     };
 
     let job_id = Uuid::new_v4();
@@ -5380,10 +5470,32 @@ async fn transfer_dir_handler(
             "transfer_dir: job={job_id} protocol={}",
             if use_ava1 { "ava1" } else { "ftx2" }
         );
+        if use_ava1 && skip_existing.is_some() {
+            let hashed = Arc::new(AtomicU64::new(0));
+            cfg.progress_verify = Some(Arc::clone(&hashed));
+            spawn_verify_stage(
+                Arc::clone(&jobs),
+                events_tx.clone(),
+                job_id,
+                hashed,
+                total_bytes,
+                Arc::clone(&_stop_guard.0),
+            );
+        }
         let result = if use_ava1 {
             // Resume is by job_id (the sender reopens with JobOpen); retries
             // live in the adapter's loop, so no flags/retry count here (C3).
-            ps5upload_ava1::upload::upload_dir(&cfg, tx_id, &req.dest_root, &src_path)
+            match skip_existing {
+                // The user's "skip existing" choice: the receiver compares (SPEC §11.4).
+                Some(mode) => ps5upload_ava1::upload::upload_dir_skip_existing(
+                    &cfg,
+                    tx_id,
+                    &req.dest_root,
+                    &src_path,
+                    mode,
+                ),
+                None => ps5upload_ava1::upload::upload_dir(&cfg, tx_id, &req.dest_root, &src_path),
+            }
         } else {
             transfer_dir_resumable(
                 &cfg,
@@ -7440,14 +7552,37 @@ async fn transfer_7z_handler(
             fail_guard.mark_succeeded();
             return;
         }
-        let result = transfer_7z_resumable(
-            &cfg,
-            tx_id,
-            &req.dest_root,
-            std::path::Path::new(&req.archive_path),
-            DEFAULT_RESUME_RETRIES,
-            initial_flags,
-        );
+        let ftx2 = |reason: Option<&str>| {
+            let mut r = transfer_7z_resumable(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                std::path::Path::new(&req.archive_path),
+                DEFAULT_RESUME_RETRIES,
+                initial_flags,
+            )?;
+            r.commit_ack_body = tag_ack_body(&r.commit_ack_body, "ftx2", reason);
+            Ok::<_, anyhow::Error>(r)
+        };
+        let result = if ps5upload_ava1::route::use_ava1(&addr) {
+            match ps5upload_ava1::upload::upload_7z(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                std::path::Path::new(&req.archive_path),
+            ) {
+                Err(e)
+                    if e.downcast_ref::<ps5upload_ava1::upload::SevenzUnsupported>()
+                        .is_some() =>
+                {
+                    crate::log_info!("transfer_7z: AVA1 fallback to FTX2: {e}");
+                    ftx2(Some("7z_unsupported_by_ava1"))
+                }
+                other => other,
+            }
+        } else {
+            ftx2(Some("ava1_unavailable"))
+        };
         match result {
             Ok(r) => {
                 let completed_at_ms = now_ms();
@@ -7664,15 +7799,41 @@ async fn transfer_rar_handler(
         // blip, or the payload's serial accept loop still draining the dropped
         // connection) burned both retries inside the first 1.5 s of backoff
         // and surfaced as "transfer_zip gave up after 2 retries".
-        let result = ps5upload_core::transfer::transfer_rar_resumable(
-            &cfg,
-            tx_id,
-            &req.dest_root,
-            std::path::Path::new(&req.archive_path),
-            req.password.as_deref(),
-            DEFAULT_RESUME_RETRIES,
-            initial_flags,
-        );
+        // The password stays in this request for the job's lifetime and is never
+        // logged; AVA1's resume passes reuse it from the RarSource.
+        let ftx2 = |reason: Option<&str>| {
+            let mut r = ps5upload_core::transfer::transfer_rar_resumable(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                std::path::Path::new(&req.archive_path),
+                req.password.as_deref(),
+                DEFAULT_RESUME_RETRIES,
+                initial_flags,
+            )?;
+            r.commit_ack_body = tag_ack_body(&r.commit_ack_body, "ftx2", reason);
+            Ok::<_, anyhow::Error>(r)
+        };
+        let result = if ps5upload_ava1::route::use_ava1(&addr) {
+            match ps5upload_ava1::upload::upload_rar(
+                &cfg,
+                tx_id,
+                &req.dest_root,
+                std::path::Path::new(&req.archive_path),
+                req.password.as_deref(),
+            ) {
+                Err(e)
+                    if e.downcast_ref::<ps5upload_ava1::upload::RarUnsupported>()
+                        .is_some() =>
+                {
+                    crate::log_info!("transfer_rar: AVA1 fallback to FTX2: {e}");
+                    ftx2(Some("rar_unsupported_by_ava1"))
+                }
+                other => other,
+            }
+        } else {
+            ftx2(Some("ava1_unavailable"))
+        };
         match result {
             Ok(r) => {
                 let completed_at_ms = now_ms();
@@ -8783,6 +8944,32 @@ async fn transfer_dir_reconcile_handler(
         }
     };
 
+    // An AVA1 console decides what to skip itself (size and mtime, or content,
+    // SPEC §11.4), so the FTX2 listing-based plan below is not needed: run the folder
+    // upload with the skip-existing choice. Remote (NAS) sources go the same way.
+    let probe_addr = addr.clone();
+    if tokio::task::spawn_blocking(move || ps5upload_ava1::route::use_ava1(&probe_addr))
+        .await
+        .unwrap_or(false)
+    {
+        let skip = match mode {
+            ReconcileMode::Fast => "fast",
+            ReconcileMode::Safe => "safe",
+        };
+        let dir_req = TransferDirReq {
+            addr: Some(addr),
+            tx_id: req.tx_id,
+            dest_root: req.dest_root,
+            src_dir: req.src_dir,
+            excludes: req.excludes,
+            bandwidth_cap_mbps: req.bandwidth_cap_mbps,
+            skip_existing: Some(skip.to_string()),
+        };
+        return transfer_dir_handler(State(state), Json(dir_req))
+            .await
+            .into_response();
+    }
+
     let job_id = Uuid::new_v4();
     let started_at_ms = now_ms();
     set_job(
@@ -9607,6 +9794,10 @@ pub struct EngineConfig {
 async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
     // Convert (and the package viewer) read games on saved servers and the console in place.
     fpkg_remote::register();
+    // Every management call (hardware, filesystem, apps, ...) goes through one transport
+    // seam in the core crate; this registers the AVA1 implementation over the shared pool.
+    // A console without AVA1 management keeps the FTX2 path inside the seam.
+    ps5upload_ava1::mgmt::install();
     // SPEC.md §14.3: expire old AVA1 job directories at start and then daily.
     ava1_api::spawn_journal_gc();
     // AVA1 cutover (Task 23, controller A4): one line at startup naming the
@@ -10537,6 +10728,7 @@ mod helpers_tests {
             src_dir: "/definitely/not/a/real/directory/for/tests".to_string(),
             excludes: vec![],
             bandwidth_cap_mbps: None,
+            skip_existing: None,
         };
 
         let resp = transfer_dir_handler(State(state), Json(req))
@@ -10602,6 +10794,7 @@ mod helpers_tests {
             src_dir: format!("remote://{id}/g"),
             excludes: vec![],
             bandwidth_cap_mbps: None,
+            skip_existing: None,
         };
         let _ = transfer_dir_handler(State(state), Json(req))
             .await
@@ -10627,6 +10820,38 @@ mod helpers_tests {
             !error.contains("readdir"),
             "could not list the source: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_skip_existing_mode_is_a_bad_request() {
+        let (events_tx, _rx) = broadcast::channel(16);
+        let state = AppState {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            default_ps5_addr: "127.0.0.1:1".to_string(),
+            events_tx,
+        };
+        let req = TransferDirReq {
+            addr: Some("127.0.0.1:1".to_string()),
+            tx_id: None,
+            dest_root: "/data/x".to_string(),
+            src_dir: "/nowhere".to_string(),
+            excludes: vec![],
+            bandwidth_cap_mbps: None,
+            skip_existing: Some("sometimes".to_string()),
+        };
+        let resp = transfer_dir_handler(State(state), Json(req))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn an_all_skipped_ack_reports_nothing_sent() {
+        let ack =
+            r#"{"protocol":"ava1","files":5,"skipped_files":5,"skipped_bytes":900,"files_sent":0}"#;
+        assert_eq!(ava1_skip_counts(ack), Some((5, 900, 0)));
+        assert_eq!(ava1_skip_counts(r#"{"protocol":"ftx2"}"#), None);
+        assert_eq!(ava1_skip_counts("not json"), None);
     }
 
     #[tokio::test]
