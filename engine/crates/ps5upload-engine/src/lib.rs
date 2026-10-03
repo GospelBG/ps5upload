@@ -1376,6 +1376,11 @@ struct TransferDirReq {
     excludes: Vec<String>,
     #[serde(default)]
     bandwidth_cap_mbps: Option<f64>,
+    /// "fast" | "safe": skip files the console already has (the Resume strategy).
+    /// Honoured on AVA1 consoles, where the receiver decides; `/api/transfer/dir-reconcile`
+    /// sets it when it hands a job to this handler.
+    #[serde(default)]
+    skip_existing: Option<String>,
 }
 
 /// Upload a `.zip`'s contents, decompressing on the host so files land
@@ -5158,6 +5163,20 @@ async fn transfer_dir_handler(
         0
     };
 
+    let skip_existing = match req.skip_existing.as_deref() {
+        None => None,
+        Some(m) => match ps5upload_ava1::upload::SkipMode::parse(m) {
+            Some(m) => Some(m),
+            None => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown skip_existing mode: {m}"),
+                )
+                .into_response();
+            }
+        },
+    };
+
     let job_id = Uuid::new_v4();
     let started_at_ms = now_ms();
     crate::log_info!(
@@ -5383,7 +5402,17 @@ async fn transfer_dir_handler(
         let result = if use_ava1 {
             // Resume is by job_id (the sender reopens with JobOpen); retries
             // live in the adapter's loop, so no flags/retry count here (C3).
-            ps5upload_ava1::upload::upload_dir(&cfg, tx_id, &req.dest_root, &src_path)
+            match skip_existing {
+                // The user's "skip existing" choice: the receiver compares (SPEC §11.4).
+                Some(mode) => ps5upload_ava1::upload::upload_dir_skip_existing(
+                    &cfg,
+                    tx_id,
+                    &req.dest_root,
+                    &src_path,
+                    mode,
+                ),
+                None => ps5upload_ava1::upload::upload_dir(&cfg, tx_id, &req.dest_root, &src_path),
+            }
         } else {
             transfer_dir_resumable(
                 &cfg,
@@ -8783,6 +8812,32 @@ async fn transfer_dir_reconcile_handler(
         }
     };
 
+    // An AVA1 console decides what to skip itself (size and mtime, or content,
+    // SPEC §11.4), so the FTX2 listing-based plan below is not needed: run the folder
+    // upload with the skip-existing choice. Remote (NAS) sources go the same way.
+    let probe_addr = addr.clone();
+    if tokio::task::spawn_blocking(move || ps5upload_ava1::route::use_ava1(&probe_addr))
+        .await
+        .unwrap_or(false)
+    {
+        let skip = match mode {
+            ReconcileMode::Fast => "fast",
+            ReconcileMode::Safe => "safe",
+        };
+        let dir_req = TransferDirReq {
+            addr: Some(addr),
+            tx_id: req.tx_id,
+            dest_root: req.dest_root,
+            src_dir: req.src_dir,
+            excludes: req.excludes,
+            bandwidth_cap_mbps: req.bandwidth_cap_mbps,
+            skip_existing: Some(skip.to_string()),
+        };
+        return transfer_dir_handler(State(state), Json(dir_req))
+            .await
+            .into_response();
+    }
+
     let job_id = Uuid::new_v4();
     let started_at_ms = now_ms();
     set_job(
@@ -10537,6 +10592,7 @@ mod helpers_tests {
             src_dir: "/definitely/not/a/real/directory/for/tests".to_string(),
             excludes: vec![],
             bandwidth_cap_mbps: None,
+            skip_existing: None,
         };
 
         let resp = transfer_dir_handler(State(state), Json(req))
@@ -10602,6 +10658,7 @@ mod helpers_tests {
             src_dir: format!("remote://{id}/g"),
             excludes: vec![],
             bandwidth_cap_mbps: None,
+            skip_existing: None,
         };
         let _ = transfer_dir_handler(State(state), Json(req))
             .await
@@ -10627,6 +10684,29 @@ mod helpers_tests {
             !error.contains("readdir"),
             "could not list the source: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_skip_existing_mode_is_a_bad_request() {
+        let (events_tx, _rx) = broadcast::channel(16);
+        let state = AppState {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            default_ps5_addr: "127.0.0.1:1".to_string(),
+            events_tx,
+        };
+        let req = TransferDirReq {
+            addr: Some("127.0.0.1:1".to_string()),
+            tx_id: None,
+            dest_root: "/data/x".to_string(),
+            src_dir: "/nowhere".to_string(),
+            excludes: vec![],
+            bandwidth_cap_mbps: None,
+            skip_existing: Some("sometimes".to_string()),
+        };
+        let resp = transfer_dir_handler(State(state), Json(req))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

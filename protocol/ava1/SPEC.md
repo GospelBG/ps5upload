@@ -339,7 +339,9 @@ when every file reports a real mtime (local disk; SMB, FTP and SFTP servers) it 
 that reports none) it uses `verify` for the whole job, computing each file's root before
 the manifest is sent. `verify` costs one read of the source plus a hash of each existing
 console file of the right size, but is correct without an mtime; the sender never guesses
-an mtime. A directory's mtime is always 0 and is ignored by both policies.
+an mtime. The engine's "safe" resume mode always uses `verify`. The known weakness of
+`skip-existing`: a file whose content changed but whose size and mtime did not is skipped.
+A directory's mtime is always 0 and is ignored by both policies.
 
 11.5 A `JobOpen` for a job the receiver already knows is a resume: the receiver matches
 the new manifest against its stored one by path, keeps the progress of entries whose

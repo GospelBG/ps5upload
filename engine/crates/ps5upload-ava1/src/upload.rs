@@ -251,6 +251,36 @@ pub fn apply_existing_policy(
         opts.policy = gen::POLICY_SKIP_EXISTING;
         return Ok(opts.policy);
     }
+    apply_verify_policy(source, manifest, opts)?;
+    Ok(opts.policy)
+}
+
+/// The user's "skip files the console already has" choice, the engine's reconcile
+/// modes: `Fast` compares size and mtime when the source has them (SPEC.md §11.4),
+/// `Safe` always compares content (size plus BLAKE3 root).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipMode {
+    Fast,
+    Safe,
+}
+
+impl SkipMode {
+    /// The engine API's `"fast"` / `"safe"`.
+    pub fn parse(s: &str) -> Option<SkipMode> {
+        match s {
+            "fast" => Some(SkipMode::Fast),
+            "safe" => Some(SkipMode::Safe),
+            _ => None,
+        }
+    }
+}
+
+/// `Safe`: puts every file's root in the manifest and selects `verify`.
+fn apply_verify_policy(
+    source: &dyn Source,
+    manifest: &mut Manifest,
+    opts: &mut SendOptions,
+) -> io::Result<()> {
     for e in manifest
         .entries
         .iter_mut()
@@ -259,7 +289,7 @@ pub fn apply_existing_policy(
         e.root = Some(hash_file(source, &e.path, e.size)?);
     }
     opts.policy = gen::POLICY_VERIFY;
-    Ok(opts.policy)
+    Ok(())
 }
 
 /// BLAKE3 of a source file (equal to the root the receiver computes, `ava1::verify`).
@@ -479,6 +509,41 @@ pub fn upload_dir_in(
         SendOptions::upload(dest_root),
         cfg,
     )
+}
+
+/// A folder upload that skips what the console already has (the engine's "resume"
+/// strategy). Local and remote sources alike; see [`apply_existing_policy`].
+pub fn upload_dir_skip_existing_in(
+    pool: &Pool,
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    dest_root: &str,
+    src_dir: &Path,
+    mode: SkipMode,
+) -> Result<TransferResult> {
+    let source = source_for(cfg, src_dir);
+    let excludes = cfg.excludes.clone();
+    let mut manifest = manifest::walk(source.as_ref(), &|p: &str| {
+        ps5upload_core::excludes::is_excluded_strings(Path::new(p), &excludes)
+    })?;
+    let mut opts = SendOptions::upload(dest_root);
+    match mode {
+        SkipMode::Fast => {
+            apply_existing_policy(source.as_ref(), &mut manifest, &mut opts)?;
+        }
+        SkipMode::Safe => apply_verify_policy(source.as_ref(), &mut manifest, &mut opts)?,
+    }
+    upload_with_in(pool, &cfg.addr, job_id, manifest, source, opts, cfg)
+}
+
+pub fn upload_dir_skip_existing(
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    dest_root: &str,
+    src_dir: &Path,
+    mode: SkipMode,
+) -> Result<TransferResult> {
+    upload_dir_skip_existing_in(pool(), cfg, job_id, dest_root, src_dir, mode)
 }
 
 /// The path within an AVA1 job's destination root. FTX2 treats relative list
