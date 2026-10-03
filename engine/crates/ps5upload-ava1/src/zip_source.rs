@@ -13,6 +13,36 @@ struct Located {
     stored: bool,
     data_start: u64,
     compressed: u64,
+    /// The central directory's CRC-32 of the decompressed bytes.
+    crc: u32,
+}
+
+/// An entry's decompressed bytes do not match its stored CRC-32 (or the stream is
+/// damaged or short). Carried inside an `InvalidData` `io::Error`; the upload turns
+/// it into the terminal reason `ava1_zip_corrupt`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ZipCorrupt(pub String);
+
+fn corrupt(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, ZipCorrupt(msg))
+}
+
+/// Whether `e` (or anything it wraps) is a [`ZipCorrupt`].
+pub fn is_zip_corrupt(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(c) = cur {
+        if c.is::<ZipCorrupt>() {
+            return true;
+        }
+        if let Some(io) = c.downcast_ref::<io::Error>() {
+            if io.get_ref().is_some_and(|i| i.is::<ZipCorrupt>()) {
+                return true;
+            }
+        }
+        cur = c.source();
+    }
+    false
 }
 
 pub struct ZipSource {
@@ -79,6 +109,7 @@ impl ZipSource {
                             stored,
                             data_start,
                             compressed: entry.compressed_size(),
+                            crc: entry.crc32(),
                         },
                         SourceMeta {
                             size: entry.size(),
@@ -130,6 +161,15 @@ impl ZipSource {
     }
 }
 
+/// A damaged deflate stream is corruption; any other read failure is an ordinary I/O error.
+fn inflate_error(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::InvalidData {
+        corrupt(format!("zip entry is damaged: {e}"))
+    } else {
+        e
+    }
+}
+
 fn invalid_zip(e: zip::result::ZipError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
@@ -145,6 +185,10 @@ pub struct ZipEntryReader {
     /// Uncompressed offset the inflater is at.
     pos: u64,
     restarts: u32,
+    /// CRC-32 of the decompressed stream from offset 0 up to `pos`; meaningful only
+    /// while `tracking` (the reader has seen every byte since the last restart).
+    crc: flate2::Crc,
+    tracking: bool,
 }
 
 impl ZipEntryReader {
@@ -160,6 +204,8 @@ impl ZipEntryReader {
             f.take(self.at.compressed),
         ));
         self.pos = 0;
+        self.crc = flate2::Crc::new();
+        self.tracking = true;
         self.restarts += 1;
         Ok(())
     }
@@ -185,7 +231,22 @@ impl ZipEntryReader {
         if self.at.stored {
             self.file.seek(SeekFrom::Start(self.at.data_start + off))?;
             let want = (buf.len() as u64).min(self.size - off) as usize;
-            return self.file.read(&mut buf[..want]);
+            let got = self.file.read(&mut buf[..want])?;
+            // Verify when the reads walk the entry front to back; a random-access
+            // pattern simply isn't verified until a pass from offset 0 reaches the end.
+            if off == 0 {
+                self.crc = flate2::Crc::new();
+                self.pos = 0;
+                self.tracking = true;
+            }
+            if self.tracking && off == self.pos {
+                self.crc.update(&buf[..got]);
+                self.pos += got as u64;
+                self.verify_at_end()?;
+            } else {
+                self.tracking = false;
+            }
+            return Ok(got);
         }
         if self.inflater.is_none() || off < self.pos {
             self.start()?;
@@ -194,10 +255,11 @@ impl ZipEntryReader {
         let mut scratch = [0u8; 16 << 10];
         while self.pos < off {
             let n = ((off - self.pos) as usize).min(scratch.len());
-            let got = dec.read(&mut scratch[..n])?;
+            let got = dec.read(&mut scratch[..n]).map_err(inflate_error)?;
             if got == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
+                return Err(corrupt("zip entry ends before its declared size".into()));
             }
+            self.crc.update(&scratch[..got]);
             self.pos += got as u64;
         }
         // Fill the buffer: a deflate stream yields short reads, and callers treat a
@@ -205,14 +267,31 @@ impl ZipEntryReader {
         let want = (buf.len() as u64).min(self.size - off) as usize;
         let mut filled = 0;
         while filled < want {
-            let got = dec.read(&mut buf[filled..want])?;
+            let got = dec.read(&mut buf[filled..want]).map_err(inflate_error)?;
             if got == 0 {
-                break;
+                return Err(corrupt("zip entry ends before its declared size".into()));
             }
+            self.crc.update(&buf[filled..filled + got]);
             filled += got;
         }
         self.pos += filled as u64;
+        self.verify_at_end()?;
         Ok(filled)
+    }
+
+    /// Once a full pass has been read, its CRC must equal the directory's. A pass is
+    /// verified exactly once: a restart (backwards read) begins a new one.
+    fn verify_at_end(&mut self) -> io::Result<()> {
+        if self.tracking && self.pos == self.size {
+            let got = self.crc.sum();
+            if got != self.at.crc {
+                return Err(corrupt(format!(
+                    "zip entry CRC-32 mismatch (stored {:08x}, computed {got:08x})",
+                    self.at.crc
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -230,6 +309,8 @@ impl ZipSource {
             inflater: None,
             pos: 0,
             restarts: 0,
+            crc: flate2::Crc::new(),
+            tracking: true,
         })
     }
 }

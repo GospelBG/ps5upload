@@ -21,10 +21,10 @@ use crate::progress::{bottleneck_name, Bridge};
 use crate::source::{FsSource, ListSource};
 use crate::zip_source::ZipSource;
 
-/// `ZipEntryReader::read_at` inflates from the beginning for every read. Above
-/// this size its repeated work grows quadratically; FTX2 streams those entries.
+/// Retained for the engine's fallback match: AVA1 no longer caps zip entry size
+/// (`ZipEntryReader` keeps its inflater, so a large entry inflates once).
 #[derive(Debug, thiserror::Error)]
-#[error("zip entry {0} is larger than 256 MiB: AVA1 sends this archive with FTX2")]
+#[error("zip entry {0} is too large for AVA1")]
 pub struct ZipTooLarge(pub String);
 
 /// The archive cannot be an AVA1 source (a path the manifest refuses, an unsupported
@@ -32,15 +32,6 @@ pub struct ZipTooLarge(pub String);
 #[derive(Debug, thiserror::Error)]
 #[error("zip is not usable as an AVA1 source: {0}")]
 pub struct ZipUnsupported(pub String);
-
-pub const ZIP_MAX_ENTRY: u64 = 256 << 20;
-
-pub fn zip_too_large(m: &Manifest) -> Option<&str> {
-    m.entries
-        .iter()
-        .find(|e| e.kind == gen::ENTRY_FILE && e.size > ZIP_MAX_ENTRY)
-        .map(|e| e.path.as_str())
-}
 
 pub fn upload_zip_in(
     pool: &Pool,
@@ -51,9 +42,6 @@ pub fn upload_zip_in(
 ) -> Result<TransferResult> {
     let (manifest, source) =
         ZipSource::open(zip_path, &cfg.excludes).map_err(|e| ZipUnsupported(e.to_string()))?;
-    if let Some(path) = zip_too_large(&manifest) {
-        return Err(ZipTooLarge(path.to_owned()).into());
-    }
     upload_with_in(
         pool,
         &cfg.addr,
@@ -63,6 +51,18 @@ pub fn upload_zip_in(
         SendOptions::upload(dest_root),
         cfg,
     )
+    .map_err(|e| {
+        // An entry whose bytes fail their CRC-32 is damaged input: terminal, typed.
+        if e.chain().any(crate::zip_source::is_zip_corrupt) {
+            UploadFailure {
+                reason: "ava1_zip_corrupt".into(),
+                detail: format!("the zip archive is corrupt: {e:#}"),
+            }
+            .into()
+        } else {
+            e
+        }
+    })
 }
 
 pub fn upload_zip(

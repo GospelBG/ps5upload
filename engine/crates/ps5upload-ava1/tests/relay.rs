@@ -8,12 +8,11 @@ use std::time::Duration;
 
 use ava1::gen;
 use ava1::keys::Identity;
-use ava1::manifest::{Entry, Manifest};
 use ava1::send::Progress;
 use ava1_chaos::{ChaosConfig, ChaosProxy};
 use common::*;
 use ps5upload_ava1::relay::ps5_to_ps5_between;
-use ps5upload_ava1::upload::{self, ZipTooLarge, ZIP_MAX_ENTRY};
+use ps5upload_ava1::upload;
 use ps5upload_ava1::zip_source::ZipSource;
 use ps5upload_ava1::Pool;
 use ps5upload_core::transfer::TransferConfig;
@@ -377,21 +376,208 @@ fn traversal_zip_fails_before_connecting() {
     assert!(err.downcast_ref::<upload::ZipUnsupported>().is_some());
 }
 
+/// Overwrites the CRC-32 field of every central-directory record.
+fn break_central_crcs(path: &std::path::Path) {
+    let mut b = std::fs::read(path).unwrap();
+    let mut i = 0;
+    while i + 20 < b.len() {
+        if b[i..i + 4] == [0x50, 0x4b, 0x01, 0x02] {
+            for k in 0..4 {
+                b[i + 16 + k] ^= 0xa5;
+            }
+        }
+        i += 1;
+    }
+    std::fs::write(path, b).unwrap();
+}
+
+fn upload_zip_blocking(
+    d: &std::path::Path,
+    ava: std::path::PathBuf,
+    addr: String,
+    path: std::path::PathBuf,
+    id: u8,
+) -> anyhow::Result<ps5upload_core::transfer::TransferResult> {
+    let _ = d;
+    let pool = Pool::new(ava).with_addr(addr);
+    upload::upload_zip_in(
+        &pool,
+        &TransferConfig::new("127.0.0.1:9113"),
+        [id; 16],
+        "dst",
+        &path,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zip_with_a_wrong_crc_fails_typed() {
+    for method in [
+        zip::CompressionMethod::Deflated,
+        zip::CompressionMethod::Stored,
+    ] {
+        let d = temp("zip-bad-crc");
+        let ava = d.join("engine");
+        let key = Identity::load_or_create(&ava.join("identity"))
+            .unwrap()
+            .public();
+        let host_root = d.join("host");
+        std::fs::create_dir_all(host_root.join("share")).unwrap();
+        let addr = host(&host_root, key).await;
+        let path = d.join("bad.zip");
+        zip_with(&path, &[("f", method, 3, 1 << 20)]);
+        break_central_crcs(&path);
+        let (d2, ava2) = (d.clone(), ava.clone());
+        let err = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::task::spawn_blocking(move || upload_zip_blocking(&d2, ava2, addr, path, 31)),
+        )
+        .await
+        .expect("timed out")
+        .unwrap()
+        .unwrap_err();
+        let f = err
+            .downcast_ref::<upload::UploadFailure>()
+            .unwrap_or_else(|| panic!("not typed: {err:#}"));
+        assert_eq!(f.reason, "ava1_zip_corrupt");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zip_with_a_flipped_data_byte_fails_typed() {
+    let d = temp("zip-flip");
+    let ava = d.join("engine");
+    let key = Identity::load_or_create(&ava.join("identity"))
+        .unwrap()
+        .public();
+    let host_root = d.join("host");
+    std::fs::create_dir_all(host_root.join("share")).unwrap();
+    let addr = host(&host_root, key).await;
+    let path = d.join("flip.zip");
+    zip_with(
+        &path,
+        &[("f", zip::CompressionMethod::Deflated, 5, 1 << 20)],
+    );
+    let mut b = std::fs::read(&path).unwrap();
+    let mid = b.len() / 3;
+    b[mid] ^= 0x40;
+    std::fs::write(&path, b).unwrap();
+    let (d2, ava2) = (d.clone(), ava.clone());
+    let err = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || upload_zip_blocking(&d2, ava2, addr, path, 32)),
+    )
+    .await
+    .expect("timed out")
+    .unwrap()
+    .unwrap_err();
+    let f = err.downcast_ref::<upload::UploadFailure>().expect("typed");
+    assert_eq!(f.reason, "ava1_zip_corrupt");
+}
+
 #[test]
-fn large_zip_entry_has_a_typed_error() {
-    let m = Manifest {
-        entries: vec![Entry {
-            kind: gen::ENTRY_FILE,
-            size: ZIP_MAX_ENTRY + 1,
-            path: "huge".into(),
-            mode: 0o644,
-            mtime: 0,
-            root: None,
-        }],
-    };
-    let name = upload::zip_too_large(&m).unwrap();
-    let e: anyhow::Error = ZipTooLarge(name.to_owned()).into();
-    assert!(e.downcast_ref::<ZipTooLarge>().is_some());
+fn an_entry_read_in_pieces_is_verified_once_and_correct() {
+    use ava1::source::ReadAt;
+    let d = temp("zip-pieces");
+    let path = d.join("p.zip");
+    const SIZE: u64 = 3 << 20;
+    zip_with(
+        &path,
+        &[
+            ("d", zip::CompressionMethod::Deflated, 7, SIZE),
+            ("s", zip::CompressionMethod::Stored, 8, SIZE),
+        ],
+    );
+    let (_, source) = ZipSource::open(&path, &[]).unwrap();
+    for (name, seed) in [("d", 7u8), ("s", 8u8)] {
+        let mut r = source.open_entry(name).unwrap();
+        let mut off = 0u64;
+        let mut buf = vec![0u8; 300_000];
+        while off < SIZE {
+            let n = ava1::source::read_full_at(&mut r, off, &mut buf).unwrap();
+            assert!(
+                buf[..n] == pattern(seed, off, n)[..],
+                "{name} differs at {off}"
+            );
+            off += n as u64;
+        }
+        // One backwards seek, then the whole entry again: still correct, still ok.
+        let mut small = [0u8; 64];
+        r.read_at(1000, &mut small).unwrap();
+        assert_eq!(&small[..], &pattern(seed, 1000, 64)[..]);
+        let mut off = 0u64;
+        while off < SIZE {
+            let n = ava1::source::read_full_at(&mut r, off, &mut buf).unwrap();
+            off += n as u64;
+        }
+        if name == "d" {
+            assert_eq!(r.restarts(), 3);
+        }
+    }
+    break_central_crcs(&path);
+    let (_, source) = ZipSource::open(&path, &[]).unwrap();
+    let mut r = source.open_entry("d").unwrap();
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(r.read_at(0, &mut buf).unwrap(), 4096);
+    // Reaching the end of the entry is what verifies it.
+    let e = r.read_at(SIZE - 100, &mut buf).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    assert!(ps5upload_ava1::zip_source::is_zip_corrupt(&e));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zip_entry_over_256_mib_uploads_over_ava1() {
+    let _heavy = HEAVY.lock().await;
+    let d = temp("zip-big");
+    let ava = d.join("engine");
+    let key = Identity::load_or_create(&ava.join("identity"))
+        .unwrap()
+        .public();
+    let host_root = d.join("host");
+    std::fs::create_dir_all(host_root.join("share")).unwrap();
+    let addr = host(&host_root, key).await;
+    let path = d.join("big.zip");
+    const SIZE: u64 = (256 << 20) + (3 << 20) + 17;
+    {
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file(
+            "big",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .large_file(true),
+        )
+        .unwrap();
+        let chunk = vec![0x5au8; 1 << 20];
+        let mut off = 0;
+        while off < SIZE {
+            let n = (SIZE - off).min(chunk.len() as u64) as usize;
+            zip.write_all(&chunk[..n]).unwrap();
+            off += n as u64;
+        }
+        zip.finish().unwrap();
+    }
+    assert!(std::fs::metadata(&path).unwrap().len() < 8 << 20);
+    let (d2, ava2) = (d.clone(), ava.clone());
+    let result = tokio::time::timeout(
+        Duration::from_secs(600),
+        tokio::task::spawn_blocking(move || upload_zip_blocking(&d2, ava2, addr, path, 33)),
+    )
+    .await
+    .expect("big zip upload timed out")
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.shards_sent, 1);
+    let out = host_root.join("share/dst/big");
+    assert_eq!(std::fs::metadata(&out).unwrap().len(), SIZE);
+    let mut f = std::fs::File::open(&out).unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut seen = 0u64;
+    while seen < SIZE {
+        use std::io::Read;
+        let n = f.read(&mut buf).unwrap();
+        assert!(n > 0);
+        assert!(buf[..n].iter().all(|&b| b == 0x5a), "bad byte near {seen}");
+        seen += n as u64;
+    }
 }
 
 #[test]
