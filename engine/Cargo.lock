@@ -2212,6 +2212,7 @@ dependencies = [
  "flate2",
  "ps5upload-core",
  "serde_json",
+ "sevenz-rust2",
  "thiserror",
  "tokio",
  "zip",

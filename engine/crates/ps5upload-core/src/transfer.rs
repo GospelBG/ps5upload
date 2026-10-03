@@ -3838,7 +3838,7 @@ pub fn transfer_zip_resumable(
 /// `sanitize_zip_entry`, except 7z archives created on Windows legitimately use
 /// '\\' as the path separator (zip always uses '/'), so backslashes are
 /// translated to forward slashes rather than rejected.
-pub(crate) fn sanitize_7z_entry(name: &str) -> Option<String> {
+pub fn sanitize_7z_entry(name: &str) -> Option<String> {
     sanitize_zip_entry(&name.replace('\\', "/"))
 }
 
@@ -3884,7 +3884,7 @@ fn select_sevenz_decode_threads(configured: Option<&str>) -> u32 {
         .unwrap_or(1) as u32
 }
 
-pub(crate) fn sevenz_decode_threads() -> u32 {
+pub fn sevenz_decode_threads() -> u32 {
     select_sevenz_decode_threads(std::env::var("PS5UPLOAD_7Z_THREADS").ok().as_deref())
 }
 
