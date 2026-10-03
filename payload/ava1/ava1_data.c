@@ -911,7 +911,9 @@ static int route(const uint8_t sid[16], const uint8_t peer[32], uint8_t type, co
         return 0;
     }
     if (j->on_frame) { /* a sender job (Task 18): the receiving peer's acks and map */
-        if (type == AVA1_TYPE_RESUME) (void)ava1_job_attach(j, sid, 0);
+        /* A Resume re-attaches it: the new session's lanes that came up before the attach
+         * never told the job, so its writers start here (as after a JobOpen's attach). */
+        if (type == AVA1_TYPE_RESUME && ava1_job_attach(j, sid, 0) == 0) ava1_send_start(j);
         rc = j->on_frame(j, type, body, len);
         ava1_job_put_nowait(j);
         return rc;

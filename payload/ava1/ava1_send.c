@@ -11,11 +11,15 @@
 #include "ava1_apply.h"
 #include "ava1_b3.h"
 #include "ava1_data.h"
+#include "ava1_platform.h"
 #include "ava1_server.h"
 #include "ava1_thread.h"
 
 #define READ_AHEAD (32u << 20)
-#define REFUND_RING 256u
+
+uint32_t ava1_send_test_fail_sends;
+uint32_t ava1_send_test_fail_writer_starts;
+uint64_t ava1_send_test_chunk_bytes;
 
 /* ---- the reader --------------------------------------------------------------------- */
 
@@ -168,12 +172,20 @@ int ava1_read_files(ava1_reader_t *r, const uint32_t *ids, uint32_t count) {
 
 /* ---- the network sender ------------------------------------------------------------ */
 
+/* A lane frame. Window rule (SPEC.md §12.3): picking a frame charges the window; the
+ * charge comes back with the receiver's Credit after its apply, or here only when the
+ * frame provably never left — its send failed (a failed send writes nothing, or breaks
+ * the connection mid-frame, so the receiver cannot have admitted it). A lane's death
+ * requeues its frames for a re-send but keeps their charge: they may be on the wire. */
 typedef struct sframe {
     struct sframe *next;
     uint8_t *msg;
     size_t len;
     uint8_t type;
+    uint8_t sending; /* between the pick and the settle: the writer owns it */
+    uint8_t acked;   /* a Received came while it was being sent: the writer frees it */
     uint32_t seq;
+    uint32_t gen; /* its lane's generation at the pick */
     uint16_t lane;
 } sframe_t;
 
@@ -181,9 +193,6 @@ typedef struct {
     uint64_t credit, queued;
     sframe_t *ready, *ready_tail, *inflight;
     uint32_t next_seq, next_page;
-    uint32_t refund_seq[REFUND_RING];
-    uint64_t refund_len[REFUND_RING];
-    uint32_t refund_at;
     int pages_done, have_map, reading, stop, unsafe_read, single;
     ava1_bits_t skip;
     ava1_rset_t **durable;
@@ -194,6 +203,8 @@ typedef struct {
     pthread_t writer[AVA1_MAX_LANES + 1];
     int writer_up[AVA1_MAX_LANES + 1];      /* 0 down, 1 running, 2 start requested */
     int writer_started[AVA1_MAX_LANES + 1]; /* a joinable thread exists */
+    uint32_t gen[AVA1_MAX_LANES + 1];       /* bumped by every death of the lane id */
+    uint8_t wsid[AVA1_MAX_LANES + 1][16];   /* the session the lane belongs to */
 } snd_t;
 
 static snd_t *S_(ava1_job_t *j) { return (snd_t *)j->role; }
@@ -211,13 +222,20 @@ static int put_frame(void *ctx, uint8_t type, uint8_t *msg, size_t len) {
     f->type = type;
     pthread_mutex_lock(&j->mu);
     while (s->queued >= READ_AHEAD && !s->stop && !j->stopping) pthread_cond_wait(&j->cv, &j->mu);
+    if (s->stop || j->stopping) { /* the job is ending: the read-ahead bound holds to the end */
+        pthread_mutex_unlock(&j->mu);
+        free(msg);
+        free(f);
+        return -ECANCELED;
+    }
+    if (type == AVA1_TYPE_CHUNK) __atomic_add_fetch(&ava1_send_test_chunk_bytes, len, __ATOMIC_SEQ_CST);
     if (s->ready_tail) s->ready_tail->next = f;
     else s->ready = f;
     s->ready_tail = f;
     s->queued += len;
     pthread_cond_broadcast(&j->cv);
     pthread_mutex_unlock(&j->mu);
-    return s->stop ? -ECANCELED : 0;
+    return 0;
 }
 
 static void put_root(void *ctx, uint32_t id, const uint8_t root[32]) {
@@ -280,77 +298,165 @@ static void *reader_main(void *arg) {
 typedef struct {
     ava1_job_t *j;
     uint16_t lane;
+    uint32_t gen;
+    uint8_t sid[16];
 } wctx2_t;
 
+static uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+
+static void unlink_inflight(snd_t *s, sframe_t *f) {
+    sframe_t **pp;
+    for (pp = &s->inflight; *pp; pp = &(*pp)->next)
+        if (*pp == f) {
+            *pp = f->next;
+            return;
+        }
+}
+
+/* Back to the front of the ready list (caller holds mu): the next pick re-sends it. */
+static void requeue_front(snd_t *s, sframe_t *f) {
+    f->next = s->ready;
+    s->ready = f;
+    if (!s->ready_tail) s->ready_tail = f;
+    s->queued += f->len;
+}
+
+/* The writer's pick (caller holds mu): the first ready frame that fits the window — a
+ * front frame that does not fit never blocks a smaller one behind it (the head-of-line
+ * credit stall) — charged and recorded in flight on `lane`; NULL when nothing fits. */
+static sframe_t *pick_locked(snd_t *s, uint16_t lane) {
+    sframe_t **pp, *f = NULL, *prev = NULL;
+    for (pp = &s->ready; *pp; prev = *pp, pp = &(*pp)->next)
+        if ((*pp)->len <= s->credit) {
+            f = *pp;
+            break;
+        }
+    if (!f) return NULL;
+    *pp = f->next;
+    if (s->ready_tail == f) s->ready_tail = prev;
+    s->queued -= f->len;
+    s->credit -= f->len;
+    f->seq = ++s->next_seq;
+    f->lane = lane;
+    f->gen = s->gen[lane];
+    f->sending = 1;
+    f->acked = 0;
+    f->next = s->inflight;
+    s->inflight = f;
+    return f;
+}
+
+/* The writer's resolution of one send that returned `rc` (caller holds mu). Returns 1
+ * the writer goes on, 0 its lane generation is over (the lane died meanwhile), -1 the
+ * frame can never be sent (the job cannot go on). */
+static int settle_locked(snd_t *s, sframe_t *f, int rc) {
+    int dead = s->gen[f->lane] != f->gen;
+    f->sending = 0;
+    if (f->acked) { /* the receiver has it; Received already took it off the in-flight list */
+        free(f->msg);
+        free(f);
+        return dead ? 0 : 1;
+    }
+    if (rc != 0) {
+        /* Never delivered: the charge comes back here, and the frame goes again. */
+        unlink_inflight(s, f);
+        s->credit = sat_add(s->credit, f->len);
+        requeue_front(s, f);
+    } else if (dead) {
+        /* Sent on a lane that died meanwhile (the sweep left it to us): it may be on the
+         * wire, so it is re-sent with its charge held, like the sweep's frames. */
+        unlink_inflight(s, f);
+        requeue_front(s, f);
+    }
+    if (dead) return 0;
+    return rc == AVA1_E_TOOLONG ? -1 : 1;
+}
+
+static int take_one(uint32_t *n) {
+    uint32_t v = __atomic_load_n(n, __ATOMIC_SEQ_CST);
+    while (v && !__atomic_compare_exchange_n(n, &v, v - 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+    }
+    return v != 0;
+}
+
 static void *writer_main(void *arg) {
-    wctx2_t *c = arg;
-    ava1_job_t *j = c->j;
-    uint16_t lane = c->lane;
+    wctx2_t c = *(wctx2_t *)arg;
+    ava1_job_t *j = c.j;
+    uint16_t lane = c.lane;
     snd_t *s = S_(j);
-    uint8_t sid[16];
-    free(c);
+    free(arg);
     pthread_mutex_lock(&j->mu);
-    memcpy(sid, j->sid, 16);
     for (;;) {
-        sframe_t *f;
-        int rc;
-        while (!s->stop && !j->stopping && s->writer_up[lane] &&
-               (!s->ready || s->ready->len > s->credit))
+        sframe_t *f = NULL;
+        int rc, k;
+        while (!s->stop && !j->stopping && s->writer_up[lane] == 1 && s->gen[lane] == c.gen &&
+               !(f = pick_locked(s, lane)))
             pthread_cond_wait(&j->cv, &j->mu);
-        if (s->stop || j->stopping || !s->writer_up[lane]) break;
-        f = s->ready;
-        s->ready = f->next;
-        if (!s->ready) s->ready_tail = NULL;
-        s->queued -= f->len;
-        s->credit -= f->len;
-        f->seq = ++s->next_seq;
-        f->lane = lane;
-        f->next = s->inflight;
-        s->inflight = f;
+        if (!f) break;
         pthread_cond_broadcast(&j->cv); /* the reader may continue */
         pthread_mutex_unlock(&j->mu);
         /* The copying send keeps f->msg as plaintext, so a requeued frame can go out again
          * on another lane under that lane's keys. */
-        rc = ava1_server_send(sid, lane, f->type, 0, f->seq, f->msg, f->len);
+        rc = take_one(&ava1_send_test_fail_sends) ? AVA1_E_IO
+                                                   : ava1_server_send(c.sid, lane, f->type, 0, f->seq, f->msg, f->len);
         pthread_mutex_lock(&j->mu);
-        if (rc != 0) break; /* the lane is gone: on_lane_change requeues its frames */
+        k = settle_locked(s, f, rc);
+        pthread_cond_broadcast(&j->cv); /* a requeued frame or returned credit: any lane may go */
+        if (k < 0) {
+            pthread_mutex_unlock(&j->mu);
+            ava1_apply_fail(j, AVA1_ERR_INTERNAL, "a lane frame is too large to send", 0, 0);
+            return NULL;
+        }
+        if (k == 0) break;
+        if (rc != 0) {
+            /* A send error on a live lane: either the connection broke (its lane-change
+             * follows and ends this writer) or it was transient (no memory). Either way
+             * the frame is requeued; back off briefly instead of spinning on it. */
+            pthread_mutex_unlock(&j->mu);
+            ava1_platform_sleep_ms(10);
+            pthread_mutex_lock(&j->mu);
+        }
     }
     pthread_mutex_unlock(&j->mu);
     return NULL;
 }
 
-/* Moves a lane's unreceived frames back to the front of the ready list (caller holds mu). */
-static void requeue_lane(snd_t *s, uint16_t lane) {
+/* A lane died (caller holds mu): its writer's generation ends, and its frames are
+ * requeued for a re-send with their charge held (they may be on the wire). A frame the
+ * writer is still sending is left to it: the writer settles it by its send's result. */
+static void lane_down_locked(snd_t *s, uint16_t lane) {
     sframe_t **pp = &s->inflight;
+    s->writer_up[lane] = 0;
+    s->gen[lane]++;
     while (*pp) {
         sframe_t *f = *pp;
-        if (f->lane != lane) {
+        if (f->lane != lane || f->sending) {
             pp = &f->next;
             continue;
         }
         *pp = f->next;
-        s->credit += f->len;
-        s->refund_seq[s->refund_at % REFUND_RING] = f->seq;
-        s->refund_len[s->refund_at % REFUND_RING] = f->len;
-        s->refund_at++;
-        f->next = s->ready;
-        s->ready = f;
-        if (!s->ready_tail) s->ready_tail = f;
-        s->queued += f->len;
+        requeue_front(s, f);
     }
+}
+
+/* A lane of session `sid` is up (caller holds mu). A writer still marked for another
+ * session's lane of the same id (a re-attached job whose old lanes never reported their
+ * death to it) is retired first. */
+static void lane_up_locked(snd_t *s, uint16_t lane, const uint8_t sid[16]) {
+    if (s->writer_up[lane] && memcmp(s->wsid[lane], sid, 16) == 0) return;
+    if (s->writer_up[lane]) lane_down_locked(s, lane);
+    memcpy(s->wsid[lane], sid, 16);
+    s->writer_up[lane] = 2; /* "start me": the job thread starts the writer (on_tick) */
 }
 
 static void lane_change(ava1_job_t *j, uint16_t lane, int up) {
     snd_t *s = S_(j);
     if (lane == 0 || lane > AVA1_MAX_LANES) return;
-    /* Called under the job table lock: only mark state and signal; never join here. */
+    /* Called under the job table lock (so j->sid is stable): only mark state and signal;
+     * never join here. */
     pthread_mutex_lock(&j->mu);
-    if (!up) {
-        s->writer_up[lane] = 0;
-        requeue_lane(s, lane);
-    } else if (!s->writer_up[lane]) {
-        s->writer_up[lane] = 2; /* "start me": the job thread starts the writer (on_tick) */
-    }
+    if (!up) lane_down_locked(s, lane);
+    else lane_up_locked(s, lane, j->sid);
     pthread_cond_broadcast(&j->cv);
     pthread_mutex_unlock(&j->mu);
 }
@@ -396,25 +502,52 @@ static void on_tick(ava1_job_t *j) {
         s->reader_started = ava1_thread_start(reader_main, j, &s->reader) == 0;
     }
     for (l = 1; l <= AVA1_MAX_LANES; l++) {
-        if (s->writer_up[l] == 2) {
-            wctx2_t *c = malloc(sizeof *c);
-            if (s->writer_started[l]) { /* the previous writer of this lane id has exited or is exiting */
-                pthread_mutex_unlock(&j->mu);
-                pthread_join(s->writer[l], NULL);
-                pthread_mutex_lock(&j->mu);
-                s->writer_started[l] = 0;
-            }
+        wctx2_t *c;
+        if (s->writer_up[l] != 2) continue;
+        if (s->writer_started[l]) { /* the previous writer of this lane id has exited or is exiting */
+            pthread_mutex_unlock(&j->mu);
+            pthread_join(s->writer[l], NULL);
+            pthread_mutex_lock(&j->mu);
+            s->writer_started[l] = 0;
+            if (s->writer_up[l] != 2) continue; /* the lane died while we joined */
+        }
+        /* A writer that cannot start leaves the lane at 2: the next tick tries again. */
+        if (!(c = malloc(sizeof *c))) continue;
+        c->j = j;
+        c->lane = l;
+        c->gen = s->gen[l];
+        memcpy(c->sid, s->wsid[l], 16);
+        if (!take_one(&ava1_send_test_fail_writer_starts) && ava1_thread_start(writer_main, c, &s->writer[l]) == 0) {
+            s->writer_started[l] = 1;
             s->writer_up[l] = 1;
-            if (c) {
-                c->j = j;
-                c->lane = l;
-                if (ava1_thread_start(writer_main, c, &s->writer[l]) == 0) s->writer_started[l] = 1;
-                else free(c);
-            }
+        } else {
+            free(c);
         }
     }
     pthread_mutex_unlock(&j->mu);
 }
+
+/* A Received (caller holds mu): the frame to free, or NULL. A frame its writer is still
+ * sending is only marked (the writer frees it); a seq not in flight (a frame requeued
+ * when its lane died, or a duplicate) changes nothing — its charge was held all along and
+ * comes back with the receiver's Credit. */
+static sframe_t *received_locked(ava1_job_t *j, snd_t *s, uint32_t seq) {
+    sframe_t *f;
+    for (f = s->inflight; f; f = f->next)
+        if (f->seq == seq) break;
+    if (!f) return NULL;
+    unlink_inflight(s, f);
+    j->bytes_received += f->len;
+    if (f->sending) {
+        f->acked = 1;
+        return NULL;
+    }
+    return f;
+}
+
+/* More window from the receiver (caller holds mu). Credit frames are incremental (R2);
+ * the bytes are peer-controlled, so the add saturates instead of wrapping. */
+static void credit_locked(snd_t *s, uint64_t n) { s->credit = sat_add(s->credit, n); }
 
 static int on_frame(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len) {
     snd_t *s = S_(j);
@@ -448,23 +581,10 @@ static int on_frame(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len
     }
     case AVA1_TYPE_RECEIVED: {
         ava1_received_t r;
-        sframe_t **pp, *f = NULL;
-        uint32_t k;
+        sframe_t *f;
         if (ava1_received_decode(body, len, &r) != 0) return 1;
         pthread_mutex_lock(&j->mu);
-        for (pp = &s->inflight; *pp; pp = &(*pp)->next)
-            if ((*pp)->seq == r.seq) {
-                f = *pp;
-                *pp = f->next;
-                break;
-            }
-        if (!f) /* a frame we refunded after its lane died had arrived after all */
-            for (k = 0; k < REFUND_RING; k++)
-                if (s->refund_seq[k] == r.seq && s->refund_len[k]) {
-                    s->credit = s->credit > s->refund_len[k] ? s->credit - s->refund_len[k] : 0;
-                    s->refund_len[k] = 0;
-                }
-        if (f) j->bytes_received += f->len;
+        f = received_locked(j, s, r.seq);
         pthread_mutex_unlock(&j->mu);
         if (f) {
             free(f->msg);
@@ -476,7 +596,7 @@ static int on_frame(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len
         ava1_credit_t c;
         if (ava1_credit_decode(body, len, &c) != 0) return 1;
         pthread_mutex_lock(&j->mu);
-        s->credit += c.bytes; /* Credit frames are incremental (ruling R2) */
+        credit_locked(s, c.bytes);
         pthread_cond_broadcast(&j->cv);
         pthread_mutex_unlock(&j->mu);
         return 0;
@@ -611,11 +731,163 @@ ava1_job_t *ava1_send_open(const ava1_job_open_t *o, const uint8_t peer[32], ava
 void ava1_send_start(ava1_job_t *j) {
     snd_t *s = S_(j);
     uint16_t lanes[AVA1_MAX_LANES];
-    int n, i;
-    /* Lanes already up when the job was opened never produced a lane-change event for it. */
-    n = ava1_server_lanes(j->sid, lanes);
+    uint8_t sid[16];
+    int n, i, attached;
+    uint16_t l;
+    pthread_mutex_lock(&j->cmu);
+    attached = j->attached;
+    memcpy(sid, j->sid, 16);
+    pthread_mutex_unlock(&j->cmu);
+    if (!attached) return;
+    /* Lanes already up when the job was (re-)attached never produced a lane-change event
+     * for it. */
+    n = ava1_server_lanes(sid, lanes);
     pthread_mutex_lock(&j->mu);
-    for (i = 0; i < n; i++)
-        if (!s->writer_up[lanes[i]]) s->writer_up[lanes[i]] = 2;
+    /* A re-attach (a wire Resume): writers of an earlier session's lanes are retired —
+     * their frames requeued with their charge held — whether or not that session's lane
+     * deaths ever reached the job (it was parked first). */
+    for (l = 1; l <= AVA1_MAX_LANES; l++)
+        if (s->writer_up[l] && memcmp(s->wsid[l], sid, 16) != 0) lane_down_locked(s, l);
+    for (i = 0; i < n; i++) lane_up_locked(s, lanes[i], sid);
+    pthread_cond_broadcast(&j->cv);
     pthread_mutex_unlock(&j->mu);
+}
+
+/* ---- tests only: the window and the queues, driven step by step ------------------- */
+
+#define TEST_TAKEN 64
+static ava1_job_t *g_tj;
+static sframe_t *g_taken[TEST_TAKEN];
+
+void ava1_send_test_begin(uint64_t credit) {
+    snd_t *s = calloc(1, sizeof *s);
+    g_tj = calloc(1, sizeof *g_tj);
+    memset(g_taken, 0, sizeof g_taken);
+    pthread_mutex_init(&g_tj->mu, NULL);
+    pthread_cond_init(&g_tj->cv, NULL);
+    s->credit = credit;
+    g_tj->role = s;
+}
+
+void ava1_send_test_end(void) {
+    snd_t *s = S_(g_tj);
+    sframe_t *f;
+    uint32_t i;
+    for (i = 0; i < TEST_TAKEN; i++) /* a frame between pick and settle is on neither list */
+        if (g_taken[i]) {
+            sframe_t *p;
+            int listed = 0;
+            for (p = s->ready; p; p = p->next) listed |= p == g_taken[i];
+            for (p = s->inflight; p; p = p->next) listed |= p == g_taken[i];
+            if (!listed) {
+                free(g_taken[i]->msg);
+                free(g_taken[i]);
+            }
+        }
+    while ((f = s->ready) != NULL) {
+        s->ready = f->next;
+        free(f->msg);
+        free(f);
+    }
+    while ((f = s->inflight) != NULL) {
+        s->inflight = f->next;
+        free(f->msg);
+        free(f);
+    }
+    free(s);
+    pthread_cond_destroy(&g_tj->cv);
+    pthread_mutex_destroy(&g_tj->mu);
+    free(g_tj);
+    g_tj = NULL;
+}
+
+/* The reader's put of one `len`-byte frame: put_frame's return. */
+int ava1_send_test_put(uint64_t len) {
+    uint8_t *m = malloc(len ? (size_t)len : 1);
+    if (!m) return -ENOMEM;
+    return put_frame(g_tj, AVA1_TYPE_BUNDLE, m, (size_t)len);
+}
+
+/* The lane's writer picks its next frame: the frame's seq, 0 when it takes none. */
+uint32_t ava1_send_test_take(uint16_t lane) {
+    snd_t *s = S_(g_tj);
+    sframe_t *f = NULL;
+    uint32_t i;
+    pthread_mutex_lock(&g_tj->mu);
+    if (s->writer_up[lane] == 1) f = pick_locked(s, lane);
+    pthread_mutex_unlock(&g_tj->mu);
+    if (!f) return 0;
+    for (i = 0; i < TEST_TAKEN; i++)
+        if (!g_taken[i]) {
+            g_taken[i] = f;
+            break;
+        }
+    return f->seq;
+}
+
+/* The writer's send of frame `seq` returned `rc`: settle_locked's answer. */
+int ava1_send_test_settle(uint32_t seq, int rc) {
+    snd_t *s = S_(g_tj);
+    uint32_t i;
+    int k = -2;
+    for (i = 0; i < TEST_TAKEN; i++)
+        if (g_taken[i] && g_taken[i]->seq == seq) {
+            sframe_t *f = g_taken[i];
+            g_taken[i] = NULL;
+            pthread_mutex_lock(&g_tj->mu);
+            k = settle_locked(s, f, rc);
+            pthread_mutex_unlock(&g_tj->mu);
+            break;
+        }
+    return k;
+}
+
+/* A lane event; an up lane's writer counts as started (what on_tick does). */
+void ava1_send_test_lane(uint16_t lane, int up) {
+    snd_t *s = S_(g_tj);
+    lane_change(g_tj, lane, up);
+    pthread_mutex_lock(&g_tj->mu);
+    if (up && s->writer_up[lane] == 2) s->writer_up[lane] = 1;
+    pthread_mutex_unlock(&g_tj->mu);
+}
+
+void ava1_send_test_received(uint32_t seq) {
+    sframe_t *f;
+    uint32_t i;
+    pthread_mutex_lock(&g_tj->mu);
+    f = received_locked(g_tj, S_(g_tj), seq);
+    pthread_mutex_unlock(&g_tj->mu);
+    if (f) {
+        for (i = 0; i < TEST_TAKEN; i++)
+            if (g_taken[i] == f) g_taken[i] = NULL;
+        free(f->msg);
+        free(f);
+    }
+}
+
+void ava1_send_test_credit(uint64_t n) {
+    pthread_mutex_lock(&g_tj->mu);
+    credit_locked(S_(g_tj), n);
+    pthread_mutex_unlock(&g_tj->mu);
+}
+
+void ava1_send_test_stopping(void) {
+    pthread_mutex_lock(&g_tj->mu);
+    g_tj->stopping = 1;
+    pthread_cond_broadcast(&g_tj->cv);
+    pthread_mutex_unlock(&g_tj->mu);
+}
+
+/* out: credit, ready frames, queued bytes, in-flight frames. */
+void ava1_send_test_state(uint64_t out[4]) {
+    snd_t *s = S_(g_tj);
+    sframe_t *f;
+    pthread_mutex_lock(&g_tj->mu);
+    out[0] = s->credit;
+    out[1] = 0;
+    for (f = s->ready; f; f = f->next) out[1]++;
+    out[2] = s->queued;
+    out[3] = 0;
+    for (f = s->inflight; f; f = f->next) out[3]++;
+    pthread_mutex_unlock(&g_tj->mu);
 }

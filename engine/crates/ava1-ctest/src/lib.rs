@@ -359,6 +359,17 @@ pub mod ffi {
         pub fn ava1_test_job_counts(id: *const u8, out: *mut u64) -> c_int;
         pub fn ava1_test_data_knob(name: *const c_char, v: u32) -> c_int;
         pub fn ava1_test_retiring_blocks_reopen() -> c_int;
+        pub fn ava1_test_send_chunk_bytes() -> u64;
+        pub fn ava1_send_test_begin(credit: u64);
+        pub fn ava1_send_test_end();
+        pub fn ava1_send_test_put(len: u64) -> c_int;
+        pub fn ava1_send_test_take(lane: u16) -> u32;
+        pub fn ava1_send_test_settle(seq: u32, rc: c_int) -> c_int;
+        pub fn ava1_send_test_lane(lane: u16, up: c_int);
+        pub fn ava1_send_test_received(seq: u32);
+        pub fn ava1_send_test_credit(n: u64);
+        pub fn ava1_send_test_stopping();
+        pub fn ava1_send_test_state(out: *mut u64);
     }
 }
 
@@ -747,7 +758,9 @@ impl CServer {
 
     /// A data-layer test knob (test_shim.c `ava1_test_data_knob`): ack_fail (the ack's send
     /// "fails" with -v), feeder_fail, feed_delay_ms, park_ms, ctl_cap, reserve_fail,
-    /// lane_alloc_fail, fb_force (every Received takes the waiting-send fallback).
+    /// lane_alloc_fail, fb_force (every Received takes the waiting-send fallback); the
+    /// download sender's send_fail / writer_start_fail (the next v lane sends / writer
+    /// starts fail) and chunk_bytes (sets the queued-Chunk-bytes counter).
     pub fn knob(&self, name: &str, v: u32) {
         let n = CString::new(name).unwrap();
         assert_eq!(
@@ -755,6 +768,11 @@ impl CServer {
             0,
             "{name}"
         );
+    }
+
+    /// Chunk bytes the C download sender has queued since knob "chunk_bytes" set it.
+    pub fn sent_chunk_bytes(&self) -> u64 {
+        unsafe { ffi::ava1_test_send_chunk_bytes() }
     }
 
     /// 1 attached to a session, 0 parked, -1 not in the job table.
@@ -1108,6 +1126,85 @@ pub fn c_set_same_device(v: i32) {
 /// refusal test restores it; a test that starts a server should set it true first.
 pub fn c_set_read_allowed(v: bool) {
     unsafe { ffi::ava1_test_set_allow_read(v as c_int) };
+}
+
+static C_SEND_WINDOW: Mutex<()> = Mutex::new(());
+
+/// The C download sender's window and queues (ava1_send.c), driven step by step with no
+/// threads and no network: the reader's put, a lane writer's pick and the settle of its
+/// send, lane events, Received and Credit. One at a time per process.
+pub struct CSendWindow {
+    _lock: MutexGuard<'static, ()>,
+}
+
+/// What the C sender's window looks like right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CSendState {
+    pub credit: u64,
+    pub ready: u64,
+    pub queued: u64,
+    pub inflight: u64,
+}
+
+/// `settle`'s answers: the writer goes on, its lane generation is over, the job is over.
+pub const SETTLE_GO_ON: i32 = 1;
+pub const SETTLE_EXIT: i32 = 0;
+pub const SETTLE_FATAL: i32 = -1;
+/// AVA1_E_IO / AVA1_E_CLOSED / AVA1_E_TOOLONG (ava1_wire.h), what a lane send returns.
+pub const C_E_IO: i32 = -9;
+pub const C_E_CLOSED: i32 = -12;
+pub const C_E_TOOLONG: i32 = -8;
+
+impl CSendWindow {
+    pub fn new(credit: u64) -> Self {
+        let lock = C_SEND_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { ffi::ava1_send_test_begin(credit) };
+        CSendWindow { _lock: lock }
+    }
+    /// The reader queues one frame of `len` bytes: put_frame's return (0, or -ECANCELED).
+    pub fn put(&self, len: u64) -> i32 {
+        unsafe { ffi::ava1_send_test_put(len) }
+    }
+    /// The lane's writer picks a frame: its seq, or None when it takes nothing.
+    pub fn take(&self, lane: u16) -> Option<u32> {
+        match unsafe { ffi::ava1_send_test_take(lane) } {
+            0 => None,
+            s => Some(s),
+        }
+    }
+    /// The writer's send of `seq` returned `rc`: one of the SETTLE_* answers.
+    pub fn settle(&self, seq: u32, rc: i32) -> i32 {
+        unsafe { ffi::ava1_send_test_settle(seq, rc) }
+    }
+    pub fn lane(&self, lane: u16, up: bool) {
+        unsafe { ffi::ava1_send_test_lane(lane, up as c_int) }
+    }
+    pub fn received(&self, seq: u32) {
+        unsafe { ffi::ava1_send_test_received(seq) }
+    }
+    pub fn credit(&self, n: u64) {
+        unsafe { ffi::ava1_send_test_credit(n) }
+    }
+    /// The job is ending (j->stopping).
+    pub fn stopping(&self) {
+        unsafe { ffi::ava1_send_test_stopping() }
+    }
+    pub fn state(&self) -> CSendState {
+        let mut o = [0u64; 4];
+        unsafe { ffi::ava1_send_test_state(o.as_mut_ptr()) };
+        CSendState {
+            credit: o[0],
+            ready: o[1],
+            queued: o[2],
+            inflight: o[3],
+        }
+    }
+}
+
+impl Drop for CSendWindow {
+    fn drop(&mut self) {
+        unsafe { ffi::ava1_send_test_end() };
+    }
 }
 
 /// The payload's apply engine on a hand-built job (one at a time: it shares the C

@@ -23,6 +23,7 @@
 #include "ava1_journal.h"
 #include "ava1_manifest.h"
 #include "ava1_ranges.h"
+#include "ava1_send.h"
 #include "ava1_server.h"
 #include "ava1_thread.h"
 
@@ -1377,6 +1378,8 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     dc.fsync_delay_us = fsync_delay_us;
     dc.workers_start = dc.workers_min = dc.workers_max = workers;
     ava1_test_set_same_device(1);
+    __atomic_store_n(&ava1_send_test_fail_sends, 0, __ATOMIC_SEQ_CST); /* the download sender's knobs */
+    __atomic_store_n(&ava1_send_test_fail_writer_starts, 0, __ATOMIC_SEQ_CST);
     if (ava1_data_start(&dc) != 0) return -100;
     memset(&cfg, 0, sizeof cfg);
     ava1_identity_from_secret(&cfg.identity, secret);
@@ -1537,6 +1540,10 @@ int ava1_test_data_knob(const char *name, uint32_t v) {
     else if (!strcmp(name, "fb_force")) ava1_data_test_fb_force = (int)v;
     else if (!strcmp(name, "park_ms")) __atomic_store_n(&c->park_ms, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "ctl_cap")) __atomic_store_n(&c->ctl_cap, v, __ATOMIC_SEQ_CST);
+    else if (!strcmp(name, "send_fail")) __atomic_store_n(&ava1_send_test_fail_sends, v, __ATOMIC_SEQ_CST);
+    else if (!strcmp(name, "writer_start_fail"))
+        __atomic_store_n(&ava1_send_test_fail_writer_starts, v, __ATOMIC_SEQ_CST);
+    else if (!strcmp(name, "chunk_bytes")) __atomic_store_n(&ava1_send_test_chunk_bytes, v, __ATOMIC_SEQ_CST);
     else return -1;
     return 0;
 }
@@ -1570,3 +1577,7 @@ int ava1_test_retiring_blocks_reopen(void) {
     ava1_data_stop();
     return rc;
 }
+
+/* Chunk bytes the download sender has queued since the counter was last set (knob
+ * "chunk_bytes"). */
+uint64_t ava1_test_send_chunk_bytes(void) { return __atomic_load_n(&ava1_send_test_chunk_bytes, __ATOMIC_SEQ_CST); }

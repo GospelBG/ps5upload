@@ -41,4 +41,22 @@ ava1_job_t *ava1_send_open(const ava1_job_open_t *o, const uint8_t peer[32], ava
 /* Queue the manifest pages; start writers for the lanes already up (post-attach). */
 void ava1_send_start(ava1_job_t *j);
 
+/* Tests only (the ctest suite's FFI). Countdowns: the next N lane sends "fail" with
+ * AVA1_E_IO before writing anything; the next N writer thread starts "fail". The counter
+ * adds every Chunk byte the download sender queues. */
+extern uint32_t ava1_send_test_fail_sends;
+extern uint32_t ava1_send_test_fail_writer_starts;
+extern uint64_t ava1_send_test_chunk_bytes;
+/* Tests only: one sender job's window and queues, driven step by step (no threads). */
+void ava1_send_test_begin(uint64_t credit);
+void ava1_send_test_end(void);
+int ava1_send_test_put(uint64_t len);
+uint32_t ava1_send_test_take(uint16_t lane);
+int ava1_send_test_settle(uint32_t seq, int rc);
+void ava1_send_test_lane(uint16_t lane, int up);
+void ava1_send_test_received(uint32_t seq);
+void ava1_send_test_credit(uint64_t n);
+void ava1_send_test_stopping(void);
+void ava1_send_test_state(uint64_t out[4]);
+
 #endif
