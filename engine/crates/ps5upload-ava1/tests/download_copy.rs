@@ -305,6 +305,40 @@ async fn a_single_file_downloads_to_its_basename() {
     assert_eq!(names, ["big.pkg"], "no part file or extra entry is left");
 }
 
+/// Floors measured like the ava1-ctest tiny-download test: the per-file drive flush
+/// measured 56 files/s on a Mac; a healthy debug build does several hundred.
+const ZIP_FLOOR_FILES_PER_S: f64 = if cfg!(debug_assertions) { 150.0 } else { 400.0 };
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_thousand_tiny_files_zip_fast() {
+    let d = temp("zipperf");
+    let root = d.join("share/Tiny");
+    tree(&root, 2000, |i| 1024 + (i * 977) % (63 * 1024));
+    let (pool, _) = host(&d).await;
+    let pool = Arc::new(pool);
+    let out = d.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let t = std::time::Instant::now();
+    zipped(
+        pool,
+        "Tiny",
+        DownloadKind::Folder,
+        &out.join("t.zip"),
+        counters(),
+        0x71,
+    )
+    .await
+    .unwrap();
+    let secs = t.elapsed().as_secs_f64();
+    let rate = 2000.0 / secs;
+    eprintln!("tiny zip: 2000 files in {secs:.2}s = {rate:.0} files/s");
+    assert_eq!(zip_entries(&out.join("t.zip")).len(), 2000);
+    assert!(
+        rate >= ZIP_FLOOR_FILES_PER_S,
+        "{rate:.0} files/s < {ZIP_FLOOR_FILES_PER_S}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_folder_downloads_into_a_zip() {
     let d = temp("zip");
