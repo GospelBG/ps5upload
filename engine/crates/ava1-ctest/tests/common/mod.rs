@@ -134,3 +134,17 @@ pub fn same_tree(a: &Path, b: &Path) -> bool {
                         == std::fs::read(b.join(&y.path)).unwrap())
         })
 }
+
+/// `cp -r` for a test fixture: `same_tree(src, dst)` before and after.
+pub fn copy_dir(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for e in std::fs::read_dir(src).unwrap() {
+        let e = e.unwrap();
+        let to = dst.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &to);
+        } else {
+            std::fs::copy(e.path(), &to).unwrap();
+        }
+    }
+}

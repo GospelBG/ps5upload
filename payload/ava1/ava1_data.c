@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "ava1_apply.h"
+#include "ava1_copy.h"
 #include "ava1_job.h"
 #include "ava1_platform.h"
 #include "ava1_recv.h"
@@ -602,7 +603,8 @@ typedef struct {
  * is written once, by ava1_recv_open, which runs under g_open_mu like this check. */
 static void root_each(ava1_job_t *j, void *ctx) {
     root_q_t *q = ctx;
-    if (memcmp(j->id, q->id, 16) != 0 && j->kind == AVA1_JOB_UPLOAD && strcmp(j->root, q->root) == 0) {
+    if (memcmp(j->id, q->id, 16) != 0 && (j->kind == AVA1_JOB_UPLOAD || j->kind == AVA1_JOB_COPY) &&
+        strcmp(j->root, q->root) == 0) {
         j->refs++;
         q->hit[q->n++] = j;
     }
@@ -749,6 +751,87 @@ static void open_now(opening_t *o, const uint8_t sid[16], const uint8_t peer[32]
     if ((ava1_data_test_ack_fail ? ava1_data_test_ack_fail : send_ack(sid, &ack, j ? "" : msg, 0)) != 0 && j)
         ava1_job_park_session(sid); /* the session ended while we opened: on_session_end missed it */
     if (j) ava1_job_put(j);
+}
+
+/* ---- the data plane's RPC methods (SPEC.md §13.5) --------------------------------- */
+
+/* Status carries the local job's progress and how it ended (ext: state, current). */
+static int encode_status(ava1_job_t *j, uint8_t *out, size_t cap, size_t *out_len) {
+    ava1_status_t st;
+    ava1_w_t w;
+    int rc;
+    memset(&st, 0, sizeof st);
+    pthread_mutex_lock(&j->mu);
+    memcpy(st.job_id, j->id, 16);
+    st.files_done = j->files_done;
+    st.files_total = j->have_manifest ? j->m.files : j->m_in.files;
+    st.bytes_received = j->bytes_received;
+    st.bytes_durable = j->bytes_durable;
+    st.bytes_total = j->have_manifest ? j->m.bytes : j->m_in.bytes;
+    st.workers = j->want_workers;
+    st.has_state = 1;
+    st.state = !j->finished ? 0 : (j->final_status == AVA1_STATUS_OK ? 1 : 2);
+    if (j->message[0]) {
+        st.has_current = 1;
+        st.current = (const uint8_t *)j->message;
+        st.current_len = (uint16_t)strlen(j->message);
+    }
+    ava1_w_init(&w, out, cap);
+    rc = ava1_status_encode(&st, &w);
+    pthread_mutex_unlock(&j->mu);
+    *out_len = w.len;
+    return rc == 0 ? AVA1_STATUS_OK : AVA1_ERR_INTERNAL;
+}
+
+int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *out, size_t cap,
+                  size_t *out_len) {
+    *out_len = 0;
+    switch (method) {
+    case AVA1_METHOD_JOB_COPY: {
+        ava1_job_copy_t c;
+        char dest[AVA1_MAX_PATH + 1];
+        char msg[160] = "";
+        uint16_t st = AVA1_ERR_PATH;
+        ava1_job_t *j;
+        int rc;
+        if (ava1_job_copy_decode(body, len, &c) != 0) return AVA1_ERR_PROTOCOL;
+        /* The open lock is what makes the destination check race-free: ava1_recv_open
+         * writes j->root under it (open_now, same rule). */
+        pthread_mutex_lock(&g_open_mu);
+        if (c.dest_len <= AVA1_MAX_PATH) {
+            memcpy(dest, c.dest, c.dest_len);
+            dest[c.dest_len] = 0;
+            if (root_in_use(c.job_id, dest)) {
+                pthread_mutex_unlock(&g_open_mu);
+                return AVA1_ERR_BUSY;
+            }
+            j = ava1_copy_open(&c, &st, msg, sizeof msg);
+        } else {
+            j = NULL;
+        }
+        pthread_mutex_unlock(&g_open_mu);
+        if (!j) return st;
+        rc = encode_status(j, out, cap, out_len);
+        ava1_job_put(j);
+        return rc;
+    }
+    case AVA1_METHOD_JOB_STATUS:
+    case AVA1_METHOD_JOB_CANCEL: {
+        ava1_job_ref_t r;
+        ava1_job_t *j;
+        int st = AVA1_STATUS_OK;
+        if (ava1_job_ref_decode(body, len, &r) != 0) return AVA1_ERR_PROTOCOL;
+        if (!(j = ava1_job_find(r.job_id))) return AVA1_ERR_UNKNOWN_JOB;
+        if (method == AVA1_METHOD_JOB_STATUS) st = encode_status(j, out, cap, out_len);
+        else ava1_recv_cancel(j); /* stops it and unlists it: the journal stays */
+        ava1_job_put(j);
+        return st;
+    }
+    case AVA1_METHOD_DISK_CALIBRATE:
+        return AVA1_ERR_UNKNOWN_METHOD; /* Task 20 */
+    default:
+        return -1; /* not ours: the embedder's handler runs (ava1_glue.c, Task 21) */
+    }
 }
 
 /* ---- control frames ---------------------------------------------------------------- */

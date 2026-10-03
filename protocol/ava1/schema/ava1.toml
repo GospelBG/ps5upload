@@ -317,6 +317,10 @@ name = "JF_MOVE"          # job.copy: delete the source after a verified copy
 ty = "u32"
 value = 8
 [[const]]
+name = "JF_OVERWRITE"     # job.copy: replace destination files that already exist
+ty = "u32"                # (the engine's overwrite option); unset = refuse with ERR_EXISTS
+value = 16
+[[const]]
 name = "ENTRY_FILE"
 ty = "u8"
 value = 0

@@ -1353,6 +1353,14 @@ int ava1_test_apply_reserve(size_t n, int take) {
 
 /* ---- the data layer on the wire (Task 14) ----------------------------------------- */
 
+/* The data server's hook: the data plane's own methods first (Task 19), then node.info. */
+static int data_rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap,
+                    size_t *out_len) {
+    int rc = ava1_data_rpc(method, body, body_len, out, cap, out_len);
+    if (rc != -1) return rc;
+    return rpc(method, body, body_len, out, cap, out_len);
+}
+
 /* The server with the real data hooks: uploads land under any absolute path. `port` 0 =
  * any (a restart passes the old one); `workers` nonzero fixes the apply pool's size. */
 int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path, const char *jobs_dir,
@@ -1379,7 +1387,7 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     cfg.ping_every_ms = ping_ms;
     cfg.dead_after_ms = dead_ms;
     cfg.handshake_ms = handshake_ms;
-    cfg.rpc = rpc; /* node.info (Task 19 adds the data RPCs) */
+    cfg.rpc = data_rpc; /* the data plane's methods, then node.info */
     cfg.data = ava1_data_hooks();
     cfg.caps = AVA1_CAP_DATA_PLANE;
     rc = ava1_server_start(&cfg);

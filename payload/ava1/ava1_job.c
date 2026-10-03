@@ -196,6 +196,10 @@ static void job_destroy(ava1_job_t *j) {
     }
     if (j->thread_started) pthread_join(j->thread, NULL);
     for (i = 0; i < j->nworkers; i++) pthread_join(j->workers[i], NULL);
+    /* The role's reader is the only thread left that can enqueue work (a copy's reader
+     * applies what it reads, Task 19): join it before the queue below is drained, or an
+     * enqueue concurrent with the drain would append to a freed item. */
+    if (j->role_free) j->role_free(j);
     while ((w = j->q_head) != NULL) {
         j->q_head = w->next;
         free(w->owned);
@@ -219,7 +223,6 @@ static void job_destroy(ava1_job_t *j) {
     }
     ava1_jnl_close(&j->jnl);
     ava1_bits_free(&j->done);
-    if (j->role_free) j->role_free(j);
     ava1_mstore_free(&j->m);
     if (j->credit) ava1_budget_give(j->credit);
     free_frames(j->held_head);
@@ -309,13 +312,19 @@ void ava1_job_reap(uint64_t now_ms) {
         int fin;
         /* Only a parked job can be collected: detached with a park stamp. A job created
          * detached is stamped at creation, so one nobody ever attaches ages too; a job
-         * attached (find_attach, under this lock) has no stamp. A local job (JOB_COPY) is
-         * unlisted by Task 19, never here. `finished` is read without j->mu: that lock can
-         * be held across disk I/O, and waiting for it under T.mu would stall every reader
-         * thread's job lookup. It only ever goes 0 -> 1, so a stale read reaps later. */
+         * attached (find_attach, under this lock) has no stamp. `finished` is read without
+         * j->mu: that lock can be held across disk I/O, and waiting for it under T.mu would
+         * stall every reader thread's job lookup. It only ever goes 0 -> 1, so a stale read
+         * reaps later. */
         if (!j || j->attached || j->parked_at_ms == 0) continue;
         fin = __atomic_load_n(&j->finished, __ATOMIC_ACQUIRE);
-        if (now_ms - j->parked_at_ms > age || (fin && now_ms - j->parked_at_ms > done_age)) {
+        /* A local job (JOB_COPY) is a writer with no session. Its park stamp is set at
+         * creation and again when it ends, so `!fin` protects a running copy (whose stamp is
+         * the creation one) from the age rule, and the window the operator can query is the
+         * full park age from the moment it ended. */
+        if (j->kind == AVA1_JOB_COPY
+                ? (fin && now_ms - j->parked_at_ms > age)
+                : (now_ms - j->parked_at_ms > age || (fin && now_ms - j->parked_at_ms > done_age))) {
             gone[n++] = j;
             unlist(j);
         }

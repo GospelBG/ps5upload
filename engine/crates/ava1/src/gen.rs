@@ -43,6 +43,7 @@ pub const JF_SINGLE_FILE: u32 = 1;
 pub const JF_ORDERED: u32 = 2;
 pub const JF_UNSAFE_READ: u32 = 4;
 pub const JF_MOVE: u32 = 8;
+pub const JF_OVERWRITE: u32 = 16;
 pub const ENTRY_FILE: u8 = 0;
 pub const ENTRY_DIR: u8 = 1;
 pub const GROUP_SHIFT: u8 = 20;
