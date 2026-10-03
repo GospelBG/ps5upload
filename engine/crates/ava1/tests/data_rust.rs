@@ -909,3 +909,87 @@ async fn resume_answers_a_job_map_for_a_parked_job_else_unknown_job() {
     assert_eq!(map.status, gen::STATUS_OK);
     assert_eq!(map.done, vec![gen::FileRun { first: 0, count: 1 }]);
 }
+
+/// A forward-only source over in-memory entries, in an order unrelated to the manifest's.
+struct ReverseSeq {
+    entries: Vec<(String, Vec<u8>)>,
+}
+
+impl ava1::seq::SeqSource for ReverseSeq {
+    fn pass(
+        &self,
+        restart: ava1::seq::Restart,
+        want: &mut dyn FnMut(&str, u64) -> ava1::seq::Keep,
+        sink: &mut dyn ava1::seq::EntrySink,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> std::io::Result<()> {
+        for (p, d) in self.entries.iter().skip(restart.0 as usize) {
+            if want(p, d.len() as u64) == ava1::seq::Keep::Skip {
+                continue;
+            }
+            sink.begin(p)?;
+            for c in d.chunks(65536) {
+                sink.data(c)?;
+            }
+            sink.end()?;
+        }
+        Ok(())
+    }
+    fn restart_for(&self, _id: u32) -> ava1::seq::Restart {
+        ava1::seq::Restart::START
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sequential_source_uploads_into_a_folder_host() {
+    let d = common::temp_dir("rr-seq");
+    let host = Arc::new(FolderHost {
+        root: d.join("share"),
+        jobs_dir: d.join("hjobs"),
+    });
+    let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(host)).await;
+    let s = connect(&addr.to_string(), id, peers, "client", common::fast())
+        .await
+        .unwrap();
+    let pat = |n: usize, k: u8| -> Vec<u8> { (0..n).map(|i| (i as u8) ^ k).collect() };
+    // Decode order is the reverse of the sorted manifest; one file is large (>1 group).
+    let mut entries = vec![
+        ("z/small".to_string(), pat(100, 1)),
+        ("m/big.bin".to_string(), pat(3 * 1024 * 1024 + 17, 2)),
+        ("a".to_string(), pat(0, 3)),
+        ("a2".to_string(), pat(5000, 4)),
+    ];
+    let mut sorted = entries.clone();
+    sorted.sort();
+    let m = Manifest {
+        entries: sorted
+            .iter()
+            .map(|(p, b)| Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: b.len() as u64,
+                mtime: 0,
+                path: p.clone(),
+                root: None,
+            })
+            .collect(),
+    };
+    let mut o = SendOptions::upload("in");
+    o.seq = Some(Arc::new(ReverseSeq {
+        entries: entries.clone(),
+    }));
+    let empty = common::temp_dir("rr-seq-src");
+    let mut link = s.job([2; 16]);
+    let r = send_job(&mut link, Arc::new(m), Arc::new(LocalSource::new(empty)), o)
+        .await
+        .unwrap();
+    assert_eq!(r.status, 0);
+    entries.sort();
+    for (p, b) in &entries {
+        assert_eq!(
+            &std::fs::read(d.join("share/in").join(p)).unwrap(),
+            b,
+            "{p}"
+        );
+    }
+}
