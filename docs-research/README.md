@@ -14,5 +14,6 @@ branch by the cloud research session; the local implementation sessions read the
 | `006-ava1-fc2640f/` | fc2640f | deep re-review + liveness/hang audit + 20-category evaluation checklist + impl guides for the three ready fixes (nonce audit, progress watchdog, zip finish window) |
 | `007-ava1-e2208e6/` | e2208e6 | pre-hardware deep review of 66 commits (durable-by-log on both ends verified incl. crash recovery; JobOpen-after-cancel hang closed); hardware go/no-go gates and Pro-outage triage; findings HW-0..HW-4 + conformance C-1; impl guides for same_device fail-closed and a runtime durable-by-log off-switch |
 | `008-ava1-282fa0b/` | 282fa0b | review of e2208e6..282fa0b: all 006 items landed and verified (nonce audit PASS with ceilings, progress watchdog on both ends, admission bound, vectors, fs.stat decision); fix branch ava1-fixes-007 merged onto the head and re-tested green |
+| `009-ava1-282fa0b/` | 282fa0b | designs for what is still lacking: API auth, sanitizers/torn-write/soak test depth, nightly hardware-in-the-loop, per-job telemetry, download commit parity, conformance suite, group-delta integration after durable-by-log; notes that engine CI needs ava1-fixes-007 to build ctest on ubuntu-24.04 |
 
 Each new session adds `NNN-ava1-<short sha>/` with its own numbered notes and a row here.
