@@ -2217,7 +2217,7 @@ static void sync_batch(ava1_job_t *j) {
     fdlist_t l;
     uint64_t t0 = ava1_mono_ms(), new_bytes = 0, bytes_in = 0;
     ava1_ploc_t *ploc = NULL;       /* durable-by-log: where each pending small file's record is */
-    uint32_t *fids = NULL, nfd = 0, npk = 0, pk_first = 0, ndirty;
+    uint32_t *fids = NULL, nfd = 0, npk = 0, pk_first = 0, ndirty, held;
     uint8_t (*froots)[32] = NULL;   /* the pending files that hold a descriptor (the per-file fsync path) */
     int logmode = 0;
     lent_t *lg = NULL;
@@ -2233,6 +2233,7 @@ static void sync_batch(ava1_job_t *j) {
     j->pend_root = NULL;
     j->pend_loc = NULL;
     j->pend_n = j->pend_cap = 0;
+    held = j->pend_n_fd; /* every pending fd holds a reservation; `nfd` is only set once the lists exist */
     j->pend_n_fd = 0;
     logmode = n_small && ploc && ploc[0].len;
     for (ndirty = 0, k = 0; k < j->npsegs; k++)
@@ -2264,7 +2265,8 @@ static void sync_batch(ava1_job_t *j) {
     newlf = malloc(((size_t)nlf + 1u) * sizeof *newlf);
     retried = calloc((size_t)n_small + 2u * nlf + ndirty + 1u, 1);
     chk = malloc(((size_t)nlf + 1u) * sizeof *chk);
-    if (!l.fds || !rg || !roots || !runs || !newlf || !retried || !chk || !fids || !froots || !lg) {
+    if (!l.fds || !rg || !roots || !runs || !newlf || !retried || !chk || !fids || !froots || !lg ||
+        (ava1_apply_fault && ava1_apply_fault(j, AVA1_HOOK_BATCH_ALLOC, 0))) {
         pthread_mutex_unlock(&j->mu);
         ava1_apply_fail(j, AVA1_ERR_IO, "out of memory in a sync batch", ENOMEM, 0);
         goto out;
@@ -2489,7 +2491,8 @@ static void sync_batch(ava1_job_t *j) {
     pthread_mutex_unlock(&j->mu);
     for (i = 0; i < n_small; i++)
         if (sfds[i] >= 0) close(sfds[i]);
-    ava1_pend_release(nfd);
+    ava1_pend_release(held);
+    held = 0;
     nfd = 0;
     n_small = 0;
     if (nr || ng) emit_durable(j, runs, nr, rg, ng);
@@ -2538,7 +2541,7 @@ out:
     pthread_mutex_unlock(&j->mu);
     for (i = 0; i < n_small; i++)
         if (sfds[i] >= 0) close(sfds[i]);
-    ava1_pend_release(nfd);
+    ava1_pend_release(held); /* an early `goto out` leaves nfd at 0 with the reservations still taken */
     free(ploc);
     free(fids);
     free(froots);

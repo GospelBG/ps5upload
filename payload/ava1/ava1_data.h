@@ -101,6 +101,7 @@ void ava1_lf_peak_reset(void);
 /* fsync of every job's journal and pack segments, for the exit watchdog (see ava1_exit_flush). Takes no
  * job lock it cannot get at once. */
 void ava1_data_flush_for_exit(void);
+uint32_t ava1_pend_in_use(void);
 uint32_t ava1_pend_peak(void);
 void ava1_pend_peak_reset(void);
 extern uint32_t ava1_data_test_cal_peak; /* most fds disk.calibrate held at once */

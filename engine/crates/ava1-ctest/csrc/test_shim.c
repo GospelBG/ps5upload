@@ -1608,6 +1608,9 @@ static uint32_t g_fault_id = UINT32_MAX - 1; /* no file: no fault */
 static int g_sweep_fail_n; /* sweeps' file syncs fail with EIO this many times (-1: until cleared) */
 int ava1_test_sweep_fail_left(void) { return __atomic_load_n(&g_sweep_fail_n, __ATOMIC_SEQ_CST); }
 void ava1_test_sweep_fail(int n) { __atomic_store_n(&g_sweep_fail_n, n, __ATOMIC_SEQ_CST); }
+static int g_batch_alloc_fail;
+void ava1_test_apply_fail_batch_alloc(int on) { __atomic_store_n(&g_batch_alloc_fail, on, __ATOMIC_SEQ_CST); }
+
 static int t_fault(ava1_job_t *j, int point, uint32_t id) {
     (void)j;
     if (point == AVA1_HOOK_SWEEP_FILE) {
@@ -1618,6 +1621,7 @@ static int t_fault(ava1_job_t *j, int point, uint32_t id) {
         }
         return 0;
     }
+    if (point == AVA1_HOOK_BATCH_ALLOC && __atomic_exchange_n(&g_batch_alloc_fail, 0, __ATOMIC_SEQ_CST)) return ENOMEM;
     if (point == AVA1_HOOK_PREALLOC && id == __atomic_load_n(&g_prealloc_fault, __ATOMIC_SEQ_CST)) return ENOSPC;
     return point == AVA1_HOOK_DIR_SYNCED && id == __atomic_load_n(&g_fault_id, __ATOMIC_SEQ_CST) ? EIO : 0;
 }

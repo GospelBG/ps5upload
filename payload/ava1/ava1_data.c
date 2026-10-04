@@ -300,6 +300,9 @@ void ava1_lf_release(uint32_t n) {
 uint32_t ava1_lf_peak(void) { return __atomic_load_n(&g_lf_peak, __ATOMIC_SEQ_CST); }
 void ava1_lf_peak_reset(void) { __atomic_store_n(&g_lf_peak, __atomic_load_n(&g_lf_open, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST); }
 
+/* Pending-fd reservations held right now (tests: a failed batch must give every one back). */
+uint32_t ava1_pend_in_use(void) { return __atomic_load_n(&g_pend_open, __ATOMIC_SEQ_CST); }
+
 uint32_t ava1_pend_peak(void) { return __atomic_load_n(&g_pend_peak, __ATOMIC_SEQ_CST); }
 void ava1_pend_peak_reset(void) { __atomic_store_n(&g_pend_peak, __atomic_load_n(&g_pend_open, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST); }
 
