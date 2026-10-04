@@ -287,13 +287,9 @@ pub async fn cancel_midway<T: Send + 'static>(
         .await
         .expect("the cancelled upload never returned")
         .unwrap();
-    // The sender reports the cancel before the console has released the job on the shared
-    // session, and behind a throttled link the console is still reading what the old lanes had
-    // buffered. A resume under the same job id in that window is not answered (observed: the
-    // JobOpen waits indefinitely for its ack; recorded as a finding in the task report), so cut
-    // the old connections, as a dropped link would, and give the console a moment.
-    proxy.kill_all();
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // A resume under the same job id follows at once: a JobOpen for a job the receiver still
+    // holds is answered BUSY and retried by the sender (resume-after-cancel fix, 38676afe).
+    let _ = proxy;
     match r {
         Err(e) => e,
         Ok(_) => panic!("the upload finished before the cancel landed (file too small?)"),
