@@ -4329,6 +4329,7 @@ pub use rar_support::{
     inspect_rar, rar_plan_entries_for_test, rar_plan_preview, spawn_rar_worker_for_test,
     transfer_rar_resumable, transfer_rar_streaming,
 };
+#[cfg(not(target_os = "android"))]
 pub(crate) use rar_support::{rar_dirs, rar_plan_entries, spawn_rar_worker};
 #[cfg(not(target_os = "android"))]
 pub use rar_support::{rar_layout, rar_walk, RarFailKind, RarLayout, RarWalkError, RarWalkSink};
