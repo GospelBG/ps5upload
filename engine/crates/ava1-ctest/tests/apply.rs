@@ -208,6 +208,25 @@ fn c_commit_refuses_an_unknown_device_and_never_renames() {
 }
 
 #[test]
+fn c_commit_with_no_device_hook_refuses_and_never_renames() {
+    // final review fs #1: a missing same_device hook is not "no guard needed".
+    let t = tmp("xdev-nohook");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let d = data(2 * GROUP as usize + 1, 3);
+    let m = Manifest {
+        entries: vec![file("big", d.len() as u64)],
+    };
+    c_set_same_device(-2); // the shim installs no hook at all
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    send_large(&job, 0, &d, false);
+    assert_eq!(job.wait(10_000), ava1::gen::ERR_IO as i32);
+    c_set_same_device(1);
+    assert!(root.join("big.ava-part").exists());
+    assert!(!root.join("big").exists());
+}
+
+#[test]
 fn a_staged_tree_is_not_moved_when_the_device_is_unknown_or_another() {
     for (v, code) in [(-1, ava1::gen::ERR_IO), (0, ava1::gen::ERR_CROSS_DEVICE)] {
         let t = tmp(&format!("tree-xdev{v}"));

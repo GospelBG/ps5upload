@@ -107,7 +107,12 @@ static inline xdev_result_t xdev_rename_crosses_l(const char *from,
     unsigned long long dev_from = 0, dev_to = 0;
     if (from_dev(from, &dev_from) != 0) return XDEV_UNKNOWN;
 
-    char to_dir[512];
+    /* The parent is judged WHOLE: a path too long for the buffer would be clamped by xdev_parent_dir and
+     * stat a different, nonexistent directory (a parent on another mount cut off), so it is UNKNOWN, which
+     * every caller refuses (review 007 #4, final review fs #1). 4096 covers every path the payload accepts
+     * (FS_PATH_MAX is 1024). */
+    char to_dir[4096];
+    if (strlen(to) >= sizeof(to_dir)) return XDEV_UNKNOWN;
     xdev_parent_dir(to, to_dir, sizeof(to_dir));
     if (dir_dev(to_dir, &dev_to) != 0) return XDEV_UNKNOWN;
 
