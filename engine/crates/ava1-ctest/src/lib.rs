@@ -1337,6 +1337,8 @@ pub struct Probe {
     pub batch_dir_syncs: u64,
     pub batch_dir_syncs_on_workers: u64,
     pub batch_dir_sync_threads: u64,
+    /// The job switched to an fsync after every chunk (a drive too slow for batch fsyncs).
+    pub per_chunk_fsync: bool,
 }
 
 /// The payload's apply engine on a hand-built job (one at a time: it shares the C
@@ -1471,6 +1473,7 @@ impl CApplyJob {
             batch_dir_syncs: o[4],
             batch_dir_syncs_on_workers: o[5],
             batch_dir_sync_threads: o[6],
+            per_chunk_fsync: o[7] != 0,
         }
     }
 

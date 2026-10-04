@@ -178,6 +178,7 @@ void ava1_lflist_reset(ava1_job_t *j, int release) {
 }
 
 static int u32cmp(const void *a, const void *b);
+static int stopping_cb(void *a);
 static void run_commit(ava1_job_t *j, uint32_t id);
 
 /* A lf with nothing left for a batch, a commit or a snapshot to do. */
@@ -698,6 +699,31 @@ static ava1_lfile_t *lfile_open(ava1_job_t *j, uint32_t id, int *err, int create
     return lf;
 }
 
+/* fsync after a chunk's pwrite: 0, or -errno. A retried fsync may have succeeded on pages the
+ * kernel dropped, so then the chunk is read back and compared with what was received (the batch
+ * path does the same with reread_ranges). */
+static int chunk_sync(ava1_job_t *j, int fd, const uint8_t *d, size_t len, uint64_t off) {
+    int retried = 0, e = ava1_fsync_retry(fd, stopping_cb, j, &retried);
+    uint8_t *buf;
+    size_t got = 0;
+    int rc = 0;
+    if (e) return -e;
+    if (!retried) return 0;
+    if (!(buf = malloc(len ? len : 1))) return -ENOMEM;
+    while (got < len) {
+        ssize_t k = pread(fd, buf + got, len - got, (off_t)(off + got));
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) {
+            rc = k < 0 ? -errno : -EIO;
+            break;
+        }
+        got += (size_t)k;
+    }
+    if (!rc && memcmp(buf, d, len) != 0) rc = -EIO;
+    free(buf);
+    return rc;
+}
+
 static int write_chunk(ava1_job_t *j, uint32_t id, uint64_t off, const uint8_t *d, size_t len) {
     ava1_lfile_t *lf;
     int err, fd, ob;
@@ -732,6 +758,9 @@ static int write_chunk(ava1_job_t *j, uint32_t id, uint64_t off, const uint8_t *
             if ((err = pwrite_all(ob, cv, 32, g * 32u)) != 0) break;
         }
     }
+    /* A drive too slow for batch fsyncs (see slow_drive_check): flush this chunk now, so the
+     * device streams and each flush is short. The batch fsync that follows finds little to do. */
+    if (err == 0 && __atomic_load_n(&j->perchunk, __ATOMIC_RELAXED)) err = chunk_sync(j, fd, d, len, off);
     close(fd);
     if (ob >= 0) close(ob);
     if (err) return err;
@@ -1157,6 +1186,28 @@ static int sync_new_dirs(ava1_job_t *j, const uint32_t *small, uint32_t n_small,
     return rc;
 }
 
+/* Review 003 §6: after a batch's data fsync took `data_ms`, would the sender have run dry? The
+ * intake rate is measured over the time data was flowing (from the end of the last batch to the
+ * start of this one; the sender is parked on credit while an fsync runs, so including that would
+ * understate it). When the fsync takes longer than the credit window holds data at that rate,
+ * the job switches, for good, to an fsync after every chunk. */
+static void slow_drive_check(ava1_job_t *j, uint64_t bytes, uint64_t flow_ms, uint64_t data_ms) {
+    uint64_t credit, window_ms;
+    if (__atomic_load_n(&j->perchunk, __ATOMIC_RELAXED) || bytes < (1ull << 20) || flow_ms < 50 || data_ms < 200) return;
+    pthread_mutex_lock(&j->mu);
+    credit = j->credit;
+    pthread_mutex_unlock(&j->mu);
+    if (!credit) return;
+    window_ms = credit / (bytes / flow_ms ? bytes / flow_ms : 1u); /* bytes per ms */
+    if (data_ms <= window_ms) return;
+    if (__atomic_exchange_n(&j->perchunk, 1, __ATOMIC_RELAXED)) return;
+    fprintf(stderr,
+            "[ava1] job %02x%02x%02x%02x: slow drive: a batch fsync took %llu ms for %llu MiB, the %llu MiB window holds "
+            "%llu ms at the current rate; fsync per chunk from now on\n",
+            j->id[0], j->id[1], j->id[2], j->id[3], (unsigned long long)data_ms, (unsigned long long)(bytes >> 20),
+            (unsigned long long)(credit >> 20), (unsigned long long)window_ms);
+}
+
 /* The durability chain (SPEC.md §12.6), in this order and no other: (1) data fsync, then
  * the directories that gained entries, (2) journal append + fsync, (3) state, then Durable. */
 static void sync_batch(ava1_job_t *j) {
@@ -1175,7 +1226,7 @@ static void sync_batch(ava1_job_t *j) {
     ava1_file_range_t *rg = NULL;
     ava1_root_item_t *roots = NULL;
     fdlist_t l;
-    uint64_t t0 = ava1_mono_ms(), new_bytes = 0;
+    uint64_t t0 = ava1_mono_ms(), new_bytes = 0, bytes_in = 0;
     uint8_t *body = NULL;
     memset(&l, 0, sizeof l);
     pthread_mutex_lock(&j->mu);
@@ -1187,6 +1238,7 @@ static void sync_batch(ava1_job_t *j) {
     j->pend_fd = NULL;
     j->pend_root = NULL;
     j->pend_n = j->pend_cap = 0;
+    bytes_in = j->bytes_received;
     snap = lfl_snapshot(j, &nsnap);
     if (nsnap == UINT32_MAX) {
         pthread_mutex_unlock(&j->mu);
@@ -1274,6 +1326,7 @@ static void sync_batch(ava1_job_t *j) {
     }
     HOOK(j, AVA1_HOOK_BATCH_SYNCED, UINT32_MAX);
     u2 = mono_us();
+    slow_drive_check(j, bytes_in - j->rate_bytes0, t0 - j->last_batch_end_ms, (u2 - u1) / 1000u);
     if (cfg->crash_at == AVA1_CRASH_AFTER_DATA) {
         ava1_apply_crash(j);
         goto out;
@@ -1383,6 +1436,10 @@ static void sync_batch(ava1_job_t *j) {
         j->st_compact_us += mono_us() - c0;
         j->st_compacts++;
     }
+    pthread_mutex_lock(&j->mu);
+    j->rate_bytes0 = j->bytes_received;
+    pthread_mutex_unlock(&j->mu);
+    j->last_batch_end_ms = ava1_mono_ms();
     {
         uint64_t dt = ava1_mono_ms() - t0;
         if (dt > 1500 && j->batch_max > 16) j->batch_max /= 2;
@@ -1899,7 +1956,7 @@ int ava1_apply_start(ava1_job_t *j) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
     ava1_wtune_init(&j->tune, cfg->workers_start, cfg->workers_min, cfg->workers_max);
     j->batch_max = 256;
-    j->tune_ms = j->status_ms = j->last_batch_ms = ava1_mono_ms();
+    j->tune_ms = j->status_ms = j->last_batch_ms = j->last_batch_end_ms = ava1_mono_ms();
     if (add_workers(j, cfg->workers_start) != 0 && j->nworkers == 0) return -1;
     j->want_workers = j->nworkers;
     if (ava1_thread_start(job_main, j, &j->thread) != 0) return -1;

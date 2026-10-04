@@ -111,6 +111,11 @@ struct ava1_job {
      * any worker's, `fail_journal` saying whether its Done must be journaled. */
     pthread_mutex_t jnl_mu;
     uint32_t commits_inflight;
+    /* A drive whose batch fsync outlasts the credit window (review 003 §6): once set (atomic,
+     * never cleared) workers fsync each chunk right after writing it. The rate is measured
+     * between batches: bytes_received at the end of the last one and when it ended. */
+    int perchunk;
+    uint64_t rate_bytes0, last_batch_end_ms;
     int fail_journal;
     uint32_t pre_files;
     int pre_slow_logged;

@@ -322,3 +322,63 @@ fn a_crash_after_the_data_sync_before_the_directories_journals_nothing() {
 fn a_crash_between_a_batchs_directory_syncs_journals_nothing() {
     dir_crash("crash-middirs", 9);
 }
+
+fn send_range(job: &CApplyJob, id: u32, d: &[u8]) {
+    let g = GROUP as usize;
+    for o in (0..d.len()).step_by(g) {
+        job.chunk(id, o as u64, &d[o..(o + g).min(d.len())]);
+    }
+    job.root(id, *blake3::hash(d).as_bytes());
+}
+
+#[test]
+fn a_drive_whose_batch_fsync_outlasts_the_window_switches_to_per_chunk_fsync() {
+    // Review 003 §6: when the data fsync of a batch takes longer than the credit window holds
+    // data at the current rate, the sender stalls on credit while the drive idles between
+    // fsyncs. The job then fsyncs each chunk right after writing it. The test drive is slow by
+    // fsync_delay_us (every batch fsync takes 3 s); 12 MiB arrive within a quarter second.
+    let t = tmp("slowdrive");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let a = data(12 * GROUP as usize, 3);
+    let b = data(5 * GROUP as usize + 9, 4);
+    let m = Manifest {
+        entries: vec![file("a.bin", a.len() as u64), file("b.bin", b.len() as u64)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 3_000_000);
+    assert!(!job.probe().per_chunk_fsync);
+    send_range(&job, 0, &a);
+    let t0 = std::time::Instant::now();
+    while !job.probe().per_chunk_fsync {
+        assert!(
+            t0.elapsed().as_secs() < 20,
+            "never switched: {}",
+            job.events()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // the second file is written in per-chunk mode and must still arrive intact
+    send_range(&job, 1, &b);
+    assert_eq!(job.wait(30_000), 0, "{}", job.events());
+    assert_eq!(std::fs::read(root.join("a.bin")).unwrap(), a);
+    assert_eq!(std::fs::read(root.join("b.bin")).unwrap(), b);
+}
+
+#[test]
+fn a_fast_drive_keeps_the_batch_fsync() {
+    let t = tmp("fastdrive");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let a = data(12 * GROUP as usize, 5);
+    let m = Manifest {
+        entries: vec![file("a.bin", a.len() as u64)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    send_range(&job, 0, &a);
+    assert_eq!(job.wait(15_000), 0, "{}", job.events());
+    assert!(
+        !job.probe().per_chunk_fsync,
+        "switched on a drive that keeps up"
+    );
+    assert_eq!(std::fs::read(root.join("a.bin")).unwrap(), a);
+}

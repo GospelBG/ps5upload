@@ -1392,7 +1392,7 @@ void ava1_test_apply_probe(uint64_t out[8]) {
     out[4] = g_dir_calls[0];
     out[5] = g_dir_on_worker[0];
     out[6] = g_dir_nthreads[0];
-    out[7] = 0;
+    out[7] = g_job ? (uint64_t)__atomic_load_n(&g_job->perchunk, __ATOMIC_SEQ_CST) : 0;
     pthread_mutex_unlock(&g_dir_mu);
 }
 

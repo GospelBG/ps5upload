@@ -759,7 +759,9 @@ holding the job's lock, and runs a commit on a worker rather than on the thread 
 fsyncs. Journal appends from several commits and a batch are serialised, so their records land in
 some order; each is independent, since a commit's record names one file and only follows that
 file's rename and directory fsync. A journal compaction waits until no commit is between its
-rename and its record.
+rename and its record. Where a drive's fsync of a batch takes longer than the credit window
+holds data at the intake rate measured between batches, a receiver may fsync each chunk right
+after writing it (the batch fsync then finds little to flush); this changes no ordering.
 
 15.4 Sync batches: every 250 ms, or after `batch_max` small files (tuned 16–512, starting 256:
 halved when a batch takes over 1.5 s, doubled when under 0.5 s) or 64 MiB of large-file bytes.
