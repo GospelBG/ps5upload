@@ -95,6 +95,39 @@ async fn transfer_dir_with_no_ava1_listener_is_helper_not_ava1() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn tiny_zip(path: &std::path::Path) {
+    use std::io::Write;
+    let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    w.start_file("a.txt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    w.write_all(b"hello").unwrap();
+    w.finish().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transfer_zip_with_no_ava1_listener_is_helper_not_ava1() {
+    let dir = std::env::temp_dir().join(format!("p5-ava1only-zip-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let zp = dir.join("g.zip");
+    tiny_zip(&zp);
+    let jobs: Arc<Mutex<HashMap<Uuid, JobState>>> = Arc::new(Mutex::new(HashMap::new()));
+    let req = TransferZipReq {
+        addr: Some("127.0.0.1:9113".to_string()),
+        tx_id: None,
+        dest_root: "/data/x".to_string(),
+        zip_path: zp.to_string_lossy().into_owned(),
+        excludes: vec![],
+        bandwidth_cap_mbps: None,
+        ram_threshold_mb: None,
+    };
+    let resp = transfer_zip_handler(State(state_for(&jobs)), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_helper_not_ava1(&jobs).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A console that has not accepted this app fails with `not_paired` (the pairing dialog's
 /// trigger), as a job failure and as a management refusal.
 #[test]

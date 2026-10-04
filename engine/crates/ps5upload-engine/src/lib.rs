@@ -105,9 +105,8 @@ use ps5upload_core::{
     },
     transfer::{
         inspect_7z, inspect_zip, sevenz_plan_preview, transfer_7z_resumable,
-        transfer_file_list_multistream, transfer_file_list_resumable, transfer_zip_resumable,
-        zip_plan_preview, FileListEntry, TransferConfig, DEFAULT_RESUME_RETRIES,
-        DEFAULT_ZIP_ENTRY_RAM_THRESHOLD, TX_FLAG_RESUME,
+        transfer_file_list_multistream, transfer_file_list_resumable, zip_plan_preview,
+        FileListEntry, TransferConfig, DEFAULT_RESUME_RETRIES, TX_FLAG_RESUME,
     },
     users::{user_list, UserList},
     volumes::{list_volumes, VolumeList},
@@ -1563,9 +1562,10 @@ struct TransferZipReq {
     excludes: Vec<String>,
     #[serde(default)]
     bandwidth_cap_mbps: Option<f64>,
-    /// Per-entry RAM-vs-temp inflate threshold, in MiB. None = engine default
-    /// (`PS5UPLOAD_ZIP_RAM_THRESHOLD_MB` env, else the core default).
+    /// Accepted for older clients and ignored: zip entries stream, nothing is held back to
+    /// inflate.
     #[serde(default)]
+    #[allow(dead_code)]
     ram_threshold_mb: Option<u64>,
 }
 
@@ -6012,11 +6012,6 @@ async fn transfer_zip_handler(
         Ok(id) => id,
         Err(e) => return json_err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    let initial_flags = if caller_supplied_tx_id {
-        TX_FLAG_RESUME
-    } else {
-        0
-    };
 
     // Central-directory-only plan: total uncompressed bytes (progress
     // denominator) + the file list (UI tree). A corrupt/missing zip fails
@@ -6073,18 +6068,6 @@ async fn transfer_zip_handler(
         .map(|(rel_path, size)| PlannedFile { rel_path, size })
         .collect();
     let files_sent_count = files.len() as u64;
-
-    // RAM-vs-temp inflate threshold: request override (MiB) → env → core
-    // default. Bounds the host memory/temp the zip path can use at once.
-    let ram_threshold = req
-        .ram_threshold_mb
-        .map(|mb| mb.saturating_mul(1024 * 1024))
-        .or_else(|| {
-            renamed_env(ZIP_RAM_THRESHOLD_ENV.0, ZIP_RAM_THRESHOLD_ENV.1)
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|mb| mb.saturating_mul(1024 * 1024))
-        })
-        .unwrap_or(DEFAULT_ZIP_ENTRY_RAM_THRESHOLD);
 
     let job_id = Uuid::new_v4();
     let started_at_ms = now_ms();
@@ -6150,6 +6133,10 @@ async fn transfer_zip_handler(
         let _stop_guard = TickerStopGuard::new(stop_ticker);
         let mut fail_guard =
             JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
+        if fail_job_unless_console_ready(&jobs, &events_tx, job_id, started_at_ms, &addr) {
+            fail_guard.mark_succeeded();
+            return;
+        }
         if fail_job_if_capacity_insufficient(
             &jobs,
             &events_tx,
@@ -6174,51 +6161,17 @@ async fn transfer_zip_handler(
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
         cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
-        // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes, matching the file
-        // and folder routes. The archive routes used to hard-code 2, so a
-        // mid-transfer stall on a console that recovers in ~10 s (a Wi-Fi
-        // blip, or the payload's serial accept loop still draining the dropped
-        // connection) burned both retries inside the first 1.5 s of backoff
-        // and surfaced as "transfer_zip gave up after 2 retries".
-        let ftx2 = |reason: Option<&str>| {
-            let mut r = transfer_zip_resumable(
-                &cfg,
-                tx_id,
-                &req.dest_root,
-                std::path::Path::new(&req.zip_path),
-                ram_threshold,
-                DEFAULT_RESUME_RETRIES,
-                initial_flags,
-            )?;
-            r.commit_ack_body = tag_ack_body(&r.commit_ack_body, "ftx2", reason);
-            Ok::<_, anyhow::Error>(r)
-        };
-        let result = if ps5upload_ava1::route::use_ava1(&addr) {
-            match ps5upload_ava1::upload::upload_zip(
-                &cfg,
-                tx_id,
-                &req.dest_root,
-                std::path::Path::new(&req.zip_path),
-            ) {
-                Err(e)
-                    if e.downcast_ref::<ps5upload_ava1::upload::ZipTooLarge>()
-                        .is_some() =>
-                {
-                    crate::log_info!("transfer_zip: AVA1 fallback to FTX2: {e}");
-                    ftx2(Some("zip_entry_too_large"))
-                }
-                Err(e)
-                    if e.downcast_ref::<ps5upload_ava1::upload::ZipUnsupported>()
-                        .is_some() =>
-                {
-                    crate::log_info!("transfer_zip: AVA1 fallback to FTX2: {e}");
-                    ftx2(Some("zip_unsupported_by_ava1"))
-                }
-                other => other,
-            }
-        } else {
-            ftx2(Some("ava1_unavailable"))
-        };
+        // Resume is by job_id (the sender reopens with JobOpen); retries live in the
+        // adapter's loop. An archive AVA1 cannot read (encryption, an unsupported method, a
+        // path the manifest refuses, a damaged directory) is a failure with its own reason:
+        // there is no other transport to hand it to.
+        let result = ps5upload_ava1::upload::upload_zip(
+            &cfg,
+            tx_id,
+            &req.dest_root,
+            std::path::Path::new(&req.zip_path),
+        )
+        .map_err(zip_failure);
         match result {
             Ok(r) => {
                 let completed_at_ms = now_ms();
@@ -6287,6 +6240,22 @@ fn tag_ack_body(body: &str, protocol: &str, reason: Option<&str>) -> String {
         out.insert("fallback_reason".into(), serde_json::json!(reason));
     }
     serde_json::Value::Object(out).to_string()
+}
+
+/// A zip the AVA1 source refused as unusable becomes a typed job failure, so the client shows
+/// the archive problem rather than a transport one.
+fn zip_failure(e: anyhow::Error) -> anyhow::Error {
+    if e.downcast_ref::<ps5upload_ava1::upload::ZipUnsupported>()
+        .is_some()
+        || e.downcast_ref::<ps5upload_ava1::upload::ZipTooLarge>()
+            .is_some()
+    {
+        return anyhow::Error::from(ps5upload_ava1::upload::UploadFailure {
+            reason: "zip_unsupported".into(),
+            detail: format!("{e}"),
+        });
+    }
+    e
 }
 
 // ── .7z handlers ── mirror the zip handlers; see those for the rationale on
@@ -9976,13 +9945,13 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
     // seam in the core crate; this registers the AVA1 implementation over the shared pool.
     // A console without AVA1 management keeps the FTX2 path inside the seam.
     ps5upload_ava1::mgmt::install();
-    // Renamed variables: read the old name once with a deprecation line. Archive staging no
-    // longer exists (the sources stream), so this one is only reported.
-    if renamed_env(ARCHIVE_STAGE_ENV.0, ARCHIVE_STAGE_ENV.1).is_some() {
-        crate::log_info!(
-            "{} is set but archive staging no longer exists; the setting is ignored",
-            ARCHIVE_STAGE_ENV.0
-        );
+    // Renamed variables: the old name is read once with a deprecation line. Archives stream
+    // (nothing is staged or held back to inflate), so both settings are accepted and reported
+    // but change nothing.
+    for (new, old) in [ZIP_RAM_THRESHOLD_ENV, ARCHIVE_STAGE_ENV] {
+        if renamed_env(new, old).is_some() {
+            crate::log_info!("{new} is set; archives stream now, so it has no effect");
+        }
     }
     // SPEC.md §14.3: expire old AVA1 job directories at start and then daily.
     ava1_api::spawn_journal_gc();
