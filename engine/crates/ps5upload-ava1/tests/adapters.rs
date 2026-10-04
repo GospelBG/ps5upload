@@ -703,6 +703,206 @@ async fn a_console_that_stays_busy_fails_the_upload_after_the_bound_with_a_clear
     );
 }
 
+/// A host that never answers the first `mute` JobOpens (the open is swallowed, as an old job's inbox
+/// swallowed it), then serves normally.
+struct MuteHost {
+    inner: FolderHost,
+    mute: std::sync::atomic::AtomicU32,
+    seen: std::sync::atomic::AtomicU32,
+}
+
+impl ava1::router::JobHost for MuteHost {
+    fn accept(&self, link: ava1::router::JobLink, first: ava1::conn::Frame, peer: [u8; 32]) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if first.ty == gen::JobOpen::TYPE {
+            self.seen.fetch_add(1, SeqCst);
+            let left = self.mute.load(SeqCst);
+            if left > 0 {
+                self.mute.store(left - 1, SeqCst);
+                drop(link);
+                return;
+            }
+        }
+        self.inner.accept(link, first, peer)
+    }
+}
+
+async fn mute_host(dir: &Path, mute: u32) -> (Arc<MuteHost>, Pool) {
+    let ava = dir.join("ava");
+    let me = Identity::load_or_create(&ava.join("identity")).unwrap();
+    let mut peers = PeerStore::in_memory();
+    peers.add(me.public(), "engine").unwrap();
+    let h = Arc::new(MuteHost {
+        inner: FolderHost {
+            root: dir.join("share"),
+            jobs_dir: dir.join("hjobs"),
+        },
+        mute: mute.into(),
+        seen: 0.into(),
+    });
+    let ctx = ServerCtx::new(
+        Identity::generate().unwrap(),
+        "host",
+        peers,
+        node_info_rpc(),
+    )
+    .with_jobs(h.clone());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(server::serve(l, Arc::new(ctx)));
+    (
+        h,
+        Pool::new(ava)
+            .with_addr(addr)
+            .with_open_ack_timeout(Duration::from_millis(400)),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_open_nobody_answers_is_retried_after_the_ack_timeout() {
+    let d = temp_dir("mute-then-ok");
+    let src = d.join("src");
+    tree(&src, 10, |_| 2048);
+    let (h, pool) = mute_host(&d, 2).await;
+    let c = cfg();
+    within(
+        60,
+        tokio::task::spawn_blocking(move || {
+            upload::upload_dir_in(&pool, &c, [0x31; 16], "out", &src)
+        }),
+    )
+    .await
+    .unwrap()
+    .expect("the upload completes once the open is answered");
+    assert_eq!(
+        h.seen.load(Ordering::SeqCst),
+        3,
+        "two lost opens, then the real one"
+    );
+    same_tree(&d.join("src"), &d.join("share/out"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_console_that_never_answers_the_open_fails_with_a_typed_reason() {
+    let d = temp_dir("mute-forever");
+    let src = d.join("src");
+    tree(&src, 4, |_| 1024);
+    let (h, pool) = mute_host(&d, u32::MAX).await;
+    let pool = pool.with_busy_tries(2);
+    let c = cfg();
+    let e = within(
+        60,
+        tokio::task::spawn_blocking(move || {
+            upload::upload_dir_in(&pool, &c, [0x32; 16], "out", &src)
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    let f = e
+        .downcast_ref::<upload::UploadFailure>()
+        .unwrap_or_else(|| panic!("not a classified failure: {e:#}"));
+    assert_eq!(f.reason, "ava1_open_timeout", "{f:?}");
+    assert_eq!(
+        h.seen.load(Ordering::SeqCst),
+        3,
+        "the first try and two retries"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_ends_the_wait_for_an_unanswered_open() {
+    let d = temp_dir("mute-cancel");
+    let src = d.join("src");
+    tree(&src, 4, |_| 1024);
+    let (_h, pool) = mute_host(&d, u32::MAX).await;
+    let pool = pool.with_open_ack_timeout(Duration::from_secs(30));
+    let c = cfg();
+    let cancel = c.cancel.clone().unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(600));
+        cancel.store(true, Ordering::Relaxed);
+    });
+    let t = std::time::Instant::now();
+    let e = within(
+        60,
+        tokio::task::spawn_blocking(move || {
+            upload::upload_dir_in(&pool, &c, [0x33; 16], "out", &src)
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(e.to_string().contains("cancel"), "{e:#}");
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+}
+
+/// A host whose first job never ends and never reads: its link stays registered on the session, the way
+/// a cancelled job still draining its lanes is.
+struct HoldHost {
+    held: std::sync::Mutex<Vec<ava1::router::JobLink>>,
+    seen: std::sync::atomic::AtomicU32,
+}
+
+impl ava1::router::JobHost for HoldHost {
+    fn accept(&self, link: ava1::router::JobLink, _first: ava1::conn::Frame, _peer: [u8; 32]) {
+        self.seen.fetch_add(1, Ordering::SeqCst);
+        self.held.lock().unwrap().push(link);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_for_a_job_still_registered_is_answered_busy_not_swallowed() {
+    // The job id is still registered on the session (its old run is closing). The new JobOpen must be
+    // answered BUSY by the server at once: routed to the old job it would be dropped, unanswered.
+    let d = temp_dir("hold-busy");
+    let src = d.join("src");
+    tree(&src, 2, |_| 512);
+    let ava = d.join("ava");
+    let me = Identity::load_or_create(&ava.join("identity")).unwrap();
+    let mut peers = PeerStore::in_memory();
+    peers.add(me.public(), "engine").unwrap();
+    let h = Arc::new(HoldHost {
+        held: Default::default(),
+        seen: 0.into(),
+    });
+    let ctx = ServerCtx::new(
+        Identity::generate().unwrap(),
+        "host",
+        peers,
+        node_info_rpc(),
+    )
+    .with_jobs(h.clone());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(server::serve(l, Arc::new(ctx)));
+    let pool = Pool::new(ava)
+        .with_addr(addr)
+        .with_busy_tries(2)
+        .with_open_ack_timeout(Duration::from_secs(1));
+    let c = cfg();
+    let t = std::time::Instant::now();
+    let e = within(
+        60,
+        tokio::task::spawn_blocking(move || {
+            upload::upload_dir_in(&pool, &c, [0x34; 16], "out", &src)
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    let f = e
+        .downcast_ref::<upload::UploadFailure>()
+        .unwrap_or_else(|| panic!("not a classified failure: {e:#}"));
+    assert_eq!(f.reason, "ava1_busy", "{f:?}");
+    assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
+    assert_eq!(
+        h.seen.load(Ordering::SeqCst),
+        1,
+        "only the first open reached the host"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_ends_the_busy_wait() {
     let d = temp_dir("busy-cancel");
