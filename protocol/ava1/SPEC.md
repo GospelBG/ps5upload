@@ -73,15 +73,26 @@ closes the connection.
 the Join tag uses dir = c2s and m = "join" ‖ session_id ‖ u16le(lane) ‖ cn; the
 JoinAck tag uses dir = s2c and m = "join-ack" ‖ session_id ‖ u16le(lane) ‖ cn ‖ sn.
 
-4.6 Pairing code: u32le(BLAKE2b-256("AVA1 pairing" ‖ h)[0..4]) mod 10⁶, shown as
-six digits. A man in the middle yields different h, so different codes.
+4.6 Pairing code: u32le(BLAKE2b-256("AVA1 pairing" ‖ h ‖ nonce_c ‖ nonce_s)[0..4])
+mod 10⁶, shown as six digits. nonce_c and nonce_s are 16 random bytes from the client
+and the server; the server commits to its own, `pair_commit = BLAKE2b-256(nonce_s)`,
+in ServerInfo (message 2) before it has seen nonce_c (in ClientInfo, message 3), and
+reveals nonce_s in the sealed Welcome. A man in the middle yields different h, but h
+alone is not enough: the last thing mixed into h is message 3's payload, which the
+initiator chooses, so an attacker running two handshakes could search payloads until
+both codes agree. With the commit-then-reveal round, facing the client the attacker
+commits before it sees nonce_c, and facing the console it must send its own nonce
+before the console reveals nonce_s, so each active attempt is a single 1-in-10⁶ guess
+(and costs a visible pairing notification). `vectors/pairing.txt` pins the commitment
+and the code. The three fields are required (a node that omits one is refused, since
+an optional field could be stripped); a trusted reconnect carries them too.
 
 ## 5. Handshake and pairing
 1. Client → `Hs1{noise}` (unsealed): Noise message 1, payload `HelloInfo`
    (version range, caps 0).
 2. Server: no common version → `Error(ERR_UNSUPPORTED_VERSION)` unsealed, close.
    Else → `Hs2{noise}`: message 2, payload `ServerInfo` (version, caps, random
-   session_id, name). `caps` bit 0 is `CAP_DATA_PLANE` (1): the node hosts the jobs
+   session_id, pair_commit (§4.6), name). `caps` bit 0 is `CAP_DATA_PLANE` (1): the node hosts the jobs
    of §11–§16. A client sends no data-plane frame and no method 16–19 request to a
    node that did not advertise it.
    Bit 1 is `CAP_MGMT` (2): the node serves the management methods of §7.3 (numbers 4 and
@@ -89,14 +100,18 @@ six digits. A man in the middle yields different h, so different codes.
    for `ERR_UNKNOWN_METHOD`; a node that does not advertise it answers
    `ERR_UNKNOWN_METHOD` to them. The payload advertises it when its management table is
    installed (`mgmt_rpc_installed()`); the Rust `Session::has_mgmt()` reads it.
-3. Client → `Hs3{noise}`: message 3, payload `ClientInfo` (name). Both sides
+3. Client → `Hs3{noise}`: message 3, payload `ClientInfo` (nonce_c (§4.6), name). Both sides
    now key lane 0 (§4.3) and every further frame is sealed. A client that expects
    a particular device (it knows the key it paired with at this address) compares
    the server's static key from message 2 and, if it differs, closes without
    sending `Hs3` — the wrong device never learns the client's key or name.
 4. The server learned the client's key in message 3. Unknown key and pairing
-   closed → sealed `Error(ERR_PAIRING_CLOSED)`, close. Else → sealed
-   `Welcome{knows_you}`.
+   closed → sealed `Error(ERR_PAIRING_CLOSED)`, close. A ClientInfo without
+   nonce_c → sealed `Error(ERR_PROTOCOL)`, close. Else → sealed
+   `Welcome{knows_you, nonce_s}`. The client checks BLAKE2b-256(nonce_s) against the
+   pair_commit of message 2 before it shows any code or trusts anything else in the
+   Welcome; a mismatch, or a ServerInfo or Welcome without its field, closes the
+   connection (after a best-effort `Error(ERR_PROTOCOL)`).
 5. Pairing: while either side does not know the other, both show the pairing
    code (§4.6). After the user confirms, a client whose server sent knows_you = 0
    sends `PairConfirm` (channel = request id); the server answers

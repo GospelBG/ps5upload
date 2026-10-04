@@ -927,6 +927,63 @@ async fn a_replayed_join_does_not_take_over_a_live_c_lane() {
     assert!(!again.is_closed());
 }
 
+/// S1: message 3 carrying `ci_bytes` as its ClientInfo. Returns the sealed frame the C
+/// server answers with (a decoded Error) and whether it showed a pairing request.
+async fn c_server_with_client_info(ci_bytes: Vec<u8>) -> (Option<gen::Error>, u32) {
+    let d = dir("s1-clientinfo");
+    let srv = CServer::start_with(SECRET, &d.join("peers"), opts(60));
+    let me = Identity::generate().unwrap();
+    let stream = TcpStream::connect(srv.addr()).await.unwrap();
+    let (rh, wh) = stream.into_split();
+    let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+    let mut hs = ava1::keys::Handshake::initiator(&me).unwrap();
+    let hello = gen::HelloInfo {
+        version_min: gen::PROTOCOL_VERSION,
+        version_max: gen::PROTOCOL_VERSION,
+        caps: 0,
+    };
+    use ava1::wire::Message;
+    let noise = hs.write(&hello.to_bytes().unwrap()).unwrap();
+    w.send_msg(0, &gen::Hs1 { noise }).await.unwrap();
+    let m2: gen::Hs2 = r.recv().await.unwrap().decode().unwrap();
+    let si = gen::ServerInfo::decode(&hs.read(&m2.noise).unwrap()).unwrap();
+    assert_ne!(si.pair_commit, [0; 32], "the C server commits in message 2");
+    let noise = hs.write(&ci_bytes).unwrap();
+    w.send_msg(0, &gen::Hs3 { noise }).await.unwrap();
+    let k = hs.finish();
+    r.set_key(ava1::keys::control_key(&k.s2c));
+    let seen = match tokio::time::timeout(Duration::from_secs(2), r.recv()).await {
+        Ok(Ok(f)) if f.ty == gen::Error::TYPE => f.decode::<gen::Error>().ok(),
+        _ => None,
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    (seen, srv.pair_requests().0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_refuses_a_client_without_its_pairing_nonce() {
+    use ava1::wire::Message;
+    let with = gen::ClientInfo {
+        nonce_c: [1; 16],
+        name: Some("x".into()),
+    }
+    .to_bytes()
+    .unwrap();
+    // Empty, and the old name-only layout: neither carries nonce_c.
+    for bytes in [Vec::new(), with[16..].to_vec()] {
+        let (seen, shown) = c_server_with_client_info(bytes).await;
+        assert_eq!(seen.expect("a sealed refusal").code, gen::ERR_PROTOCOL);
+        assert_eq!(shown, 0, "no pairing request for a refused client");
+    }
+    // The same path with the nonce succeeds: the refusal above is the missing field.
+    let (seen, shown) = c_server_with_client_info(with).await;
+    assert!(
+        seen.as_ref().is_none_or(|e| e.code != gen::ERR_PROTOCOL),
+        "{seen:?}"
+    );
+    assert_eq!(shown, 1);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_c_server_notifies_only_once_welcome_is_sent() {
     let d = dir("notify-after-welcome");
@@ -951,6 +1008,7 @@ async fn the_c_server_notifies_only_once_welcome_is_sent() {
         let m2: gen::Hs2 = r.recv().await.unwrap().decode().unwrap();
         hs.read(&m2.noise).unwrap();
         let ci = gen::ClientInfo {
+            nonce_c: [7; 16],
             name: Some("ghost".into()),
         };
         let noise = hs.write(&ci.to_bytes().unwrap()).unwrap();

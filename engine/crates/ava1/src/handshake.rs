@@ -28,6 +28,9 @@ pub struct Established {
     /// Client side: the server proved a launch token this side issued (SPEC.md §5.2),
     /// so it is trusted without pairing; the caller stores its key.
     pub launched: bool,
+    /// The pairing code of this handshake (SPEC.md §4.6): from the Noise hash and both
+    /// pairing nonces. Shown to the user only while `pairing` is `Some`.
+    pub code: u32,
 }
 
 /// What a server decides about a client once the handshake has shown its key.
@@ -150,7 +153,15 @@ where
         return Err(refused(&f));
     }
     let m2: Hs2 = f.decode()?;
-    let info = ServerInfo::decode(&hs.read(&m2.noise)?)?;
+    let info = match ServerInfo::decode(&hs.read(&m2.noise)?) {
+        Ok(i) => i,
+        Err(e) => {
+            // A server that omits the pairing commitment is refused (SPEC.md §4.6): an
+            // optional field could be stripped by a man in the middle.
+            refuse(w, gen::ERR_PROTOCOL, "bad ServerInfo").await;
+            return Err(e.into());
+        }
+    };
     if info.version != v {
         return Err(Ava1Error::Version {
             min: info.version,
@@ -162,7 +173,9 @@ where
     if expected.is_some_and(|k| k != peer_key) {
         return Err(Ava1Error::WrongPeer);
     }
+    let nonce_c: [u8; 16] = keys::random_bytes()?;
     let ci = ClientInfo {
+        nonce_c,
         name: Some(my_name.to_string()),
     }
     .to_bytes()?;
@@ -180,11 +193,24 @@ where
     if f.ty == gen::Error::TYPE {
         return Err(refused(&f));
     }
-    let welcome: Welcome = f.decode()?;
+    let welcome: Welcome = match f.decode() {
+        Ok(wl) => wl,
+        Err(e) => {
+            refuse(w, gen::ERR_PROTOCOL, "bad Welcome").await;
+            return Err(e);
+        }
+    };
+    // The reveal must open the commitment from message 2 before anything is shown: this is
+    // what stops a man in the middle from choosing its nonce after seeing ours.
+    if keys::pair_commit(&welcome.nonce_s) != info.pair_commit {
+        refuse(w, gen::ERR_PROTOCOL, "pairing commitment mismatch").await;
+        return Err(Ava1Error::PairingCommitMismatch);
+    }
+    let code = keys::pairing_code(&keys.hash, &nonce_c, &welcome.nonce_s);
     let known = knows(&peer_key);
     let launched = proves_our_launch(known, &welcome, &keys.hash, launched);
-    let pairing = (!(known || launched) || welcome.knows_you == 0).then(|| PairingState {
-        code: keys::pairing_code(&keys.hash),
+    let pairing = (!(known || launched) || welcome.knows_you == 0).then_some(PairingState {
+        code,
         server_must_confirm: welcome.knows_you == 0,
     });
     Ok(Established {
@@ -195,6 +221,7 @@ where
         peer_caps: info.caps,
         pairing,
         launched,
+        code,
     })
 }
 
@@ -249,10 +276,12 @@ where
         });
     }
     let session_id: [u8; 16] = keys::random_bytes()?;
+    let nonce_s: [u8; 16] = keys::random_bytes()?;
     let si = ServerInfo {
         version: v,
         caps,
         session_id,
+        pair_commit: keys::pair_commit(&nonce_s),
         name: Some(my_name.to_string()),
     }
     .to_bytes()?;
@@ -264,11 +293,20 @@ where
     )
     .await?;
     let m3: Hs3 = r.recv().await?.decode()?;
-    let ci = ClientInfo::decode(&hs.read(&m3.noise)?)?;
+    let ci = ClientInfo::decode(&hs.read(&m3.noise)?);
     let peer_key = hs.remote_static().ok_or(Ava1Error::WeakKey)?;
     let keys = hs.finish();
     w.set_key(keys::control_key(&keys.s2c));
     r.set_key(keys::control_key(&keys.c2s));
+    // A client without its pairing nonce is refused (SPEC.md §4.6), sealed like every
+    // frame from here on.
+    let ci = match ci {
+        Ok(ci) => ci,
+        Err(e) => {
+            refuse(w, gen::ERR_PROTOCOL, "bad ClientInfo").await;
+            return Err(e.into());
+        }
+    };
     let known = match admit(&peer_key) {
         Admission::Known => true,
         Admission::Pairing => false,
@@ -291,13 +329,16 @@ where
         0,
         &Welcome {
             knows_you: u8::from(known),
+            nonce_s,
             launch_proof,
         },
     )
     .await?;
+    let code = keys::pairing_code(&keys.hash, &ci.nonce_c, &nonce_s);
     Ok(Established {
-        pairing: (!known).then(|| PairingState {
-            code: keys::pairing_code(&keys.hash),
+        code,
+        pairing: (!known).then_some(PairingState {
+            code,
             server_must_confirm: true,
         }),
         keys,
@@ -472,6 +513,7 @@ mod tests {
         let accepts_anything = |_: &[u8; 64], _: &[u8; 16]| true;
         let welcome = |knows_you: u8, launch_proof: Option<[u8; 16]>| Welcome {
             knows_you,
+            nonce_s: [0; 16],
             launch_proof,
         };
         assert!(proves_our_launch(
@@ -549,6 +591,211 @@ mod tests {
         assert!(c.pairing.unwrap().server_must_confirm);
     }
 
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fault {
+        /// An honest commit and reveal.
+        None,
+        /// Welcome reveals a nonce other than the one ServerInfo committed to.
+        WrongReveal,
+        /// ServerInfo without its pair_commit.
+        NoCommit,
+        /// Welcome without its nonce_s.
+        NoReveal,
+    }
+
+    /// A hand-driven server end. Returns what the client made of it, and the `Error` the
+    /// client sent back (if any).
+    async fn run_scripted_server(
+        fault: Fault,
+    ) -> (Result<Established, Ava1Error>, Option<gen::Error>) {
+        let (c_id, s_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let ((mut cr, mut cw), (mut sr, mut sw)) = pipe();
+        let c_fut = client(&mut cr, &mut cw, &c_id, "laptop", |_| false, 0);
+        let s_fut = async {
+            let nonce_s = [0x5au8; 16];
+            let m1: Hs1 = sr.recv().await.unwrap().decode().unwrap();
+            let mut hs = Handshake::responder(&s_id).unwrap();
+            hs.read(&m1.noise).unwrap();
+            let mut si = ServerInfo {
+                version: gen::PROTOCOL_VERSION,
+                caps: 0,
+                session_id: [3; 16],
+                pair_commit: keys::pair_commit(&nonce_s),
+                name: None,
+            }
+            .to_bytes()
+            .unwrap();
+            if fault == Fault::NoCommit {
+                si.truncate(2 + 8 + 16); // version, caps, session_id: the old layout
+            }
+            sw.send_msg(
+                0,
+                &Hs2 {
+                    noise: hs.write(&si).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+            if fault == Fault::NoCommit {
+                // The client has not keyed anything yet: its refusal is unsealed.
+                return match sr.recv().await {
+                    Ok(f) if f.ty == gen::Error::TYPE => f.decode::<gen::Error>().ok(),
+                    _ => None,
+                };
+            }
+            let m3: Hs3 = sr.recv().await.unwrap().decode().unwrap();
+            hs.read(&m3.noise).unwrap();
+            let k = hs.finish();
+            sw.set_key(keys::control_key(&k.s2c));
+            sr.set_key(keys::control_key(&k.c2s));
+            let mut wl = Welcome {
+                knows_you: 0,
+                nonce_s: if fault == Fault::WrongReveal {
+                    [0x5b; 16]
+                } else {
+                    nonce_s
+                },
+                launch_proof: None,
+            }
+            .to_bytes()
+            .unwrap();
+            if fault == Fault::NoReveal {
+                wl.truncate(1); // knows_you only: the old layout
+            }
+            sw.send(Welcome::TYPE, 0, &wl).await.unwrap();
+            if fault == Fault::None {
+                return None; // the client is done; there is nothing to wait for
+            }
+            match sr.recv().await {
+                Ok(f) if f.ty == gen::Error::TYPE => f.decode::<gen::Error>().ok(),
+                _ => None,
+            }
+        };
+        tokio::join!(c_fut, s_fut)
+    }
+
+    #[tokio::test]
+    async fn the_scripted_server_with_no_fault_pairs() {
+        // Guards the helper: the failures below are the fault, not the harness.
+        let (c, _) = run_scripted_server(Fault::None).await;
+        assert!(c.unwrap().pairing.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_reveal_that_does_not_match_the_commitment_aborts_before_any_code() {
+        let (c, seen) = run_scripted_server(Fault::WrongReveal).await;
+        assert!(
+            matches!(c, Err(Ava1Error::PairingCommitMismatch)),
+            "no Established, so no code was ever produced: {:?}",
+            c.err()
+        );
+        assert_eq!(seen.unwrap().code, gen::ERR_PROTOCOL);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_omits_its_commitment_is_refused_with_err_protocol() {
+        let (c, seen) = run_scripted_server(Fault::NoCommit).await;
+        assert!(matches!(c, Err(Ava1Error::Decode(_))), "{:?}", c.err());
+        assert_eq!(seen.unwrap().code, gen::ERR_PROTOCOL);
+    }
+
+    #[tokio::test]
+    async fn a_welcome_without_the_reveal_is_refused_with_err_protocol() {
+        let (c, seen) = run_scripted_server(Fault::NoReveal).await;
+        assert!(matches!(c, Err(Ava1Error::Decode(_))), "{:?}", c.err());
+        assert_eq!(seen.unwrap().code, gen::ERR_PROTOCOL);
+    }
+
+    /// A client that sends message 3 with `ci_bytes` as its ClientInfo; returns the
+    /// server's result and the sealed frame the client got back.
+    async fn run_scripted_client(
+        ci_bytes: Vec<u8>,
+    ) -> (Result<Established, Ava1Error>, Option<gen::Error>) {
+        let (c_id, s_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let ((mut cr, mut cw), (mut sr, mut sw)) = pipe();
+        let c_fut = async {
+            let mut hs = Handshake::initiator(&c_id).unwrap();
+            let hello = HelloInfo {
+                version_min: 1,
+                version_max: 1,
+                caps: 0,
+            }
+            .to_bytes()
+            .unwrap();
+            cw.send_msg(
+                0,
+                &Hs1 {
+                    noise: hs.write(&hello).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+            let m2: Hs2 = cr.recv().await.unwrap().decode().unwrap();
+            hs.read(&m2.noise).unwrap();
+            cw.send_msg(
+                0,
+                &Hs3 {
+                    noise: hs.write(&ci_bytes).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+            let k = hs.finish();
+            cr.set_key(keys::control_key(&k.s2c));
+            match cr.recv().await {
+                Ok(f) if f.ty == gen::Error::TYPE => f.decode::<gen::Error>().ok(),
+                _ => None,
+            }
+        };
+        let s_fut = async {
+            let first = sr.recv().await?;
+            server(
+                &mut sr,
+                &mut sw,
+                first,
+                &s_id,
+                "console",
+                |_| Admission::Pairing,
+                0,
+            )
+            .await
+        };
+        let (seen, s) = tokio::join!(c_fut, s_fut);
+        (s, seen)
+    }
+
+    #[tokio::test]
+    async fn a_client_without_its_nonce_is_refused_with_err_protocol() {
+        // The nonce is a base field, so an old ClientInfo (name only) or an empty one fails.
+        for bytes in [
+            Vec::new(),
+            ClientInfo {
+                nonce_c: [1; 16],
+                name: Some("x".into()),
+            }
+            .to_bytes()
+            .unwrap()[16..]
+                .to_vec(),
+        ] {
+            let (s, seen) = run_scripted_client(bytes).await;
+            assert!(matches!(s, Err(Ava1Error::Decode(_))), "{:?}", s.err());
+            assert_eq!(seen.unwrap().code, gen::ERR_PROTOCOL);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_with_its_nonce_pairs() {
+        let ci = ClientInfo {
+            nonce_c: [1; 16],
+            name: Some("x".into()),
+        }
+        .to_bytes()
+        .unwrap();
+        let (s, seen) = run_scripted_client(ci).await;
+        assert!(s.unwrap().pairing.is_some());
+        assert!(seen.is_none());
+    }
+
     #[tokio::test]
     async fn paired_devices_agree_on_keys_peers_and_names() {
         let e = run(true, true, false).await;
@@ -564,6 +811,9 @@ mod tests {
             ("console", "laptop")
         );
         assert_eq!((c.pairing, s.pairing), (None, None));
+        // The nonces ride every handshake, trusted or not (an optional field could be
+        // stripped), and both ends agree on the code even though nobody shows it.
+        assert_eq!(c.code, s.code);
     }
 
     #[tokio::test]

@@ -66,13 +66,19 @@ void ava1_join_ack_tag(const uint8_t s2c[32], const uint8_t sid[16], uint16_t la
     join_mac(s2c, "join-ack", sid, lane, client_nonce, server_nonce, out);
 }
 
-uint32_t ava1_pairing_code(const uint8_t hash[64]) {
+void ava1_pair_commit(const uint8_t nonce_s[16], uint8_t out[32]) {
+    crypto_blake2b(out, 32, nonce_s, 16);
+}
+
+uint32_t ava1_pairing_code(const uint8_t hash[64], const uint8_t nonce_c[16], const uint8_t nonce_s[16]) {
     static const char label[] = "AVA1 pairing";
     crypto_blake2b_ctx c;
     uint8_t d[32];
     crypto_blake2b_init(&c, 32);
     crypto_blake2b_update(&c, (const uint8_t *)label, sizeof label - 1);
     crypto_blake2b_update(&c, hash, 64);
+    crypto_blake2b_update(&c, nonce_c, 16);
+    crypto_blake2b_update(&c, nonce_s, 16);
     crypto_blake2b_final(&c, d);
     return ((uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24)) %
            1000000u;
