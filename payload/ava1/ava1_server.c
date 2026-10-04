@@ -1092,6 +1092,14 @@ static void *accept_main(void *arg) {
 #ifdef SO_NOSIGPIPE
         (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
+        {
+            /* Before the first read: 4 MiB each way, whatever the kernel grants. */
+            static int logged;
+            int rcv = 0, snd = 0;
+            (void)ava1_conn_tune_buffers(fd, &rcv, &snd);
+            if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+                slog("ava1: lane socket buffers asked %d, kernel gave rcv %d snd %d", AVA1_LANE_SOCKBUF, rcv, snd);
+        }
         ip = from.sin_addr.s_addr;
         k = calloc(1, sizeof *k);
         pthread_mutex_lock(&mu);

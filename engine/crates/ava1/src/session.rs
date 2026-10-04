@@ -409,6 +409,45 @@ impl Lane {
 }
 
 /// Everything needed to join lanes, shared with jobs (SPEC.md §9, §12).
+/// What a lane asks the kernel for on each socket buffer (review 003 §1): a thread that
+/// is not in `recv` for 10-20 ms (the console opens a frame) must not close the sender's
+/// TCP window, and on Wi-Fi the per-lane window is today's ceiling.
+pub(crate) const LANE_SOCKBUF: u32 = 4 << 20;
+
+/// Asks for `LANE_SOCKBUF` each way; returns the effective sizes. A refused request is
+/// not fatal: the kernel's default buffers still work.
+pub(crate) fn tune_lane_socket(sock: &tokio::net::TcpSocket) -> (Option<u32>, Option<u32>) {
+    let _ = sock.set_recv_buffer_size(LANE_SOCKBUF);
+    let _ = sock.set_send_buffer_size(LANE_SOCKBUF);
+    (sock.recv_buffer_size().ok(), sock.send_buffer_size().ok())
+}
+
+/// Connects a lane socket with 4 MiB send and receive buffers set before the connect (so
+/// the window scale is negotiated for them). Takes what the kernel gives; the effective
+/// sizes are logged once per process.
+pub(crate) async fn connect_lane_socket(addr: SocketAddr) -> std::io::Result<TcpStream> {
+    use tokio::net::TcpSocket;
+    let sock = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    let (rcv, snd) = tune_lane_socket(&sock);
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        use std::io::Write;
+        // writeln!, not eprintln!: a dead parent's closed stderr must not panic us.
+        let _ = writeln!(
+            std::io::stderr(),
+            "[ava1] lane socket buffers: asked {} each, kernel gave rcv {:?} snd {:?}",
+            LANE_SOCKBUF,
+            rcv,
+            snd
+        );
+    });
+    sock.connect(addr).await
+}
+
 pub(crate) struct Joiner {
     addr: SocketAddr,
     timing: Timing,
@@ -451,7 +490,7 @@ impl Joiner {
 
     async fn join(&self, id: u16, addr: SocketAddr) -> Result<(Link, Outbox), Ava1Error> {
         let t = self.timing.handshake;
-        let stream = within(t, async { Ok(TcpStream::connect(addr).await?) }).await?;
+        let stream = within(t, async { Ok(connect_lane_socket(addr).await?) }).await?;
         stream.set_nodelay(true)?;
         let (rh, wh) = stream.into_split();
         let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
@@ -601,5 +640,22 @@ impl Session {
             keys::lane_key(&k.c2s, lane_id, client_nonce, server_nonce),
             keys::lane_key(&k.s2c, lane_id, client_nonce, server_nonce),
         )
+    }
+}
+
+#[cfg(test)]
+mod sockbuf_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_lane_socket_gets_big_buffers_and_still_connects() {
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        let (rcv, snd) = tune_lane_socket(&sock);
+        // The kernel may cap or double the request; either way it is far above a default.
+        assert!(rcv.unwrap() >= 1 << 20, "rcv {rcv:?}");
+        assert!(snd.unwrap() >= 1 << 20, "snd {snd:?}");
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let s = connect_lane_socket(l.local_addr().unwrap()).await.unwrap();
+        assert!(s.peer_addr().is_ok());
     }
 }

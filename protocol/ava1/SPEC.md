@@ -445,6 +445,13 @@ A lane carries heartbeats and, on a node with `CAP_DATA_PLANE`, the lane data fr
 and `Bundle` (§12) and `Error`; any other frame without the IGNORABLE flag is answered
 `Error(ERR_PROTOCOL)` and closes the lane.
 
+Lane sockets (informative): both ends ask for 4 MiB `SO_RCVBUF` and `SO_SNDBUF` on every lane, the
+client before it connects and the console on accept, before the first read, and take whatever the
+kernel grants. A lane thread that is busy opening a 15 MiB frame for 10-20 ms then does not close
+the sender's TCP window. A receiver may keep a small pool of frame buffers (1, 4, 8 and 16 MiB
+classes, never more idle memory than its admit budget) so a lane does not allocate and fault in a
+fresh 15 MiB block per frame; this is not visible on the wire.
+
 ## 10. Version 1 scope
 Version 1 is what this document specifies; the sections below say what that is and what it is
 not. Unknown frame types on a control connection are a protocol error; new frame types require a
