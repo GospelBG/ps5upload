@@ -28,7 +28,7 @@ mod paged;
 
 use crate::mgmt_convert as conv;
 use crate::pool::{host_of, pool, Pool};
-use crate::route::use_ava1_mgmt_in;
+use crate::route::{mode, use_ava1_mgmt_in, Mode};
 
 /// In-flight calls the payload allows per session (`RPC_WORKERS`, SPEC.md section 7.4).
 pub const IN_FLIGHT: usize = ava1::server::RPC_WORKERS;
@@ -395,7 +395,20 @@ impl AvaTransport {
         body: &[u8],
         timeout: Duration,
     ) -> Result<Option<Vec<u8>>> {
-        self.dispatch(console, method, label, body, timeout).await
+        let r = self.dispatch(console, method, label, body, timeout).await;
+        // The two methods that run as job.run ops: see run_job (a CAP_MGMT helper without job.run).
+        if matches!(method.id, gen::METHOD_NODE_CLEANUP | gen::METHOD_SDK_SCAN)
+            && is_unknown_method(&r)
+            && mode() == Mode::Auto
+        {
+            // Still a CAP_MGMT helper: ask for the plain method (Task 7 serves sdk.scan as one too).
+            let plain = self.text(console, method, label, body, timeout).await;
+            return match plain {
+                Ok(b) => Ok(Some(b)),
+                Err(_) => Ok(None),
+            };
+        }
+        r
     }
 
     async fn dispatch(
@@ -640,8 +653,13 @@ impl MgmtTransport for AvaTransport {
             if !self.serves(addr) {
                 return Ok(None);
             }
-            // CAP_MGMT is the capability: a helper that advertises it serves job.run too.
             let r = crate::block_on(self.run_job_async(addr, op, label, body, call));
+            if is_unknown_method(&r) && mode() == Mode::Auto {
+                // Routing is by CAP_MGMT (review M1) and nothing is probed for methods. The one exception: a
+                // helper that advertises CAP_MGMT but predates `job.run` (the Task 2-4 payloads) answers
+                // ERR_UNKNOWN_METHOD to it, and FTX2 serves the operation.
+                return Ok(None);
+            }
             r
         })
     }
@@ -681,6 +699,13 @@ fn run_blocking<R: Send>(f: impl FnOnce() -> R + Send) -> R {
         }),
         Err(_) => f(),
     }
+}
+
+fn is_unknown_method<T>(r: &Result<T>) -> bool {
+    r.as_ref().err().is_some_and(|e| {
+        e.downcast_ref::<MgmtError>()
+            .is_some_and(|m| m.status == gen::ERR_UNKNOWN_METHOD)
+    })
 }
 
 /// A non-zero reply status as the error callers know: the body is the legacy token.

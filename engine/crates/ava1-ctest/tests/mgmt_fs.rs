@@ -978,9 +978,7 @@ mod transport {
             format!("{e:#}").contains("PKG_DIRECT_MOUNT failed"),
             "{e:#}"
         );
-        // cleanup and shutdown
-        let c = ps5upload_core::cleanup::cleanup_path(&t.console, "/data/x").unwrap();
-        assert_eq!(c.removed_files, 2);
+        // shutdown (node.cleanup is a job op now, Task 5)
         assert!(ps5upload_core::payload_lifecycle::shutdown_running_payload(&t.console).unwrap());
         assert_eq!(mgmt_fs::stats().1, 1);
     }

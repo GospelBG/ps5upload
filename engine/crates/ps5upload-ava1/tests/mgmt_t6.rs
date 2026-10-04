@@ -70,12 +70,12 @@ async fn console(tag: &str, handler: RpcHandler) -> (Arc<AvaTransport>, String) 
     let me = Identity::load_or_create(&ava.join("identity")).unwrap();
     let mut peers = PeerStore::in_memory();
     peers.add(me.public(), "engine").unwrap();
-    let ctx = ServerCtx::new(Identity::generate().unwrap(), "host", peers, handler).with_jobs(
-        Arc::new(FolderHost {
+    let ctx = ServerCtx::new(Identity::generate().unwrap(), "host", peers, handler)
+        .with_jobs(Arc::new(FolderHost {
             root: base.join("share"),
             jobs_dir: base.join("jobs"),
-        }),
-    );
+        }))
+        .with_mgmt();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap().to_string();
     tokio::spawn(server::serve(l, Arc::new(ctx)));

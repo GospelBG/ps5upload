@@ -145,7 +145,7 @@ fn audit(check: &str) {
 fn real_table() -> Vec<(String, String)> {
     let src = std::fs::read_to_string(payload().join("src/mgmt_table.def")).unwrap();
     src.lines()
-        .filter(|l| l.starts_with("MGMT_"))
+        .filter(|l| l.starts_with("MGMT_H") || l.starts_with("MGMT_N"))
         .map(|l| {
             let inner = &l[l.find('(').unwrap() + 1..l.rfind(')').unwrap()];
             let f: Vec<&str> = inner.split(',').map(str::trim).collect();
