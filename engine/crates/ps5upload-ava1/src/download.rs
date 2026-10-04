@@ -1162,6 +1162,10 @@ mod tests {
         kill_at: u64,
         killed: AtomicBool,
         proxy: Arc<ava1_chaos::ChaosProxy>,
+        /// Damages the part file between the drop and the resume (the 2nd `prepare`).
+        damage: Option<fn(&Path)>,
+        part: PathBuf,
+        prepares: std::sync::atomic::AtomicU32,
     }
 
     impl DropSink {
@@ -1175,6 +1179,11 @@ mod tests {
 
     impl Sink for DropSink {
         fn prepare(&self, m: &Manifest) -> io::Result<()> {
+            if self.prepares.fetch_add(1, Ordering::Relaxed) == 1 {
+                if let Some(f) = self.damage {
+                    f(&self.part);
+                }
+            }
             self.inner.prepare(m)
         }
         fn write_at(&self, id: u32, off: u64, data: &[u8]) -> io::Result<()> {
@@ -1211,7 +1220,13 @@ mod tests {
     /// Downloads `files` x `size` bytes into a Stored zip, dropping the connection at
     /// ~40% of the bytes. Returns (bytes the sink was handed in all, total bytes, run
     /// result); the archive is checked against the source byte for byte.
-    fn drop_at_forty_percent(tag: &str, files: usize, size: usize, bps: u64) -> (u64, u64) {
+    fn drop_at_forty_percent(
+        tag: &str,
+        files: usize,
+        size: usize,
+        bps: u64,
+        damage: Option<fn(&Path)>,
+    ) -> (u64, u64) {
         let d = std::env::temp_dir().join(format!("p5a-zip-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("share/G")).unwrap();
@@ -1250,6 +1265,9 @@ mod tests {
             kill_at: total * 4 / 10,
             killed: AtomicBool::new(false),
             proxy: proxy.clone(),
+            damage,
+            part: d.join("g.zip.ava-part"),
+            prepares: Default::default(),
         });
         let c = Counters::default();
         let bytes = run(
@@ -1289,7 +1307,7 @@ mod tests {
     // in flight can be lost; at 4 MiB/s a sync batch holds well under an entry.
     #[test]
     fn a_stored_zip_resumes_with_at_most_one_entry_resent() {
-        let (handed, total) = drop_at_forty_percent("entry", 16, 1 << 20, 4 << 20);
+        let (handed, total) = drop_at_forty_percent("entry", 16, 1 << 20, 4 << 20, None);
         let resent = handed - total;
         assert!(
             resent <= 1 << 20,
@@ -1302,13 +1320,160 @@ mod tests {
     // what is resent is the un-journaled tail (a sync batch), never the entry.
     #[test]
     fn a_stored_zip_resumes_mid_entry_with_at_most_a_group_or_two_resent() {
-        let (handed, total) = drop_at_forty_percent("mid", 4, 12 << 20, 8 << 20);
+        let (handed, total) = drop_at_forty_percent("mid", 4, 12 << 20, 8 << 20, None);
         let resent = handed - total;
         assert!(
             resent <= 4 << 20,
             "{resent} bytes were sent twice; the entry is {}",
             12 << 20
         );
+    }
+
+    // The sink cannot honour the journal (the archive is shorter than the journal's cut):
+    // the receiver resets the journal, the archive restarts from 0, the download completes.
+    #[test]
+    fn a_resume_the_sink_cannot_honour_starts_over_and_still_verifies() {
+        let (handed, total) = drop_at_forty_percent(
+            "fallback",
+            4,
+            12 << 20,
+            8 << 20,
+            Some(|p| {
+                let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+                f.set_len(1000).unwrap();
+            }),
+        );
+        // Everything sent before the drop was thrown away and sent again.
+        assert!(
+            handed - total >= total * 3 / 10,
+            "only {} bytes were resent",
+            handed - total
+        );
+    }
+
+    // Bit rot inside the in-flight entry's durable bytes is caught by the receiver's
+    // re-check against the group CVs (a multi-group file's outboard): the file restarts,
+    // and the finished archive still matches the source.
+    #[test]
+    fn rot_in_an_in_flight_entrys_durable_bytes_is_caught() {
+        let (handed, total) = drop_at_forty_percent(
+            "rot",
+            4,
+            12 << 20,
+            8 << 20,
+            Some(|p| {
+                // 1 MiB into the second entry: inside its durable prefix at the 40% drop.
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(p)
+                    .unwrap();
+                let at = (13 << 20) as u64;
+                let mut b = [0u8; 1];
+                std::os::unix::fs::FileExt::read_exact_at(&f, &mut b, at).unwrap();
+                b[0] ^= 0xff;
+                std::os::unix::fs::FileExt::write_all_at(&f, &b, at).unwrap();
+            }),
+        );
+        assert!(handed > total, "the rotted file was not sent again");
+    }
+
+    /// Records every write so a test can check the order bytes were delivered in.
+    struct OrderSink {
+        inner: StoredZipSink,
+        seen: Mutex<Vec<(u32, u64, usize)>>,
+    }
+
+    impl Sink for OrderSink {
+        fn prepare(&self, m: &Manifest) -> io::Result<()> {
+            self.inner.prepare(m)
+        }
+        fn write_at(&self, id: u32, off: u64, data: &[u8]) -> io::Result<()> {
+            self.seen.lock().unwrap().push((id, off, data.len()));
+            self.inner.write_at(id, off, data)
+        }
+        fn write_whole(&self, id: u32, data: &[u8]) -> io::Result<()> {
+            self.seen.lock().unwrap().push((id, 0, data.len()));
+            self.inner.write_whole(id, data)
+        }
+        fn sync(&self, ids: &[u32]) -> io::Result<()> {
+            self.inner.sync(ids)
+        }
+        fn read_at(&self, id: u32, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read_at(id, off, buf)
+        }
+        fn commit(&self, id: u32) -> io::Result<()> {
+            self.inner.commit(id)
+        }
+        fn finish(&self) -> io::Result<()> {
+            self.inner.finish()
+        }
+        fn position(
+            &self,
+            done: &std::collections::BTreeSet<u32>,
+            partial: &std::collections::BTreeMap<u32, ava1::ranges::RangeSet>,
+        ) -> io::Result<()> {
+            self.inner.position(done, partial)
+        }
+    }
+
+    // An ordered job that is not resuming has no skip list: every byte of every file is
+    // delivered, in (file, offset) order, with no gaps.
+    #[test]
+    fn a_fresh_ordered_job_delivers_every_byte_in_order() {
+        let d = std::env::temp_dir().join(format!("p5a-ord-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("share/G")).unwrap();
+        let sizes = [3 << 20, 100, (2 << 20) + 17, 1 << 20, 5];
+        for (i, n) in sizes.iter().enumerate() {
+            std::fs::write(d.join(format!("share/G/f{i}")), vec![i as u8 + 1; *n]).unwrap();
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ava = d.join("ava");
+        let key = ava1::keys::Identity::load_or_create(&ava.join("identity"))
+            .unwrap()
+            .public();
+        let addr = rt.block_on(folder_host(&d, key));
+        let pool = Pool::new(ava).with_addr(addr);
+        let sink = Arc::new(OrderSink {
+            inner: StoredZipSink::new(d.join("g.zip"), "G"),
+            seen: Mutex::new(Vec::new()),
+        });
+        let s2: Arc<dyn Sink> = sink.clone();
+        run(
+            &pool,
+            "c",
+            "G",
+            gen::JF_ORDERED,
+            [6; 16],
+            false,
+            &move || s2.clone(),
+            &Counters::default(),
+            None,
+        )
+        .unwrap();
+        let seen = sink.seen.lock().unwrap().clone();
+        let mut next = (0u32, 0u64);
+        let sz: Vec<u64> = (0..5)
+            .map(|i| {
+                std::fs::metadata(d.join(format!("share/G/f{i}")))
+                    .unwrap()
+                    .len()
+            })
+            .collect();
+        for (id, off, n) in seen {
+            assert_eq!((id, off), next, "delivery out of order or with a gap");
+            next = if off + n as u64 == sz[id as usize] {
+                (id + 1, 0)
+            } else {
+                (id, off + n as u64)
+            };
+        }
+        assert_eq!(next, (5, 0), "not every byte was delivered");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

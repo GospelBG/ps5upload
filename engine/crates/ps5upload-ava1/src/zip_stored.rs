@@ -245,6 +245,56 @@ fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Everything after the non-empty entries: the empty files' entries, the central directory,
+/// the zip64 end record, its locator and the classic end record (whose fields are all
+/// sentinels, so a reader must take the zip64 values). `at` is where the tail starts.
+fn tail_bytes(layout: &Layout, crcs: &[u32], at: u64) -> Vec<u8> {
+    let mut tail: Vec<u8> = Vec::new();
+    let mut at = at;
+    let mut empties = layout.empties.clone();
+    for s in &mut empties {
+        s.hdr_off = at;
+        s.data_off = at + s.header_len();
+        tail.extend_from_slice(&s.header());
+        tail.extend_from_slice(&s.descriptor(0));
+        at = s.end();
+    }
+    let cd_off = at;
+    let mut cd = Vec::new();
+    for (s, crc) in layout.slots.iter().zip(crcs) {
+        s.central(*crc, &mut cd);
+    }
+    for s in &empties {
+        s.central(0, &mut cd);
+    }
+    let n = (layout.slots.len() + empties.len()) as u64;
+    let eocd64_off = cd_off + cd.len() as u64;
+    tail.extend_from_slice(&cd);
+    tail.extend_from_slice(&EOCD64_SIG.to_le_bytes());
+    tail.extend_from_slice(&44u64.to_le_bytes());
+    tail.extend_from_slice(&((3u16 << 8) | 45).to_le_bytes());
+    tail.extend_from_slice(&45u16.to_le_bytes());
+    tail.extend_from_slice(&0u32.to_le_bytes());
+    tail.extend_from_slice(&0u32.to_le_bytes());
+    tail.extend_from_slice(&n.to_le_bytes());
+    tail.extend_from_slice(&n.to_le_bytes());
+    tail.extend_from_slice(&(cd.len() as u64).to_le_bytes());
+    tail.extend_from_slice(&cd_off.to_le_bytes());
+    tail.extend_from_slice(&LOC64_SIG.to_le_bytes());
+    tail.extend_from_slice(&0u32.to_le_bytes());
+    tail.extend_from_slice(&eocd64_off.to_le_bytes());
+    tail.extend_from_slice(&1u32.to_le_bytes());
+    tail.extend_from_slice(&EOCD_SIG.to_le_bytes());
+    tail.extend_from_slice(&0u16.to_le_bytes());
+    tail.extend_from_slice(&0u16.to_le_bytes());
+    tail.extend_from_slice(&u16::MAX.to_le_bytes());
+    tail.extend_from_slice(&u16::MAX.to_le_bytes());
+    tail.extend_from_slice(&u32::MAX.to_le_bytes());
+    tail.extend_from_slice(&u32::MAX.to_le_bytes());
+    tail.extend_from_slice(&0u16.to_le_bytes());
+    tail
+}
+
 struct State {
     m: Option<Arc<Manifest>>,
     layout: Arc<Layout>,
@@ -627,49 +677,8 @@ impl Sink for StoredZipSink {
             Self::start_over(&mut st)?; // an archive of empty files only
         }
         debug_assert_eq!(st.pos, layout.end());
-        let mut tail: Vec<u8> = Vec::new();
-        let mut at = st.pos;
-        let mut empties = layout.empties.clone();
-        for s in &mut empties {
-            s.hdr_off = at;
-            s.data_off = at + s.header_len();
-            tail.extend_from_slice(&s.header());
-            tail.extend_from_slice(&s.descriptor(0));
-            at = s.end();
-        }
-        let cd_off = at;
-        let mut cd = Vec::new();
-        for (s, crc) in layout.slots.iter().zip(&st.crcs) {
-            s.central(crc.expect("checked above"), &mut cd);
-        }
-        for s in &empties {
-            s.central(0, &mut cd);
-        }
-        let n = (layout.slots.len() + empties.len()) as u64;
-        let eocd64_off = cd_off + cd.len() as u64;
-        tail.extend_from_slice(&cd);
-        tail.extend_from_slice(&EOCD64_SIG.to_le_bytes());
-        tail.extend_from_slice(&44u64.to_le_bytes());
-        tail.extend_from_slice(&((3u16 << 8) | 45).to_le_bytes());
-        tail.extend_from_slice(&45u16.to_le_bytes());
-        tail.extend_from_slice(&0u32.to_le_bytes());
-        tail.extend_from_slice(&0u32.to_le_bytes());
-        tail.extend_from_slice(&n.to_le_bytes());
-        tail.extend_from_slice(&n.to_le_bytes());
-        tail.extend_from_slice(&(cd.len() as u64).to_le_bytes());
-        tail.extend_from_slice(&cd_off.to_le_bytes());
-        tail.extend_from_slice(&LOC64_SIG.to_le_bytes());
-        tail.extend_from_slice(&0u32.to_le_bytes());
-        tail.extend_from_slice(&eocd64_off.to_le_bytes());
-        tail.extend_from_slice(&1u32.to_le_bytes());
-        tail.extend_from_slice(&EOCD_SIG.to_le_bytes());
-        tail.extend_from_slice(&0u16.to_le_bytes());
-        tail.extend_from_slice(&0u16.to_le_bytes());
-        tail.extend_from_slice(&u16::MAX.to_le_bytes());
-        tail.extend_from_slice(&u16::MAX.to_le_bytes());
-        tail.extend_from_slice(&u32::MAX.to_le_bytes());
-        tail.extend_from_slice(&u32::MAX.to_le_bytes());
-        tail.extend_from_slice(&0u16.to_le_bytes());
+        let crcs: Vec<u32> = st.crcs.iter().map(|c| c.expect("checked above")).collect();
+        let tail = tail_bytes(&layout, &crcs, st.pos);
         let pos = st.pos;
         write_all_at(&file, &tail, pos)?;
         file.set_len(pos + tail.len() as u64)?;
@@ -885,6 +894,222 @@ mod tests {
         let s = StoredZipSink::new(d.join("o.zip"), "P");
         s.prepare(&m).unwrap();
         assert!(s.position(&done(&[0]), &BTreeMap::new()).is_err());
+    }
+
+    fn u16at(b: &[u8], o: usize) -> u16 {
+        u16::from_le_bytes(b[o..o + 2].try_into().unwrap())
+    }
+    fn u32at(b: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+    }
+    fn u64at(b: &[u8], o: usize) -> u64 {
+        u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+    }
+
+    /// Checks the last 22 + 20 bytes of an archive tail: the classic end record is all
+    /// sentinels and the locator points at a zip64 end record holding the real values.
+    /// `base` is the archive offset of `tail[0]`. Returns (entries, cd offset, cd size).
+    fn check_end_records(tail: &[u8], base: u64) -> (u64, u64, u64) {
+        let n = tail.len();
+        let e = &tail[n - 22..];
+        assert_eq!(u32at(e, 0), EOCD_SIG);
+        assert_eq!((u16at(e, 4), u16at(e, 6)), (0, 0), "disk numbers");
+        assert_eq!(
+            (u16at(e, 8), u16at(e, 10)),
+            (0xFFFF, 0xFFFF),
+            "entry count sentinels"
+        );
+        assert_eq!(
+            (u32at(e, 12), u32at(e, 16)),
+            (u32::MAX, u32::MAX),
+            "size/offset sentinels"
+        );
+        assert_eq!(u16at(e, 20), 0, "no comment");
+        let l = &tail[n - 42..n - 22];
+        assert_eq!(u32at(l, 0), LOC64_SIG);
+        assert_eq!(u32at(l, 4), 0);
+        assert_eq!(u32at(l, 16), 1, "one disk");
+        let z = (u64at(l, 8) - base) as usize;
+        assert_eq!(
+            z + 56,
+            n - 42,
+            "the zip64 end record sits right before its locator"
+        );
+        let r = &tail[z..z + 56];
+        assert_eq!(u32at(r, 0), EOCD64_SIG);
+        assert_eq!(u64at(r, 4), 44);
+        assert_eq!(u16at(r, 14), 45, "version needed");
+        assert_eq!(u64at(r, 24), u64at(r, 32), "entries on this disk == total");
+        (u64at(r, 32), u64at(r, 48), u64at(r, 40))
+    }
+
+    #[test]
+    fn a_file_over_4_gib_gets_zip64_fields_everywhere() {
+        const GIB5: u64 = 5 << 30;
+        let m = Manifest {
+            entries: vec![
+                file_entry("big", GIB5),
+                file_entry("small", 100),
+                file_entry("empty", 0),
+            ],
+        };
+        let l = Layout::build(&m, false, "P").unwrap();
+        let (big, small) = (&l.slots[0], &l.slots[1]);
+        assert_eq!(small.hdr_off, big.end());
+        assert!(
+            small.hdr_off > u32::MAX as u64,
+            "the second entry starts past 4 GiB"
+        );
+        // Local header: version 4.5, data-descriptor + UTF-8 flags, Stored, sentinel sizes,
+        // and a zip64 extra of two zero u64s (the descriptor carries the real sizes).
+        let h = big.header();
+        assert_eq!(u32at(&h, 0), LOCAL_SIG);
+        assert_eq!((u16at(&h, 4), u16at(&h, 6), u16at(&h, 8)), (45, 0x0808, 0));
+        assert_eq!(
+            (u32at(&h, 14), u32at(&h, 18), u32at(&h, 22)),
+            (0, u32::MAX, u32::MAX)
+        );
+        let (nl, el) = (u16at(&h, 26) as usize, u16at(&h, 28) as usize);
+        assert_eq!(el, LOCAL_EXTRA);
+        assert_eq!(h.len(), 30 + nl + el);
+        let x = &h[30 + nl..];
+        assert_eq!(
+            (u16at(x, 0), u16at(x, 2), u64at(x, 4), u64at(x, 12)),
+            (1, 16, 0, 0)
+        );
+        // Descriptor: 8-byte sizes.
+        let d = big.descriptor(0xAABB_CCDD);
+        assert_eq!((u32at(&d, 0), u32at(&d, 4)), (DESC_SIG, 0xAABB_CCDD));
+        assert_eq!((u64at(&d, 8), u64at(&d, 16)), (GIB5, GIB5));
+        // Central record of the entry that lives past 4 GiB.
+        let mut c = Vec::new();
+        small.central(7, &mut c);
+        assert_eq!(u32at(&c, 0), CENTRAL_SIG);
+        assert_eq!((u16at(&c, 6), u16at(&c, 8)), (45, 0x0808));
+        assert_eq!(u32at(&c, 16), 7, "crc");
+        assert_eq!(
+            (u32at(&c, 20), u32at(&c, 24)),
+            (u32::MAX, u32::MAX),
+            "size sentinels"
+        );
+        assert_eq!(u32at(&c, 42), u32::MAX, "offset sentinel");
+        let nl = u16at(&c, 28) as usize;
+        assert_eq!(u16at(&c, 30), 28);
+        let x = &c[46 + nl..];
+        assert_eq!((u16at(x, 0), u16at(x, 2)), (1, 24));
+        assert_eq!(
+            (u64at(x, 4), u64at(x, 12), u64at(x, 20)),
+            (100, 100, small.hdr_off)
+        );
+        // The tail: the empty file's entry, the directory and the three end records.
+        let at = l.end();
+        let tail = tail_bytes(&l, &[1, 2], at);
+        let (n, cd_off, cd_len) = check_end_records(&tail, at);
+        assert_eq!(n, 3);
+        assert!(cd_off > GIB5);
+        assert_eq!(cd_off - at + cd_len + 56 + 20 + 22, tail.len() as u64);
+        let first = &tail[(cd_off - at) as usize..];
+        assert_eq!(u32at(first, 0), CENTRAL_SIG);
+        let x = &first[46 + u16at(first, 28) as usize..];
+        assert_eq!(u64at(x, 4), GIB5, "the 5 GiB size lives in the zip64 extra");
+    }
+
+    #[test]
+    fn more_than_65535_entries_round_trip_and_list_in_other_readers() {
+        const N: usize = 70_000;
+        let d = dir("many");
+        let mut entries: Vec<Entry> = (0..N).map(|i| file_entry(&format!("d/f{i}"), 1)).collect();
+        for i in 0..5 {
+            entries.push(file_entry(&format!("d/empty{i}"), 0));
+        }
+        let m = Manifest { entries };
+        let s = StoredZipSink::new(d.join("m.zip"), "P");
+        s.prepare(&m).unwrap();
+        s.position(&BTreeSet::new(), &BTreeMap::new()).unwrap();
+        for i in 0..N {
+            s.write_at(i as u32, 0, &[(i % 251) as u8]).unwrap();
+        }
+        for i in 0..5 {
+            s.write_whole((N + i) as u32, &[]).unwrap();
+        }
+        s.finish().unwrap();
+        let path = d.join("m.zip");
+        let raw = std::fs::read(&path).unwrap();
+        let (n, _, _) = check_end_records(&raw, 0);
+        assert_eq!(n, (N + 5) as u64);
+        let mut z = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        assert_eq!(z.len(), N + 5);
+        for i in [0usize, 1, 65_534, 65_535, 65_536, N - 1] {
+            let mut b = Vec::new();
+            z.by_name(&format!("P/d/f{i}"))
+                .unwrap()
+                .read_to_end(&mut b)
+                .unwrap();
+            assert_eq!(b, [(i % 251) as u8], "entry {i}");
+        }
+        assert!(z.by_name("P/d/empty4").unwrap().size() == 0);
+        // Other readers, when installed: bsdtar lists every entry; Info-ZIP unzip tests them all.
+        let run = |cmd: &str, args: &[&str]| {
+            std::process::Command::new(cmd)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+        };
+        let p = path.to_str().unwrap();
+        let mut other = 0;
+        if let Some(o) = run("bsdtar", &["-tf", p]) {
+            assert_eq!(
+                String::from_utf8_lossy(&o.stdout).lines().count(),
+                N + 5,
+                "bsdtar"
+            );
+            other += 1;
+        }
+        if let Some(o) = run("unzip", &["-tq", p]) {
+            let out = String::from_utf8_lossy(&o.stdout).to_string();
+            assert!(out.contains("No errors detected"), "unzip: {out}");
+            other += 1;
+        }
+        eprintln!("zip64 archive also read by {other} non-zip-crate reader(s)");
+    }
+
+    #[test]
+    fn an_in_flight_entry_cut_exactly_at_the_journal_resumes() {
+        // The disk holds exactly what the journal says, no more: nothing to truncate.
+        let d = dir("exact");
+        let m = manifest();
+        {
+            let s = StoredZipSink::new(d.join("o.zip"), "P");
+            s.prepare(&m).unwrap();
+            s.position(&BTreeSet::new(), &BTreeMap::new()).unwrap();
+            feed(&s, &m, 0, 0, 3000);
+            feed(&s, &m, 2, 0, 1024);
+            s.sync(&[]).unwrap();
+            std::mem::forget(s);
+        }
+        let s = StoredZipSink::new(d.join("o.zip"), "P");
+        s.prepare(&m).unwrap();
+        s.position(&done(&[0]), &part(2, 1024)).unwrap();
+        s.write_whole(1, &[]).unwrap();
+        feed(&s, &m, 2, 1024, 5000);
+        feed(&s, &m, 3, 0, 1234);
+        s.finish().unwrap();
+        check_zip(&d.join("o.zip"), &m);
+    }
+
+    #[test]
+    fn a_whole_but_unfinished_last_file_is_not_resumable() {
+        // The restart window (CUTOVER): every byte of the file is journaled but its Done is
+        // not. The sink refuses, so the receiver starts the archive over.
+        let d = dir("whole");
+        let m = manifest();
+        let s = StoredZipSink::new(d.join("o.zip"), "P");
+        s.prepare(&m).unwrap();
+        s.position(&BTreeSet::new(), &BTreeMap::new()).unwrap();
+        feed(&s, &m, 0, 0, 3000);
+        feed(&s, &m, 2, 0, 5000);
+        assert!(s.position(&done(&[0]), &part(2, 5000)).is_err());
     }
 
     #[test]
