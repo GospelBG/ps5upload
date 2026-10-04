@@ -595,29 +595,54 @@ impl Sink for StoredZipSink {
         let mut cut = layout.slots[..k].last().map_or(0, Slot::end);
         let mut partial_bytes = 0u64;
         let mut in_flight = None;
-        for (id, rs) in partial {
-            let Some(&pk) = layout.by_id.get(id) else {
-                continue;
-            };
-            if in_flight.is_some() || pk != k {
+        // The journal can hold the bytes of several files whose `Done` it has not recorded yet
+        // (a file's `Done` waits on its verification, and the next file's bytes keep arriving
+        // and syncing meanwhile): every such file but the last is whole, the last is a prefix.
+        // They are contiguous after the finished files, in archive order.
+        let mut parts: Vec<(usize, u32, &RangeSet)> = partial
+            .iter()
+            .filter_map(|(id, rs)| layout.by_id.get(id).map(|&pk| (pk, *id, rs)))
+            .collect();
+        parts.sort_by_key(|p| p.0);
+        let mut whole: Vec<usize> = Vec::new();
+        let mut need = cut;
+        for (j, (pk, id, rs)) in parts.iter().enumerate() {
+            if *pk != k + j {
                 return Err(bad(format!("file {id} is partly durable out of order")));
             }
             let runs: Vec<(u64, u64)> = rs.iter().collect();
             let [(0, x)] = runs[..] else {
                 return Err(bad(format!("file {id}'s durable bytes are not a prefix")));
             };
-            // x == size: every byte is durable but the Done is not; the descriptor was
-            // never written (or is cut), and `commit` writes it (review 005 section 5).
-            if x > layout.slots[pk].size {
+            let slot = &layout.slots[*pk];
+            if x > slot.size {
                 return Err(bad(format!("file {id} is longer than its size")));
             }
-            partial_bytes = x;
-            cut = layout.slots[pk].data_off + x;
-            in_flight = Some(pk);
+            if j + 1 < parts.len() {
+                if x != slot.size {
+                    return Err(bad(format!(
+                        "file {id} is partly durable but not the last in flight"
+                    )));
+                }
+                whole.push(*pk);
+                need = slot.data_off + slot.size;
+            } else {
+                // x == size: every byte is durable but the Done is not; the descriptor was
+                // never written (or is cut), and `commit` writes it (review 005 section 5).
+                partial_bytes = x;
+                cut = slot.data_off + x;
+                need = cut;
+                in_flight = Some(*pk);
+            }
         }
-        if file.metadata()?.len() < cut {
+        if in_flight.is_none() {
+            if let Some(&last) = whole.last() {
+                cut = layout.slots[last].end();
+            }
+        }
+        if file.metadata()?.len() < need {
             return Err(bad(format!(
-                "the archive is {} bytes; the journal needs {cut}",
+                "the archive is {} bytes; the journal needs {need}",
                 file.metadata()?.len()
             )));
         }
@@ -636,6 +661,29 @@ impl Sink for StoredZipSink {
                 )));
             }
             crcs[i] = Some(crc);
+        }
+        // Whole files without a `Done`: verify the header, rebuild the CRC from the durable
+        // bytes and write the descriptor now (the receiver's `commit` for them is then a no-op).
+        for &wk in &whole {
+            let s = &layout.slots[wk];
+            let want = s.header();
+            let mut got = vec![0u8; want.len()];
+            read_exact_at(&file, &mut got, s.hdr_off)?;
+            if got != want {
+                return Err(bad(format!("entry {} has a different header", s.id)));
+            }
+            let mut crc = crc32fast::Hasher::new();
+            let mut buf = vec![0u8; READBACK];
+            let mut at = 0u64;
+            while at < s.size {
+                let n = ((s.size - at) as usize).min(READBACK);
+                read_exact_at(&file, &mut buf[..n], s.data_off + at)?;
+                crc.update(&buf[..n]);
+                at += n as u64;
+            }
+            let crc = crc.finalize();
+            write_all_at(&file, &s.descriptor(crc), s.data_off + s.size)?;
+            crcs[wk] = Some(crc);
         }
         let mut crc = crc32fast::Hasher::new();
         if let Some(pk) = in_flight {
@@ -662,11 +710,12 @@ impl Sink for StoredZipSink {
         st.written = partial_bytes;
         st.crc = crc;
         st.crcs = crcs;
+        let finished = k + whole.len();
         st.last = match in_flight {
             Some(pk) => Some(layout.slots[pk].id),
-            None => k.checked_sub(1).map(|i| layout.slots[i].id),
+            None => finished.checked_sub(1).map(|i| layout.slots[i].id),
         };
-        st.started = k + usize::from(in_flight.is_some());
+        st.started = finished + usize::from(in_flight.is_some());
         Ok(())
     }
 
@@ -1152,6 +1201,81 @@ mod tests {
         feed(&s, &m, 3, 0, 1234);
         s.finish().unwrap();
         check_zip(&d.join("o.zip"), &m);
+    }
+
+    fn parts(list: &[(u32, u64)]) -> BTreeMap<u32, RangeSet> {
+        list.iter()
+            .map(|&(id, x)| {
+                let mut r = RangeSet::new();
+                r.insert(0, x);
+                (id, r)
+            })
+            .collect()
+    }
+
+    fn write_then_die(d: &PathBuf, m: &Manifest, upto: &[(u32, u64)]) {
+        let s = StoredZipSink::new(d.join("o.zip"), "P");
+        s.prepare(m).unwrap();
+        s.position(&BTreeSet::new(), &BTreeMap::new()).unwrap();
+        for &(id, x) in upto {
+            feed(&s, m, id, 0, x);
+        }
+        s.sync(&[]).unwrap();
+        std::mem::forget(s);
+    }
+
+    #[test]
+    fn several_whole_files_without_a_done_and_a_prefix_resume_without_starting_over() {
+        // The journal records a file's Done after its verification, while the next files' bytes
+        // keep syncing: at a drop it can hold files 0 and 2 whole (no Done) and 3 partly. That
+        // used to be refused as "out of order" and restarted the whole archive (a flake of the
+        // resume-size test under load).
+        let d = dir("several");
+        let m = manifest();
+        write_then_die(&d, &m, &[(0, 3000), (2, 5000), (3, 600)]);
+        let s = StoredZipSink::new(d.join("o.zip"), "P");
+        s.prepare(&m).unwrap();
+        s.position(&BTreeSet::new(), &parts(&[(0, 3000), (2, 5000), (3, 600)]))
+            .expect("resumes where the journal says");
+        // The receiver's commits for the whole files are no-ops now.
+        s.commit(0).unwrap();
+        s.commit(2).unwrap();
+        s.write_whole(1, &[]).unwrap();
+        feed(&s, &m, 3, 600, 1234);
+        s.finish().unwrap();
+        check_zip(&d.join("o.zip"), &m);
+    }
+
+    #[test]
+    fn several_whole_files_and_no_prefix_resume_too() {
+        let d = dir("severalwhole");
+        let m = manifest();
+        write_then_die(&d, &m, &[(0, 3000), (2, 5000)]);
+        let s = StoredZipSink::new(d.join("o.zip"), "P");
+        s.prepare(&m).unwrap();
+        s.position(&done(&[]), &parts(&[(0, 3000), (2, 5000)]))
+            .unwrap();
+        s.commit(0).unwrap();
+        s.commit(2).unwrap();
+        s.write_whole(1, &[]).unwrap();
+        feed(&s, &m, 3, 0, 1234);
+        s.finish().unwrap();
+        check_zip(&d.join("o.zip"), &m);
+    }
+
+    #[test]
+    fn a_hole_or_a_second_prefix_is_still_refused() {
+        let d = dir("hole");
+        let m = manifest();
+        write_then_die(&d, &m, &[(0, 3000), (2, 5000), (3, 600)]);
+        let s = StoredZipSink::new(d.join("o.zip"), "P");
+        s.prepare(&m).unwrap();
+        // File 2 missing from the journal while file 3 has bytes: a hole.
+        assert!(s.position(&done(&[0]), &parts(&[(3, 600)])).is_err());
+        // Two prefixes: only the last may be partial.
+        assert!(s
+            .position(&done(&[]), &parts(&[(0, 100), (2, 100)]))
+            .is_err());
     }
 
     #[test]
