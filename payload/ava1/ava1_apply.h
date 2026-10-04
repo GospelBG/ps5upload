@@ -32,6 +32,12 @@ void ava1_apply_unreserve(ava1_job_t *j, size_t n);
 int ava1_apply_chunk(ava1_job_t *j, uint8_t *owned, size_t owned_len, uint32_t file_id, uint64_t off,
                      const uint8_t *data, size_t len);
 int ava1_apply_bundle(ava1_job_t *j, uint8_t *owned, size_t owned_len, const ava1_bundle_t *b);
+/* The same, for an `owned` buffer from ava1_frame_alloc: `owned_cap` is the capacity it
+ * returned and the buffer goes back to the pool, not the allocator (review 003 section 3). */
+int ava1_apply_chunk_pooled(ava1_job_t *j, uint8_t *owned, size_t owned_len, size_t owned_cap, uint32_t file_id,
+                            uint64_t off, const uint8_t *data, size_t len);
+int ava1_apply_bundle_pooled(ava1_job_t *j, uint8_t *owned, size_t owned_len, size_t owned_cap,
+                             const ava1_bundle_t *b);
 int ava1_apply_root(ava1_job_t *j, uint32_t file_id, const uint8_t root[32]);
 /* Runs fn(j, arg, 0..n-1) on the workers and waits for all of them. */
 int ava1_apply_parallel(ava1_job_t *j, void (*fn)(ava1_job_t *, void *, uint32_t), void *arg, uint32_t n);

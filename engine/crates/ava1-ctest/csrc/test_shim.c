@@ -17,6 +17,7 @@
 #include "ava1_recv.h"
 #include "ava1_conn.h"
 #include "ava1_data.h"
+#include "ava1_frame.h"
 #include "ava1_platform.h"
 
 #include "ava1_gen.h"
@@ -588,7 +589,7 @@ static int echo_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
         rc = echo_send(sid, AVA1_TYPE_RECEIVED, enc_received, &r) != 0 ||
              echo_send(sid, AVA1_TYPE_CREDIT, enc_credit, &cr) != 0;
     }
-    free(body);
+    (void)ava1_frame_free(body, ava1_frame_class(len)); /* the server read it into a pool buffer */
     return rc;
 }
 
