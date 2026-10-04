@@ -36,6 +36,9 @@ import { useUploadSettingsStore } from "./uploadSettings";
 import { useRecentHostMetricsStore } from "./recentHostMetrics";
 import { effectiveUploadStreams } from "../lib/uploadStreams";
 import { jobLiveFromSnapshot, type JobLive } from "../lib/jobLive";
+import { pushNotification } from "./notifications";
+import { withConsolePrefix } from "./roster";
+import { trStatic } from "../lib/trStatic";
 
 /** Module-level shortcut to the recent-host-metrics recorder. Pulled
  *  out as a function (not a direct `store.record`) so future call
@@ -695,6 +698,21 @@ export const useTransferStore = create<TransferState>((set) => {
             "upload",
             `done "${uploadName}" → ${finalDest}: ${snap.files_sent ?? 0} files, ${snap.bytes_sent ?? 0} bytes in ${snap.elapsed_ms ?? 0}ms${mountedAt ? `, mounted ${mountedAt}` : ""}`,
           );
+          if (jobLiveFromSnapshot(snap)?.unsettled) {
+            pushNotification(
+              "warning",
+              withConsolePrefix(
+                host ?? "",
+                trStatic("upload_warn_unsettled_title", "Upload finished, but not confirmed saved"),
+              ),
+              {
+                body: trStatic(
+                  "upload_warn_unsettled",
+                  "Every byte reached the console, but it has not confirmed saving all files yet. They finish on their own; if the console loses power first, send the folder again.",
+                ),
+              },
+            );
+          }
           // Matching "complete" toast on the PS5 itself.
           if (host) {
             void toastPush(mgmtAddr(host), "Upload complete", {

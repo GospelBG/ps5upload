@@ -1146,15 +1146,32 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             measuredAtMs: Date.now(),
           });
         }
+        // The finished transfer's bottleneck (commit ack); a stale skipping/settling
+        // note from the last running tick must not outlive the job.
+        const finishedLive = jobLiveFromSnapshot({
+          bottleneck: snap.bottleneck,
+          commit_ack: snap.commit_ack,
+        });
+        if (finishedLive?.unsettled) {
+          // The engine stopped waiting for the console to finish saving the files: not a clean success.
+          pushNotification(
+            "warning",
+            withConsolePrefix(
+              item.addr,
+              trStatic("upload_warn_unsettled_title", "Upload finished, but not confirmed saved"),
+            ),
+            {
+              body: trStatic(
+                "upload_warn_unsettled",
+                "Every byte reached the console, but it has not confirmed saving all files yet. They finish on their own; if the console loses power first, send the folder again.",
+              ),
+            },
+          );
+        }
         return {
           bytesSent: finalBytes,
           bytesPerSec: averageRate(finalBytes, elapsedMs),
-          // The finished transfer's bottleneck (commit ack); a stale skipping/settling
-          // note from the last running tick must not outlive the job.
-          live: jobLiveFromSnapshot({
-            bottleneck: snap.bottleneck,
-            commit_ack: snap.commit_ack,
-          }),
+          live: finishedLive,
           mountedAt,
           mountWarnings,
           registeredAs,
