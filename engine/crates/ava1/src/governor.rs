@@ -11,7 +11,18 @@ pub const MAX_BUNDLE: u32 = 15 << 20;
 pub const START_BUNDLE: u32 = 1 << 20;
 pub const START_LANES: u8 = 2;
 pub const MAX_LANES: u8 = 8;
+/// A lane probe must raise the rate by this factor to keep its lane.
 const GAIN: f64 = 1.10;
+/// The easier bar while the link is not yet at its best observed rate (review 003 §5): a
+/// third lane that adds a few percent is worth keeping then, and reverting it holds the
+/// governor back for `HOLD_TICKS`.
+const GAIN_BELOW_BEST: f64 = 1.05;
+/// "Below its best" means under this share of the best rate seen.
+const NEAR_BEST: f64 = 0.90;
+/// While lanes are below `PREFER_LANES_UNTIL` and the network is the limit, the chunk is
+/// held at this size (more lanes first, bigger frames only when lanes stop helping).
+const LANES_FIRST_CHUNK: u32 = 4 << 20;
+const PREFER_LANES_UNTIL: u8 = 4;
 const HOLD_TICKS: u32 = 30;
 const STABLE_TICKS: u32 = 10;
 const PROBE_TICKS: u32 = 5;
@@ -82,6 +93,10 @@ pub struct GovernorOptions {
     pub pin_lanes: Option<u8>,
     /// Hold the chunk size in bytes (a whole number of MiB, MIN_CHUNK..=MAX_CHUNK).
     pub pin_chunk: Option<u32>,
+    /// The §5 policy: probe lanes with a lower gain bar while below the best rate, and do
+    /// not grow the chunk past 4 MiB before lanes stop helping. On by default; switch it
+    /// off to A/B against the old policy.
+    pub lanes_first: bool,
 }
 
 impl Default for GovernorOptions {
@@ -89,23 +104,29 @@ impl Default for GovernorOptions {
         Self {
             pin_lanes: None,
             pin_chunk: None,
+            lanes_first: true,
         }
     }
 }
 
 impl GovernorOptions {
-    /// `PS5UPLOAD_AVA1_LANES=n` and `PS5UPLOAD_AVA1_CHUNK=m` (MiB) pin the governor.
-    /// Benchmarking only: a pinned governor ignores what the link says. Values out of
-    /// range are ignored.
+    /// `PS5UPLOAD_AVA1_LANES=n` and `PS5UPLOAD_AVA1_CHUNK=m` (MiB) pin the governor, and
+    /// `PS5UPLOAD_AVA1_LANES_FIRST=0` turns the §5 policy off. Benchmarking only: a pinned
+    /// governor ignores what the link says. Values out of range are ignored.
     pub fn from_env() -> Self {
         let get = |k: &str| std::env::var(k).ok();
         Self::from_vars(
             get("PS5UPLOAD_AVA1_LANES").as_deref(),
             get("PS5UPLOAD_AVA1_CHUNK").as_deref(),
+            get("PS5UPLOAD_AVA1_LANES_FIRST").as_deref(),
         )
     }
 
-    pub fn from_vars(lanes: Option<&str>, chunk_mib: Option<&str>) -> Self {
+    pub fn from_vars(
+        lanes: Option<&str>,
+        chunk_mib: Option<&str>,
+        lanes_first: Option<&str>,
+    ) -> Self {
         let pin_lanes = lanes
             .and_then(|v| v.trim().parse::<u8>().ok())
             .filter(|n| (1..=MAX_LANES).contains(n));
@@ -116,12 +137,18 @@ impl GovernorOptions {
         Self {
             pin_lanes,
             pin_chunk,
+            lanes_first: lanes_first.map(|v| v.trim() != "0").unwrap_or(true),
         }
     }
 }
 
 pub struct Governor {
     opts: GovernorOptions,
+    /// The highest per-tick rate seen (bytes/s).
+    best_rate: f64,
+    /// A lane probe failed (or lanes are maxed): more lanes no longer help, so the chunk
+    /// may grow past `LANES_FIRST_CHUNK`.
+    lanes_capped: bool,
     lanes: u8,
     chunk: u32,
     bundle: u32,
@@ -163,6 +190,8 @@ impl Governor {
     pub fn with_options(opts: GovernorOptions) -> Self {
         Self {
             opts,
+            best_rate: 0.0,
+            lanes_capped: false,
             lanes: opts.pin_lanes.unwrap_or(START_LANES),
             chunk: opts.pin_chunk.unwrap_or(START_CHUNK),
             bundle: START_BUNDLE,
@@ -222,26 +251,45 @@ impl Governor {
             BN_NETWORK
         };
 
+        self.best_rate = self.best_rate.max(rate);
+        let gain = if self.opts.lanes_first && rate < self.best_rate * NEAR_BEST {
+            GAIN_BELOW_BEST
+        } else {
+            GAIN
+        };
+
         // Lanes and chunk.
         if s.stalls > 0 {
             self.lanes = self.lanes.saturating_sub(1).max(1);
             self.chunk = (self.chunk / 2).max(MIN_CHUNK) & !((1 << 20) - 1);
             self.stable = 0;
+            self.lanes_capped = false;
             self.step = LaneStep::Hold(HOLD_TICKS / 3);
         } else {
             self.stable += 1;
             if self.stable >= STABLE_TICKS {
                 self.stable = 0;
-                self.chunk = (self.chunk * 2).min(MAX_CHUNK);
+                let mut grown = (self.chunk * 2).min(MAX_CHUNK);
+                if self.opts.lanes_first
+                    && bottleneck == BN_NETWORK
+                    && self.lanes < PREFER_LANES_UNTIL
+                    && !self.lanes_capped
+                {
+                    // Lanes first: a bigger frame lengthens every decrypt stall on the
+                    // console, so hold at 4 MiB (never shrinking what is already larger).
+                    grown = grown.min(LANES_FIRST_CHUNK.max(self.chunk));
+                }
+                self.chunk = grown;
             }
             self.step = match self.step {
                 LaneStep::Hold(0) => LaneStep::Steady,
                 LaneStep::Hold(n) => LaneStep::Hold(n - 1),
                 LaneStep::Trying { before, wait: 0 } => {
-                    if rate >= before * GAIN {
+                    if rate >= before * gain {
                         LaneStep::Steady
                     } else {
                         self.lanes = self.lanes.saturating_sub(1).max(1);
+                        self.lanes_capped = true; // another lane did not help
                         LaneStep::Hold(HOLD_TICKS)
                     }
                 }
@@ -262,6 +310,9 @@ impl Governor {
                 }
                 st => st,
             };
+        }
+        if self.lanes >= MAX_LANES {
+            self.lanes_capped = true;
         }
         let half_second = ((lane_rate * 0.5) as u32) & !((1 << 20) - 1);
         self.chunk = self.chunk.min(half_second.max(MIN_CHUNK));
@@ -572,13 +623,129 @@ mod tests {
         assert!(matches!(g.probe, Probe::Done), "the probe never runs twice");
     }
 
-    // ---- review 003 §4: the benchmark pins ----
+    // ---- review 003 §5: lanes first, and the benchmark pins ----------------------------
+
+    fn steady(rate: f64, lanes: u8) -> Sample {
+        Sample {
+            secs: 1.0,
+            bytes_acked: rate as u64,
+            lanes,
+            ..Default::default()
+        }
+    }
+
+    /// A governor one tick away from judging a third lane that was added at `before` B/s,
+    /// having seen `best` B/s earlier.
+    fn probing(opts: GovernorOptions, before: f64, best: f64) -> Governor {
+        let mut g = Governor::with_options(opts);
+        g.lanes = 3;
+        g.best_rate = best;
+        g.step = LaneStep::Trying { before, wait: 0 };
+        g
+    }
+
+    #[test]
+    fn a_small_lane_gain_is_kept_while_the_link_is_below_its_best() {
+        // Best seen 100 MB/s; now 80 (below 90 %). The third lane lifts it 7 %: kept at the
+        // 1.05 bar, reverted at the old 1.10 bar.
+        let mut g = probing(GovernorOptions::default(), 80e6, 100e6);
+        let d = g.tick(&steady(85.6e6, 3));
+        assert_eq!(d.lanes, 3, "a 7 % gain below the best rate keeps the lane");
+        let mut old = probing(
+            GovernorOptions {
+                lanes_first: false,
+                ..Default::default()
+            },
+            80e6,
+            100e6,
+        );
+        assert_eq!(
+            old.tick(&steady(85.6e6, 3)).lanes,
+            2,
+            "the old bar reverts it"
+        );
+    }
+
+    #[test]
+    fn near_the_best_rate_the_lane_must_earn_ten_percent() {
+        // 95 MB/s is within 90 % of the 100 MB/s best: the bar is 1.10, 7 % is not enough.
+        let mut g = probing(GovernorOptions::default(), 88.8e6, 100e6);
+        assert_eq!(g.tick(&steady(95e6, 3)).lanes, 2);
+        // And exactly at the best rate it still needs 10 %.
+        let mut g = probing(GovernorOptions::default(), 91e6, 100e6);
+        assert_eq!(g.tick(&steady(100e6, 3)).lanes, 2, "9.9 % < 10 %");
+        let mut g = probing(GovernorOptions::default(), 90e6, 100e6);
+        assert_eq!(g.tick(&steady(100e6, 3)).lanes, 3, "11 % keeps it");
+    }
+
+    /// Ticks a clean link where the network is the limit, with `lanes` held.
+    fn run_stable(g: &mut Governor, lanes: u8, ticks: usize) -> Decision {
+        let mut d = g.tick(&Sample::default());
+        for _ in 0..ticks {
+            d = g.tick(&steady(200e6, lanes));
+        }
+        d
+    }
+
+    #[test]
+    fn the_chunk_stays_at_four_mib_while_lanes_are_few_and_the_network_limits() {
+        let mut g = Governor::new();
+        // Pretend the lane probe is mid-hold so lanes stay at 2 while time passes.
+        g.step = LaneStep::Hold(1_000);
+        let d = run_stable(&mut g, 2, 60);
+        assert_eq!(d.chunk, 4 << 20, "no growth past 4 MiB with 2 lanes");
+    }
+
+    #[test]
+    fn the_chunk_grows_once_lanes_stop_helping_or_reach_four() {
+        // Lanes at 4: free to grow.
+        let mut g = Governor::new();
+        g.lanes = 4;
+        g.step = LaneStep::Hold(1_000);
+        assert!(run_stable(&mut g, 4, 40).chunk > 4 << 20);
+        // Lanes at 2 but a probe already failed: lanes stopped helping, so grow.
+        let mut g = Governor::new();
+        g.step = LaneStep::Hold(1_000);
+        g.lanes_capped = true;
+        assert!(run_stable(&mut g, 2, 40).chunk > 4 << 20);
+        // And a receiver-bound job is not the network: the rule does not apply.
+        let mut g = Governor::new();
+        g.step = LaneStep::Hold(1_000);
+        let mut d = g.tick(&Sample::default());
+        for _ in 0..40 {
+            d = g.tick(&Sample {
+                credit_starved: true,
+                receiver_bottleneck: crate::gen::BN_DISK,
+                ..steady(200e6, 2)
+            });
+        }
+        assert!(d.chunk > 4 << 20);
+    }
+
+    #[test]
+    fn with_lanes_first_off_the_chunk_grows_as_before() {
+        let mut g = Governor::with_options(GovernorOptions {
+            lanes_first: false,
+            ..Default::default()
+        });
+        g.step = LaneStep::Hold(1_000);
+        assert!(run_stable(&mut g, 2, 40).chunk > 4 << 20);
+    }
+
+    #[test]
+    fn a_failed_probe_marks_lanes_as_not_helping() {
+        let mut g = probing(GovernorOptions::default(), 100e6, 100e6);
+        assert!(!g.lanes_capped);
+        g.tick(&steady(100e6, 3)); // no gain
+        assert!(g.lanes_capped);
+    }
 
     #[test]
     fn pinned_lanes_and_chunk_are_honoured_through_everything() {
         let opts = GovernorOptions {
             pin_lanes: Some(4),
             pin_chunk: Some(8 << 20),
+            lanes_first: true,
         };
         let mut g = Governor::with_options(opts);
         let first = g.tick(&Sample::default());
@@ -612,15 +779,21 @@ mod tests {
 
     #[test]
     fn the_env_knobs_parse_and_ignore_nonsense() {
-        let o = GovernorOptions::from_vars(Some("6"), Some("4"));
-        assert_eq!((o.pin_lanes, o.pin_chunk), (Some(6), Some(4 << 20)));
-        let o = GovernorOptions::from_vars(Some("0"), Some("16"));
+        let o = GovernorOptions::from_vars(Some("6"), Some("4"), None);
+        assert_eq!(
+            (o.pin_lanes, o.pin_chunk, o.lanes_first),
+            (Some(6), Some(4 << 20), true)
+        );
+        let o = GovernorOptions::from_vars(Some("0"), Some("16"), Some("0"));
+        assert_eq!(
+            (o.pin_lanes, o.pin_chunk, o.lanes_first),
+            (None, None, false)
+        );
+        let o = GovernorOptions::from_vars(Some("9"), Some("0"), None);
         assert_eq!((o.pin_lanes, o.pin_chunk), (None, None));
-        let o = GovernorOptions::from_vars(Some("9"), Some("0"));
-        assert_eq!((o.pin_lanes, o.pin_chunk), (None, None));
-        let o = GovernorOptions::from_vars(Some(" 2 "), Some("15"));
+        let o = GovernorOptions::from_vars(Some(" 2 "), Some("15"), None);
         assert_eq!((o.pin_lanes, o.pin_chunk), (Some(2), Some(15 << 20)));
-        let o = GovernorOptions::from_vars(Some("x"), Some(""));
+        let o = GovernorOptions::from_vars(Some("x"), Some(""), None);
         assert_eq!(o, GovernorOptions::default());
     }
 

@@ -816,11 +816,16 @@ numbers they are fed, so both are tested against models rather than sockets.
 
 - Start: 2 lanes, a 4 MiB chunk and a 1 MiB bundle target; receiver workers start at 4.
 - Lanes: add one while the bottleneck is the network and the last addition raised throughput by
-  ≥ 10 %; otherwise revert it and hold for 30 s. A tick with a lane death or requeue drops one
+  ≥ 10 % (≥ 5 % while the rate is below 90 % of the best rate seen in the job); otherwise revert
+  it and hold for 30 s. A tick with a lane death or requeue drops one
   lane (min 1) and halves the chunk. At most 8 lanes: on a link that scales past that the count
   simply stops growing.
 - Chunk: 1–15 MiB in whole groups; halved on a stall, doubled after 10 stable ticks; never more
-  than half a second of one lane's throughput (min 1 MiB). 15 MiB, not 16: the frame cap (§2)
+  than half a second of one lane's throughput (min 1 MiB). Lanes before chunk: while the network
+  is the bottleneck, fewer than 4 lanes are open and no lane probe has failed yet, the chunk is
+  not doubled past 4 MiB (a bigger frame lengthens every decrypt stall on the receiver); once a
+  probe fails or 4 lanes are open, growth resumes. The sender can switch this policy off
+  (`PS5UPLOAD_AVA1_LANES_FIRST=0`) to A/B it; it is on by default. 15 MiB, not 16: the frame cap (§2)
   counts the header and the MAC, which a 16 MiB body would not fit under.
 - Benchmark pins (sender-local, never on the wire): `PS5UPLOAD_AVA1_LANES=n` holds the lane count
   at n (1-8) and `PS5UPLOAD_AVA1_CHUNK=m` holds the chunk at m MiB (1-15); a pinned value ignores
