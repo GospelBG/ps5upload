@@ -24,6 +24,7 @@
 #include "ava1_glue.h"
 #include "takeover_flag.h"
 #include "ava1_stop.h"
+#include "sony_api_lock.h"
 
 #include "proc_identity.h"
 /* Sony "debugger" / system-process authid. Setting our process's
@@ -80,7 +81,11 @@ void pop_notification(const char *message) {
     ps5_notify_req_t req;
     memset(&req, 0, sizeof(req));
     strncpy(req.message, message, sizeof(req.message) - 1);
+    /* A Sony request: one at a time with every other Sony call (final review: console). No caller holds
+     * the lock (the mutex is not recursive); the AVA1 pairing prompt runs on the server thread. */
+    pthread_mutex_lock(&sony_api_lock);
     (void)p_send(0, &req, sizeof(req), 0);
+    pthread_mutex_unlock(&sony_api_lock);
 }
 
 /*

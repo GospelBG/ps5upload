@@ -9301,7 +9301,10 @@ static int handle_time_get(runtime_state_t *state, int client_fd,
     sce_datetime_t dt;
     memset(&dt, 0, sizeof(dt));
     uint32_t ec = 0;
+    pthread_mutex_lock(&sony_api_lock); /* sceSystemServiceGetCurrentDateTime: one Sony call at a time */
     int rc = sys_time_get(&dt, &ec);
+    usleep(SONY_API_POST_SLEEP_US);
+    pthread_mutex_unlock(&sony_api_lock);
     char body[256];
     int n;
     if (rc == 0) {
@@ -9366,7 +9369,10 @@ static int handle_time_set(runtime_state_t *state, int client_fd,
     uint32_t ec = 0;
     int64_t prior_unix = -1, new_unix = -1;
     int used_fallback = 0;
+    pthread_mutex_lock(&sony_api_lock); /* sceSystemServiceGet/SetCurrentDateTime: one Sony call at a time */
     int rc = sys_time_set(&dt, &ec, &prior_unix, &new_unix, &used_fallback);
+    usleep(SONY_API_POST_SLEEP_US);
+    pthread_mutex_unlock(&sony_api_lock);
     char body[256];
     /* snake_case keys: the engine deserializes this with serde, which
      * silently zeroes any field whose name doesn't match. */
@@ -9479,8 +9485,8 @@ static int handle_time_state_get(runtime_state_t *state, int client_fd,
                                                 &tzdata_ver_err);
     int ntp_tick_rc    = sys_registry_get_ntp_tick_unix(&ntp_tick_unix,
                                                           &ntp_tick_err);
+    int wall_rc        = sys_time_get(&wall_dt, &wall_err); /* a Sony call: still under the lock */
     pthread_mutex_unlock(&sony_api_lock);
-    int wall_rc        = sys_time_get(&wall_dt, &wall_err);
 
     /* Build response. JSON grows up to ~1.2 KB with all fields
      * populated; sizing to 2 KB gives plenty of slack for the
@@ -10236,7 +10242,7 @@ static int handle_system_control(runtime_state_t *state, int client_fd,
         rc = send_frame(client_fd, FTX2_FRAME_SYSTEM_CONTROL_ACK, 0,
                         trace_id, ack, strlen(ack));
         if (mgmt_capture_active() && power_defer(SC_ACTION_REBOOT) == 0) return rc;
-        sceSystemServiceRequestReboot();
+        power_do_action(SC_ACTION_REBOOT); /* takes sony_api_lock (legacy path and power_defer failure) */
         return rc;
     }
     case SC_ACTION_SHUTDOWN: {
@@ -10257,13 +10263,7 @@ static int handle_system_control(runtime_state_t *state, int client_fd,
          * niladic the extra register is ignored; if it takes a mode/reason,
          * 0 is the safe "normal shutdown" default. Avoids passing a garbage
          * register the way a `(void)` cast would if the arity is non-zero. */
-        void *h = dlsym(RTLD_DEFAULT, "sceSystemStateMgrTurnOff");
-        if (h) {
-            int (*turn_off)(int) = (int (*)(int))h;
-            turn_off(0);
-        } else {
-            sceSystemServiceRequestPowerOff();
-        }
+        power_do_action(SC_ACTION_SHUTDOWN); /* sceSystemStateMgrTurnOff, else RequestPowerOff, under sony_api_lock */
         return rc;
     }
     case SC_ACTION_STANDBY: {
@@ -10275,12 +10275,11 @@ static int handle_system_control(runtime_state_t *state, int client_fd,
             return send_frame(client_fd, FTX2_FRAME_SYSTEM_CONTROL_ACK,
                               0, trace_id, err_str, strlen(err_str));
         }
-        int (*enter_standby)(void) = (int (*)(void))h;
         const char *ack = "{\"ok\":true,\"action\":\"standby\"}";
         rc = send_frame(client_fd, FTX2_FRAME_SYSTEM_CONTROL_ACK, 0,
                         trace_id, ack, strlen(ack));
         if (mgmt_capture_active() && power_defer(SC_ACTION_STANDBY) == 0) return rc;
-        enter_standby();
+        power_do_action(SC_ACTION_STANDBY);
         return rc;
     }
     case SC_ACTION_TICK:
@@ -10481,8 +10480,8 @@ static int handle_user_create(runtime_state_t *state, int client_fd,
     int new_uid = -1;
     const char *err_msg = "";
     if (name[0]) {
-        sceUserServiceInitialize(NULL);
         pthread_mutex_lock(&sony_api_lock);
+        sceUserServiceInitialize(NULL); /* a Sony call: inside the lock (final review: console) */
         int raw_uid = -1;
         int init_rc = sceUserServiceGetInitialUser(&raw_uid);
         if (init_rc == 0 && raw_uid >= 0) {
@@ -10534,8 +10533,8 @@ static int handle_user_delete(runtime_state_t *state, int client_fd,
                      "/user/home/%d/savedata_prospero", uid);
             remove_recursive_path(sd_path, NULL, NULL);
         }
-        sceUserServiceInitialize(NULL);
         pthread_mutex_lock(&sony_api_lock);
+        sceUserServiceInitialize(NULL); /* a Sony call: inside the lock (final review: console) */
         int del_rc = sceUserServiceDestroyUser(uid);
         usleep(SONY_API_POST_SLEEP_US);
         pthread_mutex_unlock(&sony_api_lock);
@@ -10879,7 +10878,7 @@ static int handle_notif_send(runtime_state_t *state, int client_fd,
                           err, strlen(err));
     }
     int level = (int)extract_json_uint64_field(body, "level");
-    int rc = notif_send(msg, level);
+    int rc = notif_send_serialised(msg, level); /* sceNotificationSend needs sony_api_lock */
     pthread_mutex_lock(&state->state_mtx);
     state->command_count += 1;
     pthread_mutex_unlock(&state->state_mtx);
