@@ -65,18 +65,28 @@ pub fn classify(e: &Ava1Error) -> UploadFailure {
 /// every bit of `cap`; the session is kept by the pool and reused by the job that follows.
 /// Blocking: call from a blocking thread.
 pub fn require_in(pool: &Pool, console: &str, cap: u64) -> Result<(), UploadFailure> {
+    // A failed attempt is repeated for a few seconds without dialling again: the client polls
+    // many endpoints, and each fresh handshake with an unpaired console can show a pairing code
+    // and count against the console's connection cap, while an unreachable one blocks for the
+    // whole probe. A pairing or any successful session clears it (`Pool::clear_refusal`).
+    if let Some((reason, detail)) = pool.recent_refusal(console) {
+        return Err(UploadFailure { reason, detail });
+    }
     let session =
         crate::block_on(async { tokio::time::timeout(PROBE_TIMEOUT, pool.session(console)).await });
-    match session {
-        Err(_) => Err(UploadFailure {
+    let failure = match session {
+        Err(_) => UploadFailure {
             reason: "ava1_unreachable".into(),
             detail: "the console did not answer on the AVA1 port in time".into(),
-        }),
-        Ok(Err(e)) => Err(classify(&e)),
-        Ok(Ok(s)) if s.peer_caps() & cap == cap => Ok(()),
-        // It answered but does not serve what this app needs: an older helper.
-        Ok(Ok(_)) => Err(helper_not_ava1()),
-    }
+        },
+        Ok(Err(e)) => classify(&e),
+        Ok(Ok(s)) if s.peer_caps() & cap == cap => return Ok(()),
+        // It answered but does not serve what this app needs: an older helper. Not cached:
+        // the session is live and asking again costs nothing.
+        Ok(Ok(_)) => return Err(helper_not_ava1()),
+    };
+    pool.note_refusal(console, &failure.reason, &failure.detail);
+    Err(failure)
 }
 
 /// [`require_in`] on the process's pool, for the data plane (uploads and downloads).

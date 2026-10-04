@@ -33,6 +33,22 @@ pub struct ZipTooLarge(pub String);
 #[error("zip is not usable as an AVA1 source: {0}")]
 pub struct ZipUnsupported(pub String);
 
+/// A failed `ZipSource::open`: a format problem (damaged directory, unsupported method,
+/// encryption, an unsafe path) is `ZipUnsupported`, which the client treats as terminal; an I/O
+/// error reading the file (a share that dropped, a permission) is `zip_read_error`, which stays
+/// retryable like any other transient failure.
+fn zip_open_error(e: io::Error) -> anyhow::Error {
+    if e.kind() == io::ErrorKind::InvalidData {
+        ZipUnsupported(e.to_string()).into()
+    } else {
+        UploadFailure {
+            reason: "zip_read_error".into(),
+            detail: format!("could not read the zip archive: {e}"),
+        }
+        .into()
+    }
+}
+
 pub fn upload_zip_in(
     pool: &Pool,
     cfg: &TransferConfig,
@@ -40,8 +56,7 @@ pub fn upload_zip_in(
     dest_root: &str,
     zip_path: &Path,
 ) -> Result<TransferResult> {
-    let (manifest, source) =
-        ZipSource::open(zip_path, &cfg.excludes).map_err(|e| ZipUnsupported(e.to_string()))?;
+    let (manifest, source) = ZipSource::open(zip_path, &cfg.excludes).map_err(zip_open_error)?;
     upload_with_in(
         pool,
         &cfg.addr,
@@ -833,28 +848,33 @@ enum Placed {
 }
 
 fn place_list_path(dest_root: &str, dest: &str) -> Result<Placed> {
-    match relative_list_path(dest_root, dest) {
-        Ok(rel) => Ok(Placed::In(rel)),
-        Err(e) if dest.starts_with('/') => {
-            // Absolute and not under the root: its own directory, if it is a plain file path.
-            let p = Path::new(dest);
-            let (Some(dir), Some(name)) = (
-                p.parent().and_then(|d| d.to_str()),
-                p.file_name().and_then(|n| n.to_str()),
-            ) else {
-                return Err(e);
-            };
-            manifest::check_path(name)?;
-            if dir.split('/').any(|c| c == "..") {
-                return Err(e);
-            }
-            Ok(Placed::Out {
-                dir: dir.to_string(),
-                name: name.to_string(),
-            })
-        }
-        Err(e) => Err(e),
+    let root = if dest_root == "/" {
+        "/"
+    } else {
+        dest_root.trim_end_matches('/')
+    };
+    // Only a path that is not below the root at all is "elsewhere". One below the root that
+    // fails the path rules (`..`, an empty or odd component) is refused, never rerouted.
+    if !dest.starts_with('/') || Path::new(dest).strip_prefix(Path::new(root)).is_ok() {
+        return relative_list_path(root, dest).map(Placed::In);
     }
+    let p = Path::new(dest);
+    let (Some(dir), Some(name)) = (
+        p.parent().and_then(|d| d.to_str()),
+        p.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return Err(anyhow!("{dest} is not a file path"));
+    };
+    manifest::check_path(name)?;
+    // Every component of the directory the job will be rooted at is checked too.
+    if dir != "/" {
+        manifest::check_path(dir.trim_start_matches('/'))
+            .map_err(|e| anyhow!("{dest}: the directory is refused: {e}"))?;
+    }
+    Ok(Placed::Out {
+        dir: dir.to_string(),
+        name: name.to_string(),
+    })
 }
 
 /// One AVA1 job is one manifest under one root. A file list may name destinations in several
@@ -982,25 +1002,40 @@ fn run_aggregated<T>(
             }
         }
     };
-    let stop = Arc::new(AtomicBool::new(false));
-    let base = *done;
-    let ticker = {
-        let stop = stop.clone();
-        let pairs = pairs(base);
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                for (real, mine, base) in &pairs {
-                    if let (Some(real), Some(mine)) = (real, mine) {
-                        real.store(base + mine.load(Ordering::Relaxed), Ordering::Relaxed);
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(25));
+    /// Stops and joins the mirroring thread when dropped, so a panicking job (which unwinds past
+    /// this function) cannot leave it running.
+    struct Ticker {
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Ticker {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
             }
-        })
+        }
+    }
+    let base = *done;
+    let stop = Arc::new(AtomicBool::new(false));
+    let ticker = Ticker {
+        stop: stop.clone(),
+        handle: Some({
+            let pairs = pairs(base);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for (real, mine, base) in &pairs {
+                        if let (Some(real), Some(mine)) = (real, mine) {
+                            real.store(base + mine.load(Ordering::Relaxed), Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            })
+        }),
     };
     let r = f(&inner);
-    stop.store(true, Ordering::Relaxed);
-    let _ = ticker.join();
+    drop(ticker);
     mirror(base);
     let get = |c: &C| c.as_ref().map_or(0, |a| a.load(Ordering::Relaxed));
     done.bytes += get(&inner.progress_bytes);
@@ -1233,9 +1268,87 @@ mod list_destination_tests {
     }
 
     #[test]
+    fn a_bad_path_under_the_root_is_refused_not_rerouted_as_elsewhere() {
+        // Below the root, but `..` escapes it again: the path error, not a job rooted at
+        // "/data/games/..".
+        let err = split_list("/data/games", &[e("b", "/data/games/../etc/b")]).unwrap_err();
+        assert!(!format!("{err:#}").is_empty());
+    }
+
+    #[test]
+    fn every_component_of_an_outside_directory_is_checked() {
+        for bad in [
+            "/data/./x/b",
+            "/data//x/b",
+            "/data/x/../b",
+            "/data/\u{0}x/b",
+        ] {
+            assert!(
+                split_list("/data/games", &[e("b", bad)]).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(split_list("/data/games", &[e("b", "/data/ok dir/x/b")]).is_ok());
+    }
+
+    #[test]
     fn a_hostile_destination_is_still_refused() {
         assert!(split_list("/data/games", &[e("b", "/data/../etc/b")]).is_err());
         assert!(split_list("/data/games", &[e("b", "../other/b")]).is_err());
+    }
+
+    #[test]
+    fn a_panicking_job_does_not_leak_the_progress_ticker() {
+        use ps5upload_core::transfer::TransferConfig;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let real = Arc::new(AtomicU64::new(0));
+        let mut cfg = TransferConfig::new("c");
+        cfg.progress_bytes = Some(real.clone());
+        let mut done = super::Done::default();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::run_aggregated(&cfg, &mut done, |c| -> anyhow::Result<()> {
+                c.progress_bytes
+                    .as_ref()
+                    .unwrap()
+                    .store(7, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                panic!("the job panicked");
+            });
+        }));
+        assert!(r.is_err());
+        assert_eq!(
+            real.load(Ordering::Relaxed),
+            7,
+            "the mirror ran while the job did"
+        );
+        // The ticker must have stopped with the panic: it would overwrite this sentinel.
+        real.store(12_345, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            real.load(Ordering::Relaxed),
+            12_345,
+            "a leaked ticker kept mirroring"
+        );
+    }
+
+    #[test]
+    fn a_zip_that_cannot_be_read_is_retryable_but_a_bad_one_is_unsupported() {
+        let d = std::env::temp_dir().join(format!("p5a-zip-open-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let cfg = ps5upload_core::transfer::TransferConfig::new("c");
+        let pool = crate::pool::Pool::unavailable();
+        // Missing file: an I/O error, typed zip_read_error (retryable; the message carries
+        // the OS text the client's fatal-message rules also look at).
+        let e = super::upload_zip_in(&pool, &cfg, [1; 16], "r", &d.join("nope.zip")).unwrap_err();
+        let f = e.downcast_ref::<super::UploadFailure>().expect("typed");
+        assert_eq!(f.reason, "zip_read_error");
+        assert!(e.downcast_ref::<super::ZipUnsupported>().is_none());
+        // Not a zip at all: a format error, unsupported (terminal).
+        std::fs::write(d.join("junk.zip"), b"this is not a zip file").unwrap();
+        let e = super::upload_zip_in(&pool, &cfg, [1; 16], "r", &d.join("junk.zip")).unwrap_err();
+        assert!(e.downcast_ref::<super::ZipUnsupported>().is_some(), "{e:#}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

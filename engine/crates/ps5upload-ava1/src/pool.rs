@@ -64,7 +64,23 @@ pub struct Pool {
     /// Connections whose pairing a person has not confirmed yet, one per console: the code on
     /// screen belongs to that handshake, so it is held (not redone) until `confirm_pairing`.
     pending: tokio::sync::Mutex<HashMap<String, Session>>,
+    /// Recent session failures by console host, so a client that polls many endpoints does not
+    /// open a handshake (an unpaired console may show a pairing code per handshake, and the
+    /// console caps connections per IP) or block on an unreachable console for every call.
+    refusals: Mutex<HashMap<String, Refusal>>,
+    refusal_ttl: Duration,
 }
+
+/// A remembered session failure: when it happened and the reason/detail to repeat.
+#[derive(Clone)]
+struct Refusal {
+    at: Instant,
+    reason: String,
+    detail: String,
+}
+
+/// How long a failed session attempt is repeated without trying again.
+pub const REFUSAL_TTL: Duration = Duration::from_secs(5);
 
 /// Where a console stands for the pairing dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +226,8 @@ impl Pool {
             live: Mutex::default(),
             connecting: Mutex::default(),
             pending: Default::default(),
+            refusals: Mutex::default(),
+            refusal_ttl: REFUSAL_TTL,
         }
     }
 
@@ -237,6 +255,8 @@ impl Pool {
             live: Mutex::default(),
             connecting: Mutex::default(),
             pending: Default::default(),
+            refusals: Mutex::default(),
+            refusal_ttl: REFUSAL_TTL,
         }
     }
 
@@ -245,6 +265,52 @@ impl Pool {
     pub fn with_addr(mut self, addr: impl Into<String>) -> Pool {
         self.addr = Some(addr.into());
         self
+    }
+
+    /// Test seam: how long a failed session attempt is remembered.
+    pub fn with_refusal_ttl(mut self, ttl: Duration) -> Pool {
+        self.refusal_ttl = ttl;
+        self
+    }
+
+    /// The failure (`reason`, `detail`) of a session attempt to `console` within the last
+    /// [`REFUSAL_TTL`], if any.
+    pub(crate) fn recent_refusal(&self, console: &str) -> Option<(String, String)> {
+        let host = host_of(console);
+        let mut m = self.refusals.lock().unwrap_or_else(|e| e.into_inner());
+        match m.get(&host) {
+            Some(r) if r.at.elapsed() < self.refusal_ttl => {
+                Some((r.reason.clone(), r.detail.clone()))
+            }
+            Some(_) => {
+                m.remove(&host);
+                None
+            }
+            None => None,
+        }
+    }
+
+    pub(crate) fn note_refusal(&self, console: &str, reason: &str, detail: &str) {
+        self.refusals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                host_of(console),
+                Refusal {
+                    at: Instant::now(),
+                    reason: reason.to_string(),
+                    detail: detail.to_string(),
+                },
+            );
+    }
+
+    /// Forgets a remembered failure: a pairing or any successful session just proved the
+    /// console usable, so the next call must not repeat the old answer.
+    pub fn clear_refusal(&self, console: &str) {
+        self.refusals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&host_of(console));
     }
 
     pub fn ava_dir(&self) -> &Path {
@@ -517,6 +583,7 @@ impl Pool {
             self.pin(&host, s.peer_key());
         }
         let s = Arc::new(s);
+        self.clear_refusal(&host);
         let mut map = self.sessions.lock().await;
         let kept = match map.get(&host) {
             Some(kept) if !kept.session.is_closed() => Some(kept.session.clone()),

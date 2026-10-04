@@ -382,9 +382,44 @@ fn the_retired_tuning_variables_are_not_read() {
     assert_eq!(cfg.inflight_bytes, base.inflight_bytes);
     assert_eq!(cfg.pack_size, base.pack_size);
     assert_eq!(cfg.pack_file_max, base.pack_file_max);
-    assert_eq!(cfg.bandwidth_cap_bps, base.bandwidth_cap_bps);
     for name in old {
         std::env::remove_var(format!("{prefix}{name}"));
+    }
+}
+
+/// The bandwidth cap is the one transport knob that stays: `PS5UPLOAD_BANDWIDTH_MBPS` (the old
+/// name still works, with a deprecation line), mapped to the config's cap in bytes per second.
+#[test]
+fn the_bandwidth_cap_env_is_renamed_and_maps_to_bytes_per_second() {
+    let warned = Mutex::new(std::collections::HashSet::new());
+    let old = ["FT", "X2_BANDWIDTH_MBPS"].concat();
+    let env = |vars: Vec<(String, &'static str)>| {
+        move |k: &str| {
+            vars.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    };
+    let cap = |get: &dyn Fn(&str) -> Option<String>| bandwidth_cap_from_env(get, &warned);
+    assert_eq!(cap(&env(vec![])), None);
+    assert_eq!(
+        cap(&env(vec![("PS5UPLOAD_BANDWIDTH_MBPS".into(), "10")])),
+        Some(10 * 1024 * 1024)
+    );
+    assert_eq!(
+        cap(&env(vec![("PS5UPLOAD_BANDWIDTH_MBPS".into(), "1.5")])),
+        Some(1_572_864)
+    );
+    // The old name is read, and warned about once.
+    assert_eq!(cap(&env(vec![(old.clone(), "4")])), Some(4 * 1024 * 1024));
+    assert!(warned.lock().unwrap().contains(&old));
+    // 0, negative and junk mean "no cap", as before.
+    for v in ["0", "-3", "fast", ""] {
+        assert_eq!(
+            cap(&env(vec![("PS5UPLOAD_BANDWIDTH_MBPS".into(), v)])),
+            None,
+            "{v}"
+        );
     }
 }
 

@@ -940,22 +940,15 @@ rejected with a clear message.
 **Q: Does an archive upload need free space on my PC?**
 It depends on the format.
 
-- **`.rar` and `.7z` — no.** Both are decompressed and sent at the same
-  time: bytes go straight from the decoder onto the network, so nothing
-  is written to your disk. You only need room for the archive you already
-  have.
-- **`.zip` — sometimes.** Each file inside the zip is decompressed before
-  it is sent. Anything under **512 MB** is held in memory, but a larger
-  file is written to your temp folder first and deleted once it has been
-  sent. Only one file is held at a time, so the space you need is the
-  size of the **single biggest file inside the archive** — not the whole
-  game. A zip containing one 20 GB `.pkg` needs 20 GB free in temp; the
-  same game as a `.rar` or `.7z` needs none.
+- **`.zip`, `.rar` and `.7z` — no.** All three are decompressed and sent at
+  the same time: bytes go straight from the decoder onto the network, so
+  nothing is written to your disk. You only need room for the archive you
+  already have.
 
-If your temp drive is small and the game is large, prefer `.rar` or
-`.7z`. The in-memory limit can be raised with the `PS5UPLOAD_ZIP_RAM_THRESHOLD_MB`
-environment variable, at the cost of more RAM (the old `FTX2_ZIP_RAM_THRESHOLD_MB`
-name still works for one release and logs a deprecation line).
+A `.zip` entry of any size is inflated as it is sent, so nothing is held back in memory
+or written to temp. The `PS5UPLOAD_ZIP_RAM_THRESHOLD_MB` environment variable (and its old
+`FTX2_ZIP_RAM_THRESHOLD_MB` name) is still accepted so an existing setup does not
+break, but it is ignored.
 
 This changed in a recent version. Older builds extracted a `.rar` in full
 first, which meant a 180 GB game needed 180 GB free on top of the archive.

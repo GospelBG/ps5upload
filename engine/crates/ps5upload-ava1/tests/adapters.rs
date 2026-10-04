@@ -352,6 +352,62 @@ async fn a_console_that_wants_a_user_code_is_not_paired() {
     );
 }
 
+/// A client polls many endpoints: ten rapid calls to an unpaired console must make ONE handshake
+/// (each one can show a pairing code on the console and counts against its per-IP connection cap),
+/// not ten. With the memory switched off the same ten calls dial ten times.
+#[tokio::test(flavor = "multi_thread")]
+async fn rapid_calls_to_an_unpaired_console_make_one_handshake() {
+    let d = temp_dir("pair-cache");
+    std::fs::create_dir_all(&d).unwrap();
+    let ctx = ServerCtx::new(
+        Identity::generate().unwrap(),
+        "stranger",
+        PeerStore::in_memory(),
+        node_info_rpc(),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(server::serve(l, Arc::new(ctx)));
+    let cached = Arc::new(Pool::new(d.join("ava")).with_addr(addr.clone()));
+    let uncached = Arc::new(
+        Pool::new(d.join("ava2"))
+            .with_addr(addr.clone())
+            .with_refusal_ttl(Duration::ZERO),
+    );
+    let (c2, u2, a2) = (cached.clone(), uncached.clone(), addr.clone());
+    tokio::task::spawn_blocking(move || {
+        for _ in 0..10 {
+            let f = console::require_in(&c2, &a2, ava1::gen::CAP_DATA_PLANE).unwrap_err();
+            assert_eq!(f.reason, "not_paired");
+            console::require_in(&u2, &a2, ava1::gen::CAP_DATA_PLANE).unwrap_err();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(cached.attempts(), 1, "ten calls, one handshake");
+    assert_eq!(
+        uncached.attempts(),
+        10,
+        "without the memory every call dials"
+    );
+}
+
+/// An unreachable console is remembered too, so a poll does not block on it every call, and a
+/// pairing (or any session that works) forgets the answer at once.
+#[test]
+fn an_unreachable_console_is_remembered_until_cleared() {
+    let d = temp_dir("down-cache");
+    let p = Pool::new(d.join("ava")).with_addr("127.0.0.1:1");
+    for _ in 0..10 {
+        let f = console::require_in(&p, "c", ava1::gen::CAP_DATA_PLANE).unwrap_err();
+        assert_eq!(f.reason, "helper_not_ava1");
+    }
+    assert_eq!(p.attempts(), 1);
+    p.clear_refusal("c");
+    console::require_in(&p, "c", ava1::gen::CAP_DATA_PLANE).unwrap_err();
+    assert_eq!(p.attempts(), 2, "cleared: the next call tries again");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_killed_session_resumes_the_same_job() {
     let d = temp_dir("chaos");

@@ -116,6 +116,10 @@ describe("isAutoRecoverable", () => {
     expect(isAutoRecoverable(r, "")).toBe(true);
   });
 
+  it("recovers zip_read_error: an I/O failure reading the archive is transient", () => {
+    expect(isAutoRecoverable("zip_read_error", "")).toBe(true);
+  });
+
   it("recovers ava1_unreachable: the payload may need a re-deploy", () => {
     expect(isAutoRecoverable("ava1_unreachable", "")).toBe(true);
   });

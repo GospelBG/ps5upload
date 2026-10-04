@@ -106,10 +106,23 @@ use ps5upload_core::{
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 /// Build a `TransferConfig` for the given address. The transport's own knobs (in-flight
-/// window, pack sizes, bandwidth governor) belong to AVA1's governor, so the retired
-/// shard-tuning environment variables are not read; the defaults are the config's own.
+/// window, pack sizes) belong to AVA1's governor, so the retired shard-tuning environment
+/// variables are not read. The outbound cap (`PS5UPLOAD_BANDWIDTH_MBPS`) is the one that stays.
 fn make_transfer_config(addr: &str) -> TransferConfig {
-    TransferConfig::new(addr)
+    let mut cfg = TransferConfig::new(addr);
+    cfg.bandwidth_cap_bps = bandwidth_cap_from_env(&|k| std::env::var(k).ok(), process_warned());
+    cfg
+}
+
+/// The environment's outbound cap in bytes per second: `PS5UPLOAD_BANDWIDTH_MBPS` (the old
+/// name is still read, with a deprecation line). Zero, negative or unparseable = no cap.
+fn bandwidth_cap_from_env(
+    get: &dyn Fn(&str) -> Option<String>,
+    warned: &Mutex<std::collections::HashSet<String>>,
+) -> Option<u64> {
+    let (v, _) = renamed_env_with(BANDWIDTH_ENV.0, BANDWIDTH_ENV.1, get, warned);
+    let mbps = v?.trim().parse::<f64>().ok().filter(|n| *n > 0.0)?;
+    Some((mbps * 1024.0 * 1024.0) as u64)
 }
 
 /// Apply a per-request bandwidth cap to the config. None / 0 / negative
@@ -460,16 +473,24 @@ fn renamed_env_with(
     (Some(v), first)
 }
 
+/// Which deprecated names this process has already warned about.
+fn process_warned() -> &'static Mutex<std::collections::HashSet<String>> {
+    static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    WARNED.get_or_init(Default::default)
+}
+
 /// [`renamed_env_with`] on the process environment.
 fn renamed_env(new: &str, old: &str) -> Option<String> {
-    static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    let warned = WARNED.get_or_init(Default::default);
-    renamed_env_with(new, old, &|k| std::env::var(k).ok(), warned).0
+    renamed_env_with(new, old, &|k| std::env::var(k).ok(), process_warned()).0
 }
 
 const ZIP_RAM_THRESHOLD_ENV: (&str, &str) = (
     "PS5UPLOAD_ZIP_RAM_THRESHOLD_MB",
     concat!("FT", "X2_ZIP_RAM_THRESHOLD_MB"),
+);
+const BANDWIDTH_ENV: (&str, &str) = (
+    "PS5UPLOAD_BANDWIDTH_MBPS",
+    concat!("FT", "X2_BANDWIDTH_MBPS"),
 );
 const ARCHIVE_STAGE_ENV: (&str, &str) = (
     "PS5UPLOAD_ARCHIVE_STAGE_MB",
