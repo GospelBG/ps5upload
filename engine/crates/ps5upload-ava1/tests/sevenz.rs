@@ -519,6 +519,20 @@ async fn resume_restarts_the_folder_and_sends_only_missing_files() {
     let total: u64 = expected(&spec).values().map(|v| v.len() as u64).sum();
     let fin1 = partial_upload(&d, &d.join("a.7z"), [3; 16], 2 << 20).await;
     assert!(fin1 >= 2 << 20 && fin1 < total, "{fin1} of {total}");
+    // Lanes make files durable out of order, so which folders are finished at the cut is not
+    // fixed: count the folders with a file still missing or wrong on disk (a file can be whole
+    // on disk and not yet durable, so the resume may need one folder more than this).
+    let out = d.join("share/out");
+    let have = if out.is_dir() {
+        read_tree(&out)
+    } else {
+        BTreeMap::new() // nothing has landed yet (a staged job renames the tree at its end)
+    };
+    let need = spec
+        .folders
+        .iter()
+        .filter(|f| f.iter().any(|(n, data)| have.get(n) != Some(data)))
+        .count();
 
     // Second attempt: a fresh source object, the same job id, straight to the host.
     let (addr, ava) = host(&d).await;
@@ -545,8 +559,8 @@ async fn resume_restarts_the_folder_and_sends_only_missing_files() {
         total - fin1
     );
     assert!(
-        src.folders_opened() <= 2,
-        "the finished folder was not decoded again ({} opened)",
+        (src.folders_opened() as usize) <= need + 1,
+        "a finished folder was decoded again ({} opened, {need} unfinished at the cut)",
         src.folders_opened()
     );
     assert!(
