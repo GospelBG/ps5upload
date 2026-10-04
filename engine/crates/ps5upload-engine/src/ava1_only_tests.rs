@@ -160,6 +160,27 @@ async fn transfer_7z_with_no_ava1_listener_is_helper_not_ava1() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn transfer_rar_with_no_ava1_listener_is_helper_not_ava1() {
+    let rar = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../ps5upload-core/testdata/rar/crypted.rar");
+    let jobs: Arc<Mutex<HashMap<Uuid, JobState>>> = Arc::new(Mutex::new(HashMap::new()));
+    let req = TransferRarReq {
+        addr: Some("127.0.0.1:9113".to_string()),
+        tx_id: None,
+        dest_root: "/data/x".to_string(),
+        archive_path: rar.to_string_lossy().into_owned(),
+        excludes: vec![],
+        bandwidth_cap_mbps: None,
+        password: Some("unrar".to_string()),
+    };
+    let resp = transfer_rar_handler(State(state_for(&jobs)), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_helper_not_ava1(&jobs).await;
+}
+
 /// A console that has not accepted this app fails with `not_paired` (the pairing dialog's
 /// trigger), as a job failure and as a management refusal.
 #[test]

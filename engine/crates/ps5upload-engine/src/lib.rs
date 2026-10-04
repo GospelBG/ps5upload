@@ -6216,32 +6216,6 @@ async fn transfer_zip_handler(
         .into_response()
 }
 
-/// Adds `protocol` (and a fallback reason) to a commit acknowledgement. The ack is
-/// the payload's own JSON; a body that is not an object (an array, a number, text)
-/// is kept whole under `ack` instead of being indexed into or dropped.
-fn tag_ack_body(body: &str, protocol: &str, reason: Option<&str>) -> String {
-    let parsed = serde_json::from_str::<serde_json::Value>(body);
-    let mut out = match parsed {
-        Ok(serde_json::Value::Object(map)) => map,
-        Ok(other) => {
-            let mut m = serde_json::Map::new();
-            m.insert("ack".into(), other);
-            m
-        }
-        Err(_) if body.trim().is_empty() => serde_json::Map::new(),
-        Err(_) => {
-            let mut m = serde_json::Map::new();
-            m.insert("ack".into(), serde_json::Value::String(body.to_owned()));
-            m
-        }
-    };
-    out.insert("protocol".into(), serde_json::json!(protocol));
-    if let Some(reason) = reason {
-        out.insert("fallback_reason".into(), serde_json::json!(reason));
-    }
-    serde_json::Value::Object(out).to_string()
-}
-
 /// A zip the AVA1 source refused as unusable becomes a typed job failure, so the client shows
 /// the archive problem rather than a transport one.
 fn zip_failure(e: anyhow::Error) -> anyhow::Error {
@@ -7778,11 +7752,6 @@ async fn transfer_rar_handler(
         Ok(id) => id,
         Err(e) => return json_err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    let initial_flags = if caller_supplied_tx_id {
-        TX_FLAG_RESUME
-    } else {
-        0
-    };
 
     // Plan: list entries (names + sizes) without extracting.
     let (total_bytes, preview) = {
@@ -7877,6 +7846,10 @@ async fn transfer_rar_handler(
         let _stop_guard = TickerStopGuard::new(stop_ticker);
         let mut fail_guard =
             JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
+        if fail_job_unless_console_ready(&jobs, &events_tx, job_id, started_at_ms, &addr) {
+            fail_guard.mark_succeeded();
+            return;
+        }
         if fail_job_if_capacity_insufficient(
             &jobs,
             &events_tx,
@@ -7901,47 +7874,28 @@ async fn transfer_rar_handler(
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
         cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
-        // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes, matching the file
-        // and folder routes. The archive routes used to hard-code 2, so a
-        // mid-transfer stall on a console that recovers in ~10 s (a Wi-Fi
-        // blip, or the payload's serial accept loop still draining the dropped
-        // connection) burned both retries inside the first 1.5 s of backoff
-        // and surfaced as "transfer_zip gave up after 2 retries".
-        // The password stays in this request for the job's lifetime and is never
-        // logged; AVA1's resume passes reuse it from the RarSource.
-        let ftx2 = |reason: Option<&str>| {
-            let mut r = ps5upload_core::transfer::transfer_rar_resumable(
-                &cfg,
-                tx_id,
-                &req.dest_root,
-                std::path::Path::new(&req.archive_path),
-                req.password.as_deref(),
-                DEFAULT_RESUME_RETRIES,
-                initial_flags,
-            )?;
-            r.commit_ack_body = tag_ack_body(&r.commit_ack_body, "ftx2", reason);
-            Ok::<_, anyhow::Error>(r)
-        };
-        let result = if ps5upload_ava1::route::use_ava1(&addr) {
-            match ps5upload_ava1::upload::upload_rar(
-                &cfg,
-                tx_id,
-                &req.dest_root,
-                std::path::Path::new(&req.archive_path),
-                req.password.as_deref(),
-            ) {
-                Err(e)
-                    if e.downcast_ref::<ps5upload_ava1::upload::RarUnsupported>()
-                        .is_some() =>
-                {
-                    crate::log_info!("transfer_rar: AVA1 fallback to FTX2: {e}");
-                    ftx2(Some("rar_unsupported_by_ava1"))
-                }
-                other => other,
+        // The password stays in this request for the job's lifetime and is never logged;
+        // resume passes reuse it from the RarSource. An archive AVA1 cannot read is a failure
+        // with its own reason: there is no other transport to hand it to.
+        let result = ps5upload_ava1::upload::upload_rar(
+            &cfg,
+            tx_id,
+            &req.dest_root,
+            std::path::Path::new(&req.archive_path),
+            req.password.as_deref(),
+        )
+        .map_err(|e| {
+            if e.downcast_ref::<ps5upload_ava1::upload::RarUnsupported>()
+                .is_some()
+            {
+                anyhow::Error::from(ps5upload_ava1::upload::UploadFailure {
+                    reason: "rar_unsupported".into(),
+                    detail: format!("{e}"),
+                })
+            } else {
+                e
             }
-        } else {
-            ftx2(Some("ava1_unavailable"))
-        };
+        });
         match result {
             Ok(r) => {
                 let completed_at_ms = now_ms();
@@ -10995,7 +10949,7 @@ mod helpers_tests {
         let ack =
             r#"{"protocol":"ava1","files":5,"skipped_files":5,"skipped_bytes":900,"files_sent":0}"#;
         assert_eq!(ava1_skip_counts(ack), Some((5, 900, 0)));
-        assert_eq!(ava1_skip_counts(r#"{"protocol":"ftx2"}"#), None);
+        assert_eq!(ava1_skip_counts(r#"{"protocol":"other"}"#), None);
         assert_eq!(ava1_skip_counts("not json"), None);
     }
 
@@ -11634,35 +11588,5 @@ mod appdb_installed_additions_tests {
         let rows = vec![("PLDM00001".to_string(), "Payload Manager".to_string())];
         let got = appdb_installed_additions(&rows, &set(&["PLDM00001"]), &set(&["PLDM00001"]));
         assert!(got.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod tag_ack_body_tests {
-    use super::tag_ack_body;
-
-    fn parse(s: &str) -> serde_json::Value {
-        serde_json::from_str(s).unwrap()
-    }
-
-    #[test]
-    fn an_object_ack_keeps_its_fields() {
-        let v = parse(&tag_ack_body(r#"{"files":3}"#, "ftx2", Some("why")));
-        assert_eq!(v["files"], 3);
-        assert_eq!(v["protocol"], "ftx2");
-        assert_eq!(v["fallback_reason"], "why");
-    }
-
-    #[test]
-    fn a_non_object_ack_never_panics_and_is_kept() {
-        let v = parse(&tag_ack_body("[1,2]", "ftx2", None));
-        assert_eq!(v["ack"], serde_json::json!([1, 2]));
-        assert_eq!(v["protocol"], "ftx2");
-        let v = parse(&tag_ack_body("not json", "ftx2", None));
-        assert_eq!(v["ack"], "not json");
-        let v = parse(&tag_ack_body("7", "ftx2", None));
-        assert_eq!(v["ack"], 7);
-        let v = parse(&tag_ack_body("", "ftx2", None));
-        assert_eq!(v["protocol"], "ftx2");
     }
 }
