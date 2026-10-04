@@ -716,10 +716,17 @@ fn relay_failure(pa: Pool, pb: Pool) -> (String, Duration) {
         Arc::new(AtomicBool::new(false)),
     )
     .unwrap_err();
-    let f = e
-        .downcast_ref::<upload::UploadFailure>()
-        .unwrap_or_else(|| panic!("not an UploadFailure: {e:#}"));
-    (f.reason.clone(), started.elapsed())
+    // A terminal session failure names the console it came from (ConsoleFailure); others
+    // are plain UploadFailures.
+    let reason = match e.downcast_ref::<upload::ConsoleFailure>() {
+        Some(cf) => cf.failure.reason.clone(),
+        None => e
+            .downcast_ref::<upload::UploadFailure>()
+            .unwrap_or_else(|| panic!("not an UploadFailure: {e:#}"))
+            .reason
+            .clone(),
+    };
+    (reason, started.elapsed())
 }
 
 #[tokio::test(flavor = "multi_thread")]
