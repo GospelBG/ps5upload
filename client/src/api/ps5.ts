@@ -4176,6 +4176,10 @@ export interface JobSnapshot {
    *  underlying errno. Shown as a secondary line under the
    *  humanized title. */
   error_detail?: string;
+  /** The console the failure came from, when the engine names one (a PS5 to PS5 relay talks
+   *  to two: the failure may be the source's, not the destination the caller polls
+   *  against). A not-paired failure opens THIS console's pairing dialog. */
+  error_console?: string;
 }
 
 /** Job-failure exception carrying the structured `error_reason` +
@@ -4332,9 +4336,10 @@ export async function jobStatus(
   }
   if (status === "failed") {
     // A transfer that died because the console has not accepted this app opens the pairing dialog.
+    const named = (raw as { error_console?: unknown }).error_console;
     reportIfNotPaired(
       (raw as { error_reason?: unknown }).error_reason ?? raw.error,
-      host,
+      typeof named === "string" && named.trim() ? named : host,
     );
   }
   return raw as unknown as JobSnapshot;

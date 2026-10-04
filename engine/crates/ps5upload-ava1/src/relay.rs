@@ -15,7 +15,7 @@ use ava1::send::{open_upload, run_upload, Progress, SendError, SendOptions, Send
 use ava1::source::{ReadAt, Source, SourceMeta};
 
 use crate::pool::{pool, Pool};
-use crate::upload::{refusal, SessionGate};
+use crate::upload::{refusal, ConsoleFailure, SessionGate};
 
 const RELAY_CAP: usize = 64 << 20;
 // A blocked source or lane may leave both halves alive without progress.
@@ -550,7 +550,7 @@ pub fn ps5_to_ps5_between(
                 Ok(s) => s,
                 Err(e) => {
                     if let Some(failure) = gate_a.failed(&e) {
-                        return Err(failure.into());
+                        return Err(ConsoleFailure::on(from, failure).into());
                     }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -563,7 +563,7 @@ pub fn ps5_to_ps5_between(
                 Ok(s) => s,
                 Err(e) => {
                     if let Some(failure) = gate_b.failed(&e) {
-                        return Err(failure.into());
+                        return Err(ConsoleFailure::on(to, failure).into());
                     }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -828,6 +828,19 @@ mod tests {
         let e = read_all(&src, "f1").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
         assert!(started.elapsed() < Duration::from_secs(5), "{e}");
+    }
+
+    #[test]
+    fn a_terminal_session_failure_names_the_console_it_came_from() {
+        let mut gate = SessionGate::default();
+        let mut failure = None;
+        for _ in 0..crate::upload::TERMINAL_ATTEMPTS {
+            failure = gate.failed(&ava1::Ava1Error::NotPaired);
+        }
+        let e: anyhow::Error = ConsoleFailure::on("10.0.0.2", failure.unwrap()).into();
+        let cf = e.downcast_ref::<ConsoleFailure>().expect("typed");
+        assert_eq!(cf.console, "10.0.0.2");
+        assert_eq!(cf.failure.reason, "ava1_not_paired");
     }
 
     #[test]

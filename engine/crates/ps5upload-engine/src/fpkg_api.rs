@@ -430,6 +430,7 @@ pub(crate) async fn fpkg_build_handler(
                         error: error.to_string(),
                         error_reason: None,
                         error_detail: None,
+                        error_console: None,
                     },
                 );
             }
@@ -648,6 +649,7 @@ pub(crate) async fn ffpfsc_compress_handler(
                         error: error.to_string(),
                         error_reason: None,
                         error_detail: None,
+                        error_console: None,
                     },
                 );
             }
@@ -901,6 +903,7 @@ pub(crate) async fn fpkg_extract_handler(
                         error: format!("{error:#}"),
                         error_reason: None,
                         error_detail: None,
+                        error_console: None,
                     },
                 );
             }

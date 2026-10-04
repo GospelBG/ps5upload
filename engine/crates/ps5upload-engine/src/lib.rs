@@ -299,6 +299,11 @@ pub(crate) enum JobState {
         /// in the error card.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_detail: Option<String>,
+        /// The console the failure came from, when it names one (a PS5-to-PS5 relay talks
+        /// to two). The client opens the pairing dialog for THIS console, not the one it
+        /// happens to be watching the job against.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_console: Option<String>,
     },
 }
 
@@ -321,7 +326,19 @@ fn job_failed_from_err(started_at_ms: u64, completed_at_ms: u64, err: &anyhow::E
             error: format!("{err:#}"),
             error_reason: Some(pce.kind.as_str().into()),
             error_detail: Some(pce.detail.clone()), // the console's message
+            error_console: None,
         };
+    }
+    if let Some(cf) = err.downcast_ref::<ps5upload_ava1::upload::ConsoleFailure>() {
+        let mut state = job_failed_from_err(
+            started_at_ms,
+            completed_at_ms,
+            &anyhow::Error::from(cf.failure.clone()),
+        );
+        if let JobState::Failed { error_console, .. } = &mut state {
+            *error_console = Some(cf.console.clone());
+        }
+        return state;
     }
     if let Some(failure) = err.downcast_ref::<ps5upload_ava1::upload::UploadFailure>() {
         log_error!(
@@ -336,6 +353,7 @@ fn job_failed_from_err(started_at_ms: u64, completed_at_ms: u64, err: &anyhow::E
             error: failure.detail.clone(),
             error_reason: Some(failure.reason.clone()),
             error_detail: Some(failure.detail.clone()),
+            error_console: None,
         };
     }
     let (reason, detail) = extract_payload_error(err);
@@ -364,6 +382,7 @@ fn job_failed_from_err(started_at_ms: u64, completed_at_ms: u64, err: &anyhow::E
         error: format!("{err:#}"),
         error_reason: reason,
         error_detail: detail,
+        error_console: None,
     }
 }
 
@@ -1250,6 +1269,7 @@ impl Drop for JobFailOnDropGuard {
                 error: "engine task panicked (see engine logs)".to_string(),
                 error_reason: None,
                 error_detail: None,
+                error_console: None,
             },
         );
     }
@@ -1502,6 +1522,7 @@ fn fail_job_if_capacity_insufficient(
             error,
             error_reason: Some("preflight_insufficient_space".to_string()),
             error_detail: Some(detail),
+            error_console: None,
         },
     );
     true
@@ -1536,12 +1557,27 @@ fn fail_job_unless_console_ready(
                 job_failed_from_err(
                     started_at_ms,
                     completed_at_ms,
-                    &anyhow::Error::from(failure),
+                    // Names the console: the client opens THAT console's pairing dialog.
+                    &anyhow::Error::from(ps5upload_ava1::upload::ConsoleFailure::on(addr, failure)),
                 ),
             );
             true
         }
     }
+}
+
+/// Both consoles of a PS5-to-PS5 copy must be usable over AVA1 before any work starts;
+/// the first one that is not names itself in the failure. `check` is the readiness probe
+/// (the real one is `console::require_ava1`).
+fn relay_preflight(
+    from: &str,
+    to: &str,
+    check: impl Fn(&str) -> Result<(), ps5upload_ava1::upload::UploadFailure>,
+) -> Result<(), ps5upload_ava1::upload::ConsoleFailure> {
+    for console in [from, to] {
+        check(console).map_err(|f| ps5upload_ava1::upload::ConsoleFailure::on(console, f))?;
+    }
+    Ok(())
 }
 
 // ─── Request / response types ─────────────────────────────────────────────────
@@ -1688,15 +1724,22 @@ async fn ps5_to_ps5_handler(
         let _stop_guard = TickerStopGuard::new(stop_ticker.clone());
         let mut fail_guard =
             JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
-        let result = ps5upload_ava1::relay::ps5_to_ps5(
-            &req.from,
-            &req.src,
-            &req.to,
-            &req.dest,
-            tx_id,
-            progress.clone(),
-            cancel,
-        );
+        // Like every other AVA1 job: no console that cannot be used (not paired, an old
+        // helper, nobody listening) starts a relay, and the failure names which one.
+        let result = match relay_preflight(&req.from, &req.to, |c| {
+            ps5upload_ava1::console::require_ava1(c)
+        }) {
+            Err(f) => Err(anyhow::Error::from(f)),
+            Ok(()) => ps5upload_ava1::relay::ps5_to_ps5(
+                &req.from,
+                &req.src,
+                &req.to,
+                &req.dest,
+                tx_id,
+                progress.clone(),
+                cancel,
+            ),
+        };
         let completed_at_ms = now_ms();
         let state = match result {
             Ok(r) => JobState::Done {

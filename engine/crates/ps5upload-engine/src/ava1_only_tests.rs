@@ -323,6 +323,67 @@ fn not_paired_surfaces_not_paired() {
     }
 }
 
+/// A relay's failure names the console it came from, so the client opens that console's
+/// pairing dialog and not the other one's.
+#[test]
+fn a_console_failure_names_its_console_in_the_job() {
+    let f = ps5upload_ava1::upload::ConsoleFailure::on(
+        "10.0.0.2",
+        ps5upload_ava1::console::not_paired(),
+    );
+    match job_failed_from_err(1, 2, &anyhow::Error::from(f)) {
+        JobState::Failed {
+            error_reason,
+            error_console,
+            ..
+        } => {
+            assert_eq!(error_reason.as_deref(), Some("not_paired"));
+            assert_eq!(error_console.as_deref(), Some("10.0.0.2"));
+        }
+        _ => panic!("expected Failed"),
+    }
+    // A plain failure names no console.
+    match job_failed_from_err(
+        1,
+        2,
+        &anyhow::Error::from(ps5upload_ava1::console::not_paired()),
+    ) {
+        JobState::Failed { error_console, .. } => assert_eq!(error_console, None),
+        _ => panic!("expected Failed"),
+    }
+}
+
+/// The relay checks BOTH consoles before it starts, source first, and the failure names
+/// the one that is not ready.
+#[test]
+fn a_relay_checks_both_consoles_and_names_the_one_that_is_not_ready() {
+    use std::cell::RefCell;
+    let seen = RefCell::new(Vec::new());
+    let ok = |c: &str| {
+        seen.borrow_mut().push(c.to_string());
+        Ok(())
+    };
+    assert!(relay_preflight("10.0.0.2", "10.0.0.3", ok).is_ok());
+    assert_eq!(*seen.borrow(), ["10.0.0.2", "10.0.0.3"], "both are checked");
+    let only_dest_bad = |c: &str| {
+        if c == "10.0.0.3" {
+            Err(ps5upload_ava1::console::not_paired())
+        } else {
+            Ok(())
+        }
+    };
+    let e = relay_preflight("10.0.0.2", "10.0.0.3", only_dest_bad).unwrap_err();
+    assert_eq!(e.console, "10.0.0.3");
+    let both_bad = |_: &str| Err(ps5upload_ava1::console::not_paired());
+    assert_eq!(
+        relay_preflight("10.0.0.2", "10.0.0.3", both_bad)
+            .unwrap_err()
+            .console,
+        "10.0.0.2",
+        "the source first"
+    );
+}
+
 #[test]
 fn old_env_names_are_accepted_once_with_a_warning() {
     let env = |k: &str| match k {

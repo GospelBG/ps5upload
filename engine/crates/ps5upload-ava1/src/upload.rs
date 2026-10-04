@@ -311,11 +311,30 @@ pub struct PostCommitError {
 }
 
 /// A refusal or terminal connection failure with a stable reason for the UI.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("{detail}")]
 pub struct UploadFailure {
     pub reason: String,
     pub detail: String,
+}
+
+/// An [`UploadFailure`] that happened on one named console. A relay talks to two, so its
+/// failure must say which one the user has to fix (the not-paired dialog opens for that
+/// console); `console` is the address as the caller gave it.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{failure}")]
+pub struct ConsoleFailure {
+    pub console: String,
+    pub failure: UploadFailure,
+}
+
+impl ConsoleFailure {
+    pub fn on(console: &str, failure: UploadFailure) -> Self {
+        Self {
+            console: console.to_string(),
+            failure,
+        }
+    }
 }
 
 /// The failure when a console answered BUSY to every JobOpen the bound allowed.
