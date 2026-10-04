@@ -34,7 +34,7 @@ impl Default for Timing {
     fn default() -> Self {
         Self {
             ping_every: Duration::from_secs(2),
-            dead_after: Duration::from_secs(6),
+            dead_after: Duration::from_secs(12),
             handshake: Duration::from_secs(10),
             min_frame_rate: crate::link::MIN_FRAME_RATE,
         }
@@ -646,6 +646,14 @@ impl Session {
 #[cfg(test)]
 mod sockbuf_tests {
     use super::*;
+
+    #[test]
+    fn liveness_defaults_are_a_twelve_second_verdict_on_a_two_second_ping() {
+        // SPEC.md section 6; the payload's default (payload/src/ava1_glue.c) matches.
+        let t = Timing::default();
+        assert_eq!(t.ping_every, Duration::from_secs(2));
+        assert_eq!(t.dead_after, Duration::from_secs(12));
+    }
 
     #[tokio::test]
     async fn a_lane_socket_gets_big_buffers_and_still_connects() {

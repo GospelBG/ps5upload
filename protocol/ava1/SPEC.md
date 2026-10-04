@@ -179,8 +179,8 @@ written, not when it is queued, so time spent behind other frames is not counted
 round trip. A sender may skip a Ping or Pong while other frames are queued or being
 written: they are proof of life too.
 
-Liveness counts bytes, not frames: a connection is dead after 6 s (default,
-`dead_after`) with no byte received, so a 16 MiB frame on a slow link is never
+Liveness counts bytes, not frames: a connection is dead after 12 s (default,
+`dead_after`; the ping stays at 2 s, so six pings go unanswered first) with no byte received, so a 16 MiB frame on a slow link is never
 mistaken for silence. Silence is judged by what can be read: a reader that was busy
 elsewhere (writing, waiting to write) past `dead_after` checks the socket first and
 carries on if bytes are waiting; a process that was not running (a late timer tick)

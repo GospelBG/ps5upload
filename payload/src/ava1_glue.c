@@ -175,7 +175,7 @@ int ava1_payload_start(void) {
     snprintf(cfg.name, sizeof cfg.name, "%s", "PS5");
     cfg.port = AVA1_DEFAULT_PORT;
     cfg.ping_every_ms = 2000;
-    cfg.dead_after_ms = 6000;
+    cfg.dead_after_ms = 12000; /* SPEC.md section 6: the ping stays at 2 s */
     cfg.handshake_ms = 10000;
     cfg.pairing_window_s = 300;
     cfg.on_pair_request = on_pair_request;
