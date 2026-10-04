@@ -109,9 +109,16 @@ kept.
       desktop's directory) evict each other's console session. Give each engine its own data
       directory. The engine warns ("another ps5upload engine using the same identity is
       connected to this console") when a session is superseded 3 times in 120 s.
-- [ ] Zip downloads restart the archive from zero on a reconnect (a fresh job per attempt; the
-      reported progress stays monotonic). FTX2 resumes mid-entry, so this is a measured regression:
-      implement an in-run resume, or accept it explicitly in the release notes.
+- [x] Zip downloads resume on a reconnect (review 003 section 5, P3 Task 15): the archive is Stored
+      by default and resumes mid-entry from the receiver's journal (`SPEC.md` section 10.1). The
+      optional Deflate archive cannot resume and restarts from zero on a drop.
+- [ ] Zip resume restart window: a drop after a file's last range is journaled but before the file's
+      Done record makes `StoredZipSink::position` refuse (the file is whole but unfinished) and the
+      receiver restarts the archive from zero. The window is one sync batch wide (about 250 ms per
+      file boundary). Not fixed: finishing such a file needs the receiver to commit it without any
+      new frame, which it does not do for a fully durable partial file. Finished entries' data is
+      trusted from the journal (only their headers and descriptors are re-read); the in-flight
+      entry's durable groups are re-hashed by the receiver's resume check.
 - [ ] A failed download into an existing folder leaves its per-file `.ava-part` behind; cleanup is
       only done for new destinations.
 - [ ] The engine never removes `<data dir>/ava/jobs/*` or `<data dir>/ava/send/*` (`SPEC.md` §14.3

@@ -498,10 +498,32 @@ Not in version 1, each with its reason:
 - Sources of unknown length: every file's size must be known when the manifest is built.
 - Auto-tuning of the small/large cutoff (the design spec's 64 KiB–4 MiB range): the cutoff
   is the protocol constant `LARGE_CUTOFF`, §12.2.
-- Resuming a zip download within a run: a dropped zip download restarts the archive with a
-  fresh job per attempt (progress stays monotonic). FTX2 resumes mid-entry, so this is a
-  regression against FTX2 and is listed as one in `CUTOVER.md`.
+- Resuming a Deflate zip download: a deflate stream cannot be continued, so the optional
+  Deflate archive restarts with a fresh job per attempt (progress stays monotonic) and says
+  so. The default archive is Stored and does resume (below).
 - Resuming a download whose remote manifest changed: the engine restarts that job.
+
+### 10.1 Zip downloads resume
+
+A download into a `.zip` writes Stored (uncompressed) entries and resumes mid-entry on a
+reconnect, within one engine run (the job id is reused, as for a download to a folder). No
+wire change and no journal record: the receiver is `JF_ORDERED` and its journal already holds the
+durable files and the durable prefix of the file in flight.
+
+- Layout: every entry is `local header ‖ data ‖ data descriptor` (zip64 throughout), in manifest
+  order, then the empty files, then the central directory and the zip64 end records. Because the
+  manifest carries every size, entry `i` starts at the sum of the entries before it: offsets are
+  recomputed on resume, never recorded.
+- Resume: after the §13.4 re-check and before the map is sent, the receiver passes the journal's
+  state (finished files, partial prefix) to the sink (`Sink::position`). The sink verifies each
+  finished entry's header and data descriptor (the descriptor holds the CRC-32), rebuilds the
+  in-flight entry's CRC-32 by reading its durable bytes back, truncates the archive to
+  `data offset + durable bytes` and continues. The sender, told by the map, sends the rest.
+- The sink's fsync runs inside the receiver's batch (data sync, journal append, Durable), so the
+  journal is never ahead of the archive. A sink that cannot honour the journal (a missing or
+  altered archive) makes the receiver drop the journal and start the job over.
+- A file the receiver asks to have sent again (a verify mismatch) still restarts the archive.
+- Deflate remains available as an option (`ZipCompression::Deflate`); it cannot resume.
 - A same-drive `fs.move` over AVA1 is `fs.rename` (§7.3), with the `st_dev` guard; a cross-mount
   move (copy, verify, delete) is an AVA1 job.
 - Typed bodies for the management text methods (§7.3): the filesystem, node and job methods are
