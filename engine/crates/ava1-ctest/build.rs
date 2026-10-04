@@ -54,10 +54,12 @@ fn main() {
             ava1.join("ava1_send.c"),
             ava1.join("ava1_copy.c"),
             ava1.join("ava1_calibrate.c"),
+            ava1.join("ava1_op.c"),
             ava1.join("ava1_b3.c"),
             ava1.join("platform_posix.c"),
             ava1.join("gen/ava1_gen.c"),
             p.join("src/mgmt_rpc.c"),
+            p.join("src/fs_jobs.c"),
             here.join("csrc/sizes.c"),
             here.join("csrc/test_shim.c"),
             here.join("csrc/firmware_shim.c"),
@@ -102,6 +104,14 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         p.join("include/mgmt_rpc.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("src/fs_jobs.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("include/fs_jobs.h").display()
     );
     println!("cargo:rerun-if-changed={}", mono.display());
     println!("cargo:rerun-if-changed={}", b3.display());

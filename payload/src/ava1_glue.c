@@ -21,6 +21,7 @@
 #include "ava1_store.h"
 #include "ava1_trust.h"
 #include "config.h"
+#include "fs_jobs.h"
 #include "mgmt_rpc.h"
 #include "cross_device.h" /* payload/include, not next to the AVA1 sources */
 #include "monocypher.h"
@@ -206,6 +207,7 @@ int ava1_payload_start(void) {
                 cfg.data = ava1_data_hooks();
                 cfg.caps = AVA1_CAP_DATA_PLANE;
                 g_data_on = 1;
+                fsj_register_ops(); /* job.run: delete, chmod -R, hash, crc32 (the table adds the rest) */
             }
         }
     }

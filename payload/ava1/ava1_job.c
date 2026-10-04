@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include "ava1_data.h"
+#include "ava1_op.h"
 #include "ava1_thread.h"
 
 static struct {
@@ -329,7 +330,11 @@ void ava1_job_reap(uint64_t now_ms) {
          * creation and again when it ends, so `!fin` protects a running copy (whose stamp is
          * the creation one) from the age rule, and the window the operator can query is the
          * full park age from the moment it ended. */
-        if (j->kind == AVA1_JOB_COPY
+        /* An operation job (job.run, ava1_op.c) is the same: stamped when it ends, so its result
+         * can be read for the full park age. */
+        if (j->kind == AVA1_JOB_OPKIND
+                ? (fin && now_ms - j->parked_at_ms > (age < AVA1_OP_DONE_AGE_MS ? age : AVA1_OP_DONE_AGE_MS))
+                : j->kind == AVA1_JOB_COPY
                 ? (fin && now_ms - j->parked_at_ms > age)
                 : (now_ms - j->parked_at_ms > age || (fin && now_ms - j->parked_at_ms > done_age))) {
             gone[n++] = j;

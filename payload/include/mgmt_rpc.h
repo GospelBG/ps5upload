@@ -19,6 +19,7 @@
 #include <stdint.h>
 
 #include "ava1_gen.h" /* AVA1_METHOD_* for the table */
+#include "ava1_op.h"  /* job.run operations (AVA1_JOB_OP_*) */
 
 /* Entry flags. */
 #define MGMT_SONY (1u << 0) /* the handler reaches Sony code (register/profile/registry/remoteplay/notif or a Sony API) and takes the serialisation lock itself; the dispatcher adds no lock and no Sony call */
@@ -81,6 +82,31 @@ int mgmt_rpc_handles(uint16_t method);
  * ERR_UNKNOWN_METHOD. */
 int mgmt_rpc_dispatch(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *out, size_t cap,
                       size_t *out_len);
+
+/* ---- job.run operations wrapped around an FTX2 handler (P3 Task 5) ----
+ *
+ * An operation entry (the MGMT_OP* lines of mgmt_table.def) runs on an op job's worker: the
+ * environment hook, the handler behind the capture sink, then the reply becomes the job's
+ * result. Unlike a plain method, an `{"ok":false,...}` body is NOT turned into an error: the
+ * operation ran and the body is its answer (fsck's non-zero code, a backup's err text), kept
+ * verbatim for the caller that parses it. Only an ERROR frame fails the job (status from the
+ * token, cause = the token). */
+typedef struct {
+    uint8_t op;            /* AVA1_JOB_OP_* */
+    uint16_t legacy_frame; /* the FTX2 frame number (g_inflight_frame_type, the crash breadcrumb) */
+    uint16_t ack_frame;
+    uint32_t flags;        /* MGMT_* */
+    mgmt_legacy_fn fn;
+} mgmt_op_entry_t;
+
+/* Registers the operations with ava1_op.c (after mgmt_rpc_install). 0, or -1. */
+int mgmt_rpc_install_ops(const mgmt_op_entry_t *table, size_t n);
+
+/* For a legacy handler running as an operation (no-ops anywhere else, e.g. on the FTX2 path):
+ * has job.cancel arrived, and progress / totals for job.status. */
+int mgmt_op_cancelled(void);
+void mgmt_op_progress(uint64_t files, uint64_t bytes);
+void mgmt_op_total(uint64_t files, uint64_t bytes);
 
 /* ---- the capture sink (called from runtime.c's send_frame) ---- */
 int mgmt_capture_active(void);

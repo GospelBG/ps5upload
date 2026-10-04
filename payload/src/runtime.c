@@ -43,6 +43,7 @@
 #include "hw_info.h"
 #include "drive_sensors.h"
 #include "backup.h"
+#include "fs_jobs.h"
 #include "remoteplay.h"
 #include "fan_curve.h"
 #include "notif.h"
@@ -6575,121 +6576,14 @@ static void fs_op_progress(int idx, uint64_t delta);
  * existing engine + UI plumbing renders delete progress without
  * changes (total_bytes from recursive_size, bytes_copied from this
  * accumulator). */
-/* Force-flush the parent directory's metadata after a delete.
- * exFAT (used for USB external storage on PS5) caches directory
- * entries and the FAT allocation bitmap in kernel buffers. After
- * unlink(), the freed clusters may not be reflected in statfs()
- * free-space until the volume is lazily flushed — which can take
- * minutes or require a remount. On large files (multi-GiB game
- * images) this surfaces as "file is gone but space is still used,"
- * confusing users into thinking the delete failed.
- *
- * fsync() on a directory fd is the POSIX-recommended way to force
- * the metadata flush. On UFS2 (internal SSD) this is a cheap no-op
- * beyond the normal journal commit; on exFAT it forces the bitmap
- * update so free space is immediately reclaimable.
- *
- * Best-effort: failure is non-fatal because the delete itself
- * already succeeded — the space WILL be reclaimed eventually
- * regardless. */
-static void fsync_parent_dir(const char *path) {
-    char parent[1024];
-    const char *slash = strrchr(path, '/');
-    if (!slash) return;
-    size_t plen;
-    if (slash == path) {
-        plen = 1;
-    } else {
-        plen = (size_t)(slash - path);
-    }
-    if (plen >= sizeof(parent)) plen = sizeof(parent) - 1;
-    memcpy(parent, path, plen);
-    parent[plen] = '\0';
-    int dfd = open(parent, O_RDONLY);
-    if (dfd >= 0) {
-        (void)fsync(dfd);
-        close(dfd);
-    }
-}
+/* The recursive remove, chmod and size walks live in fs_jobs.c (shared with the job.run
+ * operations); these adapt the in-flight op table (progress + cancel by slot) to its hooks. */
+static int fsop_cancelled_cb(void *arg) { return fs_op_cancel_pending((int)(intptr_t)arg); }
+static void fsop_file_cb(void *arg, uint64_t bytes) { fs_op_progress((int)(intptr_t)arg, bytes); }
 
 static int rm_rf_op(const char *path, int depth, int op_idx) {
-    struct stat st;
-    DIR *d;
-    struct dirent *e;
-    char sub[1024];
-    int rc = 0;
-
-    if (depth > 64) return -1;
-    if (op_idx >= 0 && fs_op_cancel_pending(op_idx)) return -2;
-    if (lstat(path, &st) != 0) {
-        /* Already gone (ENOENT) is SUCCESS, not failure. A concurrent boot
-         * sweep, or the caller's own earlier delete, may have removed it —
-         * surfacing that as fs_delete_failed turned a benign race (e.g. the
-         * staged-pkg auto-delete after an install) into a scary user error. */
-        if (errno == ENOENT) return 0;
-        return -1;
-    }
-    if (!S_ISDIR(st.st_mode)) {
-        /* Regular file / symlink / device. unlink() works for all. */
-        if (unlink(path) != 0) {
-            if (errno == ENOENT) return 0; /* already gone → ok */
-            /* EBUSY: Sony's async installer can still hold a just-installed
-             * .pkg open when auto-delete-after-install fires. Retry briefly
-             * (≤1s) before declaring failure rather than failing the click. */
-            if (errno == EBUSY) {
-                int freed = 0;
-                for (int i = 0; i < 10; i++) {
-                    usleep(100000); /* 100 ms */
-                    if (unlink(path) == 0 || errno == ENOENT) {
-                        freed = 1;
-                        break;
-                    }
-                    if (errno != EBUSY) break;
-                }
-                if (!freed) return -1;
-            } else {
-                return -1;
-            }
-        }
-        if (op_idx >= 0 && S_ISREG(st.st_mode)) {
-            fs_op_progress(op_idx, (uint64_t)st.st_size);
-        }
-        /* Flush the parent directory so exFAT reclaims the freed
-         * clusters immediately rather than lazily. Without this, a
-         * multi-GiB delete (e.g. moving a 116 GB game image off USB)
-         * leaves the space marked "used" until the volume is remounted
-         * or the kernel's lazy flush runs — confusing the user into
-         * thinking the delete failed. See fsync_parent_dir for details. */
-        if (st.st_size >= (off_t)(100 * 1024 * 1024)) {
-            fsync_parent_dir(path);
-        }
-        return 0;
-    }
-    d = opendir(path);
-    if (!d) return -1;
-    while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        if (op_idx >= 0 && fs_op_cancel_pending(op_idx)) { rc = -2; break; }
-        int n = snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name);
-        if (n < 0 || (size_t)n >= sizeof(sub)) { rc = -1; break; }
-        int sub_rc = rm_rf_op(sub, depth + 1, op_idx);
-        if (sub_rc == -2) { rc = -2; break; }   /* propagate cancel */
-        if (sub_rc != 0) { rc = -1; /* keep going; best effort */ }
-    }
-    closedir(d);
-    /* Only rmdir if we weren't cancelled — leaving the dir avoids the
-     * surprising case where a user hits Stop and the top-level dir
-     * vanishes anyway because rmdir succeeded on the now-empty subtree
-     * we already cleared. The fs_copy_cancelled cleanup pattern in
-     * handle_fs_delete also relies on this: a partial tree is
-     * acceptable, but the entry the user clicked Stop on stays so
-     * they can see what's left. */
-    /* ENOENT here too means the directory is already gone — treat as success. */
-    if (rc != -2 && rmdir(path) != 0 && errno != ENOENT) rc = -1;
-    /* Flush the parent dir after rmdir for the same exFAT reason as
-     * the file-unlink path above. */
-    if (rc == 0) fsync_parent_dir(path);
-    return rc;
+    fsj_hooks_t h = { fsop_cancelled_cb, fsop_file_cb, (void *)(intptr_t)op_idx, NULL };
+    return fsj_rm_rf(path, depth, op_idx >= 0 ? &h : NULL);
 }
 
 static int rm_rf(const char *path, int depth) {
@@ -6698,28 +6592,7 @@ static int rm_rf(const char *path, int depth) {
 
 /* Recursive chmod on `path`. Descends dirs. Same depth cap as rm_rf. */
 static int chmod_rf(const char *path, mode_t mode, int depth) {
-    struct stat st;
-    DIR *d;
-    struct dirent *e;
-    char sub[1024];
-    int rc = 0;
-
-    if (depth > 64) return -1;
-    if (lstat(path, &st) != 0) return -1;
-    /* chmod first, then descend — so even if recursion fails partially
-     * we've at least updated the top. */
-    if (chmod(path, mode) != 0) rc = -1;
-    if (!S_ISDIR(st.st_mode)) return rc;
-    d = opendir(path);
-    if (!d) return -1;
-    while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        int n = snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name);
-        if (n < 0 || (size_t)n >= sizeof(sub)) { rc = -1; break; }
-        if (chmod_rf(sub, mode, depth + 1) != 0) rc = -1;
-    }
-    closedir(d);
-    return rc;
+    return fsj_chmod_rf(path, (unsigned)mode, depth, NULL);
 }
 
 /* Recursive copy from `src` to `dst`. Descends dirs, copies regular
@@ -6947,57 +6820,10 @@ static int fs_op_set_cancel(uint64_t op_id) {
  * the much longer cp_rf phase to finish first. Returns -2 on cancel
  * (matches cp_rf_op's convention). */
 #define RECURSIVE_SIZE_MAX_DEPTH 64
-static int recursive_size_inner(const char *path, uint64_t *out,
-                                 int depth, int op_idx) {
-    struct stat st;
-    DIR *d;
-    struct dirent *e;
-    if (depth > RECURSIVE_SIZE_MAX_DEPTH) {
-        fprintf(stderr,
-                "[payload2] recursive_size: depth cap %d hit at %s\n",
-                RECURSIVE_SIZE_MAX_DEPTH, path);
-        return -1;
-    }
-    /* Cancel check at directory boundaries — same cadence as
-     * rm_rf_op / cp_rf_op. Per-file granularity isn't worth it for
-     * stat walks (each stat is sub-microsecond on warm cache). */
-    if (op_idx >= 0 && fs_op_cancel_pending(op_idx)) return -2;
-    if (lstat(path, &st) != 0) return -1;
-    if (S_ISREG(st.st_mode)) {
-        *out += (uint64_t)st.st_size;
-        return 0;
-    }
-    if (!S_ISDIR(st.st_mode)) {
-        /* symlinks/specials don't contribute bytes. */
-        return 0;
-    }
-    d = opendir(path);
-    if (!d) return -1;
-    int rc = 0;
-    while ((e = readdir(d)) != NULL) {
-        char sub[1024];
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        if (snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name) >= (int)sizeof(sub)) {
-            /* A truncated child path means the copy will hit the same
-             * limit and bail; reporting success here would lie about
-             * total_bytes and make the progress bar drift past 100%.
-             * Surface the failure now so the caller fails fast with
-             * fs_copy_walk_failed rather than mid-copy. */
-            rc = -1;
-            break;
-        }
-        int sub_rc = recursive_size_inner(sub, out, depth + 1, op_idx);
-        if (sub_rc != 0) {
-            rc = sub_rc; /* propagate -1 (error) or -2 (cancel) */
-            break;
-        }
-    }
-    closedir(d);
-    return rc;
-}
 
 static int recursive_size_op(const char *path, uint64_t *out, int op_idx) {
-    return recursive_size_inner(path, out, 0, op_idx);
+    fsj_hooks_t h = { fsop_cancelled_cb, NULL, (void *)(intptr_t)op_idx, NULL };
+    return fsj_tree_size(path, out, NULL, 0, op_idx >= 0 ? &h : NULL);
 }
 
 /* ── Async-write file copier (parallel read + write) ──────────────────────────
@@ -10712,6 +10538,8 @@ static int handle_backup_snapshot(runtime_state_t *state, int client_fd,
     int rc = -1;
     if (tag[0] && path[0]) {
         rc = backup_snapshot(tag, path, &ts, &files, &bytes);
+        if (rc == BACKUP_CANCELLED)
+            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id, "backup_cancelled", 16);
         if (rc != 0) err = "snapshot failed (source not found or empty)";
     } else {
         err = "missing tag or path";
@@ -10762,6 +10590,8 @@ static int handle_backup_restore(runtime_state_t *state, int client_fd,
     int rc = -1;
     if (tag[0] && ts > 0) {
         rc = backup_restore(tag, ts, &restored);
+        if (rc == BACKUP_CANCELLED)
+            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id, "backup_cancelled", 16);
         if (rc != 0) err = "snapshot not found or restore failed";
     } else {
         err = "missing tag or timestamp";
@@ -12887,9 +12717,16 @@ static int handle_crc32_file(runtime_state_t *state, int client_fd,
     build_crc32_table();
     uint32_t crc = 0xffffffffu;
     uint64_t total = 0;
-    char buf[64 * 1024];
+    /* Heap, not stack: 64 KiB on a management thread's stack is what mgmt_audit.py refuses. */
+    char *buf = (char *)malloc(64 * 1024);
+    if (!buf) {
+        close(fd);
+        const char *err = "{\"err\":\"oom\"}";
+        return send_frame(client_fd, FTX2_FRAME_CRC32_FILE_ACK, 0,
+                          trace_id, err, strlen(err));
+    }
     while (1) {
-        ssize_t n = read(fd, buf, sizeof(buf));
+        ssize_t n = read(fd, buf, 64 * 1024);
         if (n <= 0) break;
         for (ssize_t i = 0; i < n; i++) {
             crc = g_crc32_table[(crc ^ (unsigned char)buf[i]) & 0xff]
@@ -12897,6 +12734,7 @@ static int handle_crc32_file(runtime_state_t *state, int client_fd,
         }
         total += (uint64_t)n;
     }
+    free(buf);
     close(fd);
     crc ^= 0xffffffffu;
     char resp[160];

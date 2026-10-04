@@ -24,11 +24,33 @@
         return h((runtime_state_t *)st, fd, hdr, scratch, sizeof scratch);                                  \
     }                                                                                                      \
     static int mgmt_r_##m(const uint8_t *q, uint32_t n, mgmt_ctx_t *cx) { return helper(q, n, cx, mgmt_l_##m); }
+/* job.run operations: the handler adapted to mgmt_legacy_fn. */
+#define MGMT_OP0(op, f, a, fl, h)                                                                          \
+    static int mgmt_lo_##op(void *st, int fd, uint64_t t, const char *b, uint64_t l) {                     \
+        (void)b;                                                                                           \
+        (void)l;                                                                                           \
+        return h((runtime_state_t *)st, fd, t);                                                            \
+    }
+#define MGMT_OP1(op, f, a, fl, h)                                                                          \
+    static int mgmt_lo_##op(void *st, int fd, uint64_t t, const char *b, uint64_t l) {                     \
+        return h((runtime_state_t *)st, fd, t, b, l);                                                      \
+    }
+#define MGMT_OP1B(op, f, a, fl, h)                                                                         \
+    static int mgmt_lo_##op(void *st, int fd, uint64_t t, const char *b, uint64_t l) {                     \
+        (void)l;                                                                                           \
+        return h((runtime_state_t *)st, fd, t, b);                                                         \
+    }
 #include "mgmt_table.def"
 #undef MGMT_H0
 #undef MGMT_H1
 #undef MGMT_HS
+#undef MGMT_OP0
+#undef MGMT_OP1
+#undef MGMT_OP1B
 
+#define MGMT_OP0(op, f, a, fl, h) /* the operations are tabled below */
+#define MGMT_OP1(op, f, a, fl, h)
+#define MGMT_OP1B(op, f, a, fl, h)
 #define MGMT_H0(m, f, a, fl, h, helper) {(uint16_t)(m), (uint16_t)(f), (uint16_t)(a), (fl), mgmt_r_##m},
 #define MGMT_H1(m, f, a, fl, h, helper) {(uint16_t)(m), (uint16_t)(f), (uint16_t)(a), (fl), mgmt_r_##m},
 #define MGMT_HS(m, f, a, fl, h, helper) {(uint16_t)(m), (uint16_t)(f), (uint16_t)(a), (fl), mgmt_r_##m},
@@ -38,6 +60,25 @@ static const mgmt_entry_t k_mgmt_table[] = {
 #undef MGMT_H0
 #undef MGMT_H1
 #undef MGMT_HS
+#undef MGMT_OP0
+#undef MGMT_OP1
+#undef MGMT_OP1B
+
+#define MGMT_H0(m, f, a, fl, h, helper)
+#define MGMT_H1(m, f, a, fl, h, helper)
+#define MGMT_HS(m, f, a, fl, h, helper)
+#define MGMT_OP0(op, f, a, fl, h) {(uint8_t)(op), (uint16_t)(f), (uint16_t)(a), (fl), mgmt_lo_##op},
+#define MGMT_OP1(op, f, a, fl, h) {(uint8_t)(op), (uint16_t)(f), (uint16_t)(a), (fl), mgmt_lo_##op},
+#define MGMT_OP1B(op, f, a, fl, h) {(uint8_t)(op), (uint16_t)(f), (uint16_t)(a), (fl), mgmt_lo_##op},
+static const mgmt_op_entry_t k_mgmt_ops[] = {
+#include "mgmt_table.def"
+};
+#undef MGMT_H0
+#undef MGMT_H1
+#undef MGMT_HS
+#undef MGMT_OP0
+#undef MGMT_OP1
+#undef MGMT_OP1B
 
 _Static_assert(FTX2_FRAME_ERROR == 3u, "mgmt_rpc.c's MGMT_FRAME_ERROR must match FTX2_FRAME_ERROR");
 
@@ -53,6 +94,9 @@ static void mgmt_env_enter(uint16_t legacy_frame) {
 static void mgmt_env_leave(void) { g_inflight_frame_type = 0; }
 
 int runtime_mgmt_install(runtime_state_t *state) {
-    return mgmt_rpc_install(k_mgmt_table, sizeof k_mgmt_table / sizeof k_mgmt_table[0], state, mgmt_env_enter,
-                            mgmt_env_leave);
+    int rc = mgmt_rpc_install(k_mgmt_table, sizeof k_mgmt_table / sizeof k_mgmt_table[0], state, mgmt_env_enter,
+                              mgmt_env_leave);
+    if (rc != 0) return rc;
+    /* job.run operations that wrap an FTX2 handler (the rest: fs_jobs.c, registered by ava1_glue.c). */
+    return mgmt_rpc_install_ops(k_mgmt_ops, sizeof k_mgmt_ops / sizeof k_mgmt_ops[0]);
 }

@@ -11,6 +11,7 @@ use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
 use crate::connection::Connection;
+use crate::mgmt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupSnapshotResult {
@@ -78,20 +79,19 @@ pub fn validate_tag(tag: &str) -> Result<()> {
 
 pub fn backup_snapshot(addr: &str, tag: &str, path: &str) -> Result<BackupSnapshotResult> {
     validate_tag(tag)?;
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::json!({ "tag": tag, "path": path });
-    c.send_frame(FrameType::BackupSnapshot, &serde_json::to_vec(&body)?)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected BACKUP_SNAPSHOT: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::BackupSnapshotAck {
-        bail!("expected BACKUP_SNAPSHOT_ACK, got {ft:?}");
-    }
+    // A job over AVA1: copying a save folder is quick, a whole title's data is not.
+    let resp = mgmt::run_op(
+        addr,
+        mgmt::ops::BACKUP_SNAPSHOT,
+        "BACKUP_SNAPSHOT",
+        &serde_json::to_vec(&body)?,
+        &mgmt::JobCall {
+            op_id: 0,
+            subject: path,
+            deadline: BACKUP_DEADLINE,
+        },
+    )?;
     let parsed: BackupSnapshotResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(
@@ -105,6 +105,9 @@ pub fn backup_snapshot(addr: &str, tag: &str, path: &str) -> Result<BackupSnapsh
     }
     Ok(parsed)
 }
+
+/// How long a snapshot or restore may take before the engine stops waiting for it.
+const BACKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 pub fn backup_list(addr: &str, tag: &str) -> Result<BackupList> {
     let mut c = Connection::connect(addr)?;
@@ -127,20 +130,18 @@ pub fn backup_list(addr: &str, tag: &str) -> Result<BackupList> {
 
 pub fn backup_restore(addr: &str, tag: &str, timestamp: i64) -> Result<BackupRestoreResult> {
     validate_tag(tag)?;
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::json!({ "tag": tag, "timestamp": timestamp });
-    c.send_frame(FrameType::BackupRestore, &serde_json::to_vec(&body)?)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected BACKUP_RESTORE: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::BackupRestoreAck {
-        bail!("expected BACKUP_RESTORE_ACK, got {ft:?}");
-    }
+    let resp = mgmt::run_op(
+        addr,
+        mgmt::ops::BACKUP_RESTORE,
+        "BACKUP_RESTORE",
+        &serde_json::to_vec(&body)?,
+        &mgmt::JobCall {
+            op_id: 0,
+            subject: tag,
+            deadline: BACKUP_DEADLINE,
+        },
+    )?;
     let parsed: BackupRestoreResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(

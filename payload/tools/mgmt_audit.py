@@ -224,6 +224,12 @@ def table():
         if m:
             f = [x.strip() for x in m.group(2).split(",")]
             out.append(dict(kind=m.group(1), method=f[0], frame=f[1], ack=f[2], flags=f[3], handler=f[4], runner=f[5]))
+        # job.run operations: MGMT_OP0/OP1/OP1B(op, frame, ack, flags, handler); no runner (the op worker
+        # runs the handler, mgmt_rpc.c op_entry_run). They get every audit a method gets.
+        m = re.match(r"MGMT_OP(0|1|1B)\((.*)\)\s*$", l)
+        if m:
+            f = [x.strip() for x in m.group(2).split(",")]
+            out.append(dict(kind="OP" + m.group(1), method=f[0], frame=f[1], ack=f[2], flags=f[3], handler=f[4], runner=""))
     return out
 
 
@@ -239,6 +245,11 @@ def check_table():
             bad.append("%s is not a generated AVA1_METHOD_* constant" % e["method"])
         if e["handler"] not in FUNCS or FUNCS[e["handler"]][1] != "src/runtime.c":
             bad.append("%s: handler %s is not defined in runtime.c" % (e["method"], e["handler"]))
+        if e["kind"].startswith("OP"):
+            op = e["method"][len("AVA1_JOB_OP_"):]
+            if not e["method"].startswith("AVA1_JOB_OP_") or "job.run (op %s)" % op not in checklist:
+                bad.append("%s is not a job.run op row in MGMT_METHODS.md (looked for 'job.run (op %s)')" % (e["method"], op))
+            continue
         dotted = e["method"][len("AVA1_METHOD_"):].lower()
         if "`%s`" % dotted.replace("_", ".", 1) not in checklist and "`%s`" % dotted not in checklist:
             bad.append("%s is not in MGMT_METHODS.md (looked for %s)" % (e["method"], dotted.replace("_", ".", 1)))

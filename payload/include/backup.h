@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* backup_snapshot / backup_restore return this when a job.run cancel stopped them. */
+#define BACKUP_CANCELLED (-2)
+
 /* Validate tag name: [a-zA-Z0-9_-], max 32 chars. Returns 0 if valid. */
 int backup_validate_tag(const char *tag);
 
