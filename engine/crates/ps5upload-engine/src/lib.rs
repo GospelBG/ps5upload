@@ -8180,8 +8180,8 @@ struct TransferDownloadReq {
 enum Ava1DownloadTarget {
     /// A tree under this directory: `dest_dir/<basename>`.
     Folder(std::path::PathBuf),
-    /// One `.zip` at this path.
-    Zip(std::path::PathBuf),
+    /// One `.zip` at this path, Stored (resumable) or Deflated (cannot resume).
+    Zip(std::path::PathBuf, ps5upload_ava1::download::ZipCompression),
 }
 
 /// Starts a console -> computer download over AVA1 and answers `ACCEPTED` with the job id,
@@ -8214,7 +8214,7 @@ fn start_ava1_download(
         .to_string();
     let dest_display = match &target {
         Ava1DownloadTarget::Folder(dir) => dir.join(&basename).to_string_lossy().to_string(),
-        Ava1DownloadTarget::Zip(zip) => zip.to_string_lossy().to_string(),
+        Ava1DownloadTarget::Zip(zip, _) => zip.to_string_lossy().to_string(),
     };
     crate::log_info!("transfer_download: job={job_id} protocol=ava1 src={src} dest={dest_display}");
     let progress = Arc::new(AtomicU64::new(0));
@@ -8283,12 +8283,13 @@ fn start_ava1_download(
                 &counters,
                 Some(cancel),
             ),
-            Ava1DownloadTarget::Zip(zip) => ps5upload_ava1::download::to_zip(
+            Ava1DownloadTarget::Zip(zip, compression) => ps5upload_ava1::download::to_zip_with(
                 &addr,
                 &src,
                 kind,
                 zip,
                 unsafe_read,
+                *compression,
                 id,
                 &counters,
                 Some(cancel),
@@ -8633,6 +8634,10 @@ struct TransferDownloadZipReq {
     /// allow-list (e.g. /system, /system_data). Read-only. Default false.
     #[serde(default)]
     unsafe_read: bool,
+    /// "stored" (default: resumes mid-entry after a dropped connection) or "deflate"
+    /// (smaller for text-heavy trees; cannot resume, so a drop restarts the archive).
+    #[serde(default)]
+    compression: Option<String>,
 }
 
 /// POST /api/transfer/download-zip — pull a PS5 file/folder straight into a
@@ -8670,6 +8675,17 @@ async fn transfer_download_zip_handler(
         return json_err(StatusCode::BAD_REQUEST, "dest_zip cannot be empty").into_response();
     }
     let dest_zip = std::path::PathBuf::from(&req.dest_zip);
+    let zip_compression = match req.compression.as_deref() {
+        None | Some("") | Some("stored") => ps5upload_ava1::download::ZipCompression::Stored,
+        Some("deflate") => ps5upload_ava1::download::ZipCompression::Deflate,
+        Some(other) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                &format!("compression must be \"stored\" or \"deflate\", not {other:?}"),
+            )
+            .into_response();
+        }
+    };
     let req_unsafe_zip = req.unsafe_read;
     // The save dialog hands us a path inside an existing dir, but verify the
     // parent is a real directory (off-reactor — it may be a network mount) so a
@@ -8703,7 +8719,7 @@ async fn transfer_download_zip_handler(
             req.src_path.clone(),
             kind,
             req_unsafe_zip,
-            Ava1DownloadTarget::Zip(dest_zip),
+            Ava1DownloadTarget::Zip(dest_zip, zip_compression),
         );
     }
 

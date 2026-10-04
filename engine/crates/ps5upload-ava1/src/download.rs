@@ -23,6 +23,7 @@ use zip::write::SimpleFileOptions;
 
 use crate::pool::{pool, Pool};
 use crate::upload::{refusal, wait, SessionGate, UploadFailure, STALL_LIMIT};
+use crate::zip_stored::StoredZipSink;
 
 /// The grant a download extends to the console (SPEC.md §12.4).
 const CREDIT: u64 = 64 << 20;
@@ -147,7 +148,7 @@ fn host_unsafe_component(comp: &str) -> Option<&'static str> {
 /// What the manifest of a download may look like (peer-supplied data: `Manifest::
 /// from_pages` already ran `check_path` on every path; this adds the shape the request
 /// promised and the one path rule `check_path` leaves to the host OS).
-fn check_shape(m: &Manifest, single: bool) -> io::Result<()> {
+pub(crate) fn check_shape(m: &Manifest, single: bool) -> io::Result<()> {
     let bad = |why: String| io::Error::new(io::ErrorKind::InvalidData, why);
     for e in &m.entries {
         manifest::check_path(&e.path).map_err(|e| bad(e.to_string()))?;
@@ -292,7 +293,7 @@ impl std::fmt::Display for ZipRestart {
 
 impl std::error::Error for ZipRestart {}
 
-fn zip_restart(why: impl Into<String>) -> io::Error {
+pub(crate) fn zip_restart(why: impl Into<String>) -> io::Error {
     io::Error::other(ZipRestart(why.into()))
 }
 
@@ -305,7 +306,7 @@ pub fn is_zip_restart(e: &io::Error) -> bool {
 /// A file that keeps failing verification must end the job, not restart forever.
 const MAX_RETRY_RESTARTS: u32 = 3;
 
-fn invalid(why: impl Into<String>) -> io::Error {
+pub(crate) fn invalid(why: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, why.into())
 }
 
@@ -540,9 +541,11 @@ fn terminal(e: SendError) -> anyhow::Error {
 }
 
 /// Job id of attempt `n`: attempt 0 is the job's own id (so the journal directory, the
-/// `JobOpen` and the job record agree); later attempts of a zip hash it with the attempt.
-fn attempt_id(job_id: [u8; 16], attempt: u32, fresh_per_attempt: bool) -> [u8; 16] {
-    if attempt == 0 || !fresh_per_attempt {
+/// `JobOpen` and the job record agree); a later attempt exists only because the archive
+/// was started over, and hashes the id with the attempt so it gets a journal of its own.
+/// A resumed connection is the SAME attempt and keeps the id.
+fn attempt_id(job_id: [u8; 16], attempt: u32) -> [u8; 16] {
+    if attempt == 0 {
         return job_id;
     }
     let mut h = blake3::Hasher::new();
@@ -556,15 +559,18 @@ fn attempt_id(job_id: [u8; 16], attempt: u32, fresh_per_attempt: bool) -> [u8; 1
 /// One download, retried across connection loss. `make_sink` builds the sink for an
 /// attempt.
 ///
-/// `fresh_per_attempt` (zip): every attempt is a NEW job with a new journal. FTX2
-/// resumes a zip inside one run (it keeps the `ZipWriter` and re-requests from the
-/// offset), which AVA1's ordered receiver cannot: a deflate stream cannot be seeked
-/// into, and the journal's ranges cannot reconstruct compressed bytes. So a dropped zip
-/// download restarts the archive from byte zero — a 40 GiB zip that drops at 90% pays
-/// for it again, which FTX2 does not. The previous attempt's archive is discarded
-/// (`ZipSink::prepare` truncates, and an abandoned sink deletes its part file) so two
-/// archives are never mixed, and the restart is logged with the attempt number and the
-/// bytes spent.
+/// `fresh_per_attempt` is the Deflate zip: a deflate stream cannot be seeked into, and the
+/// journal's ranges cannot reconstruct compressed bytes, so a dropped connection restarts
+/// the archive from byte zero as a NEW job with a new journal (a 40 GiB zip that drops at
+/// 90% pays for it again, which is why Stored is the default). The previous attempt's
+/// archive is discarded (`ZipSink::prepare` truncates, and an abandoned sink deletes its
+/// part file) so two archives are never mixed, and the restart is logged with the attempt
+/// number and the bytes spent.
+///
+/// With `fresh_per_attempt == false` a dropped connection resumes the same job id: the
+/// sink re-derives its position from the journal (`Sink::position`; the Stored zip resumes
+/// at the durable byte). A file the receiver asks to have re-sent (`ZipRestart`) starts
+/// the archive over under either setting, since a zip cannot rewrite what it holds.
 #[allow(clippy::too_many_arguments)]
 fn run(
     pool: &Pool,
@@ -613,7 +619,7 @@ fn run(
                 }
             };
             gate.connected();
-            let id = attempt_id(job_id, attempt, fresh_per_attempt);
+            let id = attempt_id(job_id, attempt);
             let _live_attempt = pool.live_job(&id);
             let mut link = session.job(id);
             let _ticker = Ticker::start(progress.clone(), counters, base_bytes, base_files);
@@ -633,9 +639,7 @@ fn run(
                 }
                 Err(SendError::Disconnected(why)) => (why, true),
                 Err(SendError::Source(e))
-                    if fresh_per_attempt
-                        && is_zip_restart(&e)
-                        && retry_restarts < MAX_RETRY_RESTARTS =>
+                    if is_zip_restart(&e) && retry_restarts < MAX_RETRY_RESTARTS =>
                 {
                     retry_restarts += 1;
                     (e.to_string(), false)
@@ -646,7 +650,7 @@ fn run(
             if dropped {
                 pool.forget(console).await;
             }
-            if fresh_per_attempt {
+            if fresh_per_attempt || !dropped {
                 let _ = std::fs::remove_dir_all(journal::job_dir(&jobs_dir, &id));
                 base_bytes += durable;
                 base_files += progress.files_durable.load(Ordering::Relaxed);
@@ -773,6 +777,18 @@ pub fn to_local(
     )
 }
 
+/// How a zip download stores its entries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ZipCompression {
+    /// Uncompressed entries (the default): game data is already compressed, and the archive
+    /// resumes at the byte a dropped connection reached.
+    #[default]
+    Stored,
+    /// Deflated entries, for text-heavy trees. A deflate stream cannot be continued, so a
+    /// dropped connection restarts the whole archive from zero: it cannot resume.
+    Deflate,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn to_zip_in(
     pool: &Pool,
@@ -781,6 +797,33 @@ pub fn to_zip_in(
     kind: DownloadKind,
     dest_zip: &Path,
     unsafe_read: bool,
+    job_id: [u8; 16],
+    counters: &Counters,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<u64> {
+    to_zip_with_in(
+        pool,
+        console,
+        src,
+        kind,
+        dest_zip,
+        unsafe_read,
+        ZipCompression::Stored,
+        job_id,
+        counters,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn to_zip_with_in(
+    pool: &Pool,
+    console: &str,
+    src: &str,
+    kind: DownloadKind,
+    dest_zip: &Path,
+    unsafe_read: bool,
+    compression: ZipCompression,
     job_id: [u8; 16],
     counters: &Counters,
     cancel: Option<Arc<AtomicBool>>,
@@ -796,23 +839,31 @@ pub fn to_zip_in(
         flags |= gen::JF_UNSAFE_READ;
     }
     let dest = dest_zip.to_path_buf();
-    run(
+    let deflate = compression == ZipCompression::Deflate;
+    let r = run(
         pool,
         console,
         src,
         flags,
         job_id,
-        true,
+        deflate,
         &move || -> Arc<dyn Sink> {
-            Arc::new(if single {
-                ZipSink::single(dest.clone(), &name)
-            } else {
-                ZipSink::new(dest.clone(), &name)
-            })
+            match (deflate, single) {
+                (true, true) => Arc::new(ZipSink::single(dest.clone(), &name)),
+                (true, false) => Arc::new(ZipSink::new(dest.clone(), &name)),
+                (false, true) => Arc::new(StoredZipSink::single(dest.clone(), &name)),
+                (false, false) => Arc::new(StoredZipSink::new(dest.clone(), &name)),
+            }
         },
         counters,
         cancel,
-    )
+    );
+    if r.is_err() {
+        // Terminal (a cancel, a refusal, a local write failure, the stall limit): nothing
+        // resumes this job, so its journal must not outlive it (the sink removes its part).
+        let _ = std::fs::remove_dir_all(journal::job_dir(&pool.ava_dir().join("jobs"), &job_id));
+    }
+    r
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -826,13 +877,39 @@ pub fn to_zip(
     counters: &Counters,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<u64> {
-    to_zip_in(
+    to_zip_with(
+        console,
+        src,
+        kind,
+        dest_zip,
+        unsafe_read,
+        ZipCompression::Stored,
+        job_id,
+        counters,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn to_zip_with(
+    console: &str,
+    src: &str,
+    kind: DownloadKind,
+    dest_zip: &Path,
+    unsafe_read: bool,
+    compression: ZipCompression,
+    job_id: [u8; 16],
+    counters: &Counters,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<u64> {
+    to_zip_with_in(
         pool(),
         console,
         src,
         kind,
         dest_zip,
         unsafe_read,
+        compression,
         job_id,
         counters,
         cancel,
@@ -850,12 +927,11 @@ mod tests {
     }
 
     #[test]
-    fn attempt_ids_differ_only_for_a_fresh_per_attempt_job() {
+    fn attempt_ids_differ_only_after_a_restart() {
         let id = [7u8; 16];
-        assert_eq!(attempt_id(id, 0, true), id);
-        assert_eq!(attempt_id(id, 3, false), id);
-        assert_ne!(attempt_id(id, 1, true), id);
-        assert_ne!(attempt_id(id, 1, true), attempt_id(id, 2, true));
+        assert_eq!(attempt_id(id, 0), id);
+        assert_ne!(attempt_id(id, 1), id);
+        assert_ne!(attempt_id(id, 1), attempt_id(id, 2));
     }
 
     #[test]
@@ -1076,6 +1152,163 @@ mod tests {
         }
         assert!(!d.join("g.zip.ava-part").exists());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A sink that counts every byte handed to it and, once, drops the connection when the
+    /// count reaches `kill_at`: what a flaky link does mid-download.
+    struct DropSink {
+        inner: Arc<dyn Sink>,
+        written: Arc<AtomicU64>,
+        kill_at: u64,
+        killed: AtomicBool,
+        proxy: Arc<ava1_chaos::ChaosProxy>,
+    }
+
+    impl DropSink {
+        fn count(&self, n: usize) {
+            let w = self.written.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+            if w >= self.kill_at && !self.killed.swap(true, Ordering::Relaxed) {
+                self.proxy.kill_all();
+            }
+        }
+    }
+
+    impl Sink for DropSink {
+        fn prepare(&self, m: &Manifest) -> io::Result<()> {
+            self.inner.prepare(m)
+        }
+        fn write_at(&self, id: u32, off: u64, data: &[u8]) -> io::Result<()> {
+            self.inner.write_at(id, off, data)?;
+            self.count(data.len());
+            Ok(())
+        }
+        fn write_whole(&self, id: u32, data: &[u8]) -> io::Result<()> {
+            self.inner.write_whole(id, data)?;
+            self.count(data.len());
+            Ok(())
+        }
+        fn sync(&self, ids: &[u32]) -> io::Result<()> {
+            self.inner.sync(ids)
+        }
+        fn read_at(&self, id: u32, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read_at(id, off, buf)
+        }
+        fn commit(&self, id: u32) -> io::Result<()> {
+            self.inner.commit(id)
+        }
+        fn finish(&self) -> io::Result<()> {
+            self.inner.finish()
+        }
+        fn position(
+            &self,
+            done: &std::collections::BTreeSet<u32>,
+            partial: &std::collections::BTreeMap<u32, ava1::ranges::RangeSet>,
+        ) -> io::Result<()> {
+            self.inner.position(done, partial)
+        }
+    }
+
+    /// Downloads `files` x `size` bytes into a Stored zip, dropping the connection at
+    /// ~40% of the bytes. Returns (bytes the sink was handed in all, total bytes, run
+    /// result); the archive is checked against the source byte for byte.
+    fn drop_at_forty_percent(tag: &str, files: usize, size: usize, bps: u64) -> (u64, u64) {
+        let d = std::env::temp_dir().join(format!("p5a-zip-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("share/G")).unwrap();
+        let mut want = Vec::new();
+        for i in 0..files {
+            let b: Vec<u8> = (0..size).map(|k| (k * 7 + i * 13) as u8).collect();
+            std::fs::write(d.join(format!("share/G/f{i:02}")), &b).unwrap();
+            want.push(b);
+        }
+        let total = (files * size) as u64;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ava = d.join("ava");
+        let key = ava1::keys::Identity::load_or_create(&ava.join("identity"))
+            .unwrap()
+            .public();
+        let host = rt.block_on(folder_host(&d, key));
+        let proxy = Arc::new(
+            rt.block_on(ava1_chaos::ChaosProxy::start(
+                host.parse().unwrap(),
+                ava1_chaos::ChaosConfig {
+                    bytes_per_sec: Some(bps),
+                    ..Default::default()
+                },
+            ))
+            .unwrap(),
+        );
+        let pool = Pool::new(ava).with_addr(proxy.addr.to_string());
+        let dest = d.join("g.zip");
+        let written = Arc::new(AtomicU64::new(0));
+        let sink: Arc<dyn Sink> = Arc::new(DropSink {
+            inner: Arc::new(StoredZipSink::new(dest.clone(), "G")),
+            written: written.clone(),
+            kill_at: total * 4 / 10,
+            killed: AtomicBool::new(false),
+            proxy: proxy.clone(),
+        });
+        let c = Counters::default();
+        let bytes = run(
+            &pool,
+            "c",
+            "G",
+            gen::JF_ORDERED,
+            [5; 16],
+            false,
+            &move || sink.clone(),
+            &c,
+            None,
+        )
+        .expect("a dropped Stored zip download must resume");
+        assert_eq!(bytes, total);
+        assert!(pool.attempts() >= 2, "the connection never dropped");
+        assert_eq!(
+            c.bytes.load(Ordering::Relaxed),
+            total,
+            "resumed, not restarted: the work counter never needed more than the archive"
+        );
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&dest).unwrap()).unwrap();
+        assert_eq!(z.len(), files);
+        for (i, b) in want.iter().enumerate() {
+            let mut e = z.by_name(&format!("G/f{i:02}")).unwrap();
+            assert_eq!(e.compression(), zip::CompressionMethod::Stored);
+            let mut got = Vec::new();
+            io::Read::read_to_end(&mut e, &mut got).unwrap();
+            assert!(&got == b, "G/f{i:02} differs");
+        }
+        assert!(!d.join("g.zip.ava-part").exists());
+        let _ = std::fs::remove_dir_all(&d);
+        (written.load(Ordering::Relaxed), total)
+    }
+
+    // Step 2: whole entries are kept. 1 MiB entries are one group each, so only the entry
+    // in flight can be lost; at 4 MiB/s a sync batch holds well under an entry.
+    #[test]
+    fn a_stored_zip_resumes_with_at_most_one_entry_resent() {
+        let (handed, total) = drop_at_forty_percent("entry", 16, 1 << 20, 4 << 20);
+        let resent = handed - total;
+        assert!(
+            resent <= 1 << 20,
+            "{resent} bytes were sent twice; one entry is {}",
+            1 << 20
+        );
+    }
+
+    // Step 3: inside an entry. 12 MiB entries are 12 groups; the cut lands inside one, and
+    // what is resent is the un-journaled tail (a sync batch), never the entry.
+    #[test]
+    fn a_stored_zip_resumes_mid_entry_with_at_most_a_group_or_two_resent() {
+        let (handed, total) = drop_at_forty_percent("mid", 4, 12 << 20, 8 << 20);
+        let resent = handed - total;
+        assert!(
+            resent <= 4 << 20,
+            "{resent} bytes were sent twice; the entry is {}",
+            12 << 20
+        );
     }
 
     #[test]
