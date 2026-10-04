@@ -886,7 +886,8 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
                     s.next_seq += 1;
                     let seq = s.next_seq;
                     let ty = f.ty;
-                    let body = (*f.body).clone();
+                    // Shared, not copied: the frame stays in `inflight` for a resend.
+                    let body = f.body.clone();
                     if f.class == Class::Bundle {
                         s.bundles_inflight += 1;
                     }
@@ -954,7 +955,7 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
             continue;
         };
         if let Some(bps) = cap_bps {
-            sent_bytes += body.len() as u64;
+            sent_bytes += body.len() as u64; // plaintext bytes, as before
             let due = Duration::from_secs_f64(sent_bytes as f64 / bps as f64);
             if let Some(wait) = due.checked_sub(started.elapsed()) {
                 tokio::time::sleep(wait).await;
