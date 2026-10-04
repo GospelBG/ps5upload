@@ -296,14 +296,76 @@ impl LocalSink {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .truncate(truncate)
-            .open(&p)?;
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .truncate(truncate)
+                .open(&p)
+        };
+        // Descriptors are bounded: past the cap the cache drops its other entries (their data is
+        // fsynced later through a reopen, see `sync`), and the process running out anyway is
+        // answered the same way once before the error is reported.
+        if st.open.len() >= MAX_OPEN {
+            st.open.clear();
+        }
+        let f = match open() {
+            Err(e) if is_fd_exhausted(&e) => {
+                st.open.clear();
+                open()?
+            }
+            r => r?,
+        };
         st.open.insert(id, f.try_clone()?);
         Ok(f)
+    }
+
+    /// A descriptor for `id` to fsync: the cached one, or the file reopened by path (its part
+    /// file, else its final place) when it was written whole or evicted from the cache.
+    fn reopen(&self, id: u32) -> io::Result<(std::fs::File, PathBuf)> {
+        let (fin, part) = {
+            let st = self.st.lock().unwrap();
+            if let Some(f) = st.open.get(&id) {
+                let p = self.path(&st, id, true);
+                return Ok((f.try_clone()?, p));
+            }
+            (self.path(&st, id, false), self.path(&st, id, true))
+        };
+        let open = |p: &Path| std::fs::OpenOptions::new().write(true).open(p);
+        // The part file first: a large file mid-write lives there, while a small file written
+        // whole has no part file and is at its final path.
+        match open(&part) {
+            Ok(f) => Ok((f, part)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && part != fin => {
+                open(&fin).map(|f| (f, fin))
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The most files a `LocalSink` keeps open at once (large files being written; a small file's
+/// descriptor is closed as soon as its bytes are written).
+const MAX_OPEN: usize = 64;
+
+/// Whether `e` is the process or the system running out of file descriptors. That is a
+/// condition to wait out and retry, not a verdict on the download.
+pub fn is_fd_exhausted(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        // EMFILE, ENFILE
+        matches!(e.raw_os_error(), Some(24) | Some(23))
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_TOO_MANY_OPEN_FILES
+        matches!(e.raw_os_error(), Some(4))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = e;
+        false
     }
 }
 
@@ -424,33 +486,30 @@ impl Sink for LocalSink {
         if self.log && self.pack.lock().unwrap().is_some() {
             return self.write_logged(id, *blake3::hash(data).as_bytes(), data);
         }
-        let f = self.file(id, false, true)?;
-        verify::write_all_at(&f, data, 0)?;
-        f.set_len(data.len() as u64)
+        // Not cached: a folder of tens of thousands of small files must not hold a descriptor
+        // each. `sync` reopens the file to fsync it.
+        self.st.lock().unwrap().open.remove(&id);
+        self.make_file(id, data)
     }
 
     fn sync(&self, ids: &[u32]) -> io::Result<()> {
-        let (files, dirs): (Vec<std::fs::File>, BTreeSet<PathBuf>) = {
-            let st = self.st.lock().unwrap();
-            let files = ids
-                .iter()
-                .filter_map(|i| st.open.get(i).and_then(|f| f.try_clone().ok()))
-                .collect();
-            let dirs = ids
-                .iter()
-                .filter(|i| st.open.contains_key(i))
-                .filter_map(|i| self.path(&st, *i, true).parent().map(|p| p.to_path_buf()))
-                .collect();
-            (files, dirs)
-        };
         // One sync per batch, not one drive flush per file (T28): every file gets the
         // cheap fsync, then ONE drive-cache flush covers them all, then the directories
         // (so the new names are durable too). std's `sync_data` is F_FULLFSYNC on macOS —
-        // ~15 ms a file, which capped a 2,000-file download at 56 files/s.
-        for f in &files {
-            sys_fsync(f)?;
+        // ~15 ms a file, which capped a 2,000-file download at 56 files/s. Each file is
+        // reopened (or its cached descriptor used) and dropped before the next, so a batch of
+        // any size holds one descriptor of its own.
+        let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut last: Option<std::fs::File> = None;
+        for &id in ids {
+            let (f, p) = self.reopen(id)?;
+            sys_fsync(&f)?;
+            if let Some(parent) = p.parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+            last = Some(f);
         }
-        if let Some(f) = files.last() {
+        if let Some(f) = &last {
             flush_drive_cache(f)?;
         }
         sync_dirs(&dirs)
@@ -587,13 +646,22 @@ impl Sink for LocalSink {
                 .entry(id)
                 .expect("an id the receiver validated against the manifest")
                 .size;
-        if let Some(f) = st.open.remove(&id) {
+        let (part, fin) = (self.path(&st, id, true), self.path(&st, id, false));
+        // The cached descriptor, or (the cache having been trimmed) the part file reopened.
+        let f = match st.open.remove(&id) {
+            Some(f) => Some(f),
+            None => match std::fs::OpenOptions::new().write(true).open(&part) {
+                Ok(f) => Some(f),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            },
+        };
+        if let Some(f) = f {
             f.set_len(size)?;
             // Cheap fsync only: the batch's journal append (sync_all) flushes the drive cache
             // once for every file this batch committed.
             sys_fsync(&f)?;
         }
-        let (part, fin) = (self.path(&st, id, true), self.path(&st, id, false));
         if part != fin {
             std::fs::rename(&part, &fin)?; // same directory by construction (ruling Q3)
         }
