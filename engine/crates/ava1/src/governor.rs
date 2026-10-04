@@ -331,6 +331,64 @@ impl Governor {
     }
 }
 
+/// Where a job's time went, one tick (a second) at a time: the line CUTOVER §4 rows quote
+/// (review 003 §2.2 item 3).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct JobSummary {
+    ticks: u32,
+    credit_starved: u32,
+    source_starved: u32,
+    /// Credit-starved while the receiver reported disk or workers as its limit.
+    receiver_bound: u32,
+    lanes_sum: u64,
+    chunk_sum: u64,
+    receiver_bottleneck: u8,
+}
+
+fn bottleneck_name(b: u8) -> &'static str {
+    match b {
+        BN_NETWORK => "network",
+        BN_SOURCE => "source",
+        BN_DISK => "disk",
+        BN_WORKERS => "workers",
+        BN_CREDIT => "credit",
+        _ => "none",
+    }
+}
+
+impl JobSummary {
+    /// One governor tick: the sample it was fed and the decision it made.
+    pub fn observe(&mut self, s: &Sample, d: &Decision) {
+        self.ticks += 1;
+        self.credit_starved += u32::from(s.credit_starved);
+        self.source_starved += u32::from(s.source_starved);
+        self.receiver_bound +=
+            u32::from(s.credit_starved && matches!(s.receiver_bottleneck, BN_DISK | BN_WORKERS));
+        self.lanes_sum += u64::from(s.lanes);
+        self.chunk_sum += u64::from(d.chunk);
+        self.receiver_bottleneck = s.receiver_bottleneck;
+    }
+
+    /// `None` for a job too short to have had a tick.
+    pub fn line(&self) -> Option<String> {
+        if self.ticks == 0 {
+            return None;
+        }
+        let n = f64::from(self.ticks);
+        let pct = |c: u32| f64::from(c) * 100.0 / n;
+        Some(format!(
+            "[ava1] job bottlenecks over {} ticks: credit-starved {:.0}%, source-starved {:.0}%, receiver-bound {:.0}%; receiver reported {}; avg lanes {:.1}, avg chunk {:.1} MiB",
+            self.ticks,
+            pct(self.credit_starved),
+            pct(self.source_starved),
+            pct(self.receiver_bound),
+            bottleneck_name(self.receiver_bottleneck),
+            self.lanes_sum as f64 / n,
+            self.chunk_sum as f64 / n / f64::from(1u32 << 20),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +622,50 @@ mod tests {
         assert_eq!((o.pin_lanes, o.pin_chunk), (Some(2), Some(15 << 20)));
         let o = GovernorOptions::from_vars(Some("x"), Some(""));
         assert_eq!(o, GovernorOptions::default());
+    }
+
+    #[test]
+    fn the_job_summary_says_where_the_time_went() {
+        let mut j = JobSummary::default();
+        assert_eq!(j.line(), None, "no ticks, no line");
+        let d = |chunk| Decision {
+            lanes: 4,
+            chunk,
+            bundle: 0,
+            bottleneck: crate::gen::BN_NETWORK,
+            mode: Mode::Mixed,
+            prefer: Class::Stream,
+            sequential: false,
+        };
+        let ticks = [
+            (false, false, 0, 2u8, 4u32 << 20),
+            (true, false, crate::gen::BN_DISK, 4, 4 << 20),
+            (true, false, crate::gen::BN_NONE, 4, 8 << 20),
+            (false, true, crate::gen::BN_DISK, 6, 8 << 20),
+        ];
+        for (credit, source, rbn, lanes, chunk) in ticks {
+            j.observe(
+                &Sample {
+                    secs: 1.0,
+                    lanes,
+                    credit_starved: credit,
+                    source_starved: source,
+                    receiver_bottleneck: rbn,
+                    ..Default::default()
+                },
+                &d(chunk),
+            );
+        }
+        let line = j.line().unwrap();
+        assert!(line.contains("over 4 ticks"), "{line}");
+        assert!(line.contains("credit-starved 50%"), "{line}");
+        assert!(line.contains("source-starved 25%"), "{line}");
+        assert!(
+            line.contains("receiver-bound 25%"),
+            "only the disk tick that was starved: {line}"
+        );
+        assert!(line.contains("receiver reported disk"), "{line}");
+        assert!(line.contains("avg lanes 4.0"), "{line}");
+        assert!(line.contains("avg chunk 6.0 MiB"), "{line}");
     }
 }

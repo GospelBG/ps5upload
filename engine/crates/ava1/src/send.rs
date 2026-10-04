@@ -19,7 +19,7 @@ use crate::gen::{
     self, Bundle, BundleRecord, Chunk, Credit, Durable, FileRetry, FileRoot, JobDone, JobMap,
     JobOpen, JobOpenAck, ManifestEnd, Received, Status,
 };
-use crate::governor::{self, Class, Governor, GovernorOptions, Mode, Sample};
+use crate::governor::{self, Class, Governor, GovernorOptions, JobSummary, Mode, Sample};
 use crate::manifest::Manifest;
 use crate::ranges::{from_runs, Need, RangeSet};
 use crate::router::{ConnTx, Inbound, JobLink, LaneTx};
@@ -1124,6 +1124,7 @@ pub async fn run_upload(
     let mut gov = Governor::with_options(GovernorOptions::from_env());
     let first = gov.tick(&Sample::default());
     sh.chunk.store(first.chunk, Ordering::Relaxed);
+    let mut summary = JobSummary::default();
     sh.sched.lock().unwrap().decision = Some(first);
     let small_q = Arc::new(Mutex::new(small));
     let large_q = Arc::new(Mutex::new(large));
@@ -1504,6 +1505,7 @@ pub async fn run_upload(
                     }
                 };
                 let d = gov.tick(&sample);
+                summary.observe(&sample, &d);
                 sh.chunk.store(d.chunk, Ordering::Relaxed);
                 sh.bundle.store(d.bundle, Ordering::Relaxed);
                 sh.sched.lock().unwrap().decision = Some(d);
@@ -1553,6 +1555,11 @@ pub async fn run_upload(
     }
     for h in readers {
         let _ = h.await;
+    }
+    if let Some(line) = summary.line() {
+        use std::io::Write;
+        // writeln!, not eprintln!: a dead parent's closed stderr must not panic the engine.
+        let _ = writeln!(std::io::stderr(), "{line}");
     }
     result
 }
