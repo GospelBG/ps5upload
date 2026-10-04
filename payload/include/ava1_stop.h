@@ -9,10 +9,12 @@
  * The AVA1 half of a payload exit (node.shutdown, the takeover flag, a signal-free main return):
  *   1. stop accepting and tell every session to end (ava1_server_stop);
  *   2. wait up to conn_wait_ms for the sessions to leave, so no handler starts a new call;
- *   3. wait up to sony_wait_ms for an in-flight Sony call to finish (sony_api_lock is free);
+ *   3. wait for an in-flight Sony call to finish (sony_api_lock is free). sony_wait_ms only decides
+ *      when AVA1_STOP_SONY_BUSY is reported; the wait itself does not end until the lock frees (the
+ *      caller's exit watchdog is the bound), so the process never exits inside a Sony call;
  *   4. stop the data layer: every job is stopped, its threads joined and its journal closed, so
  *      a durable job resumes after the next start with nothing lost.
- * Both waits use CLOCK_MONOTONIC and are bounded: the caller's exit watchdog is the last resort.
+ * The waits use CLOCK_MONOTONIC.
  */
 int ava1_payload_stop(int conn_wait_ms, int sony_wait_ms);
 

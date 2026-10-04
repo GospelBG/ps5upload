@@ -43,10 +43,11 @@ impl Drop for Permit<'_> {
 }
 
 impl Guard {
-    /// Claims `host` at time `now`: `Err(token)` when one is running or the cooldown has not passed.
+    /// Claims `host` (any spelling of the console: see [`key`]) at time `now`: `Err(token)` when one is running or the cooldown has not passed.
     pub fn begin(&self, host: &str, now: Instant) -> Result<Permit<'_>, &'static str> {
+        let host = key(host);
         let mut m = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
-        let e = m.entry(host.to_string()).or_default();
+        let e = m.entry(host.clone()).or_default();
         if e.in_flight {
             return Err(REPLACE_IN_PROGRESS);
         }
@@ -58,10 +59,32 @@ impl Guard {
         e.in_flight = true;
         e.last_start = Some(now);
         drop(m);
-        Ok(Permit {
-            guard: self,
-            host: host.to_string(),
-        })
+        Ok(Permit { guard: self, host })
+    }
+}
+
+/// The guard's key for a console: lowercase, any port and IPv6 brackets stripped, and the IP the name
+/// resolves to when it resolves (so `PS5.local`, `ps5.local:9114` and its address are one console);
+/// the normalised string otherwise.
+pub fn key(host: &str) -> String {
+    key_with(host, |h| {
+        use std::net::ToSocketAddrs;
+        (h, 0).to_socket_addrs().ok()?.next().map(|a| a.ip())
+    })
+}
+
+fn key_with(host: &str, resolve: impl Fn(&str) -> Option<std::net::IpAddr>) -> String {
+    let h = host.trim().to_ascii_lowercase();
+    let bare = if let Some(rest) = h.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest).to_string() // [v6] or [v6]:port
+    } else if h.matches(':').count() == 1 {
+        h.split(':').next().unwrap_or(&h).to_string() // host:port
+    } else {
+        h // a name, an IPv4 address, or a bare IPv6 address
+    };
+    match resolve(&bare) {
+        Some(ip) => ip.to_string(),
+        None => bare,
     }
 }
 
@@ -94,6 +117,35 @@ pub fn global() -> &'static Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spellings_of_one_console_share_a_key() {
+        use std::net::IpAddr;
+        let resolve = |h: &str| -> Option<IpAddr> {
+            match h {
+                "ps5.local" => Some("10.0.0.2".parse().unwrap()),
+                other => other.parse().ok(),
+            }
+        };
+        let k = |h: &str| key_with(h, resolve);
+        assert_eq!(k("10.0.0.2"), "10.0.0.2");
+        assert_eq!(k("10.0.0.2:9114"), "10.0.0.2");
+        assert_eq!(k("PS5.local"), "10.0.0.2");
+        assert_eq!(k("ps5.LOCAL:9113"), "10.0.0.2");
+        assert_eq!(k(" 10.0.0.2 "), "10.0.0.2");
+        assert_eq!(k("[fe80::1]:9114"), "fe80::1");
+        assert_eq!(k("FE80::1"), "fe80::1");
+        // unresolvable: the normalised string
+        assert_eq!(key_with("Nope.Invalid:9114", |_| None), "nope.invalid");
+        // and the guard treats them as one console
+        let g = Guard::default();
+        let t0 = Instant::now();
+        let _p = g.begin("10.0.0.2", t0).unwrap();
+        assert_eq!(
+            g.begin("10.0.0.2:9114", t0).err(),
+            Some(REPLACE_IN_PROGRESS)
+        );
+    }
 
     #[test]
     fn only_an_old_helper_is_offered_a_replace() {

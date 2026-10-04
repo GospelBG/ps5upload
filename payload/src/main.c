@@ -747,12 +747,12 @@ int main(void) {
 
     runtime_arm_shutdown_watchdog(&state, rc == 0 ? 0 : 1);
 
-    /* The AVA1 half: stop accepting, let sessions and in-flight Sony calls finish (bounded, inside
-     * the 8 s exit watchdog above), then stop the data layer so journals are closed and durable
-     * jobs resume on the next start. */
+    /* The AVA1 half: stop accepting, wait for the sessions (2 s) and for any in-flight Sony call
+     * (this does NOT return while one runs: only the 8 s exit watchdog armed above can end the
+     * process then), then stop the data layer so journals are closed and durable jobs resume. */
     {
         int sr = ava1_payload_stop(2000, 3000);
-        if (sr) fprintf(stderr, "ava1: stop incomplete (0x%x); the exit watchdog ends the process\n", sr);
+        if (sr) fprintf(stderr, "ava1: stop was slow (0x%x): sessions or a Sony call outlived the soft wait\n", sr);
     }
 
     /* Ask the mgmt thread to exit by closing its listener. accept()

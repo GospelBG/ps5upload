@@ -25,17 +25,22 @@ int ava1_payload_stop(int conn_wait_ms, int sony_wait_ms) {
     while (ava1_server_conns() > 0 && mono_ms() < end) usleep(10000);
     if (ava1_server_conns() > 0) rc |= AVA1_STOP_CONNS_LEFT;
 
-    /* No new call can start now; taking the lock proves the last one returned. */
+    /* No new SESSION can start a call now (accept is closed and the sessions were told to end), but
+     * the legacy ports stay open until main.c closes them after this returns, so this check is a
+     * point in time, not a barrier. Taking the lock proves the last Sony call returned.
+     *
+     * A call that outlives `sony_wait_ms` is reported (AVA1_STOP_SONY_BUSY) but NOT abandoned: the
+     * caller must not return, and the process must not exit, while a worker is inside a Sony call
+     * (a cut call can wedge the console). So keep polling until the lock frees. The only other way
+     * out is the exit watchdog main.c armed (runtime_arm_shutdown_watchdog, 8 s), which ends the
+     * process itself. */
     end = mono_ms() + sony_wait_ms;
     for (;;) {
         if (pthread_mutex_trylock(&sony_api_lock) == 0) {
             pthread_mutex_unlock(&sony_api_lock);
             break;
         }
-        if (mono_ms() >= end) {
-            rc |= AVA1_STOP_SONY_BUSY;
-            break;
-        }
+        if (mono_ms() >= end) rc |= AVA1_STOP_SONY_BUSY;
         usleep(10000);
     }
 

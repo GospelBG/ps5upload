@@ -1813,3 +1813,17 @@ pub mod t7 {
         unsafe { ffi::ava1_test_t7_reset_peak() }
     }
 }
+
+/// Holds the Sony API lock on another thread for `ms`, as a worker inside a Sony call does. Returns once
+/// the lock is held; join the handle to know it was released.
+pub fn sony_hold(ms: u64) -> std::thread::JoinHandle<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || {
+        unsafe { ffi::ava1_test_sony_lock() };
+        tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        unsafe { ffi::ava1_test_sony_unlock() };
+    });
+    rx.recv().unwrap();
+    h
+}

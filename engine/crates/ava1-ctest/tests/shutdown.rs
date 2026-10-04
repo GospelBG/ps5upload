@@ -140,7 +140,7 @@ async fn a_running_copy_resumes_after_the_payload_stop_sequence() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_stop_waits_for_a_sony_call_but_only_a_bounded_time() {
+async fn the_stop_does_not_return_while_a_sony_call_is_running() {
     let d = dir("t8-stop-sony");
     let mut srv = CServer::start_data(
         SECRET,
@@ -151,23 +151,25 @@ async fn the_stop_waits_for_a_sony_call_but_only_a_bounded_time() {
         2000,
         0,
     );
-    srv.sony_lock(true);
+    // A worker inside a Sony call for 4 s; the soft wait is only 500 ms.
     let t0 = Instant::now();
-    let rc = srv.payload_stop(500, 400);
+    let holder = ava1_ctest::sony_hold(4000);
+    let rc = srv.payload_stop(500, 500);
     let took = t0.elapsed();
-    srv.sony_lock(false);
+    holder.join().unwrap();
+    assert!(
+        took >= Duration::from_millis(3900),
+        "returned while the Sony call still held the lock: {took:?}"
+    );
     assert_eq!(
         rc & STOP_SONY_BUSY,
         STOP_SONY_BUSY,
-        "a Sony call still running is reported"
+        "the slow call is reported"
     );
     assert_eq!(rc & STOP_CONNS_LEFT, 0);
-    assert!(
-        took >= Duration::from_millis(400),
-        "waited for the call: {took:?}"
-    );
-    assert!(took < Duration::from_secs(3), "but not forever: {took:?}");
-    // a second stop with the lock free is clean
+    // with the lock free the stop is prompt and clean
     srv.start_data_again();
-    assert_eq!(srv.payload_stop(500, 400), 0);
+    let t1 = Instant::now();
+    assert_eq!(srv.payload_stop(500, 500), 0);
+    assert!(t1.elapsed() < Duration::from_secs(2));
 }
