@@ -24,6 +24,7 @@
 #define AVA1_CRASH_STAGED_RENAMED 6 /* tests: die after the staging rename + sync, before Done */
 #define AVA1_CRASH_MID_REMAP 7      /* tests: die after a remap's outboard renames */
 #define AVA1_CRASH_AFTER_DATA 8     /* tests: die after the batch's data fsync, before any directory sync */
+#define AVA1_CRASH_MID_SWEEP 11     /* tests: die in a sweep, after its files and directories are synced, before JnlSweep */
 #define AVA1_CRASH_AFTER_SWEEP 10   /* tests: die after a JnlSweep is journaled, before its pack segment is deleted */
 #define AVA1_CRASH_MID_DIRS 9       /* tests: die once the first of a batch's directories is synced */
 
@@ -62,7 +63,7 @@ void ava1_apply_reset(ava1_job_t *j, uint32_t id, uint16_t reason);
 int ava1_apply_compact(ava1_job_t *j);
 /* Job thread only: waits until no work is queued or running, then makes what was applied
  * durable (one sync batch) and drops what could not be, so the manifest can change. */
-void ava1_apply_quiesce(ava1_job_t *j);
+int ava1_apply_quiesce(ava1_job_t *j); /* 0, or an errno when the unswept files could not be made durable */
 /* Queues the commit of every large file whose ranges and root are all durable onto the
  * workers and returns at once (a commit is four fsyncs; it must not stop the job thread). */
 void ava1_apply_commit_ready(ava1_job_t *j);
@@ -95,6 +96,7 @@ void ava1_apply_finish_landed(ava1_job_t *j);
 #define AVA1_HOOK_BATCH_DIR_SYNCED 7 /* one directory that gained an entry, fsynced */
 #define AVA1_HOOK_BATCH_JOURNALED 8 /* the batch appended to the journal */
 #define AVA1_HOOK_PREP_DIR_SYNCED 10 /* one directory prepare synced (job thread's wait, workers' sync) */
+#define AVA1_HOOK_SWEEP_FILE 12     /* a sweep is about to sync file `id`: ava1_apply_fault may fail it (tests) */
 #define AVA1_HOOK_SWEPT 11          /* a JnlSweep was appended (the files are durable in place) */
 #define AVA1_HOOK_PREALLOC 9        /* a part file is about to be preallocated (job mutex NOT held) */
 extern void (*ava1_apply_hook)(ava1_job_t *j, int point, uint32_t id);

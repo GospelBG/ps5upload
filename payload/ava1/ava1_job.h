@@ -126,6 +126,10 @@ struct ava1_job {
     uint64_t unswept_bytes;         /* pack bytes of files not yet swept (pending ones included) */
     uint32_t sweeps_inflight;       /* sweeps queued or running (a compaction waits for none) */
     int sweep_queued, settled;
+    uint32_t sweep_fail_n;          /* consecutive failed sweeps */
+    uint64_t sweep_retry_ms;        /* no sweep is queued before this (backoff) */
+    int sweep_err;                  /* sticky: the errno once failures pass SWEEP_FAIL_MAX; Status reports it */
+    char sweep_msg[96];
     uint32_t *lfl;
     uint32_t lfl_n, lfl_cap;
     int lfl_all;

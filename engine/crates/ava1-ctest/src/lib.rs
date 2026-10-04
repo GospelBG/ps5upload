@@ -350,12 +350,12 @@ pub mod ffi {
         pub fn ava1_test_apply_trace(on: c_int);
         pub fn ava1_test_apply_probe(out: *mut u64);
         pub fn ava1_test_apply_probe_prep(out: *mut u64);
-        pub fn ava1_test_apply_opts(
-            mode: u32,
-            pack_segment: u32,
-            unswept_max: u64,
-            sweep_age_ms: u32,
-        );
+        pub fn ava1_test_apply_opts2(v: *const u64);
+        pub fn ava1_test_sweep_fail(n: c_int);
+        pub fn ava1_test_apply_unswept_bytes() -> u64;
+        pub fn ava1_test_jobs_gc(jobs: *const c_char, age_s: i64, max_age_s: i64) -> c_int;
+        pub fn ava1_test_recv_restart_noopen() -> c_int;
+        pub fn ava1_test_reap_and_drop();
         pub fn ava1_test_apply_unswept() -> u32;
         pub fn ava1_test_apply_segments() -> u32;
         pub fn ava1_test_apply_hold_commit(on: c_int);
@@ -811,14 +811,7 @@ impl CServer {
         opts: LogOpts,
     ) -> Self {
         let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            ffi::ava1_test_apply_opts(
-                opts.mode,
-                opts.pack_segment,
-                opts.unswept_max,
-                opts.sweep_age_ms,
-            )
-        };
+        opts.apply();
         let a = DataArgs {
             secret,
             peers: CString::new(peers.to_str().unwrap()).unwrap(),
@@ -1451,6 +1444,14 @@ pub struct LogOpts {
     pub pack_segment: u32,
     pub unswept_max: u64,
     pub sweep_age_ms: u32,
+    /// The cap across all jobs (0 = the default).
+    pub unswept_total: u64,
+    /// How often housekeeping recovers job directories nobody holds (0 = the default, 10 s).
+    pub recover_every_ms: u32,
+    /// Job directories one recovery pass takes (0 = the default).
+    pub recover_max: u32,
+    /// The first byte of the test job's id repeated (0 = 7).
+    pub job_byte: u8,
 }
 
 impl LogOpts {
@@ -1459,13 +1460,30 @@ impl LogOpts {
         pack_segment: 0,
         unswept_max: 0,
         sweep_age_ms: 0,
+        unswept_total: 0,
+        recover_every_ms: 0,
+        recover_max: 0,
+        job_byte: 0,
     };
     pub const OFF: LogOpts = LogOpts {
         mode: 2,
-        pack_segment: 0,
-        unswept_max: 0,
-        sweep_age_ms: 0,
+        ..LogOpts::ON
     };
+
+    /// Hands the options to the C shim (the next job begun or opened takes them).
+    pub fn apply(&self) {
+        let v = [
+            self.mode as u64,
+            self.pack_segment as u64,
+            self.unswept_max,
+            self.sweep_age_ms as u64,
+            self.unswept_total,
+            self.recover_every_ms as u64,
+            self.recover_max as u64,
+            self.job_byte as u64,
+        ];
+        unsafe { ffi::ava1_test_apply_opts2(v.as_ptr()) }
+    }
 }
 
 /// The payload's apply engine on a hand-built job (one at a time: it shares the C
@@ -1514,14 +1532,7 @@ impl CApplyJob {
         opts: LogOpts,
     ) -> Self {
         let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            ffi::ava1_test_apply_opts(
-                opts.mode,
-                opts.pack_segment,
-                opts.unswept_max,
-                opts.sweep_age_ms,
-            )
-        };
+        opts.apply();
         let dir = std::env::temp_dir().join(format!("ava1-blob-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         ava1::journal::write_manifest(&dir, m).unwrap();
@@ -1642,9 +1653,19 @@ impl CApplyJob {
         unsafe { ffi::ava1_test_apply_unswept() }
     }
 
+    /// Pack bytes of files not yet swept (pending ones included).
+    pub fn unswept_bytes(&self) -> u64 {
+        unsafe { ffi::ava1_test_apply_unswept_bytes() }
+    }
+
     /// Pack segment files currently on disk in the job directory.
     pub fn segments(&self) -> u32 {
         unsafe { ffi::ava1_test_apply_segments() }
+    }
+
+    /// The next `n` file syncs of a sweep fail with EIO (-1: until set to 0).
+    pub fn fail_sweeps(&self, n: i32) {
+        unsafe { ffi::ava1_test_sweep_fail(n) }
     }
 
     /// While on, every commit waits as it is verified (so commits stay in flight).
@@ -1796,14 +1817,7 @@ impl CRecv {
         opts: LogOpts,
     ) -> Self {
         let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            ffi::ava1_test_apply_opts(
-                opts.mode,
-                opts.pack_segment,
-                opts.unswept_max,
-                opts.sweep_age_ms,
-            )
-        };
+        opts.apply();
         let inner = CApplyJob::from_lock(lock); // from here on, Drop stops the data layer
         assert_eq!(
             recv_open_raw(jobs, root, flags, policy, 0, crash_at),
@@ -1836,6 +1850,18 @@ impl CRecv {
     /// The fast path: `Resume{manifest_hash}`.
     pub fn resume(&self, hash: [u8; 32]) {
         assert_eq!(unsafe { ffi::ava1_test_recv_resume(hash.as_ptr()) }, 0);
+    }
+
+    /// A helper restart with no JobOpen after it: only the start-time recovery runs.
+    pub fn restart_without_open(self) -> Self {
+        assert_eq!(unsafe { ffi::ava1_test_recv_restart_noopen() }, 0);
+        self
+    }
+
+    /// Housekeeping's reap as if an hour had passed, then the job is dropped: a settling job is
+    /// destroyed with its files unswept (its directory stays).
+    pub fn reap_and_drop(&self) {
+        unsafe { ffi::ava1_test_reap_and_drop() }
     }
 
     /// Simulates a payload restart; the returned value replaces `self`.
@@ -2078,4 +2104,12 @@ pub fn sony_hold(ms: u64) -> std::thread::JoinHandle<()> {
     });
     rx.recv().unwrap();
     h
+}
+
+/// `ava1_jobs_gc` over `jobs` as if `age_s` seconds had passed and the limit were `max_age_s`: how
+/// many job directories it removed.
+pub fn jobs_gc(jobs: &Path, age_s: i64, max_age_s: i64) -> i32 {
+    let _lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+    let j = CString::new(jobs.to_str().unwrap()).unwrap();
+    unsafe { ffi::ava1_test_jobs_gc(j.as_ptr(), age_s, max_age_s) }
 }

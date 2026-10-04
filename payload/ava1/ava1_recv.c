@@ -328,14 +328,20 @@ static int load_from_disk(ava1_job_t *j) {
     return 0;
 }
 
-/* Every job directory under `jobs_dir` whose journal leaves unswept files: recovered at helper start, so a
- * power cut inside the sweep's lag is repaired before any session can ask. Each is loaded into a throwaway
- * job exactly as a JobOpen would (load_from_disk runs the recovery) and freed again. */
-void ava1_recv_recover_all(const char *jobs_dir) {
-    DIR *dp = opendir(jobs_dir);
+/* One recovery pass (SPEC.md §15.7): up to `max` job directories under `jobs_dir` that hold a pack log and
+ * nobody has open. Each is loaded into a throwaway job exactly as a JobOpen would load it (load_from_disk
+ * runs the recovery) and freed again; a directory whose job is listed (create refuses its id) is skipped.
+ * Bounded so a start never replays a whole disk of journals: housekeeping takes the rest. Returns how many
+ * it took. */
+uint32_t ava1_recv_recover_pass(const char *jobs_dir, uint32_t max) {
+    static pthread_mutex_t pass_mu = PTHREAD_MUTEX_INITIALIZER;
+    DIR *dp;
     struct dirent *de;
     static const uint8_t zero_owner[32];
-    while (dp && (de = readdir(dp)) != NULL) {
+    uint32_t took = 0;
+    if (pthread_mutex_trylock(&pass_mu) != 0) return 0; /* another pass is running */
+    dp = opendir(jobs_dir);
+    while (dp && took < max && (de = readdir(dp)) != NULL) {
         uint8_t id[16], buf[AVA1_MAX_PATH + 256];
         char dir[sizeof ((ava1_job_t *)0)->dir];
         ava1_jnl_open_t o;
@@ -349,6 +355,7 @@ void ava1_recv_recover_all(const char *jobs_dir) {
         }
         if (i != 16) continue;
         ava1_job_dir(jobs_dir, id, dir, sizeof dir);
+        if (!ava1_dir_has_pack(dir)) continue;
         if (ava1_jnl_peek_open(dir, buf, sizeof buf, &o) != 0 || o.kind != AVA1_JOB_UPLOAD || o.root_len >= AVA1_MAX_PATH)
             continue;
         if (!(j = ava1_job_create(id, zero_owner))) continue;
@@ -360,8 +367,11 @@ void ava1_recv_recover_all(const char *jobs_dir) {
         (void)load_from_disk(j); /* recovers; a job that is not ours or has nothing unswept changes nothing */
         ava1_job_free_one(j->id);
         ava1_job_put(j);
+        took++;
     }
     if (dp) closedir(dp);
+    pthread_mutex_unlock(&pass_mu);
+    return took;
 }
 
 /* ---- messages ---------------------------------------------------------------------- */
@@ -1246,7 +1256,19 @@ static void recv_events(ava1_job_t *j) {
         ava1_mstore_free(&in); /* the same manifest: the replayed state stands */
     } else {
         int stopped;
-        ava1_apply_quiesce(j); /* frames of an earlier session name the old ids */
+        /* frames of an earlier session name the old ids; and files not yet durable in place must settle first,
+         * or the sweep queue would name other files once the ids move (SPEC.md §15.7) */
+        if (ava1_apply_quiesce(j) != 0) {
+            pthread_mutex_lock(&j->mu);
+            stopped = j->stopping;
+            pthread_mutex_unlock(&j->mu);
+            ava1_mstore_free(&in);
+            if (stopped) return; /* a stop or a test crash point */
+            snprintf(msg, sizeof msg, "files are still being made durable on the console; try again");
+            emit_map(j, AVA1_ERR_IO, msg);
+            ava1_apply_fail(j, AVA1_ERR_IO, msg, 0, 0);
+            return;
+        }
         st = adopt(j, &in, hash, msg, sizeof msg);
         ava1_mstore_free(&in);
         pthread_mutex_lock(&j->mu);

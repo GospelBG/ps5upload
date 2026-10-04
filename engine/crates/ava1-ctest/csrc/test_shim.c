@@ -1268,7 +1268,7 @@ static size_t g_ev_len;
 static int g_ev_done; /* the recorder has seen JOB_DONE */
 static int g_same_device = 1;
 static ava1_job_t *g_job;
-static const uint8_t TEST_JOB[16] = { 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 };
+static uint8_t TEST_JOB[16] = { 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 };
 static const uint8_t TEST_OWNER[32] = { 1 };
 static int g_trace;           /* record hook points as events */
 static uint8_t *g_dup;        /* a chunk to apply again at its file's commit */
@@ -1328,19 +1328,27 @@ static void *pre_watcher(void *arg) {
 
 /* Durable-by-log options for the next job (ava1_test_apply_opts); 0 = default: off, or on when the
  * environment sets AVA1_TEST_LOG_SMALL (the suite is run both ways). The sweep age defaults to 100 ms. */
-static uint32_t g_opt_mode, g_opt_seg, g_opt_age;
-static uint64_t g_opt_max;
-void ava1_test_apply_opts(uint32_t mode, uint32_t pack_segment, uint64_t unswept_max, uint32_t sweep_age_ms) {
-    g_opt_mode = mode;
-    g_opt_seg = pack_segment;
-    g_opt_max = unswept_max;
-    g_opt_age = sweep_age_ms;
+static uint32_t g_opt_mode, g_opt_seg, g_opt_age, g_opt_every, g_opt_rmax;
+static uint64_t g_opt_max, g_opt_total;
+/* v = mode, pack_segment, unswept_max, sweep_age_ms, unswept_total, recover_every_ms, recover_max, job id byte (0 = 7) */
+void ava1_test_apply_opts2(const uint64_t v[8]) {
+    g_opt_mode = (uint32_t)v[0];
+    g_opt_seg = (uint32_t)v[1];
+    g_opt_max = v[2];
+    g_opt_age = (uint32_t)v[3];
+    g_opt_total = v[4];
+    g_opt_every = (uint32_t)v[5];
+    g_opt_rmax = (uint32_t)v[6];
+    memset(TEST_JOB, v[7] ? (int)v[7] : 7, 16);
 }
 static void apply_opts(ava1_data_cfg_t *cfg) {
     cfg->log_small = (uint8_t)(g_opt_mode ? g_opt_mode : (getenv("AVA1_TEST_LOG_SMALL") ? AVA1_LOG_SMALL_ON : AVA1_LOG_SMALL_OFF));
     cfg->pack_segment = g_opt_seg;
     cfg->unswept_max = g_opt_max;
     cfg->sweep_age_ms = g_opt_age ? g_opt_age : 100;
+    cfg->unswept_total = g_opt_total;
+    cfg->recover_every_ms = g_opt_every;
+    cfg->recover_max = g_opt_rmax;
 }
 static int g_hold_commit;                           /* commits wait at COMMIT_VERIFIED while set */
 static uint32_t g_prealloc_fault = UINT32_MAX - 1;  /* a file whose preallocation answers ENOSPC */
@@ -1451,6 +1459,18 @@ void ava1_test_apply_probe_prep(uint64_t out[3]) {
 /* Each directory sync the apply engine reports (hooks 7 and 10) then takes `ms` more. */
 void ava1_test_apply_hook_sleep(uint32_t ms) { __atomic_store_n(&g_hook_sleep_ms, ms, __ATOMIC_SEQ_CST); }
 
+uint64_t ava1_test_apply_unswept_bytes(void) {
+    uint64_t n;
+    if (!g_job) return 0;
+    pthread_mutex_lock(&g_job->mu);
+    n = g_job->unswept_bytes;
+    pthread_mutex_unlock(&g_job->mu);
+    return n;
+}
+/* ava1_jobs_gc over `jobs_dir` as if `age_s` seconds had passed and the limit were `max_age_s`. */
+int ava1_test_jobs_gc(const char *jobs_dir, int64_t age_s, int64_t max_age_s) {
+    return ava1_jobs_gc(jobs_dir, (int64_t)time(NULL) + age_s, max_age_s);
+}
 uint32_t ava1_test_apply_unswept(void) {
     uint32_t n;
     if (!g_job) return 0;
@@ -1486,8 +1506,18 @@ uint32_t ava1_test_apply_commits_inflight(void) {
 void ava1_test_apply_trace(int on) { __atomic_store_n(&g_trace, on, __ATOMIC_SEQ_CST); }
 
 static uint32_t g_fault_id = UINT32_MAX - 1; /* no file: no fault */
+static int g_sweep_fail_n; /* sweeps' file syncs fail with EIO this many times (-1: until cleared) */
+void ava1_test_sweep_fail(int n) { __atomic_store_n(&g_sweep_fail_n, n, __ATOMIC_SEQ_CST); }
 static int t_fault(ava1_job_t *j, int point, uint32_t id) {
     (void)j;
+    if (point == AVA1_HOOK_SWEEP_FILE) {
+        int n = __atomic_load_n(&g_sweep_fail_n, __ATOMIC_SEQ_CST);
+        while (n != 0) {
+            if (n < 0) return EIO;
+            if (__atomic_compare_exchange_n(&g_sweep_fail_n, &n, n - 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return EIO;
+        }
+        return 0;
+    }
     if (point == AVA1_HOOK_PREALLOC && id == __atomic_load_n(&g_prealloc_fault, __ATOMIC_SEQ_CST)) return ENOSPC;
     return point == AVA1_HOOK_DIR_SYNCED && id == __atomic_load_n(&g_fault_id, __ATOMIC_SEQ_CST) ? EIO : 0;
 }
@@ -1591,6 +1621,15 @@ static void rec_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *
         else
             snprintf(line, sizeof line, "%sdone %u\n", d.has_settling && d.settling ? "settling\n" : "", d.status);
         ev_add(line, 1);
+    } else if (type == AVA1_TYPE_STATUS) {
+        ava1_status_t st;
+        static uint16_t last_code;
+        if (ava1_status_decode(body, len, &st) != 0) return;
+        if (st.has_code && st.code && st.code != last_code) { /* a receiver-side failure the sender must see */
+            snprintf(line, sizeof line, "status code=%u unswept=%u\n", st.code, st.has_unswept ? st.unswept : 0);
+            ev_add(line, 0);
+        }
+        last_code = st.has_code ? st.code : 0;
     } else if (type == AVA1_TYPE_JOB_MAP) {
         ava1_job_map_t m;
         ava1_r_t it;
@@ -1799,7 +1838,11 @@ size_t ava1_test_apply_events(char *out, size_t cap) {
 }
 
 void ava1_test_apply_end(void) {
-    ava1_test_apply_opts(0, 0, 0, 0);
+    {
+        static const uint64_t none[8] = { 0 };
+        ava1_test_apply_opts2(none);
+    }
+    __atomic_store_n(&g_sweep_fail_n, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_hold_commit, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_prealloc_fault, UINT32_MAX - 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_hook_sleep_ms, 0, __ATOMIC_SEQ_CST);
@@ -1889,6 +1932,24 @@ int ava1_test_recv_open(const char *jobs_dir, const char *root, uint32_t flags, 
 uint8_t ava1_test_recv_staged(void) { return g_ack.staged; }
 
 /* A payload restart: every job and thread gone, the disk kept. */
+/* A helper restart where no JobOpen follows: only the start-time recovery runs. 0, or the start's error. */
+int ava1_test_recv_restart_noopen(void) {
+    if (g_job) ava1_job_put(g_job);
+    g_job = NULL;
+    ava1_data_stop();
+    g_cfg.crash_at = 0;
+    ev_reset();
+    return ava1_data_start(&g_cfg);
+}
+
+/* The housekeeping reap as if an hour had passed, then the shim's own reference too: a settling job is
+ * destroyed with its files unswept (the directory stays for recovery). */
+void ava1_test_reap_and_drop(void) {
+    ava1_job_reap(ava1_mono_ms() + 3600u * 1000u);
+    if (g_job) ava1_job_put(g_job);
+    g_job = NULL;
+}
+
 int ava1_test_recv_restart(int crash_at) {
     if (g_job) ava1_job_put(g_job);
     g_job = NULL;

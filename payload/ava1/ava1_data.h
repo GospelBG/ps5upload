@@ -35,17 +35,26 @@ typedef struct {
     uint32_t pack_segment;                /* bytes per pack segment; 0 = 64 MiB */
     uint64_t unswept_max;                 /* pack bytes whose files are not yet durable in place; 0 = 256 MiB */
     uint32_t sweep_age_ms;                /* a batch's files are swept after this; 0 = 3000 (tests set 1) */
+    uint64_t unswept_total;               /* the same cap across all jobs; 0 = 512 MiB */
+    uint32_t recover_every_ms;            /* housekeeping recovers parked/crashed job dirs this often; 0 = 10000 */
+    uint32_t recover_max;                 /* job directories one recovery pass takes; 0 = 4 */
 } ava1_data_cfg_t;
 #define AVA1_LOG_SMALL_ON 1
 #define AVA1_LOG_SMALL_OFF 2
 #define AVA1_PACK_SEGMENT (64u << 20)
 #define AVA1_UNSWEPT_MAX (256ull << 20)
+#define AVA1_UNSWEPT_TOTAL (512ull << 20)
 #define AVA1_SWEEP_AGE_MS 3000u
 /* 1 when small files go through the pack log (the data layer's effective setting). */
 int ava1_data_log_small(void);
-/* Crash recovery of durable-by-log, one pass over the jobs directory (SPEC.md §15.7): every job
- * whose journal leaves unswept files has them re-materialised and swept. Run at start. */
-void ava1_recv_recover_all(const char *jobs_dir);
+/* Crash recovery of durable-by-log (SPEC.md §15.7): one pass over the jobs directory takes up to `max`
+ * job directories that hold a pack log and nobody has open, re-makes their unswept files from the log and
+ * sweeps them. Run at start and then by housekeeping, so a job that was reaped or crashed is finished
+ * without a JobOpen. Returns how many it took. */
+uint32_t ava1_recv_recover_pass(const char *jobs_dir, uint32_t max);
+/* Pack bytes of files not yet swept, all jobs together (the cross-job cap's counter). */
+void ava1_unswept_add(int64_t delta);
+uint64_t ava1_unswept_total(void);
 
 int ava1_data_start(const ava1_data_cfg_t *cfg);  /* starts housekeeping; 0 or -errno */
 void ava1_data_stop(void);                         /* stops and frees every job */

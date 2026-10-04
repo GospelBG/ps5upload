@@ -371,6 +371,17 @@ static int rm_tree(const char *p) {
     return rmdir(p) == 0 ? 0 : -errno;
 }
 
+/* True when the job directory holds a pack log (a file named pack.<n>): the only copy of files not yet durable in
+ * place, so recovery must reach it before anything deletes it. */
+int ava1_dir_has_pack(const char *dir) {
+    DIR *dp = opendir(dir);
+    struct dirent *de;
+    int has = 0;
+    while (dp && !has && (de = readdir(dp)) != NULL) has = strncmp(de->d_name, "pack.", 5) == 0;
+    if (dp) closedir(dp);
+    return has;
+}
+
 int ava1_jobs_gc(const char *jobs_dir, int64_t now_unix, int64_t max_age_s) {
     DIR *d = opendir(jobs_dir);
     struct dirent *e;
@@ -386,7 +397,9 @@ int ava1_jobs_gc(const char *jobs_dir, int64_t now_unix, int64_t max_age_s) {
         last = (int64_t)st.st_mtime;
         snprintf(jp, sizeof jp, "%s/journal", p);
         if (stat(jp, &js) == 0 && (int64_t)js.st_mtime > last) last = (int64_t)js.st_mtime;
-        if (now_unix - last > max_age_s && rm_tree(p) == 0) n++;
+        /* A directory with a pack log holds the only copy of files not yet durable in place: never collected,
+         * however old (recovery finishes it, and its journal's Done then lets the pack go). */
+        if (now_unix - last > max_age_s && !ava1_dir_has_pack(p) && rm_tree(p) == 0) n++;
     }
     closedir(d);
     return n;

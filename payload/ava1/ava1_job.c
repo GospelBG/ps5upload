@@ -218,6 +218,7 @@ static void job_destroy(ava1_job_t *j) {
     ava1_pend_release(j->pend_n_fd);
     for (i = 0; i < j->npsegs; i++)
         if (j->psegs[i].fd >= 0) close(j->psegs[i].fd); /* the files stay: recovery sweeps them */
+    ava1_unswept_add(-(int64_t)j->unswept_bytes); /* the cross-job cap no longer counts what this job held */
     free(j->psegs);
     free(j->usw);
     free(j->pend_loc);
@@ -340,6 +341,8 @@ void ava1_job_reap(uint64_t now_ms) {
         /* Files still settling (durable-by-log) keep their job alive for the full park age: it owns the
          * sweep, and the engine polls its Status for `unswept`. */
         if (fin && __atomic_load_n(&j->unswept_n, __ATOMIC_RELAXED) && now_ms - j->parked_at_ms <= age) continue;
+        /* past the park age a settling job is destroyed anyway (a stuck one must not hold a table slot
+         * forever): its directory and log stay, and housekeeping's recovery pass finishes it. */
         /* The receiver marks finished before the copy role removes its source. A move
          * must remain listed throughout that delete phase, however long it takes. */
         if (j->kind == AVA1_JOB_COPY && __atomic_load_n(&j->copy_move, __ATOMIC_ACQUIRE) &&

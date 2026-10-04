@@ -351,7 +351,8 @@ done:
 
 void ava1_apply_status(ava1_job_t *j) {
     ava1_status_t st;
-    uint8_t b[128];
+    char sm[96];
+    uint8_t b[192];
     ava1_w_t w;
     uint8_t bn;
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
@@ -373,6 +374,14 @@ void ava1_apply_status(ava1_job_t *j) {
     if (j->unswept_n) {
         st.has_unswept = 1;
         st.unswept = j->unswept_n;
+    }
+    if (j->sweep_err) { /* files cannot be made durable: the sender must hear it (SPEC.md §15.7) */
+        st.has_code = 1;
+        st.code = AVA1_ERR_IO;
+        snprintf(sm, sizeof sm, "%s", j->sweep_msg);
+        st.has_current = 1;
+        st.current = (const uint8_t *)sm;
+        st.current_len = (uint16_t)strlen(sm);
     }
     pthread_mutex_unlock(&j->mu);
     ava1_w_init(&w, b, sizeof b);
@@ -879,7 +888,11 @@ static void pack_unref_locked(ava1_job_t *j, uint32_t seg, uint32_t len) {
     if (seg >= j->npsegs) return;
     p = &j->psegs[seg];
     if (p->nusw) p->nusw--;
-    j->unswept_bytes = j->unswept_bytes >= len ? j->unswept_bytes - len : 0;
+    {
+        uint64_t sub = j->unswept_bytes >= len ? len : j->unswept_bytes;
+        j->unswept_bytes -= sub;
+        ava1_unswept_add(-(int64_t)sub);
+    }
     if (p->closed && !p->nusw && !p->removed) {
         char path[PATH_CAP];
         if (p->fd >= 0) close(p->fd);
@@ -893,10 +906,11 @@ static void pack_unref_locked(ava1_job_t *j, uint32_t seg, uint32_t len) {
 /* Makes room for segment numbers below `n` (all closed and removed until a caller fills one).
  * Caller holds j->mu. 0, or -1 when out of memory. */
 static int psegs_reserve_locked(ava1_job_t *j, uint32_t n) {
+    if (n > (1u << 20)) return -1; /* a million segments of 64 MiB: not a log, a corrupt number */
     if (n > j->psegs_cap) {
         uint32_t c = j->psegs_cap ? j->psegs_cap : 8;
         ava1_pseg_t *q;
-        while (c < n) c *= 2;
+        while (c < n) c *= 2; /* n <= 2^20: this ends, and c stays far below 2^31 */
         if (!(q = realloc(j->psegs, (size_t)c * sizeof *q))) return -1;
         j->psegs = q;
         j->psegs_cap = c;
@@ -974,6 +988,7 @@ static int pack_append(ava1_job_t *j, const ava1_bundle_record_t *r, ava1_ploc_t
     j->psegs[seg].tail += n;
     j->psegs[seg].nusw++;
     j->unswept_bytes += n;
+    ava1_unswept_add((int64_t)n);
     pthread_mutex_unlock(&j->mu);
     if ((rc = pwrite_all(fd, rec, n, off)) != 0) {
         pthread_mutex_lock(&j->mu);
@@ -1093,7 +1108,9 @@ static int apply_record_logged(ava1_job_t *j, const ava1_bundle_record_t *r, con
         stop = j->stopping || j->finished || j->final_status;
         pthread_mutex_unlock(&j->mu);
         if (stop) return 0;
-        if (b + r->data_len + 128u <= cfg->unswept_max) break;
+        if (b + r->data_len + 128u <= cfg->unswept_max &&
+            ava1_unswept_total() + r->data_len + 128u <= cfg->unswept_total)
+            break;
         if (sweep_step(j, 1) <= 0) pend_gate_idle(j);
     }
     if ((rc = pack_append(j, r, &loc)) != 0) return rc;
@@ -1549,6 +1566,7 @@ static int sweep_one(ava1_job_t *j, const ava1_usw_t *u) {
     int fd, rc, retried = 0, again;
     ava1_apply_path(j, u->id, 0, path, sizeof path);
     if (!path[0]) return ENAMETOOLONG;
+    if (ava1_apply_fault && (rc = ava1_apply_fault(j, AVA1_HOOK_SWEEP_FILE, u->id)) != 0) return rc; /* tests */
     for (again = 0; again < 2; again++) {
         fd = open(path, O_RDONLY | O_NOFOLLOW);
         if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != e->size || again) {
@@ -1571,6 +1589,31 @@ static int sweep_one(ava1_job_t *j, const ava1_usw_t *u) {
     }
     return 0;
 }
+
+/* Puts files a failed sweep took back at the front of the queue, so they are tried again (caller holds
+ * j->mu). Grows the queue if the room in front of its head is gone. */
+static void usw_push_front_locked(ava1_job_t *j, const ava1_usw_t *take, uint32_t k) {
+    if (j->usw_head >= k) {
+        j->usw_head -= k;
+        memcpy(j->usw + j->usw_head, take, (size_t)k * sizeof *take);
+        j->usw_n += k;
+        return;
+    }
+    if ((size_t)j->usw_n + k > j->usw_cap) {
+        uint32_t c = j->usw_cap ? j->usw_cap : 256;
+        ava1_usw_t *q;
+        while (c < j->usw_n + k) c *= 2;
+        if (!(q = realloc(j->usw, (size_t)c * sizeof *q))) return; /* cannot track them: the log still holds them */
+        j->usw = q;
+        j->usw_cap = c;
+    }
+    memmove(j->usw + k, j->usw + j->usw_head, (size_t)j->usw_n * sizeof *j->usw);
+    memcpy(j->usw, take, (size_t)k * sizeof *take);
+    j->usw_head = 0;
+    j->usw_n += k;
+}
+
+#define SWEEP_FAIL_MAX 5u /* consecutive failures before the error is sticky and a running job fails */
 
 /* One sweep: up to 64 files (all that are old enough; every one when `force`) made durable in place,
  * their parent directories synced, then the sweep journaled; only then do the files stop holding
@@ -1612,6 +1655,10 @@ static int sweep_step(ava1_job_t *j, int force) {
             if (!i || strcmp(d[i].dir, d[i - 1].dir) != 0) rc = sync_dir(d[i].dir);
     }
     for (i = 0; i < nd; i++) free(d[i].dir);
+    if (!rc && cfg->crash_at == AVA1_CRASH_MID_SWEEP) {
+        ava1_apply_crash(j);
+        rc = -1;
+    }
     if (!rc) { /* the sweep record: runs of the (sorted) ids */
         uint8_t fb[SWEEP_BATCH * 16u + 16u], body[SWEEP_BATCH * 16u + 64u];
         ava1_w_t fw, w;
@@ -1646,25 +1693,57 @@ static int sweep_step(ava1_job_t *j, int force) {
     if (!rc) {
         for (i = 0; i < k; i++) pack_unref_locked(j, take[i].seg, take[i].len);
         j->unswept_n -= k;
+        if (j->sweep_err) fprintf(stderr, "[ava1] job %02x%02x%02x%02x: sweeping works again\n", j->id[0], j->id[1], j->id[2], j->id[3]);
+        j->sweep_fail_n = 0;
+        j->sweep_err = 0;
+        j->sweep_msg[0] = 0;
+    } else if (!j->stopping) {
+        /* A failed sweep loses nothing: the files go back to the front of the queue and are tried again
+         * after a backoff. After SWEEP_FAIL_MAX in a row the error is sticky (Status reports it) and a job
+         * that is still running fails; an ended job keeps retrying. */
+        usw_push_front_locked(j, take, k);
+        j->sweep_fail_n++;
+        j->sweep_retry_ms = ava1_mono_ms() + (100u << (j->sweep_fail_n < 6 ? j->sweep_fail_n - 1 : 5));
+        if (j->sweep_fail_n >= SWEEP_FAIL_MAX && rc > 0) {
+            int first = !j->sweep_err;
+            j->sweep_err = rc;
+            snprintf(j->sweep_msg, sizeof j->sweep_msg, "making files durable on the console failed: %s", strerror(rc));
+            if (first)
+                fprintf(stderr, "[ava1] job %02x%02x%02x%02x: %s\n", j->id[0], j->id[1], j->id[2], j->id[3], j->sweep_msg);
+        }
     }
     j->sweeps_inflight--;
     pthread_cond_broadcast(&j->cv);
     pthread_mutex_unlock(&j->mu);
-    if (rc > 0) worker_fail(j, AVA1_ERR_IO, "making files durable failed", rc);
+    if (rc > 0 && j->sweep_fail_n >= SWEEP_FAIL_MAX && !j->finished) worker_fail(j, AVA1_ERR_IO, "making files durable failed", rc);
     return rc ? -(rc > 0 ? rc : EINTR) : (int)k;
 }
 
-/* Every logged file durable in place before this returns (0), or an errno. */
+/* Every logged file durable in place before this returns (0), or an errno; EINTR when the job is
+ * stopping (the caller must not fail or journal anything then). A failing sweep is tried again a few
+ * times, with a backoff, before it gives up. `unswept_n` is the truth: the queue can look empty while a
+ * failed sweep's files are still counted. */
 int ava1_pack_drain(ava1_job_t *j) {
+    uint32_t fails = 0;
     for (;;) {
-        uint32_t left;
+        uint32_t left, queued, inflight;
         int n = sweep_step(j, 1);
-        if (n < 0) return -n;
+        if (n < 0) {
+            if (n == -EINTR || is_stopping(j)) return EINTR;
+            if (++fails >= SWEEP_FAIL_MAX) return -n;
+            ava1_platform_sleep_ms(50u << (fails - 1));
+            continue;
+        }
         pthread_mutex_lock(&j->mu);
-        left = j->usw_n + j->sweeps_inflight;
+        left = j->unswept_n;
+        queued = j->usw_n;
+        inflight = j->sweeps_inflight;
         pthread_mutex_unlock(&j->mu);
         if (!left) return 0;
-        if (n == 0) ava1_platform_sleep_ms(2); /* another thread's sweep is finishing */
+        if (n == 0) {
+            if (!queued && !inflight) return EIO; /* counted files nobody holds: never say "settled" */
+            ava1_platform_sleep_ms(2); /* another thread's sweep is finishing */
+        }
     }
 }
 
@@ -1684,6 +1763,7 @@ static void pack_forget_all(ava1_job_t *j) {
         }
     }
     j->npsegs = 0;
+    ava1_unswept_add(-(int64_t)j->unswept_bytes);
     j->unswept_bytes = 0;
     pthread_mutex_unlock(&j->mu);
 }
@@ -1770,6 +1850,7 @@ int ava1_pack_recover(ava1_job_t *j, const ava1_bits_t *unswept, const ava1_pack
                         j->psegs[seg].nusw++;
                         j->unswept_n++;
                         j->unswept_bytes += u.len;
+                        ava1_unswept_add((int64_t)u.len);
                     } else {
                         rc = -1;
                     }
@@ -2679,15 +2760,17 @@ static void finish(ava1_job_t *j) {
     /* A console copy or move: a move deletes its source once the job ends (SPEC.md §15.5), and what was
      * copied must be durable in place by then, not only in the log. */
     if (j->kind == AVA1_JOB_COPY && (e = ava1_pack_drain(j)) != 0) {
-        ava1_apply_fail(j, AVA1_ERR_IO, "making the copied files durable failed", e, 1);
+        /* EINTR: the job is stopping. Nothing was decided: journaling a terminal failure now would make a
+         * resume see a failed job. */
+        if (e != EINTR) ava1_apply_fail(j, AVA1_ERR_IO, "making the copied files durable failed", e, 1);
         return;
     }
     if (j->staged && !(j->flags & AVA1_JF_SINGLE_FILE)) {
         /* The sweep addresses files by path and the rename below moves them: settle first (the one
          * place the tail of a staged upload waits; merges and single files settle behind JobDone). */
         if ((e = ava1_pack_drain(j)) != 0) {
-            ava1_apply_fail(j, AVA1_ERR_IO, "making the last files durable failed", e, 1);
-            return;
+            if (e != EINTR) ava1_apply_fail(j, AVA1_ERR_IO, "making the last files durable failed", e, 1);
+            return; /* EINTR: stopping, so no Done is journaled (the resume finishes the job) */
         }
         parent_of(j->root, parent, sizeof parent);
         /* A held root is our own empty lock folder (SPEC.md §11.6): the rename below
@@ -2734,9 +2817,9 @@ void ava1_apply_finish_landed(ava1_job_t *j) {
     else ava1_apply_fail(j, AVA1_STATUS_OK, "", 0, 1);
 }
 
-void ava1_apply_quiesce(ava1_job_t *j) {
+int ava1_apply_quiesce(ava1_job_t *j) {
     uint32_t i;
-    int pend, ok;
+    int pend, ok, rc = 0;
     pthread_mutex_lock(&j->mu);
     while ((j->q_len || j->busy) && !j->stopping) {
         /* A worker may be waiting in pend_add for room: make it, or nobody ever will. */
@@ -2759,7 +2842,8 @@ void ava1_apply_quiesce(ava1_job_t *j) {
     ok = j->prepared && !j->finished && !j->final_status && !j->stopping;
     pthread_mutex_unlock(&j->mu);
     if (pend && ok) sync_batch(j);
-    if (ok) (void)ava1_pack_drain(j); /* a changed manifest renumbers files: nothing may stay unswept */
+    /* a changed manifest renumbers files: nothing may stay unswept, or the queue would name other files */
+    if (ok) rc = ava1_pack_drain(j);
     /* Whatever could not be made durable is dropped: it is not in the map, so it is sent again. */
     pthread_mutex_lock(&j->mu);
     for (i = 0; i < j->pend_n; i++) {
@@ -2781,6 +2865,7 @@ void ava1_apply_quiesce(ava1_job_t *j) {
     }
     j->unsynced_bytes = 0;
     pthread_mutex_unlock(&j->mu);
+    return rc;
 }
 
 static int all_done(ava1_job_t *j) {
@@ -2832,7 +2917,7 @@ static void maybe_sweep(ava1_job_t *j, uint64_t now) {
     int want = 0, settle = 0;
     ava1_work_t *w;
     pthread_mutex_lock(&j->mu);
-    if (!j->stopping && j->usw_n && !j->sweep_queued &&
+    if (!j->stopping && j->usw_n && !j->sweep_queued && now >= j->sweep_retry_ms &&
         (j->finished || j->final_status || now - j->usw[j->usw_head].t_ms >= cfg->sweep_age_ms)) {
         j->sweep_queued = want = 1;
     }

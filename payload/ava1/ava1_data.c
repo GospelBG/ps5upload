@@ -103,11 +103,32 @@ int ava1_data_spawn(void *(*fn)(void *), void *arg) {
     return 0;
 }
 
+static uint64_t g_unswept_total;
+void ava1_unswept_add(int64_t delta) {
+    if (delta >= 0) {
+        __atomic_add_fetch(&g_unswept_total, (uint64_t)delta, __ATOMIC_RELAXED);
+    } else { /* never below zero, whatever the order the claims and releases land in */
+        uint64_t cur = __atomic_load_n(&g_unswept_total, __ATOMIC_RELAXED), sub = (uint64_t)(-delta), want;
+        do {
+            want = cur >= sub ? cur - sub : 0;
+        } while (!__atomic_compare_exchange_n(&g_unswept_total, &cur, want, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    }
+}
+uint64_t ava1_unswept_total(void) { return __atomic_load_n(&g_unswept_total, __ATOMIC_RELAXED); }
+
 static void *house_main(void *arg) {
+    uint64_t last_recover = ava1_mono_ms();
     (void)arg;
     while (D.running) {
-        ava1_job_reap(ava1_mono_ms());
-        ava1_platform_sleep_ms(1000);
+        uint64_t now = ava1_mono_ms();
+        ava1_job_reap(now);
+        /* A reaped settling job, or one a crash left, has its log recovered here: the only copy of its
+         * files must never wait for the next helper start. */
+        if (D.cfg.jobs_dir[0] && now - last_recover >= D.cfg.recover_every_ms) {
+            last_recover = now;
+            (void)ava1_recv_recover_pass(D.cfg.jobs_dir, D.cfg.recover_max);
+        }
+        ava1_platform_sleep_ms(100);
     }
     return NULL;
 }
@@ -269,6 +290,9 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     if (!D.cfg.pack_segment) D.cfg.pack_segment = AVA1_PACK_SEGMENT;
     if (!D.cfg.unswept_max) D.cfg.unswept_max = AVA1_UNSWEPT_MAX;
     if (!D.cfg.sweep_age_ms) D.cfg.sweep_age_ms = AVA1_SWEEP_AGE_MS;
+    if (!D.cfg.unswept_total) D.cfg.unswept_total = AVA1_UNSWEPT_TOTAL;
+    if (!D.cfg.recover_every_ms) D.cfg.recover_every_ms = 10000u;
+    if (!D.cfg.recover_max) D.cfg.recover_max = 4u;
     D.budget_free = D.cfg.budget;
     fd_limit_init();
     __atomic_store_n(&g_pend_open, 0, __ATOMIC_SEQ_CST);
@@ -285,7 +309,7 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     }
     /* A helper that died (or was stopped) with files not yet durable in place finishes them now,
      * before any session can ask: re-materialise from the pack log and sweep. */
-    if (D.cfg.jobs_dir[0]) ava1_recv_recover_all(D.cfg.jobs_dir);
+    if (D.cfg.jobs_dir[0]) (void)ava1_recv_recover_pass(D.cfg.jobs_dir, D.cfg.recover_max);
     return 0;
 }
 
@@ -954,6 +978,10 @@ static int encode_status(ava1_job_t *j, uint8_t *out, size_t cap, size_t *out_le
     if (j->unswept_n) {
         st.has_unswept = 1;
         st.unswept = j->unswept_n;
+    }
+    if (j->sweep_err) { /* the files cannot be made durable: the sender must hear it */
+        st.has_code = 1;
+        st.code = AVA1_ERR_IO;
     }
     st.has_state = 1;
     st.state = !j->finished || (j->kind == AVA1_JOB_COPY && j->copy_move && !j->copy_delete_done)

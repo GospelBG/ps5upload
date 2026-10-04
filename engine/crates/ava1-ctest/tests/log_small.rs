@@ -347,6 +347,7 @@ fn the_unswept_cap_makes_workers_sweep_and_never_loses_a_file() {
         pack_segment: 64 << 10,
         unswept_max: 128 << 10,
         sweep_age_ms: 600_000,
+        ..LogOpts::ON
     };
     let job = CApplyJob::begin_opts(&t.join("jobs"), &root, 0, &small(n, false), 0, 0, opts);
     let mut most = 0;

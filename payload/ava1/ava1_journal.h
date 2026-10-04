@@ -17,6 +17,9 @@
 #define AVA1_JNL_SWEEP 6 /* durable-by-log: files now durable in place (SPEC.md §15.7) */
 #define AVA1_JNL_COMPACT_AT (1u << 20)
 
+/* True when `dir` holds a pack log (a file named pack.<n>): durable-by-log's only copy of unswept files. */
+int ava1_dir_has_pack(const char *dir);
+
 /* fsync(fd), retried with backoff (20, 60, 200, 600 ms; 5 tries in all) while the error is
  * one a drive can recover from (ava1_fsync_transient). 0, or the errno of the last try.
  * `stopping` (may be NULL) is polled between tries and ends the wait early. *retried is set
