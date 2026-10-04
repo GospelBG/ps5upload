@@ -22,6 +22,7 @@
 #include "wake_watchdog.h"
 #include "fakelib_overlay.h"
 #include "ava1_glue.h"
+#include "takeover_flag.h"
 
 #include "proc_identity.h"
 /* Sony "debugger" / system-process authid. Setting our process's
@@ -88,6 +89,12 @@ void pop_notification(const char *message) {
  * from binding (and makes every incoming connection get RST'd).
  */
 static runtime_state_t *g_state = NULL;
+
+/* Called from the takeover flag poll thread when a newer instance asked us to exit. */
+static void on_takeover_flag(void) {
+    fprintf(stderr, "[payload2] a newer instance asked us to exit (takeover flag)\n");
+    if (g_state) runtime_request_shutdown(g_state, "takeover_flag");
+}
 
 /*
  * Return code from the kernel_set_ucred_authid() elevation in main().
@@ -648,6 +655,12 @@ int main(void) {
      * lifetime with negligible overhead (one sleep(5) per cycle). */
     start_wake_watchdog();
     startup_trace("WAKE_WATCHDOG_STARTED");
+    /* A newer instance that finds this one serving AVA1 asks it to exit through a flag file
+     * (takeover.c); poll it once a second. Failure only costs the graceful takeover: the new
+     * instance escalates to the reap. */
+    if (takeover_flag_poll_start(PS5UPLOAD2_RUNTIME_DIR, state.instance_id, 1000,
+                                 on_takeover_flag) != 0)
+        fprintf(stderr, "takeover flag poll did not start\n");
     (void)fakelib_overlay_start();
     startup_trace("FAKELIB_OVERLAY_STARTED");
 

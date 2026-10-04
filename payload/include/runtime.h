@@ -242,6 +242,9 @@ void runtime_reconcile_mounts(void);
  * never created (e.g. read-only /data, fresh PS5 startup). */
 void runtime_sweep_stale_pkg_temp(void);
 int runtime_try_takeover(runtime_state_t *state);
+
+/* Asks this instance to exit (node.shutdown, the old shutdown frame, the takeover flag file). */
+void runtime_request_shutdown(runtime_state_t *state, const char *why);
 int runtime_server_loop(runtime_state_t *state);
 /* Management listener: started from main.c via pthread_create *before*
  * runtime_server_loop begins. Binds :9114 and handles all non-transfer

@@ -226,3 +226,37 @@ The Phat's usb0 numbers are far below the Pro's for both protocols and its AVA1 
 third of FTX2's there; that is unexplained and is a reason to re-run the Phat before the release.
 FTX2 resume failed in every Phat run (the harness did not wait for the helper's ports after a
 restart; fixed in `a67ea278`, re-run pending on the Phat).
+
+## 5. Payload lifecycle and the migration shim (Task 8)
+
+Three starting situations, and who handles each:
+
+1. **Older helper (any release up to v5.41, old protocol on 9113/9114 only) running, new app.** The
+   engine's `legacy_helper` shim (`engine/crates/ps5upload-engine/src/legacy_helper.rs`) recognises
+   it (a `Hello` on 9114, then 9113), sends the old `Shutdown`, waits up to 10 s for both ports to
+   close, sends the stamped helper to :9021 (trust slot and launch token: no pairing code) and waits
+   up to 20 s for :9120. It never sends the new helper over a live old one.
+2. **New payload loaded while an older helper is alive** (an autoloader, another sender). The new
+   payload's `legacy_takeover.c` sends the old takeover request to loopback 9114 (9113 for a
+   single-port build) and waits up to 10 s for the ports to free. If the old instance is AVA1-era
+   (it still answers on 9120), `takeover.c` writes `/data/ps5upload/runtime/takeover` naming its own
+   instance id (instance ids start with the start time in seconds); the old instance polls that file
+   every second and exits when it names a LARGER id than its own. A flag naming the same or an older
+   id (a leftover from before a reboot) does nothing.
+3. **AVA1-era to AVA1-era.** `node.shutdown` (method 5) over the paired session
+   (`payload_lifecycle::shutdown_running_payload`, called by every ps5upload helper send), or the flag
+   file in 2. `node.shutdown` replies first and starts the exit 200 ms later.
+
+Engine routes (Task 20 consumes these; the tokens are stable):
+
+| route | answers |
+|---|---|
+| `GET /api/ps5/helper/state?host=` | `{"state": "ava1" \| "helper_old" \| "not_running"}` (TCP-level: the AVA1 port accepts connections, else the old protocol answers, else nothing) |
+| `POST /api/ps5/helper/replace {host}` | 200 `{"state": "ava1" \| "starting", "replaced": bool}`; 409 with `error` starting `legacy_helper_wedged` (the older helper did not exit within 10 s: show the console restart) or `helper_not_running`; 502 with the send failure. A console already on AVA1 answers `replaced:false` and is not touched. |
+
+State tokens: `helper_old`, `ava1`, `not_running`. Error token: `legacy_helper_wedged`. Restarts must not be
+looped: the console needs at least 60 s between helper restarts, and `replace` makes one attempt.
+
+Deleted in the release after the cutover: `payload/src/legacy_takeover.c` (+ `include/legacy_takeover.h`) and
+`engine/crates/ps5upload-engine/src/legacy_helper.rs` (+ its two routes). `payload/src/takeover_flag.c` and the
+flag-file path in `takeover.c` stay.
