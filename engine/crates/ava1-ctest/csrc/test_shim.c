@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "ava1_apply.h"
+#include "ava1_stop.h"
 #include "ava1_copy.h"
 #include "ava1_recv.h"
 #include "ava1_conn.h"
@@ -410,6 +411,16 @@ static int stack_probe(uint8_t *out, size_t cap, size_t *out_len) {
     return AVA1_STATUS_OK;
 }
 
+static void fire_payload_stop(void *arg) {
+    (void)arg;
+    (void)ava1_payload_stop(2000, 2000);
+}
+
+/* Off by default: only the Task 8 shutdown tests answer node.shutdown here (the shape of runtime.c's
+ * handle_node_shutdown); every other test reaches its installed management table. */
+static int g_intercept_shutdown;
+void ava1_test_intercept_shutdown(int on) { __atomic_store_n(&g_intercept_shutdown, on, __ATOMIC_SEQ_CST); }
+
 static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap,
                size_t *out_len) {
     ava1_node_info_t ni;
@@ -427,6 +438,11 @@ static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t 
     }
     if (method == 0x7703) { /* ava1_rpc_text into a 16-byte window: "%s" of the request body */
         return ava1_rpc_text(out, 16, out_len, "%.*s", (int)body_len, (const char *)body);
+    }
+    if (method == AVA1_METHOD_NODE_SHUTDOWN && __atomic_load_n(&g_intercept_shutdown, __ATOMIC_SEQ_CST)) {
+        if (ava1_shutdown_defer(300, fire_payload_stop, NULL) != 0) return AVA1_ERR_INTERNAL;
+        *out_len = 0; /* SPEC: node.shutdown answers an empty body (mgmt_call_empty) */
+        return AVA1_STATUS_OK;
     }
     if (method == 19) return stack_probe(out, cap, out_len); /* a 256 KiB-class method (the data plane's number) */
     if (method != AVA1_METHOD_NODE_INFO) return mgmt_rpc_dispatch(method, body, body_len, out, cap, out_len);
@@ -1955,6 +1971,11 @@ void ava1_test_server_stop_data(void) {
     ava1_server_stop();
     ava1_data_stop();
 }
+
+#include "sony_api_lock.h"
+int ava1_test_payload_stop(int conn_ms, int sony_ms) { return ava1_payload_stop(conn_ms, sony_ms); }
+void ava1_test_sony_lock(void) { pthread_mutex_lock(&sony_api_lock); }
+void ava1_test_sony_unlock(void) { pthread_mutex_unlock(&sony_api_lock); }
 
 /* UINT32_MAX keeps a value. */
 void ava1_test_data_delays(uint32_t open_ms, uint32_t map_ms) {

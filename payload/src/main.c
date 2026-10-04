@@ -22,6 +22,8 @@
 #include "wake_watchdog.h"
 #include "fakelib_overlay.h"
 #include "ava1_glue.h"
+#include "takeover_flag.h"
+#include "ava1_stop.h"
 
 #include "proc_identity.h"
 /* Sony "debugger" / system-process authid. Setting our process's
@@ -88,6 +90,12 @@ void pop_notification(const char *message) {
  * from binding (and makes every incoming connection get RST'd).
  */
 static runtime_state_t *g_state = NULL;
+
+/* Called from the takeover flag poll thread when a newer instance asked us to exit. */
+static void on_takeover_flag(void) {
+    fprintf(stderr, "[payload2] a newer instance asked us to exit (takeover flag)\n");
+    if (g_state) runtime_request_shutdown(g_state, "takeover_flag");
+}
 
 /*
  * Return code from the kernel_set_ucred_authid() elevation in main().
@@ -648,6 +656,13 @@ int main(void) {
      * lifetime with negligible overhead (one sleep(5) per cycle). */
     start_wake_watchdog();
     startup_trace("WAKE_WATCHDOG_STARTED");
+    /* A newer instance that finds this one serving AVA1 asks it to exit through a flag file
+     * (takeover.c); poll it once a second. Failure only costs the graceful takeover: the new
+     * instance escalates to the reap. */
+    if (state.takeover_nonce == 0) (void)takeover_nonce_new(&state.takeover_nonce);
+    if (takeover_flag_poll_start(PS5UPLOAD2_RUNTIME_DIR, state.takeover_nonce, 1000,
+                                 on_takeover_flag) != 0)
+        fprintf(stderr, "takeover flag poll did not start\n");
     (void)fakelib_overlay_start();
     startup_trace("FAKELIB_OVERLAY_STARTED");
 
@@ -731,6 +746,14 @@ int main(void) {
     fakelib_overlay_stop();
 
     runtime_arm_shutdown_watchdog(&state, rc == 0 ? 0 : 1);
+
+    /* The AVA1 half: stop accepting, wait for the sessions (2 s) and for any in-flight Sony call
+     * (this does NOT return while one runs: only the 8 s exit watchdog armed above can end the
+     * process then), then stop the data layer so journals are closed and durable jobs resume. */
+    {
+        int sr = ava1_payload_stop(2000, 3000);
+        if (sr) fprintf(stderr, "ava1: stop was slow (0x%x): sessions or a Sony call outlived the soft wait\n", sr);
+    }
 
     /* Ask the mgmt thread to exit by closing its listener. accept()
      * returns with EBADF, mgmt loop sees shutdown_requested and

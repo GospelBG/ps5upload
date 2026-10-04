@@ -267,3 +267,49 @@ at 2 s.
 Deferred: decrypt off the lane reader thread (03 section 2) waits for the matrix above; the
 `open_us_per_mib` receiver hint (03 section 5) is optional and also waits.
 
+## 5. Payload lifecycle and the migration shim (Task 8)
+
+Three starting situations, and who handles each:
+
+1. **Older helper (any release up to v5.41, old protocol on 9113/9114 only) running, new app.** The
+   engine's `legacy_helper` shim (`engine/crates/ps5upload-engine/src/legacy_helper.rs`) recognises
+   it by its old-protocol `Hello` reply: a build from before the cutover names no AVA1 port, a new
+   build does (`"ava1_port"`, `"ava1": "starting" | "up" | "failed"`). It sends the old `Shutdown`,
+   waits up to 10 s for both ports to close, sends the stamped helper to :9021 (trust slot and launch
+   token: no pairing code) and waits up to 20 s for :9120. It never sends the new helper over a live
+   old one.
+2. **New payload loaded while an older helper is alive** (an autoloader, another sender). The new
+   payload's `legacy_takeover.c` sends the old takeover request to loopback 9114 (9113 for a
+   single-port build) and waits up to 10 s for the ports to free. If the old instance is AVA1-era
+   (it still answers on 9120), `takeover.c` writes `/data/ps5upload/runtime/takeover` holding its
+   own random nonce (kern.arandom, never a time-based id: the app moves the clock with
+   `settimeofday`). The old instance polls the file every second and exits when it holds a nonce
+   other than its own that was not already there when the poll started. The clock is never read.
+   The flag is unlinked at startup and after a successful takeover, so a leftover after a crash or
+   reboot does nothing.
+3. **AVA1-era to AVA1-era.** `node.shutdown` (method 5) over the paired session
+   (`payload_lifecycle::shutdown_running_payload`, called by every ps5upload helper send), or the flag
+   file in 2.
+
+**The exit sequence** (node.shutdown, the flag, the old shutdown frame all reach it): the reply to
+`node.shutdown` is written first; 300 ms later a deferred thread sets `shutdown_requested` and wakes
+the accept loops; `main` then runs `ava1_payload_stop`: stop accepting, end the sessions (wait up to
+2 s), wait up to 3 s for an in-flight Sony call (`sony_api_lock` free), stop the data layer (jobs
+stopped, threads joined, journals closed so durable jobs resume). The 8 s exit watchdog bounds all of it.
+
+Engine routes (Task 20 consumes these; the tokens are stable):
+
+| route | answers |
+|---|---|
+| `GET /api/ps5/helper/state?host=` | `{"state": "ava1" \| "helper_old" \| "starting" \| "ava1_failed" \| "not_running"}` (`ava1`: the AVA1 port accepts connections; `helper_old`: only a pre-cutover helper answers the old protocol; `starting` / `ava1_failed`: a new build on the old ports whose AVA1 server is not up yet / did not start; `not_running`: nothing) |
+| `POST /api/ps5/helper/replace {host}` | 200 `{"state": "ava1" \| "starting", "replaced": bool}`; 409 with `error` starting `legacy_helper_wedged` (the older helper did not exit within 10 s: show the console restart), `replace_in_progress` (one is running for this console), `replace_cooldown` (less than 60 s since the last), `helper_starting`, `ava1_failed` (restart the console; replacing would send the same build), or `helper_not_running`; 502 with the send failure. A console already on AVA1 answers `replaced:false`. Only a `helper_old` console is ever replaced. |
+
+State tokens: `helper_old`, `ava1`, `starting`, `ava1_failed`, `not_running`. Error tokens:
+`legacy_helper_wedged`, `replace_in_progress`, `replace_cooldown`, `helper_starting`, `ava1_failed`,
+`helper_not_running`. The console needs at least 60 s between helper restarts; the route enforces it per
+host (a failed attempt counts), and `replace` makes one attempt.
+
+Deleted in the release after the cutover: `payload/src/legacy_takeover.c` (+ `include/legacy_takeover.h`),
+`engine/crates/ps5upload-engine/src/legacy_helper.rs`, `legacy_helper_tests.rs`, `legacy_guard.rs` (+ the
+two routes) and the Hello `ava1` fields' reader. `payload/src/takeover_flag.c`, `ava1_stop.c` and the
+flag-file path in `takeover.c` stay.

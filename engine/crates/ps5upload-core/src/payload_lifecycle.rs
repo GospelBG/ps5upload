@@ -14,9 +14,14 @@
 //! but nothing changed" report.
 //!
 //! The fix is desktop-side: BEFORE pushing fresh ELF bytes to :9021,
-//! send a Shutdown frame to the existing :9114. The payload's
-//! shutdown handler sets a flag the main loop honours; the old
-//! process exits, its ports go free, the new payload's bind succeeds.
+//! ask the running helper to exit with `node.shutdown` over the paired
+//! AVA1 session. The payload's shutdown handler sets a flag the main loop
+//! honours; the old process exits, its ports go free, the new payload's
+//! bind succeeds. A helper from before the cutover only speaks the old
+//! protocol: the management seam still reaches it until the old protocol
+//! is removed, and the engine's `legacy_helper` shim (replace route)
+//! handles it after that. A new payload that starts while an old one is
+//! alive takes over by itself (the payload's takeover, flag file).
 //!
 //! Best-effort by design — every error path returns Ok(false) because
 //! "no old payload running" is the common case (first session boot,
@@ -73,20 +78,14 @@ const ELF_SEND_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const ELF_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ELF_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Send a Shutdown frame to the payload running at `mgmt_addr`
-/// (typically `<ps5-ip>:9114`).
+/// Ask the helper running at `mgmt_addr` (typically `<ps5-ip>:9114`; only the host matters, the
+/// AVA1 session uses its own port) to exit: `node.shutdown` over the paired session.
 ///
-/// Returns Ok(true) iff a Shutdown_Ack was received — i.e. we hit a
-/// real ps5upload payload and it acknowledged. Ok(false) on any
-/// failure (nothing listening, wrong process answering, ACK timeout):
-/// the caller proceeds as if there were no payload to displace, which
-/// is the right behaviour for the "first-send-of-the-session" path.
-///
-/// IO timeout is tightened from Connection's default 30 s down to
-/// 2 s for both the frame send and the ACK read — the payload's
-/// shutdown handler is one mutex flip and a 2-byte response; if
-/// either takes longer than 2 s we'd rather give up and let the
-/// new payload's bind tell the user whatever is really wrong.
+/// Returns Ok(true) iff the helper acknowledged. Ok(false) on any failure (nothing listening, not
+/// paired, ACK timeout): the caller proceeds as if there were no payload to displace, which is the
+/// right behaviour for the "first-send-of-the-session" path. The 2 s deadline is the old one: the
+/// handler is a flag flip and a tiny reply; if it takes longer we would rather give up and let
+/// the new payload's own takeover (or the bind error) say what is really wrong.
 pub fn shutdown_running_payload(mgmt_addr: &str) -> std::io::Result<bool> {
     // `node.shutdown` through the management seam: over AVA1 for a console that advertises it,
     // FTX2 (the frame and its ack, checked) for an older helper. Any failure, a refusal for not
@@ -259,11 +258,9 @@ pub fn send_elf_to_loader(
 mod tests {
     use super::*;
 
-    /// We can't easily spin up a fake payload server in a unit test
-    /// (Connection wants raw FTX2 framing and we'd be re-implementing
-    /// the server side just to handshake). The interesting failure
-    /// mode for callers is "nothing listening on that addr" — assert
-    /// that surfaces as Ok(false), not Err.
+    /// The interesting failure mode for callers is "nothing listening on
+    /// that addr" — assert that surfaces as Ok(false), not Err. The
+    /// acknowledged path is covered with a scripted transport below.
     #[test]
     fn nothing_listening_returns_ok_false() {
         // 198.51.100.0/24 is RFC 5737 TEST-NET-2; nothing should answer.
@@ -272,6 +269,53 @@ mod tests {
             Ok(false) => {}
             other => panic!("expected Ok(false), got {other:?}"),
         }
+    }
+
+    struct Scripted {
+        ok: bool,
+        seen: std::sync::Mutex<Vec<(u16, Vec<u8>)>>,
+    }
+    impl crate::mgmt::MgmtTransport for Scripted {
+        fn call(
+            &self,
+            _addr: &str,
+            method: crate::mgmt::Method,
+            label: &str,
+            body: &[u8],
+            _timeout: Duration,
+        ) -> anyhow::Result<Option<Vec<u8>>> {
+            self.seen.lock().unwrap().push((method.id, body.to_vec()));
+            if self.ok {
+                Ok(Some(b"{}".to_vec()))
+            } else {
+                Err(crate::mgmt::MgmtError {
+                    label: label.to_string(),
+                    status: 3,
+                    cause: "unpaired".into(),
+                }
+                .into())
+            }
+        }
+    }
+
+    /// The shutdown goes out as `node.shutdown` (method 5, empty body) through the management
+    /// seam, so it rides the paired AVA1 session; a refusal is Ok(false).
+    #[test]
+    fn shutdown_is_node_shutdown_over_the_seam() {
+        let t = std::sync::Arc::new(Scripted {
+            ok: true,
+            seen: Default::default(),
+        });
+        let _g = crate::mgmt::scoped_transport(t.clone());
+        assert!(shutdown_running_payload("10.0.0.2:9114").unwrap());
+        assert_eq!(t.seen.lock().unwrap().as_slice(), &[(5u16, Vec::new())]);
+
+        let t = std::sync::Arc::new(Scripted {
+            ok: false,
+            seen: Default::default(),
+        });
+        let _g = crate::mgmt::scoped_transport(t);
+        assert!(!shutdown_running_payload("10.0.0.2:9114").unwrap());
     }
 
     /// A non-ELF blob must never reach the loader. The loader has no

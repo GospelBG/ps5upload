@@ -44,6 +44,8 @@ mod fpkg_remote;
 mod icon_cache;
 mod inspect;
 mod install;
+mod legacy_guard;
+mod legacy_helper;
 mod local_fs;
 mod log_dedup;
 mod pkg_install;
@@ -3049,6 +3051,87 @@ async fn ps5_elfldr_ensure(Json(q): Json<HostQuery>) -> impl IntoResponse {
     match r {
         Ok(Ok(outcome)) => (StatusCode::OK, Json(outcome)).into_response(),
         Ok(Err(e)) => json_err(StatusCode::BAD_GATEWAY, e).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+/// GET /api/ps5/helper/state?host= — `{"state": "ava1" | "helper_old" | "starting" | "ava1_failed" | "not_running"}`: whether the
+/// console runs an AVA1 helper, an older helper that only speaks the old protocol (the UI offers
+/// the one-click update), or nothing (the usual send-payload flow). A TCP-level answer: pairing is
+/// a session matter.
+async fn ps5_helper_state(Query(q): Query<HostQuery>) -> impl IntoResponse {
+    let host = q.host.trim().to_string();
+    let r = tokio::task::spawn_blocking(move || {
+        legacy_helper::state(&host, legacy_helper::Ports::default())
+    })
+    .await;
+    match r {
+        Ok(s) => (StatusCode::OK, Json(serde_json::json!({ "state": s }))).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+/// POST /api/ps5/helper/replace {host} — replaces an older helper: its shutdown request, a wait for
+/// :9113/:9114 to close, the stamped helper to :9021 (the trust slot and launch token mean no
+/// pairing code), a wait for :9120. Replies `{"state","replaced"}`. Errors carry a stable token at
+/// the start of `error`: `legacy_helper_wedged` (409: the old helper did not exit; offer the
+/// console restart), `helper_not_running` (409: nothing to replace). Anything else is a 502 with
+/// the send failure. A console that already runs AVA1 answers `replaced:false` and is not touched.
+async fn ps5_helper_replace(Json(q): Json<HostQuery>) -> impl IntoResponse {
+    let host = q.host.trim().to_string();
+    let r =
+        tokio::task::spawn_blocking(move || -> Result<serde_json::Value, (StatusCode, String)> {
+            let ports = legacy_helper::Ports::default();
+            match legacy_helper::state(&host, ports) {
+                legacy_helper::AVA1 => {
+                    Ok(serde_json::json!({ "state": "ava1", "replaced": false }))
+                }
+                legacy_helper::HELPER_OLD => {
+                    // One replace per console at a time, and 60 s between restarts.
+                    let _permit = legacy_guard::global()
+                        .begin(&host, std::time::Instant::now())
+                        .map_err(|t| (StatusCode::CONFLICT, legacy_guard::message(t)))?;
+                    let elf = bundled_payload::image_bytes(bundled_payload::Image::Payload)
+                        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+                    let stamped = ava1_api::stamped_helper(&elf);
+                    let h2 = host.clone();
+                    legacy_helper::replace(
+                        &host,
+                        ports,
+                        legacy_helper::WAIT_CLOSE,
+                        legacy_helper::WAIT_AVA1,
+                        // Companion: replace() already shut the old helper down; the sender's own
+                        // eviction would only repeat the request.
+                        move || {
+                            ps5upload_core::payload_lifecycle::send_elf_to_loader(
+                                &h2,
+                                ps5upload_core::payload_lifecycle::PS5_LOADER_PORT,
+                                &stamped,
+                                ps5upload_core::payload_lifecycle::LoaderImage::Companion,
+                            )
+                            .map(|_| ())
+                        },
+                    )
+                    .map(|r| {
+                        serde_json::json!({
+                            "state": if r.ava1_up { "ava1" } else { "starting" },
+                            "replaced": true,
+                        })
+                    })
+                    .map_err(|e| match e {
+                        legacy_helper::ReplaceError::Wedged => {
+                            (StatusCode::CONFLICT, e.to_string())
+                        }
+                        legacy_helper::ReplaceError::Send(m) => (StatusCode::BAD_GATEWAY, m),
+                    })
+                }
+                other => Err((StatusCode::CONFLICT, legacy_guard::not_replaceable(other))),
+            }
+        })
+        .await;
+    match r {
+        Ok(Ok(v)) => (StatusCode::OK, Json(v)).into_response(),
+        Ok(Err((code, msg))) => json_err(code, msg).into_response(),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }
@@ -9968,6 +10051,8 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         .route("/api/ps5/process/list", get(ps5_process_list))
         .route("/api/ps5/elfldr/health", get(ps5_elfldr_health))
         .route("/api/ps5/elfldr/ensure", post(ps5_elfldr_ensure))
+        .route("/api/ps5/helper/state", get(ps5_helper_state))
+        .route("/api/ps5/helper/replace", post(ps5_helper_replace))
         .route("/api/ps5/process/kill", post(ps5_process_kill))
         .route("/api/ps5/power/control", post(ps5_power_control))
         .route("/api/ps5/power/telemetry", get(ps5_power_telemetry))
