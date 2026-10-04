@@ -77,10 +77,7 @@ use ps5upload_core::{
     cleanup::{cleanup_path, CleanupResult},
     diagnostics::appdb_query,
     diagnostics::{klog_read, net_interfaces},
-    download::{
-        download_to_local_multistream_ex, enumerate_download_set, DownloadKind,
-        MAX_DOWNLOAD_STREAMS,
-    },
+    download::{enumerate_download_set, DownloadKind},
     focus::{focus_probe, FocusProbe},
     fs_ops::{
         app_launch, app_list_registered, app_register, app_unregister, backup_content_databases,
@@ -8309,6 +8306,10 @@ fn start_ava1_download(
         let _stop_guard = TickerStopGuard::new(stop_ticker);
         let mut fail_guard =
             JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
+        if fail_job_unless_console_ready(&jobs, &events_tx, job_id, started_at_ms, &addr) {
+            fail_guard.mark_succeeded();
+            return;
+        }
         let id = *job_id.as_bytes();
         let result = match &target {
             Ava1DownloadTarget::Folder(dir) => ps5upload_ava1::download::to_local(
@@ -8388,10 +8389,6 @@ async fn transfer_download_handler(
     State(state): State<AppState>,
     Json(req): Json<TransferDownloadReq>,
 ) -> impl IntoResponse {
-    // Default to the max parallel streams so folder dumps parallelise across
-    // files automatically (single-file pulls fall back to one stream inside
-    // download_to_local_multistream). Capture before req.addr is moved below.
-    let download_streams = req.streams.unwrap_or(MAX_DOWNLOAD_STREAMS);
     let req_unsafe = req.unsafe_read;
     let mgmt_addr = console_addr_or_default(req.addr, &state.default_ps5_addr);
     crate::log_info!(
@@ -8465,198 +8462,16 @@ async fn transfer_download_handler(
             return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
         }
     }
-    // AVA1 (Task 25): decided after every input check above and before the FTX2
-    // enumeration, which an AVA1 download never runs. The probe is a blocking session
-    // attempt (up to ~3 s), so it never runs on the reactor.
-    let probe_addr = mgmt_addr.clone();
-    if tokio::task::spawn_blocking(move || ps5upload_ava1::route::use_ava1(&probe_addr))
-        .await
-        .unwrap_or(false)
-    {
-        return start_ava1_download(
-            &state,
-            mgmt_addr,
-            req.src_path.clone(),
-            kind,
-            req_unsafe,
-            Ava1DownloadTarget::Folder(dest_dir),
-        );
-    }
-    // `dest_root` is the LOGICAL landing path (dest_dir/<basename>) reported
-    // back to the UI for display. It is NOT the write root: the download
-    // manifest's rel_paths already begin with `<basename>` (walk_remote_dir
-    // prefixes folder entries, and the single-file branch sets rel_path =
-    // basename), so files are written under `dest_dir` directly — joining
-    // basename again here as the write root double-nested everything as
-    // `dest_dir/foo/foo/...` (confirmed on hardware). See download_to_local
-    // call below, which now takes `dest_dir`.
-    let dest_root = dest_dir.join(basename);
-
-    let job_id = Uuid::new_v4();
-    let started_at_ms = now_ms();
-
-    // Enumerate first so we have an honest total_bytes from tick #1.
-    // Heavy enumeration only happens for huge folders (multi-thousand-
-    // file game dirs); for single files this is one parent list_dir
-    // call. Failing to enumerate at all is fatal — the user picked
-    // something we can't see — so surface as a Failed job rather
-    // than silently returning an empty manifest.
-    let src_path_clone = req.src_path.clone();
-    let mgmt_addr_for_enum = mgmt_addr.clone();
-    let plan = match tokio::task::spawn_blocking(move || {
-        enumerate_download_set(&mgmt_addr_for_enum, &src_path_clone, kind)
-    })
-    .await
-    {
-        Ok(Ok(m)) => m,
-        Ok(Err(e)) => return json_err(StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
-        Err(e) => {
-            return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
-        }
-    };
-    let manifest = plan.manifest;
-    let skipped_count = plan.skipped.len() as u64;
-    if skipped_count > 0 {
-        // Log skipped non-regular entries so users grepping engine.log
-        // can see exactly which symlinks/special files weren't pulled.
-        // Cap the log spam — millions of skips on a pathological tree
-        // shouldn't fill the log file.
-        let preview: Vec<_> = plan
-            .skipped
-            .iter()
-            .take(20)
-            .map(|s| format!("  {} ({})", s.remote_path, s.kind))
-            .collect();
-        crate::log_warn!(
-            "download: skipped {} non-regular entries (only regular files are pulled). First {}:\n{}{}",
-            skipped_count,
-            preview.len(),
-            preview.join("\n"),
-            if plan.skipped.len() > preview.len() {
-                format!("\n  … and {} more", plan.skipped.len() - preview.len())
-            } else {
-                String::new()
-            },
-        );
-    }
-    let total_bytes: u64 = manifest.iter().map(|e| e.size).sum();
-    let files: Vec<PlannedFile> = manifest
-        .iter()
-        .map(|e| PlannedFile {
-            rel_path: e.rel_path.clone(),
-            size: e.size,
-        })
-        .collect();
-    let files_count = files.len() as u64;
-
-    let progress = Arc::new(AtomicU64::new(0));
-    let progress_files = Arc::new(AtomicU64::new(0));
-    // P3 / v2.18.0 — apply-phase counters. The engine's
-    // send_commit_and_expect_ack reads APPLY_PROGRESS frames from
-    // the payload during the commit wait and stores into these.
-    // The ticker (spawn_progress_ticker) reads and writes them to
-    // JobState::Running's files_finalized / bytes_finalized fields.
-    let progress_files_finalized = Arc::new(AtomicU64::new(0));
-    let progress_bytes_finalized = Arc::new(AtomicU64::new(0));
-    let ctx = TickerContext {
-        started_at_ms,
-        total_bytes,
-        dynamic_total_bytes: None,
-        skipped_files: 0,
-        skipped_bytes: 0,
-    };
-    set_job(
-        &state.jobs,
-        &state.events_tx,
-        job_id,
-        JobState::Running {
-            stage: None,
-            started_at_ms,
-            bytes_sent: 0,
-            total_bytes,
-            files,
-            skipped_files: 0,
-            skipped_bytes: 0,
-            files_processing: 0,
-            // P3 / v2.18.0 — apply-phase counters start at 0; the
-            // ticker fills them in once APPLY_PROGRESS frames begin
-            // arriving from the payload during commit.
-            files_finalized: 0,
-            files_finalizing_total: 0,
-            bytes_finalized: 0,
-        },
-    );
-
-    let jobs = Arc::clone(&state.jobs);
-    let events_tx = state.events_tx.clone();
-    let stop_ticker = spawn_progress_ticker(
-        Arc::clone(&jobs),
-        events_tx.clone(),
-        job_id,
-        ctx,
-        Arc::clone(&progress),
-        Arc::clone(&progress_files),
-        Arc::clone(&progress_files_finalized),
-        Arc::clone(&progress_bytes_finalized),
-    );
-
-    tokio::task::spawn_blocking(move || {
-        let _stop_guard = TickerStopGuard::new(stop_ticker);
-        let mut fail_guard =
-            JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
-        // Write root is `dest_dir` (NOT dest_root) — rel_paths already carry
-        // the basename prefix; see the dest_root comment above. Multi-stream
-        // for folders (parallel files); single-file falls back internally.
-        let result = download_to_local_multistream_ex(
-            &mgmt_addr,
-            &dest_dir,
-            &manifest,
-            download_streams,
-            Some(&progress),
-            req_unsafe,
-        );
-        match result {
-            Ok(bytes_written) => {
-                let completed_at_ms = now_ms();
-                set_job(
-                    &jobs,
-                    &events_tx,
-                    job_id,
-                    JobState::Done {
-                        started_at_ms,
-                        completed_at_ms,
-                        elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
-                        tx_id_hex: String::new(),
-                        shards_sent: 0,
-                        bytes_sent: bytes_written,
-                        dest: dest_root.to_string_lossy().to_string(),
-                        files_sent: files_count,
-                        skipped_files: 0,
-                        skipped_bytes: 0,
-                        commit_ack: None,
-                    },
-                );
-            }
-            Err(e) => {
-                let completed_at_ms = now_ms();
-                set_job(
-                    &jobs,
-                    &events_tx,
-                    job_id,
-                    job_failed_from_err(started_at_ms, completed_at_ms, &e),
-                );
-            }
-        }
-        fail_guard.mark_succeeded();
-    });
-
-    (
-        StatusCode::ACCEPTED,
-        Json(JobCreated {
-            job_id: job_id.to_string(),
-        }),
+    // The console's own manifest is the source of truth: nothing is enumerated here, and the
+    // readiness check (helper present, paired) runs on the job's blocking thread.
+    start_ava1_download(
+        &state,
+        mgmt_addr,
+        req.src_path.clone(),
+        kind,
+        req_unsafe,
+        Ava1DownloadTarget::Folder(dest_dir),
     )
-        .into_response()
 }
 
 #[derive(Deserialize)]

@@ -229,6 +229,27 @@ async fn transfer_dir_reconcile_with_no_ava1_listener_is_helper_not_ava1() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn transfer_download_with_no_ava1_listener_is_helper_not_ava1() {
+    let dir = std::env::temp_dir().join(format!("p5-ava1only-dl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let jobs: Arc<Mutex<HashMap<Uuid, JobState>>> = Arc::new(Mutex::new(HashMap::new()));
+    let req = TransferDownloadReq {
+        addr: Some("127.0.0.1:9113".to_string()),
+        src_path: "/data/x/file.bin".to_string(),
+        dest_dir: dir.to_string_lossy().into_owned(),
+        kind: "file".to_string(),
+        streams: None,
+        unsafe_read: false,
+    };
+    let resp = transfer_download_handler(State(state_for(&jobs)), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_helper_not_ava1(&jobs).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A console that has not accepted this app fails with `not_paired` (the pairing dialog's
 /// trigger), as a job failure and as a management refusal.
 #[test]
