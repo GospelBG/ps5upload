@@ -80,6 +80,7 @@ impl JobHost for FolderHost {
                         ordered: open.flags & gen::JF_ORDERED != 0,
                         progress: Arc::default(),
                         cancel: Arc::default(),
+                        progress_deadline: None,
                     };
                     let _ = receive_job(&mut link, open, sink, o).await;
                 }
@@ -192,6 +193,7 @@ async fn answer_resume(
         ordered: jo.flags & gen::JF_ORDERED != 0,
         progress: Arc::default(),
         cancel: Arc::default(),
+        progress_deadline: None,
     };
     let _ = resume_job(link, m, Arc::new(LocalSink::new(dest, single)), o).await;
 }

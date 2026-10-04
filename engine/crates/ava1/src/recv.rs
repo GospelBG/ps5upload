@@ -633,6 +633,11 @@ pub struct RecvOptions {
     pub ordered: bool,
     pub progress: Arc<Progress>,
     pub cancel: Arc<AtomicBool>,
+    /// How long a job may go without any progress (a data frame, a root, a finished disk
+    /// batch or write) while the sender still owes bytes before the receiver ends it with
+    /// `ERR_STALLED` (review 006 #2). `None` = `PROGRESS_DEADLINE` (3 x the default
+    /// `dead_after`), or `RESUME_PROGRESS_DEADLINE` for a resumed job.
+    pub progress_deadline: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -1217,6 +1222,16 @@ async fn run_loop(
     // not (SPEC.md §12.4, ledger row 19).
     let mut outstanding = granted;
     let mut last_batch = Instant::now();
+    // The last moment the job moved: a data frame, a root, a finished write or batch.
+    let mut last_progress = Instant::now();
+    // A resume (the journal holds finished or partial files) may leave the sender hashing or
+    // skipping what is durable for a long while without a frame, so it waits far longer.
+    let progress_deadline = progress_limit(
+        o.progress_deadline,
+        !need.done.is_empty() || !need.partial.is_empty(),
+    );
+    // Whether the batch in flight had anything to sync (an empty one runs every SYNC_EVERY).
+    let mut batch_worked = false;
     // Out-of-order frames are bounded by the credit granted in JobOpen: the sender cannot
     // have more than one window in flight (SPEC.md §12.4). `whole` says the entry is a
     // root-checked bundle record rather than a chunk.
@@ -1257,6 +1272,7 @@ async fn run_loop(
             w = writes.join_next(), if !writes.is_empty() => {
                 let w = w.expect("guarded by `!is_empty`").map_err(proto)??;
                 tm.write_time += w.took;
+                last_progress = Instant::now();
                 credit_back += w.credit;
                 for id in w.ok {
                     pending_small.push(id);
@@ -1275,6 +1291,9 @@ async fn run_loop(
                 tm.batch_done();
                 match b {
                     Ok(out) => {
+                        if batch_is_progress(batch_worked) {
+                            last_progress = Instant::now();
+                        }
                         fold_batch(&mut done, &mut large, &pg, &m, &out);
                         inflight_small = 0;
                         jnl = Some(out.jnl);
@@ -1323,6 +1342,7 @@ async fn run_loop(
                     .await
                     .map_err(|e| SendError::Disconnected(e.to_string()))?;
                 outstanding -= len;
+                last_progress = Instant::now();
 
                 match frame.ty {
                     Chunk::TYPE => {
@@ -1488,6 +1508,7 @@ async fn run_loop(
                             id = r.file_id
                         )));
                     }
+                    last_progress = Instant::now();
                     large
                         .entry(r.file_id)
                         .or_insert_with(|| new_large(&dir, &m, r.file_id))
@@ -1505,6 +1526,41 @@ async fn run_loop(
             // `next` maps Closed to an error; this arm documents the shape.
             Some(Inbound::Closed(why)) => return Err(SendError::Disconnected(why)),
             None => {}
+        }
+        // Review 006 #2: the sender owes bytes (a file is neither written nor in a batch),
+        // nothing of ours is in flight (no sync batch, no bundle write: a slow drive is not a
+        // stall), and nothing has moved for the whole deadline although the link is alive:
+        // end the job. The sender sees `ERR_STALLED` and can resume; a wedged source read
+        // there is its problem, not a reason to hold this job open forever.
+        // No lane up: the sender is not sending yet (or its lanes are being rebuilt), the same
+        // as the console, which arms only while a session is attached.
+        if idle && link.lanes().is_empty() {
+            last_progress = Instant::now();
+        }
+        if idle
+            && last_progress.elapsed() > progress_deadline
+            && done.len() + pending_small.len() + inflight_small < total_files
+            && batch_handle.is_none()
+            && writes.is_empty()
+        {
+            let why = format!(
+                "progress stalled: no file data for {:.1} s while the sender is still connected",
+                last_progress.elapsed().as_secs_f64()
+            );
+            let _ = writeln!(
+                std::io::stderr(),
+                "ava1: job {}: {why}",
+                crate::hex::encode(&job_id)
+            );
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                link.control.send(&JobCancel {
+                    job_id,
+                    reason: gen::ERR_STALLED,
+                }),
+            )
+            .await;
+            return Err(SendError::Disconnected(why));
         }
         if credit_back >= 4 << 20 || (credit_back > 0 && idle) {
             link.control
@@ -1586,6 +1642,8 @@ async fn run_loop(
             ) {
                 last_batch = Instant::now();
                 inflight_small = pending_small.len();
+                batch_worked =
+                    !pending_small.is_empty() || large.values().any(|l| l.written.covered() > 0);
                 tm.batch_start();
                 let snap = snapshot_batch(
                     job_id,
@@ -1604,6 +1662,39 @@ async fn run_loop(
         }
     }
 }
+
+/// A job that makes no progress for this long while the sender owes bytes is stalled: the
+/// receiver ends it rather than wait on the byte-level watchdog forever, since a Ping is a
+/// byte and a sender that heartbeats with a wedged data pump (a source read stuck on a
+/// network share) keeps the link alive indefinitely (review 006 #2). 3 x the SPEC default
+/// `dead_after` (12 s): generous, so a slow-but-moving link or drive is never cut.
+pub const PROGRESS_DEADLINE: Duration = Duration::from_secs(36);
+
+/// The deadline for a job: the override (tests, tuning) or the default, and a resumed job waits
+/// `RESUME_FACTOR` times as long (the default 36 s becomes the 15 minutes below).
+pub(crate) fn progress_limit(explicit: Option<Duration>, resumed: bool) -> Duration {
+    match (explicit, resumed) {
+        (Some(d), true) => d * RESUME_FACTOR,
+        (Some(d), false) => d,
+        (None, true) => RESUME_PROGRESS_DEADLINE,
+        (None, false) => PROGRESS_DEADLINE,
+    }
+}
+
+/// How much longer a resumed job may go without progress than a fresh one.
+const RESUME_FACTOR: u32 = 25;
+
+/// Whether a finished sync batch counts as progress: one that had something to sync did (even
+/// if it made nothing durable, e.g. a long sync that ends in retries); the empty batch that runs
+/// every `SYNC_EVERY` did not.
+pub(crate) fn batch_is_progress(had_work: bool) -> bool {
+    had_work
+}
+
+/// The same for a resumed job that already holds partial files: the sender may spend a long
+/// time hashing the durable groups it will not resend (no data frame is produced for them),
+/// so the clock is far more patient there.
+pub const RESUME_PROGRESS_DEADLINE: Duration = Duration::from_secs(900);
 
 /// Concurrent bundle writes. The Mac's file creation scales to a few threads; more only
 /// adds contention.
@@ -2751,6 +2842,24 @@ mod tests {
         }
         assert_eq!(st2, st, "a compaction loses no state");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_resumed_job_waits_longer_and_only_a_batch_with_work_is_progress() {
+        assert_eq!(progress_limit(None, false), PROGRESS_DEADLINE);
+        assert_eq!(progress_limit(None, true), RESUME_PROGRESS_DEADLINE);
+        assert_eq!(
+            progress_limit(Some(Duration::from_millis(400)), true),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            progress_limit(Some(Duration::from_millis(400)), false),
+            Duration::from_millis(400)
+        );
+        assert_eq!(PROGRESS_DEADLINE * RESUME_FACTOR, RESUME_PROGRESS_DEADLINE);
+        // A long sync that returns nothing durable still counts; the empty periodic one does not.
+        assert!(batch_is_progress(true));
+        assert!(!batch_is_progress(false));
     }
 
     #[test]

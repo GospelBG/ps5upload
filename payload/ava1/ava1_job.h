@@ -179,6 +179,14 @@ struct ava1_job {
     uint64_t last_batch_ms, unsynced_bytes;
     uint32_t roots_new;             /* FileRoots not yet journaled */
     uint8_t lanes;                  /* live lanes of the attached session (Task 14) */
+    /* The progress watchdog (review 006 #2), all on the job thread but `frames_in` (under cmu): a
+     * signature of everything that counts as the job moving, and when it last changed. */
+    uint64_t frames_in;             /* lane frames admitted and control frames queued (cmu) */
+    uint64_t prog_sig, prog_at_ms;
+    uint32_t prog_limit_ms;
+    int prog_armed;
+    int resumed;                    /* decided at open (journal replay) or at an attach that finds durable work; never per re-arm */
+    uint64_t prog_gen;              /* the attach generation `resumed` was last decided under */
     uint32_t tune_ticks, tune_busy; /* queue occupancy since the last tuning step */
     uint32_t calls_left;            /* outstanding AVA1_W_CALL items (ava1_apply_parallel) */
     int ev_end, ev_resume;          /* control events for the job thread (Task 13) */

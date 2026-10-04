@@ -224,6 +224,11 @@ impl Router {
         }
     }
 
+    /// Jobs registered on this session right now.
+    pub fn job_count(&self) -> usize {
+        self.jobs.lock().unwrap().len()
+    }
+
     pub fn has_job(&self, job: &JobId) -> bool {
         self.jobs.lock().unwrap().contains_key(job)
     }

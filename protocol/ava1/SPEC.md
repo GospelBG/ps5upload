@@ -66,8 +66,12 @@ handshake, with cn = sn = 16 zero bytes. `vectors/keys.txt` pins these derivatio
 
 4.4 Sealed frames: body = ChaCha20-Poly1305(lane key of this direction, nonce =
 4 zero bytes ‖ u64le(counter), AD = header bytes 0..11) followed by the 16-byte
-MAC; the counter is per lane and direction from 0. A frame that fails to open
-closes the connection.
+MAC; the counter is per lane and direction from 0, advances by one on every sealed
+frame of any type (Ping and ignorable frames included), and is never reset or rewound
+while a key is in use. A frame resent on another lane after a lane death is sealed again
+under that lane's own key and counter. A counter that reaches 2^64 - 2 may not seal or
+open another frame: the sender refuses and the receiver closes the connection, so a
+nonce can never repeat under one key. A frame that fails to open closes the connection.
 
 4.5 Join proofs: BLAKE2b-128(key = BLAKE2b-256(key = dir, "AVA1 join"), m):
 the Join tag uses dir = c2s and m = "join" ‖ session_id ‖ u16le(lane) ‖ cn; the
@@ -280,6 +284,7 @@ normative table; the second column names the constant in the generated code.
 | 15 | `ERR_CANCELLED` | the job was cancelled (`job.cancel`, or a `JobCancel` carrying this reason) |
 | 16 | `ERR_CROSS_DEVICE` | a staged or part-file rename whose two sides are on different devices (`st_dev`); never attempted, because a cross-device `rename` panics the console's kernel; when `st_dev` of either side cannot be read the rename is refused as `ERR_IO` rather than attempted (review 007 HW-1) |
 | 17 | `ERR_CREDIT` | a lane frame larger than the credit the receiver granted (§12.4) |
+| 18 | `ERR_STALLED` | the receiver ended a job whose sender sent no file data for the progress deadline while heartbeating (§12.8) |
 
 7.3 Management methods (the console operations FTX2 carried on :9114). Numbers are assigned by
 block; the tracked list, one row per FTX2 frame with its payload handler and engine caller, is
@@ -407,7 +412,7 @@ write small state files). The core wrapper `fs_write_bytes` chunks transparently
 Other filesystem methods, as built (`payload/src/mgmt_fs.c`, host-tested): `fs.list` pages by `offset`/`limit`
 (`limit` 0 = 256, at most 256; `more` = entries remain; names that are not valid UTF-8 are listed with `?` for
 their high bytes; `total_scanned` counts what the walk passed). `fs.stat` takes any absolute path without a `..`
-component (the policy of `fs.list`, not of `fs.read`), follows a link (`kind` is `link` only for a dangling
+component (the policy of `fs.list`, not of `fs.read`; see "Scope of `fs.stat` and `fs.list`" below), follows a link (`kind` is `link` only for a dangling
 one), and answers `ERR_IO` with `fs_stat_failed_errno_<n>` for an absent path. `fs.mkdir` honours `mode`
 (applied to the new directory despite the umask; intermediate directories get 0777) and `parents` (0: a missing
 parent is `fs_mkdir_failed`); an existing directory succeeds, an existing non-directory is `ERR_EXISTS`.
@@ -418,6 +423,17 @@ read filled the whole ask; `log.syslog` returns the newest `RPC_TEXT_MAX` bytes 
 when older text was cut. A handler whose failure carries data the caller reads (`net.reach`, `fs.mount_pkg`,
 `fs.mount_lwfs`) answers an error status whose cause is the whole `{"ok":false,...}` body (up to 1 KiB), which
 the engine's `call_legacy_ok` hands back as the reply it parses.
+
+Scope of `fs.stat` and `fs.list` (review 006, checklist D; decided: not narrowed). Both answer for any
+absolute, `..`-free path, as the FTX2 handlers did, because the product needs it: the Volumes and file
+browsers list `/`, `/mnt/*`, `/user` and `/system_data`, and existence probes (installed titles, SMP
+overlays, backport libraries) ask about paths outside every writable root. What a paired peer learns is
+metadata only: names, kind, size, mtime, mode, device. Never contents (`fs.read` and the data plane keep
+their own read policy), and the trust store's contents are refused by the read and write policies (S2), so no key
+material or peer list is reachable (its name and size are visible, like any other file's). A peer that is paired can already upload, delete, rename, launch and
+read through `fs.read`'s allowlist, so metadata of the rest adds no capability. Narrowing these two
+would break the browsers for no gain; the decision is to revisit it only if a read-only or guest pairing
+tier is ever added (then `fs.list`/`fs.stat` would take the read policy).
 
 Typed bodies decoded by the adapters: `NodeStatus.ucred_elevated` is a `u8` on the wire; the engine
 adapter restores the JSON boolean the client reads (`true`/`false`) and rebuilds the legacy
@@ -433,6 +449,11 @@ count (FTX2's reply had both); the adapter reconstructs `path` from the request 
 A server accepts at most 64 connections, 12 from one source address, and 16
 sessions (2 of them unconfirmed, §5); past any of these it sends
 `Error(ERR_BUSY)` and closes. The accept loop never stops on an accept error.
+
+Job admission is bounded as well: a receiver has at most 32 jobs open (the console's job table;
+the engine's host counts per session). A `JobOpen` past it is answered `JobOpenAck{ERR_BUSY}`
+and a `Resume` `JobMap{ERR_BUSY}`; the session and the admitted jobs are untouched and the
+sender retries (review 006, checklist T).
 
 One session per device: when a client completes a handshake (message 3 proves its
 key) while that key still has a session, the older session ends at once — its
@@ -735,6 +756,21 @@ The console-local copy and move (§15.5) use the same standard in memory: a copy
 fed by an in-process reader, with no read-back of the destination; a move deletes a source file only
 after every destination group of that file is verified in memory, the file and its directory are
 fsynced and the destination's `Done` is journaled; a copy that fails deletes nothing.
+
+12.8 Progress watchdog (review 006 #2). A Ping is a byte, so §6 cannot see a sender that heartbeats
+while its data pump is wedged (a source read stuck on a network share): such a job would stay open
+with no byte of file data moving. A receiver therefore ends a job that has made no progress for
+the progress deadline while the sender still owes bytes: a file is neither written nor in a sync
+batch, the receiver has nothing of its own in flight, and the sender is attached. Progress is a
+lane data frame admitted, a `FileRoot`, a finished bundle write, or a sync batch that made
+something durable. The deadline is 3 x `dead_after` (36 s at the default 12 s); a job that resumed
+whose journal held finished or partial files when it opened (decided once, at open, or at a reattach that finds durable work) gets 15 minutes,
+since its sender may hash or skip what is durable for a long time without producing a frame. The clock runs only while the sender is attached
+(a lane is up on the engine, a session on the console), and any finished sync batch that had work counts as progress. A slow drive never counts: any queued or running write, or a
+running sync batch, holds the clock. The engine's receiver sends `JobCancel{reason: ERR_STALLED}`
+and fails the job (the engine's session retry resumes it); the console ends it with `JobDone`
+status `ERR_STALLED` and keeps the journal, as for every console-side failure. The sender
+observes the code like any receiver-ended job and may resume.
 
 ## 13. Verification
 

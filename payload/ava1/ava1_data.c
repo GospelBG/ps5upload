@@ -734,6 +734,7 @@ static void inbox_add(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t l
         f->body = b;
     }
     pthread_mutex_lock(&j->cmu);
+    j->frames_in++; /* a root or a page is the sender making progress */
     if (!f || j->in_bytes + len > IN_MAX) {
         j->in_overflow = 1; /* its own inbox full (or no memory): the job ends PROTOCOL */
     } else if (ava1_ctl_take(len) != 0) {
@@ -1414,7 +1415,10 @@ static int data_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
         over = 1;
         take = 0;
     }
-    if (take) j->w_avail -= len;
+    if (take) {
+        j->w_avail -= len;
+        j->frames_in++;
+    }
     pthread_mutex_unlock(&j->cmu);
     if (!take) {
         free(f);

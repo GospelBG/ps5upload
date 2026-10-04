@@ -2983,6 +2983,53 @@ static void maybe_sweep(ava1_job_t *j, uint64_t now) {
     enqueue(j, w, 0);
 }
 
+/* Review 006 #2: 1 when a receiving job has made no progress for its deadline although its sender is
+ * attached and owes bytes. A Ping is a byte, so the connection's liveness cannot see a sender whose data
+ * pump is wedged (a source read stuck on a network share); this can. The clock only runs while we are
+ * waiting on the sender alone: nothing queued, applying or waiting for a sync batch (a slow drive is
+ * never a stall), and restarts on every frame, root, write or batch (the signature below). A resumed job (decided once, see `resumed`) gets the long limit: its sender may hash what it will not resend for a
+ * long time without producing a frame. */
+static int progress_stalled(ava1_job_t *j, uint64_t now) {
+    const ava1_data_cfg_t *cfg = ava1_data_cfg();
+    uint64_t sig, frames, gen;
+    int owed, ready, attached;
+    pthread_mutex_lock(&j->cmu);
+    frames = j->frames_in;
+    ready = j->ready;
+    attached = j->attached;
+    gen = j->att_gen;
+    pthread_mutex_unlock(&j->cmu);
+    pthread_mutex_lock(&j->mu);
+    /* Once per attach, not per re-arm: a reattached job that already holds durable work is a resume. */
+    if (gen != j->prog_gen) {
+        j->prog_gen = gen;
+        if (j->bytes_durable || j->files_done) j->resumed = 1;
+    }
+    owed = j->kind == AVA1_JOB_UPLOAD && !j->role && j->prepared && !j->finished && !j->final_status &&
+           !j->stopping && j->files_done + j->pend_n < j->m.files && !j->q_len && !j->busy && !j->pend_n &&
+           !j->unsynced_bytes && !j->roots_new;
+    sig = frames + j->bytes_received + j->bytes_durable + j->files_done;
+    pthread_mutex_unlock(&j->mu);
+    if (!owed || !ready || !attached) {
+        j->prog_armed = 0;
+        return 0;
+    }
+    if (!j->prog_armed || sig != j->prog_sig) {
+        if (!j->prog_armed) {
+            uint32_t fresh = cfg->progress_ms ? cfg->progress_ms : AVA1_PROGRESS_MS;
+            uint32_t resume = cfg->resume_progress_ms ? cfg->resume_progress_ms : AVA1_RESUME_PROGRESS_MS;
+            pthread_mutex_lock(&j->mu);
+            j->prog_limit_ms = j->resumed ? resume : fresh;
+            pthread_mutex_unlock(&j->mu);
+        }
+        j->prog_armed = 1;
+        j->prog_sig = sig;
+        j->prog_at_ms = now;
+        return 0;
+    }
+    return now - j->prog_at_ms >= j->prog_limit_ms;
+}
+
 static void *job_main(void *arg) {
     ava1_job_t *j = arg;
     for (;;) {
@@ -3017,6 +3064,12 @@ static void *job_main(void *arg) {
                  ((j->pend_n || j->unsynced_bytes || j->roots_new) && now - j->last_batch_ms >= BATCH_MS));
         pthread_mutex_unlock(&j->mu);
         if (failed) ava1_apply_fail(j, fail_status, fail_msg, 0, fail_journal);
+        else if (progress_stalled(j, now)) {
+            fprintf(stderr, "[ava1] job %02x%02x%02x%02x: no progress for %u s while the sender is connected\n",
+                    j->id[0], j->id[1], j->id[2], j->id[3], j->prog_limit_ms / 1000u);
+            /* The journal stays open: the sender resumes it. */
+            ava1_apply_fail(j, AVA1_ERR_STALLED, "progress stalled: the sender sent no data", 0, 0);
+        }
         if (ev && j->on_events) j->on_events(j);
         if (j->on_tick) j->on_tick(j);
         if (flush) emit_credit(j, flush);

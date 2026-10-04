@@ -386,3 +386,72 @@ fn low_order_keys_are_refused_by_c_and_rust() {
         }
     }
 }
+
+/// Review 006 #1: the C connection's counters stay in lockstep across frame kinds and the
+/// nonce ceiling refuses to seal or open (payload/ava1/ava1_conn.c).
+#[test]
+fn the_c_connection_counts_every_frame_and_stops_at_the_nonce_ceiling() {
+    let key = [0x6bu8; 32];
+    assert_eq!(
+        unsafe { ffi::ava1_test_conn_nonce_ceiling(key.as_ptr()) },
+        0
+    );
+}
+
+/// Review 006 #4 (checklist A): negative frame vectors against the C reader. The same wire bytes
+/// the Rust reader refuses (`ava1::conn` tests) are refused here, with the same count of frames
+/// opened first: a frame cut anywhere ends the stream (`AVA1_E_CLOSED`), and reordered, dropped
+/// or repeated frames fail the tag (`AVA1_E_TAG`).
+#[test]
+fn the_c_reader_refuses_truncated_and_misordered_frames() {
+    use ava1::conn::FrameWriter;
+    let key = [0x32u8; 32];
+    let bodies: [&[u8]; 3] = [b"first frame", b"second frame!", b"third"];
+    let wire = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut w = FrameWriter::new(Vec::new());
+            w.set_key(key);
+            for body in bodies {
+                w.send(0x20, 1, body).await.unwrap();
+            }
+            w.into_inner()
+        });
+    // A sealed frame is a 16-byte header, the body and a 16-byte MAC.
+    let lens: Vec<usize> = bodies.iter().map(|b| 16 + b.len() + 16).collect();
+    assert_eq!(lens.iter().sum::<usize>(), wire.len());
+    let read = |bytes: &[u8]| {
+        let mut opened = 0u32;
+        let rc = unsafe {
+            ffi::ava1_test_conn_read_all(key.as_ptr(), bytes.as_ptr(), bytes.len(), &mut opened)
+        };
+        (opened, rc)
+    };
+    const E_TAG: i32 = -10;
+    const E_CLOSED: i32 = -12;
+    assert_eq!(read(&wire), (3, E_CLOSED), "an intact stream ends at EOF");
+    for cut in 0..wire.len() {
+        let whole = lens
+            .iter()
+            .scan(0, |at, n| {
+                *at += n;
+                Some(*at)
+            })
+            .filter(|end| *end <= cut)
+            .count() as u32;
+        assert_eq!(read(&wire[..cut]), (whole, E_CLOSED), "cut at {cut}");
+    }
+    let f = |i: usize| -> &[u8] {
+        let start: usize = lens[..i].iter().sum();
+        &wire[start..start + lens[i]]
+    };
+    for (what, bytes, opened) in [
+        ("swapped", [f(1), f(0), f(2)].concat(), 0),
+        ("first dropped", [f(1), f(2)].concat(), 0),
+        ("middle dropped", [f(0), f(2)].concat(), 1),
+        ("repeated", [f(0), f(0), f(1)].concat(), 1),
+    ] {
+        assert_eq!(read(&bytes), (opened, E_TAG), "{what}");
+    }
+}

@@ -632,6 +632,7 @@ fn run(
                 ordered: flags & gen::JF_ORDERED != 0,
                 progress: progress.clone(),
                 cancel: cancel.clone(),
+                progress_deadline: None,
             };
             let (why, dropped) = match download_job(&mut link, src, flags, sink.clone(), o).await {
                 Ok(r) => {

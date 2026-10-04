@@ -173,6 +173,8 @@ export function isAutoRecoverable(
   // different console / has no identity. NOT ava1_unreachable: nothing was
   // listening, which a payload re-deploy can fix, so it stays recoverable.
   if (AVA1_FATAL_REASON_PREFIXES.some((p) => r.startsWith(p))) return false;
+  // ava1_stalled (ERR_STALLED): the source stopped sending data while the link stayed
+  // alive; the journal is kept, so a retry resumes. Deliberately not in the fatal list.
   // ava1_refused_<code>: fatal only for codes that are protocol/pairing/version
   // faults (1-6, gen.rs ERR_NOT_PAIRED..ERR_UNKNOWN_METHOD). Internal (7), busy
   // (8), unknown job (11), io (12), verify (13), credit (17) and any code we do
