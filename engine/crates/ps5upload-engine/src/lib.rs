@@ -9396,7 +9396,9 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
             } else {
                 base.to_string()
             };
-            axum::Router::new().nest(&base, app)
+            axum::Router::new()
+                .nest(&base, app)
+                .route(&format!("{}/", base), get(ui_handler))
         } else {
             app
         }
