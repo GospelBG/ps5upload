@@ -149,9 +149,9 @@ int ava1_read_files(ava1_reader_t *r, const uint32_t *ids, uint32_t count) {
             rc = -ENAMETOOLONG;
             break;
         }
-        fd = open(path, O_RDONLY);
+        fd = ava1_open_read_safe(path, ava1_data_cfg()->refuse_link);
         if (fd < 0) {
-            rc = -errno;
+            rc = fd;
             break;
         }
         if (e->size < r->cutoff) {
@@ -780,7 +780,7 @@ ava1_job_t *ava1_send_open(const ava1_job_open_t *o, const uint8_t peer[32], ava
     j->role_free = role_free;
     s->single = !S_ISDIR(st.st_mode);
     s->t_open = now_us();
-    rc = s->single ? ava1_mstore_single(&j->m, root) : ava1_mstore_walk_ex(&j->m, root, AVA1_WALK_FOLLOW);
+    rc = s->single ? ava1_mstore_single(&j->m, root) : ava1_mstore_walk_deny(&j->m, root, AVA1_WALK_FOLLOW, cfg->refuse_link);
     s->walk_us = now_us() - s->t_open;
     s->credit = o->has_credit ? o->credit : (16u << 20);
     if (rc != 0 || ava1_bits_init(&s->skip, j->m.n) != 0 ||

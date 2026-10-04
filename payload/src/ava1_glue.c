@@ -190,6 +190,7 @@ int ava1_payload_start(void) {
         snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "%s", AVA1_JOBS);
         dc.may_write = may_write;
         dc.may_read = may_read;
+        dc.refuse_link = path_tree_op_refused;
         dc.same_device = same_device;
         if (mkdir(AVA1_JOBS, 0755) != 0 && errno != EEXIST) {
             /* Not fatal: the server and FTX2 keep working without the data plane. */

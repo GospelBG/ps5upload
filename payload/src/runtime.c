@@ -7246,7 +7246,7 @@ static int cp_rf_op(const char *src, const char *dst, int depth, int op_idx,
     }
 
     if (S_ISREG(st.st_mode)) {
-        int sfd = open(src, O_RDONLY);
+        int sfd = open(src, O_RDONLY | O_NOFOLLOW); /* lstat said regular: never read through a swapped-in link */
         if (sfd < 0) return -1;
         /* Open with 0777 (not source mode) so the destination is launch-
          * ready regardless of what the source file's mode bits looked
@@ -7260,7 +7260,9 @@ static int cp_rf_op(const char *src, const char *dst, int depth, int op_idx,
         /* O_EXCL is what turns a collision into an error. When merging we
          * want the opposite: land on top of the existing file, truncating
          * whatever was there. */
-        int dfd = open(dst, O_WRONLY | O_CREAT |
+        /* O_NOFOLLOW: a merge copy must not write THROUGH a link planted at dst (it would overwrite
+         * whatever the link points at, the AVA1 trust store included). */
+        int dfd = open(dst, O_WRONLY | O_CREAT | O_NOFOLLOW |
                             (overwrite ? O_TRUNC : O_EXCL), 0777);
         if (dfd < 0) { close(sfd); return -1; }
         (void)fchmod(dfd, 0777);

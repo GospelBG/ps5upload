@@ -49,7 +49,7 @@ int ava1_copy_walk(const ava1_job_copy_t *c, ava1_mstore_t *out) {
     __atomic_store_n(&ava1_copy_test_walk_active, 1, __ATOMIC_RELEASE);
     uint32_t delay = __atomic_load_n(&ava1_copy_test_walk_delay_ms, __ATOMIC_ACQUIRE);
     if (delay) ava1_platform_sleep_ms(delay);
-    int rc = S_ISDIR(st.st_mode) ? ava1_mstore_walk(out, src) : ava1_mstore_single(out, src);
+    int rc = S_ISDIR(st.st_mode) ? ava1_mstore_walk_deny(out, src, 0, cfg->refuse_link) : ava1_mstore_single(out, src);
     __atomic_store_n(&ava1_copy_test_walk_active, 0, __ATOMIC_RELEASE);
     return rc == 0 ? AVA1_STATUS_OK : AVA1_ERR_IO;
 }
@@ -400,7 +400,7 @@ ava1_job_t *ava1_copy_open(const ava1_job_copy_t *in, const uint8_t owner[32],
         memset(prepared, 0, sizeof *prepared);
         rc = 0;
     } else {
-        rc = c ? (S_ISDIR(st.st_mode) ? ava1_mstore_walk(&j->m_in, src) : ava1_mstore_single(&j->m_in, src))
+        rc = c ? (S_ISDIR(st.st_mode) ? ava1_mstore_walk_deny(&j->m_in, src, 0, cfg->refuse_link) : ava1_mstore_single(&j->m_in, src))
                : -ENOMEM;
     }
     if (rc != 0 || ava1_bits_init(&c->skip, j->m_in.n) != 0 ||

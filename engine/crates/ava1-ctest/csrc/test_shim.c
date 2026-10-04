@@ -28,6 +28,7 @@
 #include "ava1_server.h"
 #include "ava1_thread.h"
 #include "mgmt_rpc.h"
+#include "path_policy.h"
 
 static uint32_t g_pair_requests, g_last_code, g_logs;
 
@@ -1208,6 +1209,14 @@ static int t_allow(const char *p) {
 /* The data layer's may_read hook (downloads): a test flips it through the FFI setter. */
 static int g_allow_read = 1;
 void ava1_test_set_allow_read(int v) { __atomic_store_n(&g_allow_read, v, __ATOMIC_SEQ_CST); }
+/* Review S2: the data layer's refuse_link hook, wired to the real shared policy when a test names a protected
+ * directory (NULL turns it off). */
+static int g_protect_links;
+void ava1_test_set_protected(const char *dir) {
+    path_policy_set_protected(dir);
+    __atomic_store_n(&g_protect_links, dir != NULL, __ATOMIC_SEQ_CST);
+}
+static int t_refuse_link(const char *p) { return __atomic_load_n(&g_protect_links, __ATOMIC_SEQ_CST) && path_tree_op_refused(p); }
 static int t_allow_read(const char *p, int u) {
     (void)p;
     (void)u;
@@ -1299,6 +1308,7 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
     snprintf(cfg.jobs_dir, sizeof cfg.jobs_dir, "%s", jobs_dir);
     cfg.may_write = t_allow;
     cfg.may_read = t_allow_read;
+    cfg.refuse_link = t_refuse_link;
     cfg.same_device = t_same_device;
     cfg.fsync_delay_us = fsync_delay_us;
     cfg.crash_at = crash_at;
@@ -1532,6 +1542,7 @@ int ava1_test_recv_open(const char *jobs_dir, const char *root, uint32_t flags, 
     snprintf(g_cfg.jobs_dir, sizeof g_cfg.jobs_dir, "%s", jobs_dir);
     g_cfg.may_write = t_allow;
     g_cfg.may_read = t_allow_read;
+    g_cfg.refuse_link = t_refuse_link;
     g_cfg.same_device = t_same_device;
     snprintf(g_root, sizeof g_root, "%s", root);
     g_flags = flags;
@@ -1637,6 +1648,7 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "%s", jobs_dir);
     dc.may_write = t_allow;
     dc.may_read = t_allow_read;
+    dc.refuse_link = t_refuse_link;
     dc.same_device = t_same_device;
     dc.fsync_delay_us = fsync_delay_us;
     dc.workers_start = dc.workers_min = dc.workers_max = workers;

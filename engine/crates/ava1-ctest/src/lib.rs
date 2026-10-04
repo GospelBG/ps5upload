@@ -1187,6 +1187,20 @@ pub fn c_set_same_device(v: i32) {
 /// What the C data layer's `may_read` hook answers for the next download JobOpen
 /// (test_shim.c's `t_allow_read`): false refuses the open with AVA1_ERR_PATH. The
 /// refusal test restores it; a test that starts a server should set it true first.
+/// Names the trust-store directory the data layer must never follow a link into (None: off).
+pub fn c_set_protected(dir: Option<&std::path::Path>) {
+    extern "C" {
+        fn ava1_test_set_protected(dir: *const c_char);
+    }
+    match dir {
+        Some(d) => {
+            let c = CString::new(d.to_str().unwrap()).unwrap();
+            unsafe { ava1_test_set_protected(c.as_ptr()) }
+        }
+        None => unsafe { ava1_test_set_protected(std::ptr::null()) },
+    }
+}
+
 pub fn c_set_read_allowed(v: bool) {
     unsafe { ffi::ava1_test_set_allow_read(v as c_int) };
 }

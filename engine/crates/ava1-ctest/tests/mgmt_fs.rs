@@ -1511,7 +1511,16 @@ fn s2_lint_recursive_entry_points_use_the_shared_refusal() {
             "{f} must refuse trust-store ancestors"
         );
     }
+    // round 3: the merge-copy destination is opened O_NOFOLLOW (a planted link at dst is never written through)
+    assert!(
+        rt.contains("open(dst, O_WRONLY | O_CREAT | O_NOFOLLOW |"),
+        "cp_rf_op must not open dst through a link"
+    );
     let glue = std::fs::read_to_string(payload.join("src/ava1_glue.c")).unwrap();
+    assert!(
+        glue.contains("dc.refuse_link = path_tree_op_refused"),
+        "the data layer refuses links into the store"
+    );
     assert!(
         glue.contains("path_tree_op_refused("),
         "the AVA1 data-plane hooks must too (copy, upload root, download root)"
@@ -1565,4 +1574,38 @@ fn s2_ftp_selftest_passes() {
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
+}
+
+/// Review S2 round 3, item 3: `is_safe_unsafe_read_path` already rejects `..` (runtime.c, checked), and the
+/// trust-store check itself fails closed on a `..` component, so `link/../x` cannot be judged differently
+/// from what the kernel resolves.
+#[test]
+fn s2_a_dotdot_path_fails_closed() {
+    let _g = one();
+    let base = std::env::temp_dir().join(format!("ava1-s2-dotdot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("d/ava")).unwrap();
+    let base = base.canonicalize().unwrap();
+    assert_eq!(mgmt_fs::install(&base), 0);
+    for p in [
+        format!("{}/elsewhere/../d/ava/peers", base.display()),
+        format!("{}/link/../harmless", base.display()),
+    ] {
+        assert!(
+            mgmt_fs::in_protected(&p) && mgmt_fs::tree_op_refused(&p),
+            "{p}"
+        );
+    }
+    let rt = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../payload/src/runtime.c"),
+    )
+    .unwrap();
+    let a = rt
+        .find("int is_safe_unsafe_read_path(const char *p) {")
+        .unwrap();
+    assert!(
+        rt[a..a + 300].contains("path_has_dotdot_component(p)"),
+        "the unsafe-read check rejects `..`"
+    );
+    mgmt_fs::uninstall();
 }

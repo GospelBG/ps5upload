@@ -79,9 +79,27 @@ static int under(const char *p, const char *dir) {
     return strncasecmp(p, dir, n) == 0 && (p[n] == '\0' || p[n] == '/');
 }
 
+/* A `..` component cannot be judged: collapsing it lexically BEFORE resolving symlinks gives a different
+ * answer than the kernel (`link/../x`). Every allowed path is `..`-free already (the lexical rule and
+ * is_safe_unsafe_read_path reject it), so such a path is treated as protected: fail closed. */
+static int has_dotdot(const char *p) {
+    const char *seg = p;
+    while (*seg) {
+        const char *end;
+        while (*seg == '/') seg++;
+        if (!*seg) break;
+        end = seg;
+        while (*end && *end != '/') end++;
+        if (end - seg == 2 && seg[0] == '.' && seg[1] == '.') return 1;
+        seg = end;
+    }
+    return 0;
+}
+
 int path_in_protected(const char *p) {
     char norm[PATH_MAX], canon[PATH_MAX], pnorm[PATH_MAX], pcanon[PATH_MAX];
     if (!p || !p[0]) return 0;
+    if (has_dotdot(p)) return 1;
     lex_normalize(p, norm, sizeof norm);
     canonical_of(p, canon, sizeof canon);
     lex_normalize(g_protected, pnorm, sizeof pnorm);
@@ -92,6 +110,7 @@ int path_in_protected(const char *p) {
 int path_contains_protected(const char *p) {
     char norm[PATH_MAX], canon[PATH_MAX], pnorm[PATH_MAX], pcanon[PATH_MAX];
     if (!p || !p[0]) return 0;
+    if (has_dotdot(p)) return 1;
     lex_normalize(p, norm, sizeof norm);
     canonical_of(p, canon, sizeof canon);
     lex_normalize(g_protected, pnorm, sizeof pnorm);
