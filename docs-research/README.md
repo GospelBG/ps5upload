@@ -12,5 +12,6 @@ branch by the cloud research session; the local implementation sessions read the
 | `004-ava1-da80f8f/` | da80f8f | review of f660dcc..da80f8f: S1 commit-then-reveal closed, review-002 findings (M1 still open), job.run/job.list and 83 management methods, the delete operation's symlink guard, SPEC/code mismatches on operation cancel and release |
 | `005-ava1-fc2640f/` | fc2640f | review of da80f8f..fc2640f: M1 and S2 closed, lane-path and governor changes from 003 landed with tests, stored zip resume (design 04) landed, Task 4 filesystem methods; one small fix closes the zip restart window |
 | `006-ava1-fc2640f/` | fc2640f | deep re-review + liveness/hang audit + 20-category evaluation checklist + impl guides for the three ready fixes (nonce audit, progress watchdog, zip finish window) |
+| `007-ava1-e2208e6/` | e2208e6 | pre-hardware deep review of 66 commits (durable-by-log on both ends verified incl. crash recovery; JobOpen-after-cancel hang closed); hardware go/no-go gates and Pro-outage triage; findings HW-0..HW-4 + conformance C-1; impl guides for same_device fail-closed and a runtime durable-by-log off-switch |
 
 Each new session adds `NNN-ava1-<short sha>/` with its own numbered notes and a row here.
