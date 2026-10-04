@@ -396,9 +396,15 @@ fn gc_never_removes_a_job_directory_that_holds_a_log_until_a_long_ceiling() {
         job_dir(&jobs, &[7; 16]).exists(),
         "gc removed a job that still holds its log"
     );
-    // a log that recovery could not settle in a week beyond the normal age is given up on, and says so
+    // a log that recovery could not settle in a week beyond the normal age is given up on, and says so, but
+    // not on one boot's wall clock (a clock moved forward would age every log at once): it takes three
+    // boots that each saw it past the ceiling (final review: console)
+    for strike in 1..=2 {
+        assert_eq!(jobs_gc(&jobs, 20 * 86_400, 86_400), 0, "strike {strike}: the clock alone must not take a log");
+        assert!(job_dir(&jobs, &[7; 16]).exists());
+    }
     let removed = jobs_gc(&jobs, 20 * 86_400, 86_400);
-    assert_eq!(removed, 1, "the ceiling never came");
+    assert_eq!(removed, 1, "three boots saw it past the ceiling");
     assert!(!job_dir(&jobs, &[7; 16]).exists());
 }
 
@@ -415,11 +421,41 @@ fn a_directory_recovery_cannot_open_is_kept_for_a_while_and_then_given_up() {
         0,
         "kept: it holds a log"
     );
+    assert_eq!(jobs_gc(&jobs, 20 * 86_400, 86_400), 0, "strike 1");
+    assert_eq!(jobs_gc(&jobs, 20 * 86_400, 86_400), 0, "strike 2");
     assert_eq!(
         jobs_gc(&jobs, 20 * 86_400, 86_400),
         1,
-        "given up after the ceiling"
+        "given up after the ceiling, three boots running"
     );
+}
+
+/// Final review (console): `time(NULL)` is the wall clock, and the console's clock is set by the user and
+/// by the app. A clock that is wrong must not delete resumable job directories.
+#[test]
+fn gc_does_nothing_when_the_clock_is_implausible_or_behind_a_jobs_own_stamp() {
+    let t = tmp("gc-clock");
+    let jobs = t.join("jobs");
+    let old = jobs.join("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd");
+    std::fs::create_dir_all(&old).unwrap();
+    // Thirty days old: an ordinary collection.
+    let thirty = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+    std::fs::File::open(&old).unwrap().set_modified(thirty).unwrap();
+    // Before 2024 (the console's clock reset to its epoch): the age of everything is nonsense.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(jobs_gc(&jobs, 1_000_000 - now_unix, 86_400), 0);
+    assert!(old.exists(), "an implausible clock took a job directory");
+    // A stamp in the future (the clock was moved back): the same, for every directory.
+    let fresh = jobs.join("efefefefefefefefefefefefefefefef");
+    std::fs::create_dir_all(&fresh).unwrap();
+    assert_eq!(jobs_gc(&jobs, -2 * 86_400, 86_400), 0);
+    assert!(old.exists(), "a clock behind a job's own stamp took a directory");
+    // A sane clock collects the old directory as before.
+    assert_eq!(jobs_gc(&jobs, 0, 86_400), 1);
+    assert!(!old.exists() && fresh.exists());
 }
 
 #[test]
