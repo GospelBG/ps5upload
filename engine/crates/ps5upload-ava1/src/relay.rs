@@ -525,6 +525,7 @@ pub fn ps5_to_ps5_between(
     let _scratch = Scratch(scratch.clone());
     crate::block_on(async {
         let mut backoff = Duration::from_millis(250);
+        let mut busy = 0u32;
         let (mut gate_a, mut gate_b) = (SessionGate::default(), SessionGate::default());
         let (mut last_at, mut last_durable) = (Instant::now(), 0u64);
         loop {
@@ -582,6 +583,18 @@ pub fn ps5_to_ps5_between(
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
+                Err(SendError::Refused { status, message }) if status == gen::ERR_BUSY => {
+                    busy += 1;
+                    if busy > from_pool.busy_tries() {
+                        return Err(crate::upload::busy_failure(
+                            from_pool.busy_tries(),
+                            &message,
+                        ));
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    continue;
+                }
                 Err(e) => return Err(e.into()),
             };
             let mut o = SendOptions::upload(dest);
@@ -595,6 +608,25 @@ pub fn ps5_to_ps5_between(
                 Err(SendError::Disconnected(_)) => {
                     to_pool.forget(to).await;
                     tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                // The destination console says BUSY (finishing a job's files): retry, bounded.
+                Err(SendError::Refused { status, message }) if status == gen::ERR_BUSY => {
+                    busy += 1;
+                    if busy > to_pool.busy_tries() {
+                        return Err(crate::upload::busy_failure(to_pool.busy_tries(), &message));
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    continue;
+                }
+                Err(SendError::OpenTimeout(t)) => {
+                    busy += 1;
+                    if busy > to_pool.busy_tries() {
+                        return Err(crate::upload::open_timeout_failure(to_pool.busy_tries(), t));
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
                     continue;
                 }
                 Err(e) => return Err(e.into()),

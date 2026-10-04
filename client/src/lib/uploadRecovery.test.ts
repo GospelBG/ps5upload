@@ -63,6 +63,32 @@ describe("isAutoRecoverable", () => {
     expect(isAutoRecoverable(r, "")).toBe(false);
   });
 
+  it.each(["not_paired", "password_needed"])(
+    "does NOT recover the bare token %s (a person must act: pair, or type the password)",
+    (r) => {
+      expect(isAutoRecoverable(r, "")).toBe(false);
+    },
+  );
+
+  it("DOES recover helper_not_ava1: re-sending the helper is the recovery", () => {
+    expect(isAutoRecoverable("helper_not_ava1", "")).toBe(true);
+  });
+
+  it.each([
+    "zip_unsupported",
+    "7z_unsupported",
+    "7z_unsupported_layout",
+    "ava1_7z_unsupported",
+    "ava1_7z_unsupported_layout",
+    "ava1_7z_corrupt",
+    "ava1_7z_encrypted",
+    "ava1_zip_corrupt",
+    "rar_unsupported",
+    "ava1_rar_unsupported",
+  ])("does NOT recover the unreadable-archive failure %s (the same archive fails the same way)", (r) => {
+    expect(isAutoRecoverable(r, "")).toBe(false);
+  });
+
   it.each([
     "ava1_rar_password_required",
     "ava1_rar_password_wrong",
@@ -88,6 +114,10 @@ describe("isAutoRecoverable", () => {
     "ava1_refused_",
   ])("keeps the transient or unknown refusal %s retryable", (r) => {
     expect(isAutoRecoverable(r, "")).toBe(true);
+  });
+
+  it("recovers zip_read_error: an I/O failure reading the archive is transient", () => {
+    expect(isAutoRecoverable("zip_read_error", "")).toBe(true);
   });
 
   it("recovers ava1_unreachable: the payload may need a re-deploy", () => {

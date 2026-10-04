@@ -73,7 +73,7 @@ Nothing here is tied to one network. Every entry point takes an address:
 
 ```sh
 export PS5_HOST=192.168.1.50            # console IP (loader + payload)
-export PS5_ADDR=192.168.1.50:9113       # transfer port, for scripts/bench
+export PS5_ADDR=192.168.1.50            # console IP; the engine owns the port (9120)
 
 make send-payload PS5_HOST=$PS5_HOST
 npm run smoke:hardware                  # or: node tests/smoke-hardware.mjs
@@ -85,7 +85,7 @@ committed defaults — those stay generic on purpose.
 
 | Command | Does |
 |---|---|
-| `make validate` | Build, send, wait for `:9113`, smoke, sweep, write `bench/reports/<ts>-sweep.{json,md}` |
+| `make validate` | Build, send, wait for `:9120`, smoke, sweep, write `bench/reports/<ts>-sweep.{json,md}` |
 | `make validate-xl` | Adds the 200k-file stress profile |
 | `node tests/smoke-hardware.mjs --no-spawn-engine` | Against an engine already running |
 
@@ -94,7 +94,7 @@ Clean up test uploads afterwards:
 ```sh
 curl -X POST http://127.0.0.1:19113/api/ps5/cleanup \
   -H 'content-type: application/json' \
-  -d '{"addr":"'"$PS5_HOST"':9114","path":"/data/ps5upload/tests/manual"}'
+  -d '{"addr":"'"$PS5_HOST"'","path":"/data/ps5upload/tests/manual"}'
 ```
 
 **Use a live console when touching:** the payload C runtime, AVA1

@@ -5,6 +5,12 @@
 // TCP send) stay in-process.
 
 import { trStatic } from "../lib/trStatic";
+import { humanizePs5Error } from "../lib/humanizeError";
+import {
+  classifySession,
+  reportIfNotPaired,
+  type SessionState,
+} from "../lib/consoleSession";
 import { Channel } from "@tauri-apps/api/core";
 import { getEngineUrl } from "../state/engine";
 // Logging wrapper: every command leaves a trace breadcrumb + logs failures at
@@ -142,7 +148,7 @@ export async function zipInspectStream(
 // 7z support reuses the ZipInspect / ZipInspectProgress shapes — the engine
 // returns the same fields. The host decompresses the archive's single LZMA2
 // stream (commonly one .exfat image) forward-only and streams the files into
-// the same FTX2 shard pipeline, so they land already-extracted on the PS5.
+// the same AVA1 upload pipeline, so they land already-extracted on the PS5.
 // Game metadata (title) is not surfaced for 7z: a 7z-of-.exfat has no
 // host-visible param.json, so `title` etc. stay null.
 
@@ -481,7 +487,12 @@ export async function sendPayload(
     { ip, path: elfPath, port: port ?? null },
   );
   if (resp && resp.ok === false) {
-    throw new Error(resp.error ?? resp.status ?? "payload_send failed");
+    const msg = resp.error ?? resp.status ?? "payload_send failed";
+    // The engine's replace guard tokens get their own localized text; every other
+    // failure keeps its raw message.
+    throw new Error(
+      /replace_(in_progress|cooldown)/i.test(msg) ? humanizePs5Error(msg) : msg,
+    );
   }
 }
 
@@ -1681,7 +1692,7 @@ export interface DiscoveredHost {
   services: string[];
   /** :9021 reachable — the universal payload-loader port. */
   loader_port_open: boolean;
-  /** :9114 reachable — our own payload is already running here. */
+  /** The helper's AVA1 port (9120) is reachable — our own payload is already running here. */
   payload_port_open: boolean;
   /** 0-100 score; see commands/discover.rs::confidence for weights. */
   confidence: number;
@@ -2260,8 +2271,8 @@ export interface ProcessKillAck {
   err?: string | null;
 }
 
-/** Enumerate running processes (detailed). `addr` is the mgmt addr
- *  (ip:9114). Read-only. */
+/** Enumerate running processes (detailed). `addr` is the console
+ *  address. Read-only. */
 export async function processList(addr: string): Promise<ProcessListResult> {
   return invoke<ProcessListResult>("process_list_get", { addr });
 }
@@ -4132,6 +4143,22 @@ export interface JobSnapshot {
    *  Second progress dimension alongside file count; useful when file
    *  sizes vary wildly. */
   bytes_finalized?: number;
+  /** The sending phase when it is not plain sending: `"skipping"` while a 7z/RAR
+   *  resume discards data the console already has. Absent otherwise (and on engines
+   *  that do not report it). Contract: protocol/ava1/CUTOVER.md. */
+  phase?: string;
+  /** Skipping progress: bytes decoded so far and bytes to skip in all. */
+  skip_done_bytes?: number;
+  skip_total_bytes?: number;
+  /** What limits the transfer (AVA1's words: "network", "source", "console drive",
+   *  "console workers", "console memory", "none"). Live on a running job when the
+   *  engine reports it; a finished job carries it in `commit_ack`. */
+  bottleneck?: string;
+  /** True while files are still settling on the console after the job finished
+   *  ("Finishing on the console"). Absent until the engine sends it. */
+  settling?: boolean;
+  /** The commit ack of a finished job (AVA1: protocol, files, bytes, bottleneck, ...). */
+  commit_ack?: { bottleneck?: string } & Record<string, unknown>;
   /** Files actually sent (Done only). */
   files_sent?: number;
   shards_sent?: number;
@@ -4241,6 +4268,34 @@ export function humanizeJobErrorReason(
         "joberr.fs_read_path_not_allowed",
         'This file is in a read-only system partition that\'s normally blocked. Enable Settings → "Allow downloading system files" to download from /system, /system_data, and other protected paths.',
       );
+    // An archive the uploader cannot stream (the same decoding crates the retired transport
+    // used, so nothing a fallback once handled is lost). Reasons: the engine's own
+    // `zip_unsupported` / `7z_unsupported` / `rar_unsupported`, and the source-level
+    // `ava1_7z_unsupported`, `ava1_7z_unsupported_layout`, `ava1_rar_unsupported`.
+    case "zip_unsupported":
+    case "ava1_zip_unsupported":
+      return trStatic(
+        "joberr.zip_unsupported",
+        "This .zip uses something the uploader can't stream (encryption, a compression method other than Deflate or Stored, or an unsafe or duplicate file path). Extract it on your computer and upload the folder instead.",
+      );
+    case "7z_unsupported":
+    case "ava1_7z_unsupported":
+      return trStatic(
+        "joberr.sevenz_unsupported",
+        "This .7z uses a compression method or feature the uploader can't stream. Extract it on your computer and upload the folder instead.",
+      );
+    case "7z_unsupported_layout":
+    case "ava1_7z_unsupported_layout":
+      return trStatic(
+        "joberr.sevenz_unsupported_layout",
+        "This .7z keeps directories or empty files between its files inside one solid block, a layout the uploader can't stream. Re-pack it with 7-Zip, or extract it and upload the folder.",
+      );
+    case "rar_unsupported":
+    case "ava1_rar_unsupported":
+      return trStatic(
+        "joberr.rar_unsupported",
+        "This .rar has duplicate or unsafe file paths, or a feature the uploader can't stream. Extract it on your computer and upload the folder instead.",
+      );
     case "tx_table_full":
       return trStatic(
         "joberr.tx_table_full",
@@ -4251,7 +4306,12 @@ export function humanizeJobErrorReason(
   }
 }
 
-export async function jobStatus(jobId: string): Promise<JobSnapshot> {
+export async function jobStatus(
+  jobId: string,
+  /** The console the job runs against, when known: a not-paired failure opens THAT
+   *  console's pairing dialog. Without it the failure opens nothing. */
+  host?: string,
+): Promise<JobSnapshot> {
   const raw = await invoke<Record<string, unknown>>("job_status", { jobId });
   // Cheap shape validation. If the Rust side ever returns a non-snapshot
   // payload (e.g., an error envelope we forgot to map to a thrown
@@ -4263,6 +4323,13 @@ export async function jobStatus(jobId: string): Promise<JobSnapshot> {
   if (status !== "running" && status !== "done" && status !== "failed") {
     throw new Error(
       `job_status returned unexpected shape (missing/invalid status): ${JSON.stringify(raw).slice(0, 200)}`,
+    );
+  }
+  if (status === "failed") {
+    // A transfer that died because the console has not accepted this app opens the pairing dialog.
+    reportIfNotPaired(
+      (raw as { error_reason?: unknown }).error_reason ?? raw.error,
+      host,
     );
   }
   return raw as unknown as JobSnapshot;
@@ -4388,7 +4455,7 @@ export async function portProbe(
 }
 
 /**
- * Check whether the PS5 runtime (:9113) is currently serving. Returns a
+ * Check whether the PS5 runtime (AVA1, :9120) is currently serving. Returns a
  * lightly-parsed shape — the full command's return covers more details
  * but these are the fields the status UI actually renders.
  *
@@ -4506,6 +4573,9 @@ export async function payloadCheck(ip: string): Promise<{
    *  Defaults to true when absent so an older engine degrades to the old
    *  interpretation rather than claiming a console outage it can't see. */
   engineReachable: boolean;
+  /** The ONE status verdict (connected / needs_pairing / helper_old / down),
+   *  classified from the same reply. See lib/consoleSession.ts. */
+  session: SessionState;
   /** Raw error string from the engine when reachable=false. Lets the
    *  Connection screen's wait-for-boot banner surface what actually
    *  went wrong (TCP connect refused, STATUS_ACK timeout, etc.)
@@ -4525,10 +4595,12 @@ export async function payloadCheck(ip: string): Promise<{
       max_transfer_streams?: number;
     };
   }>("payload_check", { ip });
+  const error = resp?.reachable ? null : (resp?.error ?? null);
   return {
     reachable: !!resp?.reachable,
     loaded: !!resp?.loaded,
     engineReachable: resp?.engine !== false,
+    session: classifySession({ reachable: !!resp?.reachable, error }),
     payloadVersion: resp?.status?.version ?? null,
     ps5Kernel: resp?.status?.ps5_kernel ?? null,
     ucredElevated:
@@ -4544,7 +4616,7 @@ export async function payloadCheck(ip: string): Promise<{
       resp.status.max_transfer_streams > 0
         ? resp.status.max_transfer_streams
         : null,
-    error: resp?.reachable ? null : (resp?.error ?? null),
+    error,
   };
 }
 

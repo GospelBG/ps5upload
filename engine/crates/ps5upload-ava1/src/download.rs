@@ -2,7 +2,7 @@
 //! (`to_local`) and a folder or file streamed straight into a `.zip` (`to_zip`).
 //! Blocking, like the upload adapters: call from `spawn_blocking` or a plain thread.
 //!
-//! Route selection (`route::use_ava1`), the terminal-versus-retryable split, the
+//! The console check (`console::require_ava1`), the terminal-versus-retryable split, the
 //! `error_reason` words and the retry/backoff loop are the upload adapters' own
 //! (`upload.rs`): a download differs only in which side holds the sink.
 
@@ -594,6 +594,7 @@ fn run(
         let (mut base_bytes, mut base_files) = (0u64, 0u64);
         let mut attempt = 0u32;
         let mut retry_restarts = 0u32;
+        let mut busy = 0u32;
         let (mut last_at, mut last_work) = (Instant::now(), 0u64);
         let mut progress = Arc::new(Progress::default());
         loop {
@@ -638,6 +639,15 @@ fn run(
                     return Ok(r.bytes);
                 }
                 Err(SendError::Disconnected(why)) => (why, true),
+                // The console answered BUSY to the JobOpen: not now. Same bounded backoff, same attempt.
+                Err(SendError::Refused { status, message }) if status == gen::ERR_BUSY => {
+                    busy += 1;
+                    if busy > pool.busy_tries() {
+                        return Err(crate::upload::busy_failure(pool.busy_tries(), &message));
+                    }
+                    wait(&mut backoff, &format!("the console is busy: {message}")).await;
+                    continue;
+                }
                 Err(SendError::Source(e))
                     if is_zip_restart(&e) && retry_restarts < MAX_RETRY_RESTARTS =>
                 {
@@ -1166,6 +1176,12 @@ mod tests {
         damage: Option<fn(&Path)>,
         part: PathBuf,
         prepares: std::sync::atomic::AtomicU32,
+        /// What the sink had been handed when the last sync that began before the drop started:
+        /// the bytes a journal commit could have covered. Everything written after it, up to the
+        /// resume, is what a drop may lose (and a resume then rewrites).
+        synced_floor: Arc<AtomicU64>,
+        /// What the sink had been handed when the resume began (its second `prepare`).
+        at_resume: Arc<AtomicU64>,
     }
 
     impl DropSink {
@@ -1180,6 +1196,8 @@ mod tests {
     impl Sink for DropSink {
         fn prepare(&self, m: &Manifest) -> io::Result<()> {
             if self.prepares.fetch_add(1, Ordering::Relaxed) == 1 {
+                self.at_resume
+                    .store(self.written.load(Ordering::Relaxed), Ordering::Relaxed);
                 if let Some(f) = self.damage {
                     f(&self.part);
                 }
@@ -1197,7 +1215,13 @@ mod tests {
             Ok(())
         }
         fn sync(&self, ids: &[u32]) -> io::Result<()> {
-            self.inner.sync(ids)
+            let handed = self.written.load(Ordering::Relaxed);
+            let before_drop = !self.killed.load(Ordering::Relaxed);
+            let r = self.inner.sync(ids);
+            if r.is_ok() && before_drop {
+                self.synced_floor.store(handed, Ordering::Relaxed);
+            }
+            r
         }
         fn read_at(&self, id: u32, off: u64, buf: &mut [u8]) -> io::Result<usize> {
             self.inner.read_at(id, off, buf)
@@ -1219,14 +1243,14 @@ mod tests {
 
     /// Downloads `files` x `size` bytes into a Stored zip, dropping the connection at
     /// ~40% of the bytes. Returns (bytes the sink was handed in all, total bytes, run
-    /// result); the archive is checked against the source byte for byte.
+    /// the bytes a drop could have lost); the archive is checked against the source byte for byte.
     fn drop_at_forty_percent(
         tag: &str,
         files: usize,
         size: usize,
         bps: u64,
         damage: Option<fn(&Path)>,
-    ) -> (u64, u64) {
+    ) -> (u64, u64, u64) {
         let d = std::env::temp_dir().join(format!("p5a-zip-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("share/G")).unwrap();
@@ -1259,6 +1283,8 @@ mod tests {
         let pool = Pool::new(ava).with_addr(proxy.addr.to_string());
         let dest = d.join("g.zip");
         let written = Arc::new(AtomicU64::new(0));
+        let synced_floor = Arc::new(AtomicU64::new(0));
+        let at_resume = Arc::new(AtomicU64::new(0));
         let sink: Arc<dyn Sink> = Arc::new(DropSink {
             inner: Arc::new(StoredZipSink::new(dest.clone(), "G")),
             written: written.clone(),
@@ -1268,6 +1294,8 @@ mod tests {
             damage,
             part: d.join("g.zip.ava-part"),
             prepares: Default::default(),
+            synced_floor: synced_floor.clone(),
+            at_resume: at_resume.clone(),
         });
         let c = Counters::default();
         let bytes = run(
@@ -1300,19 +1328,30 @@ mod tests {
         }
         assert!(!d.join("g.zip.ava-part").exists());
         let _ = std::fs::remove_dir_all(&d);
-        (written.load(Ordering::Relaxed), total)
+        (
+            written.load(Ordering::Relaxed),
+            total,
+            // The most a drop could have lost: handed before the resume, not yet synced.
+            at_resume
+                .load(Ordering::Relaxed)
+                .saturating_sub(synced_floor.load(Ordering::Relaxed)),
+        )
     }
 
     // Step 2: whole entries are kept. 1 MiB entries are one group each, so only the entry
     // in flight can be lost; at 4 MiB/s a sync batch holds well under an entry.
     #[test]
     fn a_stored_zip_resumes_with_at_most_one_entry_resent() {
-        let (handed, total) = drop_at_forty_percent("entry", 16, 1 << 20, 4 << 20, None);
+        let (handed, total, could_lose) =
+            drop_at_forty_percent("entry", 16, 1 << 20, 4 << 20, None);
         let resent = handed - total;
+        // What a drop loses is what was handed to the sink since the last sync that began before
+        // it, plus a commit's worth of slack (the journal record follows the sync). That is the
+        // property: nothing synced is sent twice. A fixed byte bound only held on an idle host,
+        // where the sync period is short next to the link's rate.
         assert!(
-            resent <= 1 << 20,
-            "{resent} bytes were sent twice; one entry is {}",
-            1 << 20
+            resent <= could_lose + (1 << 20),
+            "{resent} bytes were sent twice but only {could_lose} were unsynced at the drop"
         );
     }
 
@@ -1320,20 +1359,20 @@ mod tests {
     // what is resent is the un-journaled tail (a sync batch), never the entry.
     #[test]
     fn a_stored_zip_resumes_mid_entry_with_at_most_a_group_or_two_resent() {
-        let (handed, total) = drop_at_forty_percent("mid", 4, 12 << 20, 8 << 20, None);
+        let (handed, total, could_lose) = drop_at_forty_percent("mid", 4, 12 << 20, 8 << 20, None);
         let resent = handed - total;
         assert!(
-            resent <= 4 << 20,
-            "{resent} bytes were sent twice; the entry is {}",
-            12 << 20
+            resent <= could_lose + (1 << 20),
+            "{resent} bytes were sent twice but only {could_lose} were unsynced at the drop"
         );
+        assert!(resent < 12 << 20, "the entry was sent again whole");
     }
 
     // The sink cannot honour the journal (the archive is shorter than the journal's cut):
     // the receiver resets the journal, the archive restarts from 0, the download completes.
     #[test]
     fn a_resume_the_sink_cannot_honour_starts_over_and_still_verifies() {
-        let (handed, total) = drop_at_forty_percent(
+        let (handed, total, _) = drop_at_forty_percent(
             "fallback",
             4,
             12 << 20,
@@ -1356,7 +1395,7 @@ mod tests {
     // and the finished archive still matches the source.
     #[test]
     fn rot_in_an_in_flight_entrys_durable_bytes_is_caught() {
-        let (handed, total) = drop_at_forty_percent(
+        let (handed, total, _) = drop_at_forty_percent(
             "rot",
             4,
             12 << 20,

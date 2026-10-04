@@ -460,8 +460,9 @@ async fn hash_result_rides_in_status_ext() {
     assert_eq!(v["size"], 300_000);
     assert_eq!(v["path"], f.to_str().unwrap());
     assert_eq!(st.bytes_total, 300_000);
-    // A hash is repeatable, so its job was released when the terminal status was read.
-    assert_eq!(status_code(&r.me, id(30)).await, gen::ERR_UNKNOWN_JOB);
+    // A hash is repeatable, but its finished job stays listed for the grace after its terminal
+    // status was first delivered (the release is covered by the grace test below).
+    assert_eq!(status(&r.me, id(30)).await.state, Some(1));
     // A folder is not hashable, a missing file fails with a cause.
     run(&r.me, id(31), gen::JOB_OP_HASH, &delete_args(&r.d)).await;
     let st = finished(&r.me, id(31)).await;
@@ -819,7 +820,7 @@ async fn an_unknown_device_answer_refuses_the_delete() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn finished_hash_ops_release_their_slots_when_read() {
+async fn finished_hash_ops_never_fill_the_table_a_full_table_reclaims_a_delivered_slot() {
     let r = rig("jr-slots").await;
     let f = r.d.join("h.bin");
     std::fs::write(&f, b"hello").unwrap();
@@ -836,10 +837,9 @@ async fn finished_hash_ops_release_their_slots_when_read() {
         };
         assert_eq!(st.state, Some(1), "op {n}");
     }
-    assert!(
-        list(&r.me).await.is_empty(),
-        "every finished op was released once read"
-    );
+    // The table never filled although every op was read within its grace: a full table
+    // reclaims the slot of the op delivered longest ago.
+    assert!(list(&r.me).await.len() <= 32);
     // A backup is not repeatable, so its result is kept for the short done-age instead.
     run(
         &r.me,
@@ -987,5 +987,52 @@ async fn an_atomic_copy_keeps_the_source_mode_and_a_nul_in_a_path_is_refused() {
     let st = finished(&r.me, id(244)).await;
     assert_eq!((st.state, st.code), (Some(2), Some(gen::ERR_PROTOCOL)));
     assert_eq!(count_files(&victim), 2);
+    drop(r.srv);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_op_that_finishes_while_its_running_reply_is_built_stays_readable() {
+    // The reply to job.run is encoded after the op has finished, but the "was it finished" read
+    // came first: the job must stay listed, or the engine's next job.status gets ERR_UNKNOWN_JOB.
+    let r = rig("jr-race").await;
+    let f = r.d.join("race.bin");
+    std::fs::write(&f, b"hello").unwrap();
+    let a = serde_json::json!({ "path": f.to_str().unwrap() }).to_string();
+    unsafe { ffi::ava1_test_op_hold_reply_until_finished(1) };
+    let (code, _) = run(&r.me, id(201), gen::JOB_OP_HASH, &a).await;
+    unsafe { ffi::ava1_test_op_hold_reply_until_finished(0) };
+    assert_eq!(code, gen::STATUS_OK);
+    let st = status(&r.me, id(201)).await; // ERR_UNKNOWN_JOB before the fix
+    assert_eq!(st.state, Some(1));
+    drop(r.srv);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_op_stays_listed_for_a_grace_then_is_released_on_the_next_read() {
+    // Review 004 O2: a lost job.run reply must still get the stored answer, so a repeat of
+    // job.run within the grace does not re-run the op; after the grace the next read releases it.
+    let r = rig("jr-grace").await;
+    r.srv.knob("park_ms", 400); // the grace is min(park age, 10 s)
+    let f = r.d.join("g.bin");
+    std::fs::write(&f, b"first").unwrap();
+    let a = serde_json::json!({ "path": f.to_str().unwrap() }).to_string();
+    run(&r.me, id(210), gen::JOB_OP_HASH, &a).await;
+    let first = finished(&r.me, id(210)).await; // the first terminal delivery starts the grace
+    let h1 = serde_json::from_slice::<serde_json::Value>(&first.result.unwrap()).unwrap()["hash"]
+        .clone();
+    std::fs::write(&f, b"second, different").unwrap();
+    // The repeat is answered from the stored job: the old hash, not a re-run on the new bytes.
+    let (code, again) = run(&r.me, id(210), gen::JOB_OP_HASH, &a).await;
+    assert_eq!(code, gen::STATUS_OK);
+    let again = again.unwrap();
+    assert_eq!(again.state, Some(1));
+    let h2 = serde_json::from_slice::<serde_json::Value>(&again.result.unwrap()).unwrap()["hash"]
+        .clone();
+    assert_eq!(h1, h2, "nothing ran twice inside the grace");
+    assert_eq!(h1, blake3::hash(b"first").to_hex().to_string());
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Past the grace, a read releases it (or the reaper already did).
+    let _ = status_code(&r.me, id(210)).await;
+    assert_eq!(status_code(&r.me, id(210)).await, gen::ERR_UNKNOWN_JOB);
     drop(r.srv);
 }

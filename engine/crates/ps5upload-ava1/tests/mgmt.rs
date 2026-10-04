@@ -67,7 +67,6 @@ fn text_of(req: &[u8]) -> String {
 /// A loopback console running `handler` that trusts the transport's identity, and the
 /// transport over its own pool.
 async fn console(tag: &str, handler: RpcHandler) -> (Arc<AvaTransport>, &'static Pool, String) {
-    force_auto();
     let base = temp(tag);
     let ava = base.join("ava");
     std::fs::create_dir_all(&ava).unwrap();
@@ -107,17 +106,6 @@ async fn call(
     tokio::task::spawn_blocking(move || t.call(&addr, method, &label, &body, timeout))
         .await
         .unwrap()
-}
-
-/// Forces `PS5UPLOAD_TRANSFER=auto` for the whole binary before any call reads it (the
-/// `Once` makes every test wait for the one `set_var`, so none reads the environment mid-write).
-fn force_auto() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| std::env::set_var("PS5UPLOAD_TRANSFER", "auto"));
-    assert_eq!(
-        ps5upload_ava1::route::mode(),
-        ps5upload_ava1::route::Mode::Auto
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -661,10 +649,9 @@ async fn one_session_serves_every_call() {
 }
 
 /// A console that does not advertise CAP_MGMT (an older AVA1 helper: transfers, no management
-/// methods) is sent to FTX2 from its capability bits alone. Nothing is sent to it to find out.
+/// methods) is `helper_not_ava1` from its capability bits alone. Nothing is sent to it to find out.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_console_without_cap_mgmt_is_sent_to_ftx2_without_a_request() {
-    force_auto();
+async fn a_console_without_cap_mgmt_is_helper_not_ava1_without_a_request() {
     let n = Arc::new(AtomicUsize::new(0));
     let n2 = n.clone();
     let base = temp("old");
@@ -694,7 +681,8 @@ async fn a_console_without_cap_mgmt_is_sent_to_ftx2_without_a_request() {
     let t = Arc::new(AvaTransport::with_pool(pool));
     let c = "old-console:9114";
     for m in [m::HW_INFO, m::FS_LIST, m::NODE_STATUS] {
-        assert!(call(&t, c, m, "X", b"{}", T).await.unwrap().is_none());
+        let e = call(&t, c, m, "X", b"{}", T).await.unwrap_err();
+        assert!(e.to_string().contains("helper_not_ava1"), "{e}");
     }
     assert_eq!(
         n.load(Ordering::SeqCst),
@@ -711,7 +699,6 @@ async fn a_console_without_cap_mgmt_is_sent_to_ftx2_without_a_request() {
 /// A console that advertises CAP_MGMT is served over AVA1 even though it has no data plane.
 #[tokio::test(flavor = "multi_thread")]
 async fn cap_mgmt_alone_routes_management_over_ava1() {
-    force_auto();
     let base = temp("mgmtonly");
     let ava = base.join("ava");
     std::fs::create_dir_all(&ava).unwrap();
@@ -737,17 +724,16 @@ async fn cap_mgmt_alone_routes_management_over_ava1() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unreachable_console_is_not_served_and_the_caller_uses_ftx2() {
-    force_auto();
+async fn an_unreachable_console_is_helper_not_ava1() {
     let base = temp("down");
     let pool: &'static Pool = Box::leak(Box::new(
         Pool::new(base.join("ava")).with_addr("127.0.0.1:1"),
     ));
     let t = Arc::new(AvaTransport::with_pool(pool));
-    assert!(call(&t, "down-console:9114", m::HW_INFO, "HW_INFO", b"", T)
+    let e = call(&t, "down-console:9114", m::HW_INFO, "HW_INFO", b"", T)
         .await
-        .unwrap()
-        .is_none());
+        .unwrap_err();
+    assert!(e.to_string().contains("helper_not_ava1"), "{e}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -991,6 +977,7 @@ fn job_status(job_id: [u8; 16], state: u8) -> gen::Status {
         state: Some(state),
         result: None,
         code: None,
+        unswept: None,
     }
 }
 

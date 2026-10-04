@@ -61,6 +61,9 @@ fn c_replays_a_rust_journal() {
                 file_id: 1000 + i,
                 root: [i as u8; 32],
             }],
+            pack_len: None,
+            pack_offset: None,
+            pack_segment: None,
         });
         st.apply(&r);
         j.append(&r).unwrap();
@@ -102,6 +105,9 @@ fn the_c_compaction_replays_to_the_same_state_in_rust() {
                 file_id: 7,
                 root: [i as u8; 32],
             }],
+            pack_len: None,
+            pack_offset: None,
+            pack_segment: None,
         });
         st.apply(&r);
         j.append(&r).unwrap();

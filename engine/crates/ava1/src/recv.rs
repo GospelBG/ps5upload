@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,6 +20,7 @@ use crate::gen::{
 };
 use crate::journal::{self, Journal, Record, State};
 use crate::manifest::{self, Manifest};
+use crate::packlog::{Loc, LoggedGroup, PackLog, PackOpts};
 use crate::ranges::{runs, Need, RangeSet};
 use crate::router::{ConnTx, Inbound, JobLink};
 use crate::send::{next_ctl, Progress, SendError};
@@ -35,8 +36,47 @@ pub trait Sink: Send + Sync {
     fn write_at(&self, id: u32, off: u64, data: &[u8]) -> io::Result<()>;
     /// A whole small file (its root was checked when it arrived).
     fn write_whole(&self, id: u32, data: &[u8]) -> io::Result<()>;
+    /// `write_whole` when the caller already holds the file's BLAKE3 root (the pack log records it
+    /// and need not hash the bytes again).
+    fn write_whole_root(&self, id: u32, _root: &[u8; 32], data: &[u8]) -> io::Result<()> {
+        self.write_whole(id, data)
+    }
     /// Durability: the bytes of every file in `ids` must reach the disk before the return.
     fn sync(&self, ids: &[u32]) -> io::Result<()>;
+    /// Durable-by-log (SPEC.md §15.7): turns the pack log on in the job directory `dir`. Called
+    /// once, before any data. A sink with no log ignores it.
+    fn enable_log(&self, _dir: &Path) {}
+    /// One batch's durability: the large files `large` as in `sync`, and for the small files
+    /// `small` either the same (an empty answer) or, with the log on, one fsync of the log and one
+    /// group per pack segment the batch's records sit in, for the journal's pack extension.
+    fn sync_batch(&self, small: &[u32], large: &[u32]) -> io::Result<Vec<LoggedGroup>> {
+        let all: Vec<u32> = small.iter().chain(large).copied().collect();
+        self.sync(&all)?;
+        Ok(Vec::new())
+    }
+    /// The batch's records are in the journal: its files are done and wait for the sweep.
+    fn batch_journaled(&self, _groups: &[LoggedGroup]) {}
+    /// Files done but not yet durable in place.
+    fn unswept(&self) -> usize {
+        0
+    }
+    /// The unswept cap is reached: the next batch sweeps everything.
+    fn log_pressure(&self) -> bool {
+        false
+    }
+    /// Makes the logged files that are due (every one when `force`) durable in place; their ids.
+    fn sweep(&self, _force: bool) -> io::Result<Vec<u32>> {
+        Ok(Vec::new())
+    }
+    /// The `JnlSweep` for `ids` is durable: they stop holding their pack segments.
+    fn sweep_journaled(&self, _ids: &[u32]) {}
+    /// Crash recovery: re-makes the files `st` calls unswept from the pack and queues them for the
+    /// sweep. Returns the files whose record could not be found (they are reset and resent).
+    fn recover_log(&self, _st: &State) -> io::Result<Vec<u32>> {
+        Ok(Vec::new())
+    }
+    /// Nothing is unswept: removes the pack files.
+    fn log_cleanup(&self) {}
     /// The resume check's read (SPEC.md §13.4).
     fn read_at(&self, id: u32, off: u64, buf: &mut [u8]) -> io::Result<usize>;
     /// A relay keeps no durable bytes. Its need hint comes from the destination
@@ -70,6 +110,19 @@ pub trait Sink: Send + Sync {
     }
 }
 
+/// Whether a `LocalSink` takes the durable-by-log path unless told otherwise. The environment decides
+/// (`PS5UPLOAD_AVA1_LOG_SMALL=1` / `0`); with no setting it is on everywhere but macOS, where a plain
+/// fsync never reaches the drive (one `F_FULLFSYNC` per batch already covers the files) so the log
+/// only adds a second write: measured on loopback, 2,000 tiny files download at ~2,300 files/s with
+/// the log against ~2,900 without. The log is for drives where a per-file fsync costs (the console's,
+/// Linux and Windows disks).
+fn log_small_default() -> bool {
+    match std::env::var("PS5UPLOAD_AVA1_LOG_SMALL") {
+        Ok(v) => v != "0",
+        Err(_) => !cfg!(target_vendor = "apple"),
+    }
+}
+
 /// Files under `root` on this computer: new folders staged in `<root>.ava-part`, large
 /// files through `<name>.ava-part`, one rename each at the end.
 pub struct LocalSink {
@@ -81,6 +134,12 @@ pub struct LocalSink {
     /// `root absent ⟺ part present` on every run (ruling 10).
     staged: bool,
     st: Mutex<LocalState>,
+    /// Durable-by-log: whether small files go through the pack log (default on; the environment's
+    /// `PS5UPLOAD_AVA1_LOG_SMALL=0` keeps the per-file fsync path), its options, and the log itself
+    /// once `enable_log` has set it up.
+    log: bool,
+    pack_opts: PackOpts,
+    pack: Mutex<Option<PackLog>>,
 }
 
 #[derive(Default)]
@@ -97,7 +156,98 @@ impl LocalSink {
             single: single_file,
             staged,
             st: Mutex::default(),
+            log: log_small_default(),
+            pack_opts: PackOpts::default(),
+            pack: Mutex::new(None),
         }
+    }
+
+    /// Chooses the durable-by-log path explicitly (tests, and the fallback switch).
+    pub fn with_log(mut self, on: bool, opts: PackOpts) -> Self {
+        self.log = on;
+        self.pack_opts = opts;
+        self
+    }
+
+    /// The small file's bytes in place, no fsync and no descriptor kept (the log holds them).
+    fn make_file(&self, id: u32, data: &[u8]) -> io::Result<()> {
+        let p = {
+            let st = self.st.lock().unwrap();
+            self.path(&st, id, false)
+        };
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&p)?;
+        verify::write_all_at(&f, data, 0)?;
+        f.set_len(data.len() as u64)
+    }
+
+    fn write_logged(&self, id: u32, root: [u8; 32], data: &[u8]) -> io::Result<()> {
+        let rec = gen::BundleRecord {
+            file_id: id,
+            root,
+            data: data.to_vec(),
+        };
+        let loc = {
+            let mut g = self.pack.lock().unwrap();
+            g.as_mut().expect("checked by the caller").append(&rec)?
+        };
+        let r = self.make_file(id, data);
+        if r.is_err() {
+            if let Some(p) = self.pack.lock().unwrap().as_mut() {
+                p.forget(loc);
+            }
+        }
+        r
+    }
+
+    /// Makes the files of `due` right in place and durable: re-made from their record when missing
+    /// or the wrong size, fsynced, one drive-cache flush, their directories synced.
+    fn sweep_files(&self, due: &[Loc]) -> io::Result<()> {
+        let m = self
+            .st
+            .lock()
+            .unwrap()
+            .m
+            .clone()
+            .ok_or_else(|| io::Error::other("sweep before prepare"))?;
+        let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut last: Option<std::fs::File> = None;
+        for l in due {
+            let p = {
+                let st = self.st.lock().unwrap();
+                self.path(&st, l.id, false)
+            };
+            let size = m.entry(l.id).map_or(0, |e| e.size);
+            let open = || std::fs::OpenOptions::new().write(true).open(&p);
+            let f = match open() {
+                Ok(f) if f.metadata().map(|md| md.len() == size).unwrap_or(false) => f,
+                _ => {
+                    let rec = {
+                        let g = self.pack.lock().unwrap();
+                        g.as_ref()
+                            .ok_or_else(|| io::Error::other("no pack log"))?
+                            .read(l)?
+                    };
+                    self.make_file(l.id, &rec.data)?;
+                    open()?
+                }
+            };
+            sys_fsync(&f)?;
+            if let Some(parent) = p.parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+            last = Some(f);
+        }
+        if let Some(f) = &last {
+            flush_drive_cache(f)?;
+        }
+        sync_dirs(&dirs)
     }
 
     fn base(&self) -> PathBuf {
@@ -205,6 +355,45 @@ fn flush_drive_cache(_f: &std::fs::File) -> io::Result<()> {
     Ok(())
 }
 
+/// fsyncs each directory (so the new names are durable). They are independent descriptors, so
+/// a game-sized tree's tens of directories go four at a time instead of one after another
+/// (review 003 §3.3 item 1, the engine's side of the console's striped directory syncs).
+#[cfg(unix)] // a directory cannot be opened for sync on Windows
+fn sync_dirs(dirs: &BTreeSet<PathBuf>) -> io::Result<()> {
+    const WAYS: usize = 4;
+    let list: Vec<&PathBuf> = dirs.iter().collect();
+    if list.len() <= 2 {
+        return list
+            .iter()
+            .try_for_each(|d| sys_fsync(&std::fs::File::open(d)?));
+    }
+    let mut first_err: Option<io::Error> = None;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..WAYS.min(list.len()))
+            .map(|k| {
+                let list = &list;
+                s.spawn(move || {
+                    list.iter()
+                        .skip(k)
+                        .step_by(WAYS)
+                        .try_for_each(|d| sys_fsync(&std::fs::File::open(d)?))
+                })
+            })
+            .collect();
+        for h in handles {
+            if let Err(e) = h.join().expect("a directory sync thread panicked") {
+                first_err.get_or_insert(e);
+            }
+        }
+    });
+    first_err.map_or(Ok(()), Err)
+}
+
+#[cfg(not(unix))]
+fn sync_dirs(_dirs: &BTreeSet<PathBuf>) -> io::Result<()> {
+    Ok(())
+}
+
 impl Sink for LocalSink {
     fn prepare(&self, m: &Manifest) -> io::Result<()> {
         let mut st = self.st.lock().unwrap();
@@ -219,12 +408,22 @@ impl Sink for LocalSink {
         Ok(())
     }
 
+    fn write_whole_root(&self, id: u32, root: &[u8; 32], data: &[u8]) -> io::Result<()> {
+        if self.log && self.pack.lock().unwrap().is_some() {
+            return self.write_logged(id, *root, data);
+        }
+        self.write_whole(id, data)
+    }
+
     fn write_at(&self, id: u32, off: u64, data: &[u8]) -> io::Result<()> {
         let f = self.file(id, true, false)?;
         verify::write_all_at(&f, data, off)
     }
 
     fn write_whole(&self, id: u32, data: &[u8]) -> io::Result<()> {
+        if self.log && self.pack.lock().unwrap().is_some() {
+            return self.write_logged(id, *blake3::hash(data).as_bytes(), data);
+        }
         let f = self.file(id, false, true)?;
         verify::write_all_at(&f, data, 0)?;
         f.set_len(data.len() as u64)
@@ -254,13 +453,121 @@ impl Sink for LocalSink {
         if let Some(f) = files.last() {
             flush_drive_cache(f)?;
         }
-        #[cfg(unix)] // a directory cannot be opened for sync on Windows
-        for d in &dirs {
-            sys_fsync(&std::fs::File::open(d)?)?;
+        sync_dirs(&dirs)
+    }
+
+    fn enable_log(&self, dir: &Path) {
+        // Always: recovery of a journal that replays unswept files needs the log's files whatever this
+        // run does with new ones. `self.log` decides only whether small files are written to it.
+        *self.pack.lock().unwrap() = Some(PackLog::new(dir, self.pack_opts));
+    }
+
+    fn sync_batch(&self, small: &[u32], large: &[u32]) -> io::Result<Vec<LoggedGroup>> {
+        if !self.log || self.pack.lock().unwrap().is_none() {
+            let all: Vec<u32> = small.iter().chain(large).copied().collect();
+            self.sync(&all)?;
+            return Ok(Vec::new());
         }
-        #[cfg(not(unix))]
-        let _ = dirs;
-        Ok(())
+        // Large files: their data and the directory entries of their part files, as before.
+        if !large.is_empty() {
+            self.sync(large)?;
+        }
+        // Small files: one fsync of the log. No file and no directory is synced here (the sweep does).
+        let (fds, groups) = self
+            .pack
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("checked above")
+            .take_batch(small)?;
+        for f in &fds {
+            sys_fsync(f)?;
+        }
+        if let Some(f) = fds.last() {
+            flush_drive_cache(f)?;
+        }
+        Ok(groups)
+    }
+
+    fn batch_journaled(&self, groups: &[LoggedGroup]) {
+        if let Some(p) = self.pack.lock().unwrap().as_mut() {
+            p.journaled(groups);
+        }
+    }
+
+    fn unswept(&self) -> usize {
+        self.pack
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |p| p.unswept())
+    }
+
+    fn log_pressure(&self) -> bool {
+        self.pack
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| p.unswept_bytes() >= p.opts().max_unswept)
+    }
+
+    fn sweep(&self, force: bool) -> io::Result<Vec<u32>> {
+        let due = match self.pack.lock().unwrap().as_mut() {
+            Some(p) => p.due(force, 512),
+            None => return Ok(Vec::new()),
+        };
+        if due.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self.sweep_files(&due) {
+            Ok(()) => Ok(due.iter().map(|l| l.id).collect()),
+            Err(e) => {
+                if let Some(p) = self.pack.lock().unwrap().as_mut() {
+                    p.due_failed(&due);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn sweep_journaled(&self, ids: &[u32]) {
+        if let Some(p) = self.pack.lock().unwrap().as_mut() {
+            p.swept(ids);
+        }
+    }
+
+    fn recover_log(&self, st: &State) -> io::Result<Vec<u32>> {
+        let m = self.st.lock().unwrap().m.clone();
+        let mut g = self.pack.lock().unwrap();
+        let Some(p) = g.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let m = m.ok_or_else(|| io::Error::other("recovery before prepare"))?;
+        p.recover(st, |rec| {
+            let Some(e) = m.entry(rec.file_id) else {
+                return Ok(false);
+            };
+            if e.size != rec.data.len() as u64 {
+                return Ok(false);
+            }
+            let path = {
+                let st = self.st.lock().unwrap();
+                self.path(&st, rec.file_id, false)
+            };
+            let same = std::fs::read(&path)
+                .map(|b| *blake3::hash(&b).as_bytes() == rec.root)
+                .unwrap_or(false);
+            if !same {
+                self.make_file(rec.file_id, &rec.data)?;
+            }
+            Ok(true)
+        })
+    }
+
+    fn log_cleanup(&self) {
+        if let Some(p) = self.pack.lock().unwrap().as_mut() {
+            p.cleanup();
+        }
     }
 
     fn read_at(&self, id: u32, off: u64, buf: &mut [u8]) -> io::Result<usize> {
@@ -499,6 +806,7 @@ pub async fn receive_job(
                     files: 0,
                     bytes: 0,
                     message: Some(e.to_string()),
+                    settling: None,
                 })
                 .await;
             return Err(e);
@@ -713,11 +1021,30 @@ async fn run_loop(
             (j, fresh.clone())
         }
     };
+    sink.enable_log(&dir);
     let s2 = sink.clone();
     let m2 = m.clone();
     tokio::task::spawn_blocking(move || s2.prepare(&m2))
         .await
         .map_err(proto)??;
+    // Durable-by-log recovery (SPEC.md §15.7): files the journal calls done but not yet swept are made
+    // again from the pack where a crash lost them and swept; the ones whose record is gone are reset
+    // (and so resent). Before the map, so the sender is told the truth.
+    {
+        let (s2, st2) = (sink.clone(), st.clone());
+        let lost = tokio::task::spawn_blocking(move || s2.recover_log(&st2))
+            .await
+            .map_err(proto)??;
+        for id in lost {
+            let rec = Record::Reset(id);
+            st.apply(&rec);
+            jnl.append(&rec)?;
+        }
+        let (j, s) = sweep_logged(&sink, jnl, st, true).await?;
+        jnl = j;
+        st = s;
+        sink.log_cleanup();
+    }
 
     if sink.transient_relay() {
         if let Some(hint) = &need_hint {
@@ -1194,8 +1521,12 @@ async fn run_loop(
             let finished =
                 done.len() >= total_files && pending_small.is_empty() && writes.is_empty();
             if finished {
-                let mut jnl = jnl.take().expect("a finished job has no batch in flight");
-                let mut st = st.take().expect("a finished job has no batch in flight");
+                let jnl0 = jnl.take().expect("a finished job has no batch in flight");
+                let st0 = st.take().expect("a finished job has no batch in flight");
+                // Every logged file durable in place before the end (and before a staged tree's rename:
+                // the sweep addresses files by path); an engine has no thread to settle behind JobDone.
+                let (mut jnl, mut st) = sweep_logged(&sink, jnl0, st0, true).await?;
+                sink.log_cleanup();
                 let s2 = sink.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || s2.finish())
                     .await
@@ -1217,6 +1548,7 @@ async fn run_loop(
                             files: m.files(),
                             bytes: m.bytes(),
                             message: Some(e.to_string()),
+                            settling: None,
                         })
                         .await
                         .map_err(|e| SendError::Disconnected(e.to_string()))?;
@@ -1235,6 +1567,7 @@ async fn run_loop(
                         files: m.files(),
                         bytes: m.bytes(),
                         message: None,
+                        settling: None,
                     })
                     .await
                     .map_err(|e| SendError::Disconnected(e.to_string()))?;
@@ -1304,7 +1637,7 @@ fn write_bundle(
             out.retry.push((id, gen::RETRY_VERIFY));
             continue;
         }
-        sink.write_whole(id, &data)?;
+        sink.write_whole_root(id, &root, &data)?;
         out.ok.push(id);
     }
     out.took = t.elapsed();
@@ -1535,8 +1868,13 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
         large,
     } = job;
     let mut jnl = jnl;
-    // Nothing written since the last batch: nothing to sync, journal or send.
+    // Nothing written since the last batch: nothing to sync, journal or send — but logged files that
+    // have aged are swept (the batch cadence is the sweep's clock).
     if small.is_empty() && ranges.is_empty() && roots.is_empty() {
+        if sink.unswept() > 0 {
+            let force = sink.log_pressure();
+            (jnl, st) = sweep_logged(&sink, jnl, st, force).await?;
+        }
         return Ok(BatchDone {
             jnl,
             st,
@@ -1548,18 +1886,16 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
     }
     // The bytes first: the small files and every large file with a new range (the same
     // ids the old inline batch synced).
-    let sync_ids: Vec<u32> = small
-        .iter()
-        .copied()
-        .chain(large.iter().map(|l| l.id))
-        .collect();
-    if !sync_ids.is_empty() {
+    let small_ids: Vec<u32> = small.iter().copied().collect();
+    let large_ids: Vec<u32> = large.iter().map(|l| l.id).collect();
+    let groups: Vec<LoggedGroup> = if !small_ids.is_empty() || !large_ids.is_empty() {
         let s2 = sink.clone();
-        let ids = sync_ids;
-        tokio::task::spawn_blocking(move || s2.sync(&ids))
+        tokio::task::spawn_blocking(move || s2.sync_batch(&small_ids, &large_ids))
             .await
-            .map_err(proto)??;
-    }
+            .map_err(proto)??
+    } else {
+        Vec::new()
+    };
     // The outboards: sync the very instance the loop is still putting CVs into (a second
     // instance would rebuild its image from disk and drop the in-flight puts), so the
     // loop's puts serialize with the sync behind the same lock.
@@ -1574,20 +1910,45 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
         .await
         .map_err(proto)??;
     }
-    let rec = Record::Batch(JnlBatch {
-        files: runs(&small),
-        ranges: ranges.clone(),
-        roots,
-    });
-    let (j, rec, r) = tokio::task::spawn_blocking(move || {
-        let r = jnl.append(&rec);
-        (jnl, rec, r)
+    // One JnlBatch, or with the pack log one per segment the batch's records sit in (the first carries
+    // the large files' ranges and roots); each names its files and the byte range of their records.
+    let recs: Vec<Record> = if groups.is_empty() {
+        vec![Record::Batch(JnlBatch {
+            files: runs(&small),
+            ranges: ranges.clone(),
+            roots,
+            pack_len: None,
+            pack_offset: None,
+            pack_segment: None,
+        })]
+    } else {
+        groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                Record::Batch(JnlBatch {
+                    files: runs(&g.ids()),
+                    ranges: if i == 0 { ranges.clone() } else { Vec::new() },
+                    roots: if i == 0 { roots.clone() } else { Vec::new() },
+                    pack_segment: Some(g.segment),
+                    pack_offset: Some(g.offset),
+                    pack_len: Some(g.len),
+                })
+            })
+            .collect()
+    };
+    let (j, recs, r) = tokio::task::spawn_blocking(move || {
+        let r = recs.iter().try_for_each(|rec| jnl.append(rec));
+        (jnl, recs, r)
     })
     .await
     .map_err(proto)?;
     jnl = j;
     r?;
-    st.apply(&rec);
+    for rec in &recs {
+        st.apply(rec);
+    }
+    sink.batch_journaled(&groups);
     for r in &ranges {
         pg.bytes_durable.fetch_add(r.len, Ordering::Relaxed);
     }
@@ -1691,6 +2052,9 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
             files: runs(&set),
             ranges: Vec::new(),
             roots: Vec::new(),
+            pack_len: None,
+            pack_offset: None,
+            pack_segment: None,
         });
         let (j, rec, r) = tokio::task::spawn_blocking(move || {
             let r = jnl.append(&rec);
@@ -1714,6 +2078,11 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
                 .map_err(|e| SendError::Disconnected(e.to_string()))?;
         }
     }
+    // Logged files that have aged become durable in place now (all of them when the log is full).
+    if sink.unswept() > 0 {
+        let force = sink.log_pressure();
+        (jnl, st) = sweep_logged(&sink, jnl, st, force).await?;
+    }
     // The journal is compacted once it passes COMPACT_AT (ruling 5): the engine-side
     // journal must not grow without bound, and the C side does the same.
     if jnl.len() > journal::COMPACT_AT {
@@ -1735,6 +2104,42 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
         reset,
         ranges,
     })
+}
+
+/// Makes the logged files that are due (every one when `force`) durable in place and journals the
+/// sweep (SPEC.md §15.7): files fsynced and directories synced first, then `JnlSweep`, and only then do
+/// the files stop holding their pack segments (I3). With `force`, repeats until none is left.
+async fn sweep_logged(
+    sink: &Arc<dyn Sink>,
+    mut jnl: Journal,
+    mut st: State,
+    force: bool,
+) -> Result<(Journal, State), SendError> {
+    loop {
+        let s2 = sink.clone();
+        let ids = tokio::task::spawn_blocking(move || s2.sweep(force))
+            .await
+            .map_err(proto)??;
+        if ids.is_empty() {
+            break;
+        }
+        let set: BTreeSet<u32> = ids.iter().copied().collect();
+        let rec = Record::Sweep(runs(&set));
+        let (j, rec, r) = tokio::task::spawn_blocking(move || {
+            let r = jnl.append(&rec);
+            (jnl, rec, r)
+        })
+        .await
+        .map_err(proto)?;
+        jnl = j;
+        r?;
+        st.apply(&rec);
+        sink.sweep_journaled(&ids);
+        if !force {
+            break;
+        }
+    }
+    Ok((jnl, st))
 }
 
 /// Awaits the in-flight batch by reference — the handle stays in the slot, so if the
@@ -1811,6 +2216,385 @@ fn subtract(set: &RangeSet, from: u64, to: u64) -> RangeSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- durable-by-log, the engine's sink (SPEC.md §15.7) ----
+
+    fn log_manifest(n: usize) -> Manifest {
+        let mut entries = vec![Entry {
+            kind: gen::ENTRY_DIR,
+            mode: 0o755,
+            size: 0,
+            mtime: 0,
+            path: "d".into(),
+            root: None,
+        }];
+        for i in 0..n {
+            entries.push(Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: 4,
+                mtime: 1,
+                path: format!("d/{i}"),
+                root: None,
+            });
+        }
+        Manifest { entries }
+    }
+
+    fn log_body(i: usize) -> Vec<u8> {
+        format!("{i:04}").into_bytes()
+    }
+
+    fn log_dirs(tag: &str) -> (PathBuf, PathBuf) {
+        let t = std::env::temp_dir().join(format!("ava1-logsink-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let jd = t.join("job");
+        std::fs::create_dir_all(&jd).unwrap();
+        (t, jd)
+    }
+
+    fn quick() -> PackOpts {
+        PackOpts {
+            segment: 512,
+            max_unswept: 1 << 20,
+            age: Duration::ZERO,
+        }
+    }
+
+    /// A sink with `n` logged small files written and batched, as the receive loop would.
+    fn logged(t: &Path, jd: &Path, n: usize) -> (LocalSink, Vec<LoggedGroup>, State) {
+        let m = log_manifest(n);
+        let sink = LocalSink::new(t.join("dest"), false).with_log(true, quick());
+        sink.enable_log(jd);
+        sink.prepare(&m).unwrap();
+        for i in 0..n {
+            sink.write_whole(i as u32 + 1, &log_body(i)).unwrap();
+        }
+        let ids: Vec<u32> = (1..=n as u32).collect();
+        let groups = sink.sync_batch(&ids, &[]).unwrap();
+        assert!(!groups.is_empty(), "the log is on: groups come back");
+        sink.batch_journaled(&groups);
+        // what the journal would replay to
+        let mut st = State::default();
+        for g in &groups {
+            st.apply(&Record::Batch(JnlBatch {
+                files: runs(&g.ids()),
+                ranges: vec![],
+                roots: vec![],
+                pack_segment: Some(g.segment),
+                pack_offset: Some(g.offset),
+                pack_len: Some(g.len),
+            }));
+        }
+        (sink, groups, st)
+    }
+
+    #[test]
+    fn a_logged_batch_leaves_files_unswept_until_the_sweep_and_drops_every_segment() {
+        let (t, jd) = log_dirs("sweep");
+        let n = 40;
+        let (sink, groups, st) = logged(&t, &jd, n);
+        assert!(groups.len() >= 2, "segments of 512 bytes roll: {groups:?}");
+        assert_eq!(
+            groups.iter().map(|g| g.files.len()).sum::<usize>(),
+            n,
+            "every file is in exactly one group"
+        );
+        assert_eq!(st.unswept.len(), n);
+        assert_eq!(sink.unswept(), n);
+        for i in 0..n {
+            assert_eq!(
+                std::fs::read(t.join(format!("dest.ava-part/d/{i}"))).unwrap(),
+                log_body(i)
+            );
+        }
+        let ids = sink.sweep(true).unwrap();
+        assert_eq!(ids.len(), n);
+        sink.sweep_journaled(&ids);
+        assert_eq!(sink.unswept(), 0);
+        sink.log_cleanup();
+        let packs = std::fs::read_dir(&jd)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("pack."))
+            .count();
+        assert_eq!(packs, 0);
+    }
+
+    #[test]
+    fn a_restart_re_makes_files_lost_with_the_page_cache_from_the_log() {
+        let (t, jd) = log_dirs("recover");
+        let n = 30;
+        let (sink, _groups, st) = logged(&t, &jd, n);
+        drop(sink); // the crash: nothing was swept
+        for i in 0..n / 2 {
+            std::fs::remove_file(t.join(format!("dest.ava-part/d/{i}"))).unwrap();
+        }
+        std::fs::write(t.join("dest.ava-part/d/20"), b"junk").unwrap();
+        let again = LocalSink::new(t.join("dest"), false).with_log(true, quick());
+        again.enable_log(&jd);
+        again.prepare(&log_manifest(n)).unwrap();
+        let lost = again.recover_log(&st).unwrap();
+        assert!(lost.is_empty(), "{lost:?}");
+        for i in 0..n {
+            assert_eq!(
+                std::fs::read(t.join(format!("dest.ava-part/d/{i}"))).unwrap(),
+                log_body(i),
+                "file {i}"
+            );
+        }
+        let ids = again.sweep(true).unwrap();
+        assert_eq!(ids.len(), n);
+        again.sweep_journaled(&ids);
+        again.log_cleanup();
+    }
+
+    #[test]
+    fn a_torn_tail_or_a_missing_segment_reports_the_files_to_resend() {
+        let (t, jd) = log_dirs("torn");
+        let n = 12;
+        let (sink, groups, st) = logged(&t, &jd, n);
+        drop(sink);
+        let last = groups.last().unwrap();
+        let p = jd.join(format!("pack.{}", last.segment));
+        let len = std::fs::metadata(&p).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_len(len - 3)
+            .unwrap();
+        let first = &groups[0];
+        std::fs::remove_file(jd.join(format!("pack.{}", first.segment))).unwrap();
+        let again = LocalSink::new(t.join("dest"), false).with_log(true, quick());
+        again.enable_log(&jd);
+        again.prepare(&log_manifest(n)).unwrap();
+        let lost = again.recover_log(&st).unwrap();
+        let mut expect: BTreeSet<u32> = first.ids();
+        expect.insert(last.files.last().unwrap().id);
+        assert_eq!(lost.into_iter().collect::<BTreeSet<u32>>(), expect);
+    }
+
+    #[test]
+    fn recovery_runs_whatever_the_log_setting_when_the_replayed_state_has_unswept_files() {
+        // a job that crashed with the log on and restarts with it off (the macOS default, or
+        // PS5UPLOAD_AVA1_LOG_SMALL=0) must still re-make and sweep its files
+        let (t, jd) = log_dirs("logoff");
+        let n = 20;
+        let (sink, _g, st) = logged(&t, &jd, n);
+        drop(sink);
+        for i in 0..n / 2 {
+            std::fs::remove_file(t.join(format!("dest.ava-part/d/{i}"))).unwrap();
+        }
+        let off = LocalSink::new(t.join("dest"), false).with_log(false, quick());
+        off.enable_log(&jd);
+        off.prepare(&log_manifest(n)).unwrap();
+        let lost = off.recover_log(&st).unwrap();
+        assert!(lost.is_empty(), "{lost:?}");
+        for i in 0..n {
+            assert_eq!(
+                std::fs::read(t.join(format!("dest.ava-part/d/{i}"))).unwrap(),
+                log_body(i),
+                "file {i}"
+            );
+        }
+        let ids = off.sweep(true).unwrap();
+        assert_eq!(ids.len(), n);
+        off.sweep_journaled(&ids);
+        off.log_cleanup();
+        // ... and with the log off, new small files still go the per-file way
+        off.write_whole(1, &log_body(0)).unwrap();
+        assert_eq!(off.unswept(), 0);
+    }
+
+    /// A sink that watches the journal at the moments the durability order matters.
+    struct Spy {
+        inner: LocalSink,
+        jd: PathBuf,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl Spy {
+        fn replay(&self) -> State {
+            let (_, recs) = Journal::open(&self.jd).unwrap();
+            let mut st = State::default();
+            for r in &recs {
+                st.apply(r);
+            }
+            st
+        }
+        fn sweeps(&self) -> usize {
+            Journal::open(&self.jd)
+                .unwrap()
+                .1
+                .iter()
+                .filter(|r| matches!(r, Record::Sweep(_)))
+                .count()
+        }
+        fn packs(&self) -> usize {
+            std::fs::read_dir(&self.jd)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("pack."))
+                .count()
+        }
+    }
+
+    impl Sink for Spy {
+        fn prepare(&self, m: &Manifest) -> io::Result<()> {
+            self.inner.prepare(m)
+        }
+        fn write_at(&self, id: u32, off: u64, d: &[u8]) -> io::Result<()> {
+            self.inner.write_at(id, off, d)
+        }
+        fn write_whole(&self, id: u32, d: &[u8]) -> io::Result<()> {
+            self.inner.write_whole(id, d)
+        }
+        fn sync(&self, ids: &[u32]) -> io::Result<()> {
+            self.inner.sync(ids)
+        }
+        fn read_at(&self, id: u32, off: u64, b: &mut [u8]) -> io::Result<usize> {
+            self.inner.read_at(id, off, b)
+        }
+        fn commit(&self, id: u32) -> io::Result<()> {
+            self.inner.commit(id)
+        }
+        fn finish(&self) -> io::Result<()> {
+            self.inner.finish()
+        }
+        fn unswept(&self) -> usize {
+            self.inner.unswept()
+        }
+        fn sweep(&self, force: bool) -> io::Result<Vec<u32>> {
+            let ids = self.inner.sweep(force)?;
+            // I2: the files are synced before the record that says so: no JnlSweep is there yet
+            self.seen.lock().unwrap().push(format!(
+                "sweep returned {} files, {} sweep records so far",
+                ids.len(),
+                self.sweeps()
+            ));
+            Ok(ids)
+        }
+        fn sweep_journaled(&self, ids: &[u32]) {
+            // I3: the segments go only after the sweep is durable: the record is there, the packs still are
+            self.seen.lock().unwrap().push(format!(
+                "journaled {} files: {} sweep records, {} pack files",
+                ids.len(),
+                self.sweeps(),
+                self.packs()
+            ));
+            let st = self.replay();
+            assert!(
+                ids.iter().all(|i| !st.unswept.contains(i)),
+                "the journal still lists swept files as unswept"
+            );
+            self.inner.sweep_journaled(ids)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_is_journaled_after_its_files_and_before_a_segment_is_deleted() {
+        let (t, jd) = log_dirs("order");
+        let n = 24;
+        let (inner, _groups, st0) = logged(&t, &jd, n);
+        // a journal holding what the batches would have written
+        let open = JnlOpen {
+            job_id: [9; 16],
+            manifest_hash: [1; 32],
+            kind: gen::JOB_DOWNLOAD,
+            flags: 0,
+            staged: 1,
+            root: "x".into(),
+        };
+        let mut jnl = Journal::create(&jd, &open).unwrap();
+        let mut st = State::default();
+        st.apply(&Record::Open(open));
+        let rec = Record::Snapshot(st0.snapshot());
+        jnl.append(&rec).unwrap();
+        st.apply(&rec);
+        let spy = Arc::new(Spy {
+            inner,
+            jd: jd.clone(),
+            seen: Mutex::default(),
+        });
+        let sink: Arc<dyn Sink> = spy.clone();
+        let (jnl, st) = sweep_logged(&sink, jnl, st, true).await.unwrap();
+        assert!(st.unswept.is_empty());
+        drop(jnl);
+        let seen = spy.seen.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .any(|l| l.starts_with("sweep returned") && l.ends_with("0 sweep records so far")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|l| l.starts_with("journaled") && l.contains("1 sweep records")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .filter(|l| l.starts_with("journaled"))
+                .all(|l| !l.ends_with("0 pack files")),
+            "a segment was deleted before its sweep was journaled: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_unswept_cap_reports_pressure() {
+        let (t, jd) = log_dirs("cap");
+        let m = log_manifest(8);
+        let sink = LocalSink::new(t.join("dest"), false).with_log(
+            true,
+            PackOpts {
+                segment: 1 << 20,
+                max_unswept: 100,
+                age: Duration::from_secs(60),
+            },
+        );
+        sink.enable_log(&jd);
+        sink.prepare(&m).unwrap();
+        assert!(!sink.log_pressure());
+        for i in 0..8 {
+            sink.write_whole(i as u32 + 1, &log_body(i)).unwrap();
+        }
+        assert!(sink.log_pressure(), "8 records pass 100 bytes");
+        let ids: Vec<u32> = (1..=8).collect();
+        let g = sink.sync_batch(&ids, &[]).unwrap();
+        sink.batch_journaled(&g);
+        assert!(
+            sink.sweep(false).unwrap().is_empty(),
+            "nothing is old enough yet"
+        );
+        let swept = sink.sweep(true).unwrap();
+        sink.sweep_journaled(&swept);
+        assert!(!sink.log_pressure());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_syncs_cover_every_directory_and_report_a_failure() {
+        let t = std::env::temp_dir().join(format!("ava1-syncdirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let dirs: BTreeSet<PathBuf> = (0..37)
+            .map(|i| {
+                let d = t.join(format!("d{i:02}"));
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            })
+            .collect();
+        sync_dirs(&dirs).unwrap();
+        let mut one_gone = dirs.clone();
+        one_gone.insert(t.join("missing"));
+        assert!(
+            sync_dirs(&one_gone).is_err(),
+            "a directory that cannot be opened is an error"
+        );
+        let two: BTreeSet<PathBuf> = dirs.iter().take(2).cloned().collect();
+        sync_dirs(&two).unwrap();
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
     use crate::conn::{FrameReader, FrameWriter};
     use crate::manifest::Entry;
     use crate::router::{ConnTx, Router};
@@ -1912,6 +2696,9 @@ mod tests {
                     .collect(),
                 ranges: Vec::new(),
                 roots: Vec::new(),
+                pack_len: None,
+                pack_offset: None,
+                pack_segment: None,
             });
             st.apply(&rec);
             jnl.append(&rec).unwrap();

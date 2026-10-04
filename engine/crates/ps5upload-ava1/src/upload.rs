@@ -33,6 +33,22 @@ pub struct ZipTooLarge(pub String);
 #[error("zip is not usable as an AVA1 source: {0}")]
 pub struct ZipUnsupported(pub String);
 
+/// A failed `ZipSource::open`: a format problem (damaged directory, unsupported method,
+/// encryption, an unsafe path) is `ZipUnsupported`, which the client treats as terminal; an I/O
+/// error reading the file (a share that dropped, a permission) is `zip_read_error`, which stays
+/// retryable like any other transient failure.
+fn zip_open_error(e: io::Error) -> anyhow::Error {
+    if e.kind() == io::ErrorKind::InvalidData {
+        ZipUnsupported(e.to_string()).into()
+    } else {
+        UploadFailure {
+            reason: "zip_read_error".into(),
+            detail: format!("could not read the zip archive: {e}"),
+        }
+        .into()
+    }
+}
+
 pub fn upload_zip_in(
     pool: &Pool,
     cfg: &TransferConfig,
@@ -40,8 +56,7 @@ pub fn upload_zip_in(
     dest_root: &str,
     zip_path: &Path,
 ) -> Result<TransferResult> {
-    let (manifest, source) =
-        ZipSource::open(zip_path, &cfg.excludes).map_err(|e| ZipUnsupported(e.to_string()))?;
+    let (manifest, source) = ZipSource::open(zip_path, &cfg.excludes).map_err(zip_open_error)?;
     upload_with_in(
         pool,
         &cfg.addr,
@@ -301,6 +316,28 @@ pub struct PostCommitError {
 pub struct UploadFailure {
     pub reason: String,
     pub detail: String,
+}
+
+/// The failure when a console answered BUSY to every JobOpen the bound allowed.
+pub(crate) fn busy_failure(tries: u32, message: &str) -> anyhow::Error {
+    UploadFailure {
+        reason: "ava1_busy".into(),
+        detail: format!(
+            "the console stayed busy for {tries} retries and could not take this job: {message}"
+        ),
+    }
+    .into()
+}
+
+/// The failure when a console never answered a JobOpen the bound allowed.
+pub(crate) fn open_timeout_failure(tries: u32, waited: Duration) -> anyhow::Error {
+    UploadFailure {
+        reason: "ava1_open_timeout".into(),
+        detail: format!(
+            "the console did not answer the job open ({waited:?} each, {tries} retries) and could not take this job"
+        ),
+    }
+    .into()
 }
 
 pub(crate) fn refusal_reason(status: u16) -> String {
@@ -581,6 +618,7 @@ pub fn upload_with_seq_in(
         let _bridge = Bridge::start(progress.clone(), cfg);
         let mut backoff = Duration::from_millis(250);
         let mut gate = SessionGate::default();
+        let mut busy = 0u32;
         let (mut last_at, mut last_durable) = (Instant::now(), 0u64);
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -625,13 +663,15 @@ pub fn upload_with_seq_in(
                 bandwidth_cap: cfg.bandwidth_cap_bps,
                 // 7z passes its source as `seq`; RAR sets it on `opts`.
                 seq: seq.clone().or_else(|| opts.seq.clone()),
+                settle_max: None,
+                open_ack_timeout: pool.open_ack_timeout(),
             };
             match send_job(&mut link, manifest.clone(), source.clone(), o).await {
                 Ok(r) if r.status == gen::STATUS_OK => {
                     let _ = std::fs::remove_dir_all(&persist);
                     let skipped_files = progress.skipped_files.load(Ordering::Relaxed);
                     let skipped_bytes = progress.skipped_bytes.load(Ordering::Relaxed);
-                    let body = serde_json::json!({
+                    let mut body = serde_json::json!({
                         "protocol": "ava1",
                         "files": r.files,
                         "bytes": r.bytes,
@@ -645,6 +685,11 @@ pub fn upload_with_seq_in(
                         "skipped_bytes": skipped_bytes,
                         "files_sent": manifest_files.saturating_sub(skipped_files),
                     });
+                    // The bytes are durable, but the console did not confirm its files settled in place
+                    // (SPEC.md §15.7): the job's snapshot says so instead of a clean success.
+                    if let Some(w) = &r.message {
+                        body["warning"] = serde_json::Value::String(w.clone());
+                    }
                     return Ok(TransferResult {
                         tx_id_hex: hex(&job_id),
                         // The field name is FTX2's; for AVA1 it is files (C19).
@@ -665,6 +710,28 @@ pub fn upload_with_seq_in(
                     let durable = progress.bytes_durable.load(Ordering::Relaxed);
                     pool.forget(console).await;
                     wait(&mut backoff, &format!("{why} ({durable} bytes durable)")).await;
+                }
+                // BUSY on the JobOpen is the console saying "not now" (it is finishing this job's files, or
+                // has no room): the same bounded backoff as a lost session, cancel honoured at the loop top.
+                Err(SendError::Refused { status, message }) if status == gen::ERR_BUSY => {
+                    busy += 1;
+                    if busy > pool.busy_tries() {
+                        return Err(busy_failure(pool.busy_tries(), &message));
+                    }
+                    wait(&mut backoff, &format!("the console is busy: {message}")).await;
+                }
+                // The console never answered the JobOpen (the open was lost behind a job it was closing):
+                // retried like BUSY within the same bound, then a typed failure.
+                Err(SendError::OpenTimeout(t)) => {
+                    busy += 1;
+                    if busy > pool.busy_tries() {
+                        return Err(open_timeout_failure(pool.busy_tries(), t));
+                    }
+                    wait(
+                        &mut backoff,
+                        &format!("the console did not answer the open in {t:?}"),
+                    )
+                    .await;
                 }
                 Err(SendError::Refused { status, message }) if status == gen::ERR_EXISTS => {
                     return Err(PostCommitError::new(PostCommitKind::Exists, Some(message)).into());
@@ -825,14 +892,251 @@ fn relative_list_path(dest_root: &str, dest: &str) -> Result<String> {
     Ok(rel.to_owned())
 }
 
-/// A mixed file list may contain absolute paths outside the AVA1 job root.
-/// The engine routes that entire job through FTX2, which supports them.
-pub fn upload_list_supported(dest_root: &str, entries: &[FileListEntry]) -> bool {
-    entries
-        .iter()
-        .all(|e| relative_list_path(dest_root, &e.dest).is_ok())
+/// Where one file-list destination goes: below the list's root (relative to it), or in another
+/// directory (an absolute destination outside the root), which needs a job of its own.
+enum Placed {
+    In(String),
+    Out { dir: String, name: String },
 }
 
+fn place_list_path(dest_root: &str, dest: &str) -> Result<Placed> {
+    let root = if dest_root == "/" {
+        "/"
+    } else {
+        dest_root.trim_end_matches('/')
+    };
+    // Only a path that is not below the root at all is "elsewhere". One below the root that
+    // fails the path rules (`..`, an empty or odd component) is refused, never rerouted.
+    if !dest.starts_with('/') || Path::new(dest).strip_prefix(Path::new(root)).is_ok() {
+        return relative_list_path(root, dest).map(Placed::In);
+    }
+    let p = Path::new(dest);
+    let (Some(dir), Some(name)) = (
+        p.parent().and_then(|d| d.to_str()),
+        p.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return Err(anyhow!("{dest} is not a file path"));
+    };
+    manifest::check_path(name)?;
+    // Every component of the directory the job will be rooted at is checked too.
+    if dir != "/" {
+        manifest::check_path(dir.trim_start_matches('/'))
+            .map_err(|e| anyhow!("{dest}: the directory is refused: {e}"))?;
+    }
+    Ok(Placed::Out {
+        dir: dir.to_string(),
+        name: name.to_string(),
+    })
+}
+
+/// One AVA1 job is one manifest under one root. A file list may name destinations in several
+/// directories, so it is split: the files under `dest_root` first, then one job per other
+/// destination directory (sorted, so a resume sees the same jobs). Each entry is
+/// `(job root, [(path relative to that root, source)])`.
+type ListGroup = (String, Vec<(String, PathBuf)>);
+
+fn split_list(dest_root: &str, entries: &[FileListEntry]) -> Result<Vec<ListGroup>> {
+    let root = if dest_root == "/" {
+        "/"
+    } else {
+        dest_root.trim_end_matches('/')
+    };
+    let mut inside: Vec<(String, PathBuf)> = Vec::new();
+    let mut outside: std::collections::BTreeMap<String, Vec<(String, PathBuf)>> =
+        Default::default();
+    for e in entries {
+        match place_list_path(root, &e.dest)? {
+            Placed::In(rel) => inside.push((rel, e.src.clone().into())),
+            Placed::Out { dir, name } => outside
+                .entry(dir)
+                .or_default()
+                .push((name, e.src.clone().into())),
+        }
+    }
+    let mut groups = Vec::new();
+    if !inside.is_empty() || outside.is_empty() {
+        groups.push((root.to_string(), inside));
+    }
+    groups.extend(outside);
+    Ok(groups)
+}
+
+/// The destination of a group's first file, for an error that says which path failed.
+fn first_dest(root: &str, files: &[(String, PathBuf)]) -> String {
+    let rel = files.iter().map(|f| f.0.as_str()).min().unwrap_or("");
+    format!("{}/{rel}", root.trim_end_matches('/'))
+}
+
+/// Names the failing path while keeping the error's type (a typed failure keeps its reason).
+fn named(e: anyhow::Error, path: &str) -> anyhow::Error {
+    if e.to_string().contains("transfer_cancelled") {
+        return e;
+    }
+    if let Some(f) = e.downcast_ref::<UploadFailure>() {
+        return UploadFailure {
+            reason: f.reason.clone(),
+            detail: format!("{path}: {}", f.detail),
+        }
+        .into();
+    }
+    if let Some(p) = e.downcast_ref::<PostCommitError>() {
+        return PostCommitError {
+            kind: p.kind,
+            detail: format!("{path}: {}", p.detail),
+        }
+        .into();
+    }
+    e.context(path.to_string())
+}
+
+/// The job id of group `k`: group 0 keeps the caller's id, the others derive from it, so a
+/// resume of the whole list finds each job's journal again.
+fn group_job_id(base: [u8; 16], k: usize) -> [u8; 16] {
+    let mut id = base;
+    for (b, x) in id[8..].iter_mut().zip((k as u64).to_le_bytes()) {
+        *b ^= x;
+    }
+    id
+}
+
+/// Counters of the jobs already finished, added to the running job's own.
+#[derive(Default, Clone, Copy)]
+struct Done {
+    bytes: u64,
+    files: u64,
+    files_finalized: u64,
+    bytes_finalized: u64,
+}
+
+/// Runs one job of a list with private counters and mirrors `done + private` into the caller's
+/// absolute counters while it runs, so the engine's ticker sees one progressing transfer.
+fn run_aggregated<T>(
+    cfg: &TransferConfig,
+    done: &mut Done,
+    f: impl FnOnce(&TransferConfig) -> Result<T>,
+) -> Result<T> {
+    use std::sync::atomic::AtomicU64;
+    type C = Option<Arc<AtomicU64>>;
+    let fresh = |c: &C| c.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
+    let mut inner = cfg.clone();
+    inner.progress_bytes = fresh(&cfg.progress_bytes);
+    inner.progress_files = fresh(&cfg.progress_files);
+    inner.progress_files_finalized = fresh(&cfg.progress_files_finalized);
+    inner.progress_bytes_finalized = fresh(&cfg.progress_bytes_finalized);
+    let pairs = |d: Done| -> Vec<(C, C, u64)> {
+        vec![
+            (
+                cfg.progress_bytes.clone(),
+                inner.progress_bytes.clone(),
+                d.bytes,
+            ),
+            (
+                cfg.progress_files.clone(),
+                inner.progress_files.clone(),
+                d.files,
+            ),
+            (
+                cfg.progress_files_finalized.clone(),
+                inner.progress_files_finalized.clone(),
+                d.files_finalized,
+            ),
+            (
+                cfg.progress_bytes_finalized.clone(),
+                inner.progress_bytes_finalized.clone(),
+                d.bytes_finalized,
+            ),
+        ]
+    };
+    let mirror = |d: Done| {
+        for (real, mine, base) in pairs(d) {
+            if let (Some(real), Some(mine)) = (real, mine) {
+                real.store(base + mine.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        }
+    };
+    /// Stops and joins the mirroring thread when dropped, so a panicking job (which unwinds past
+    /// this function) cannot leave it running.
+    struct Ticker {
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Ticker {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+    let base = *done;
+    let stop = Arc::new(AtomicBool::new(false));
+    let ticker = Ticker {
+        stop: stop.clone(),
+        handle: Some({
+            let pairs = pairs(base);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for (real, mine, base) in &pairs {
+                        if let (Some(real), Some(mine)) = (real, mine) {
+                            real.store(base + mine.load(Ordering::Relaxed), Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            })
+        }),
+    };
+    let r = f(&inner);
+    drop(ticker);
+    mirror(base);
+    let get = |c: &C| c.as_ref().map_or(0, |a| a.load(Ordering::Relaxed));
+    done.bytes += get(&inner.progress_bytes);
+    done.files += get(&inner.progress_files);
+    done.files_finalized += get(&inner.progress_files_finalized);
+    done.bytes_finalized += get(&inner.progress_bytes_finalized);
+    r
+}
+
+/// Folds the per-job results of a split list into one.
+fn merge_results(parts: Vec<TransferResult>) -> TransferResult {
+    let jobs = parts.len();
+    let mut it = parts.into_iter();
+    let mut out = it.next().expect("at least one job");
+    let mut ack: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&out.commit_ack_body).unwrap_or_default();
+    for p in it {
+        out.shards_sent += p.shards_sent;
+        out.bytes_sent += p.bytes_sent;
+        let other: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&p.commit_ack_body).unwrap_or_default();
+        for k in [
+            "files",
+            "bytes",
+            "resent",
+            "skipped_files",
+            "skipped_bytes",
+            "files_sent",
+        ] {
+            let sum = ack.get(k).and_then(|v| v.as_u64()).unwrap_or(0)
+                + other.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            ack.insert(k.into(), sum.into());
+        }
+        let lanes = ack
+            .get("max_lanes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .max(other.get("max_lanes").and_then(|v| v.as_u64()).unwrap_or(0));
+        ack.insert("max_lanes".into(), lanes.into());
+    }
+    ack.insert("jobs".into(), jobs.into());
+    out.commit_ack_body = serde_json::Value::Object(ack).to_string();
+    out
+}
+
+/// A file-list upload. Destinations below `dest_root` form one job; each other directory a
+/// destination names (an absolute path outside the root) is a job of its own, run in sequence
+/// under this one call: progress aggregates, a cancel stops the rest, and a failure names the
+/// first failing path.
 pub fn upload_list_in(
     pool: &Pool,
     cfg: &TransferConfig,
@@ -840,15 +1144,38 @@ pub fn upload_list_in(
     dest_root: &str,
     entries: &[FileListEntry],
 ) -> Result<TransferResult> {
-    let root = if dest_root == "/" {
-        "/"
-    } else {
-        dest_root.trim_end_matches('/')
-    };
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
-    for e in entries {
-        files.push((relative_list_path(root, &e.dest)?, e.src.clone().into()));
+    let mut groups = split_list(dest_root, entries)?;
+    if groups.len() == 1 {
+        let (root, files) = groups.remove(0);
+        let first = first_dest(&root, &files);
+        return upload_list_group_in(pool, cfg, job_id, &root, files).map_err(|e| named(e, &first));
     }
+    let cancel = cfg.cancel.clone();
+    let mut done = Done::default();
+    let mut results = Vec::new();
+    for (k, (root, files)) in groups.into_iter().enumerate() {
+        if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(anyhow!("transfer_cancelled"));
+        }
+        let first = first_dest(&root, &files);
+        let id = group_job_id(job_id, k);
+        let r = run_aggregated(cfg, &mut done, |c| {
+            upload_list_group_in(pool, c, id, &root, files)
+        })
+        .map_err(|e| named(e, &first))?;
+        results.push(r);
+    }
+    Ok(merge_results(results))
+}
+
+/// One job of a file list: `files` are `(path relative to root, source)`.
+fn upload_list_group_in(
+    pool: &Pool,
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    root: &str,
+    mut files: Vec<(String, PathBuf)>,
+) -> Result<TransferResult> {
     // Exactly manifest::walk's order (depth-first preorder: component comparison).
     files.sort_by(|a, b| a.0.split('/').cmp(b.0.split('/')));
     let mut all: Vec<Entry> = Vec::new();
@@ -931,7 +1258,7 @@ pub fn upload_list(
 
 #[cfg(test)]
 mod list_destination_tests {
-    use super::{relative_list_path, upload_list_supported};
+    use super::{group_job_id, relative_list_path, split_list};
     use ps5upload_core::transfer::FileListEntry;
 
     #[test]
@@ -957,19 +1284,131 @@ mod list_destination_tests {
         assert!(relative_list_path("/data/games", "../other/file.bin").is_err());
     }
 
+    fn e(src: &str, dest: &str) -> FileListEntry {
+        FileListEntry {
+            src: src.into(),
+            dest: dest.into(),
+        }
+    }
+
     #[test]
-    fn a_mixed_list_with_one_outside_path_uses_the_ftx2_route() {
-        let entries = [
-            FileListEntry {
-                src: "a".into(),
-                dest: "Title/a".into(),
-            },
-            FileListEntry {
-                src: "b".into(),
-                dest: "/data/other/b".into(),
-            },
-        ];
-        assert!(!upload_list_supported("/data/games", &entries));
+    fn a_list_splits_into_the_root_then_one_job_per_other_directory() {
+        let groups = split_list(
+            "/data/games/",
+            &[
+                e("a", "Title/a"),
+                e("b", "/data/other/b"),
+                e("c", "/data/games/Title/c"),
+                e("d", "/data/other/d"),
+                e("f", "/data/third/x/f"),
+            ],
+        )
+        .unwrap();
+        let roots: Vec<&str> = groups.iter().map(|g| g.0.as_str()).collect();
+        assert_eq!(roots, ["/data/games", "/data/other", "/data/third/x"]);
+        let names = |i: usize| groups[i].1.iter().map(|f| f.0.as_str()).collect::<Vec<_>>();
+        assert_eq!(names(0), ["Title/a", "Title/c"]);
+        assert_eq!(names(1), ["b", "d"]);
+        assert_eq!(names(2), ["f"]);
+    }
+
+    #[test]
+    fn a_list_wholly_outside_the_root_has_no_empty_first_job() {
+        let groups = split_list("/data/games", &[e("b", "/data/other/b")]).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "/data/other");
+    }
+
+    #[test]
+    fn a_bad_path_under_the_root_is_refused_not_rerouted_as_elsewhere() {
+        // Below the root, but `..` escapes it again: the path error, not a job rooted at
+        // "/data/games/..".
+        let err = split_list("/data/games", &[e("b", "/data/games/../etc/b")]).unwrap_err();
+        assert!(!format!("{err:#}").is_empty());
+    }
+
+    #[test]
+    fn every_component_of_an_outside_directory_is_checked() {
+        for bad in [
+            "/data/./x/b",
+            "/data//x/b",
+            "/data/x/../b",
+            "/data/\u{0}x/b",
+        ] {
+            assert!(
+                split_list("/data/games", &[e("b", bad)]).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(split_list("/data/games", &[e("b", "/data/ok dir/x/b")]).is_ok());
+    }
+
+    #[test]
+    fn a_hostile_destination_is_still_refused() {
+        assert!(split_list("/data/games", &[e("b", "/data/../etc/b")]).is_err());
+        assert!(split_list("/data/games", &[e("b", "../other/b")]).is_err());
+    }
+
+    #[test]
+    fn a_panicking_job_does_not_leak_the_progress_ticker() {
+        use ps5upload_core::transfer::TransferConfig;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let real = Arc::new(AtomicU64::new(0));
+        let mut cfg = TransferConfig::new("c");
+        cfg.progress_bytes = Some(real.clone());
+        let mut done = super::Done::default();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::run_aggregated(&cfg, &mut done, |c| -> anyhow::Result<()> {
+                c.progress_bytes
+                    .as_ref()
+                    .unwrap()
+                    .store(7, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                panic!("the job panicked");
+            });
+        }));
+        assert!(r.is_err());
+        assert_eq!(
+            real.load(Ordering::Relaxed),
+            7,
+            "the mirror ran while the job did"
+        );
+        // The ticker must have stopped with the panic: it would overwrite this sentinel.
+        real.store(12_345, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            real.load(Ordering::Relaxed),
+            12_345,
+            "a leaked ticker kept mirroring"
+        );
+    }
+
+    #[test]
+    fn a_zip_that_cannot_be_read_is_retryable_but_a_bad_one_is_unsupported() {
+        let d = std::env::temp_dir().join(format!("p5a-zip-open-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let cfg = ps5upload_core::transfer::TransferConfig::new("c");
+        let pool = crate::pool::Pool::unavailable();
+        // Missing file: an I/O error, typed zip_read_error (retryable; the message carries
+        // the OS text the client's fatal-message rules also look at).
+        let e = super::upload_zip_in(&pool, &cfg, [1; 16], "r", &d.join("nope.zip")).unwrap_err();
+        let f = e.downcast_ref::<super::UploadFailure>().expect("typed");
+        assert_eq!(f.reason, "zip_read_error");
+        assert!(e.downcast_ref::<super::ZipUnsupported>().is_none());
+        // Not a zip at all: a format error, unsupported (terminal).
+        std::fs::write(d.join("junk.zip"), b"this is not a zip file").unwrap();
+        let e = super::upload_zip_in(&pool, &cfg, [1; 16], "r", &d.join("junk.zip")).unwrap_err();
+        assert!(e.downcast_ref::<super::ZipUnsupported>().is_some(), "{e:#}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn group_job_ids_are_stable_and_distinct() {
+        let base = [7u8; 16];
+        assert_eq!(group_job_id(base, 0), base);
+        assert_ne!(group_job_id(base, 1), group_job_id(base, 2));
+        assert_eq!(group_job_id(base, 1), group_job_id(base, 1));
     }
 }
 

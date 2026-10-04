@@ -2268,7 +2268,6 @@ dependencies = [
  "axum",
  "base64",
  "blake3",
- "ftx2-proto",
  "getrandom 0.4.3",
  "mime_guess",
  "ps5upload-ava1",
@@ -2281,6 +2280,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sevenz-rust2",
  "sha2 0.11.0",
  "smb2",
  "suppaftp",
@@ -2346,12 +2346,16 @@ name = "ps5upload-tests"
 version = "5.41.0"
 dependencies = [
  "anyhow",
+ "ava1",
+ "ava1-chaos",
  "crc32fast",
  "ftx2-proto",
+ "ps5upload-ava1",
  "ps5upload-core",
  "serde",
  "serde_json",
  "sevenz-rust2",
+ "tokio",
  "zip",
 ]
 

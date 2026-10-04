@@ -32,8 +32,8 @@ check_updates: "Check Updates",
 language: "Language",
 // Source
 // Destination
-// The previous upload-mode union (payload / ftp / mix / ftx2) is
-// collapsing to a single FTX2-engine path, rebranded as "Payload"
+// The previous upload-mode union (payload / ftp / mix / and the old protocol name) is
+// collapsing to a single engine path, rebranded as "Payload"
 // for users. The legacy string keys stay for config/back-compat —
 // all four point to the same label now.
 // Queues
@@ -361,7 +361,7 @@ logs_filter_all: "All",
 status_engine: "Engine",
 status_engine_tooltip: "ps5upload-engine — the app's backend ({url})",
 status_payload: "helper",
-status_payload_tooltip: "PS5Upload helper on :9113",
+status_payload_tooltip: "PS5Upload helper on :9120",
 status_kernel_ok: "kernel OK",
 status_no_active_transfers: "No active transfers",
 status_ps5: "PS5",
@@ -431,8 +431,7 @@ about_credits_text: "See LICENSE for licensing terms.",
 // in screens/About/index.tsx, which the i18n extractor doesn't walk, so
 // these are declared here by hand).
 about_feat_fast_transfers_title: "Fast transfers",
-about_feat_fast_transfers_body:
-  "FTX2 binary protocol with BLAKE3 shard verification + pack-small-files optimization. Uses your LAN flat-out.",
+about_feat_fast_transfers_body: "AVA1 transfer protocol with BLAKE3 verification, encrypted sessions, resumable jobs and small-file packing. Uses your LAN flat-out.",
 about_feat_native_mount_title: "Native image mount",
 about_feat_native_mount_body:
   "Attach .exfat and .ffpkg images to /mnt/ps5upload/ via MDIOCATTACH + nmount — no third-party helpers needed.",
@@ -3447,6 +3446,10 @@ helper_mismatch_go: "Reload helper",
 "joberr.preflight_insufficient_space": "The destination drive doesn't have enough free space for this file. Free up space on the PS5 (Settings → Storage) or pick a different destination, then click Retry.",
 "joberr.size_mismatch": "The transfer didn't finish before being interrupted — a file on the PS5 is incomplete, so it wasn't published (your old copy, if any, is untouched). This usually means the PS5 went into rest mode or lost power mid-upload. Keep the console awake (Settings → System → Power Saving → Set Time Until PS5 Turns Off), then re-run this item — Resume now re-sends only the missing files, or choose Override for a clean copy.",
 "joberr.tx_table_full": "Too many simultaneous transfers in flight on the PS5. Wait for some to finish or restart the payload.",
+"joberr.zip_unsupported": "This .zip uses something the uploader can't stream (encryption, a compression method other than Deflate or Stored, or an unsafe or duplicate file path). Extract it on your computer and upload the folder instead.",
+"joberr.sevenz_unsupported": "This .7z uses a compression method or feature the uploader can't stream. Extract it on your computer and upload the folder instead.",
+"joberr.sevenz_unsupported_layout": "This .7z keeps directories or empty files between its files inside one solid block, a layout the uploader can't stream. Re-pack it with 7-Zip, or extract it and upload the folder.",
+"joberr.rar_unsupported": "This .rar has duplicate or unsafe file paths, or a feature the uploader can't stream. Extract it on your computer and upload the folder instead.",
 "bug_report_browser_note": "The zip downloads through your browser. It carries the engine's recent log rather than the full file on the engine host — for that, use docker logs on the container.",
 "pkg.patch_did_not_apply": "The PS5 accepted this update and then did nothing with it — the game is still on its previous version. This means the console could not match the update to the base game you have installed. Re-install the base game through ps5upload from the base package that goes with this update (choose Override), then apply the update again.",
 "pkglib.updateBaseUnknown.title": "This update might not apply",
@@ -3730,6 +3733,49 @@ first_run_helper_only: "Send only ps5upload",
 first_run_helper_only_hint: "Already load kstuff yourself (an autoloader, etaHEN, elf-arsenal)? Send only ps5upload \u2014 loading kstuff a second time stacks another copy. Payloads already running are skipped either way.",
 notif_first_run_ready_body: "ps5upload is running on {host}.",
 "pkglib.staged_install_note": "Installing from the PS5's own storage (FW {fw})\u2026 Some firmwares refuse packages from this route. If it's refused, the package stays on the console; install it with Stream & install from a computer instead.",
+
+// AVA1 cutover (P3 Task 20): pairing dialog, session status, skipping/bottleneck, PS5 to PS5.
+pairing_title: "Pair with your PS5",
+pairing_intro: "{name} is asking to pair with this app. Check that the code below is the same one shown on your PS5, then confirm.",
+pairing_code_label: "Pairing code",
+pairing_codes_differ: "Codes differ",
+pairing_confirm: "Codes match, pair",
+pairing_closed_title: "The PS5 is not accepting new pairings",
+pairing_closed_body: "Its pairing window is closed. On a device that is already paired, open pairing for this console. If no device is paired yet, restart the helper on the console to reopen the window. Then try again.",
+pairing_retry: "Try again",
+pairing_error: "Pairing failed: {error}",
+pairing_waiting: "Contacting the PS5…",
+session_needs_pairing: "This PS5 has not accepted this app yet. Pair them to continue.",
+session_pair_button: "Pair…",
+helper_old_banner: "This PS5 is running an older helper. Update it.",
+helper_old_wedged: "The old helper did not exit when asked. Restart the console, then update the helper.",
+helper_old_update: "Update helper",
+status_ps5_needs_pairing: "Needs pairing",
+status_ps5_helper_old: "Older helper, update it",
+upload_phase_skipping: "Skipping data the console already has: {done} of {total}",
+upload_bottleneck_label: "Limited by: {cause}",
+bottleneck_network: "network",
+bottleneck_source: "source (archive decoding)",
+bottleneck_disk: "console disk",
+bottleneck_workers: "console workers",
+bottleneck_memory: "console memory",
+upload_phase_settling: "Finishing on the console…",
+upload_warn_unsettled_title: "Upload finished, but not confirmed saved",
+upload_warn_unsettled: "Every byte reached the console, but it has not confirmed saving all files yet. They finish on their own; if the console loses power first, send the folder again.",
+ps5src_title: "From another PS5",
+ps5src_need_two: "Add a second console to the roster to copy between consoles.",
+ps5src_hint: "Copies a file or folder from another console to this one over your network. The data passes through this computer; nothing is stored on it.",
+ps5src_from_console: "Source console",
+ps5src_from_path: "Path on the source console",
+ps5src_dest_path: "Destination path on this console",
+ps5src_start: "Copy to this PS5",
+ps5src_need_source_path: "Enter the source path, starting with /",
+ps5src_need_dest_path: "Enter the destination path, starting with /",
+queue_rar_password_required: "This archive needs a password.",
+queue_rar_password_wrong: "That password was wrong. Try again.",
+queue_rar_password_retry: "Retry with password",
+err_replace_in_progress: "This console's helper is already being replaced. Wait for it to finish, then try again.",
+err_replace_cooldown: "The helper on this console was replaced a moment ago. Wait a minute before replacing it again.",
 };
 
 export default en;

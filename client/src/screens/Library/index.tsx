@@ -1,3 +1,4 @@
+import { consoleAddr } from "../../lib/addr";
 import {
   memo,
   useCallback,
@@ -33,7 +34,7 @@ import { pickPath } from "../../lib/pickPath";
 import { openExternalUrl as openExternal } from "../../lib/openExternalUrl";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 
-import { useConnectionStore, PS5_PAYLOAD_PORT } from "../../state/connection";
+import { useConnectionStore } from "../../state/connection";
 import RunningAppsPanel from "./RunningAppsPanel";
 import { useRunningAppsStore } from "../../state/runningApps";
 import {
@@ -1010,7 +1011,7 @@ function LibraryRowImpl({
     if (entry.kind === "image") return;
     if (!host?.trim()) return;
     let cancelled = false;
-    metaLimit(() => fetchGameMeta(`${host}:${PS5_PAYLOAD_PORT}`, entry.path))
+    metaLimit(() => fetchGameMeta(consoleAddr(host), entry.path))
       .then((m) => {
         if (!cancelled) setMeta(m);
       })
@@ -1037,14 +1038,14 @@ function LibraryRowImpl({
     const activityId = useActivityHistoryStore
       .getState()
       .start("library-delete", `Deleting ${entry.name}`, {
-        addr: `${host}:${PS5_PAYLOAD_PORT}`,
+        addr: consoleAddr(host),
         fromPath: entry.path,
         files: 1,
       });
     let okOutcome = true;
     let errMsg: string | null = null;
     try {
-      await fsDelete(`${host}:${PS5_PAYLOAD_PORT}`, entry.path);
+      await fsDelete(consoleAddr(host), entry.path);
       onChanged();
     } catch (e) {
       okOutcome = false;
@@ -1078,14 +1079,14 @@ function LibraryRowImpl({
     const activityId = useActivityHistoryStore
       .getState()
       .start("library-chmod", `Setting permissions on ${entry.name}`, {
-        addr: `${host}:${PS5_PAYLOAD_PORT}`,
+        addr: consoleAddr(host),
         fromPath: entry.path,
       });
     let okOutcome = true;
     let errMsg: string | null = null;
     try {
       await fsChmod(
-        `${host}:${PS5_PAYLOAD_PORT}`,
+        consoleAddr(host),
         entry.path,
         "0777",
         entry.kind !== "image", // recursive on dirs, single-file on disk images
@@ -1153,7 +1154,7 @@ function LibraryRowImpl({
     setBusy("mount");
     setError(null);
     setMountNote(null);
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(host);
     // Mount is usually fast (~1-2s for the lvd attach + nmount) but
     // a misbehaving image can hang for the FS_MOUNT timeout (30 s).
     // Tracking it gives the user a global "still running" signal
@@ -1161,7 +1162,7 @@ function LibraryRowImpl({
     const activityId = useActivityHistoryStore
       .getState()
       .start("library-mount", `Mounting ${entry.name}`, {
-        addr: `${host}:${PS5_PAYLOAD_PORT}`,
+        addr: consoleAddr(host),
         fromPath: entry.path,
         toPath: opts.mountPoint,
       });
@@ -1417,7 +1418,7 @@ function LibraryRowImpl({
     setMoveProgress({ bytesCopied: 0, totalBytes: 0 });
     setMoveProgressUnsupportedThreshold(null);
     moveStopRef.current = false;
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(host);
     // Generate a unique op_id so the payload can stamp the in-flight
     // fs_copy with it; we can then poll FS_OP_STATUS for live byte
     // progress and fire FS_OP_CANCEL on Stop.
@@ -1678,7 +1679,7 @@ function LibraryRowImpl({
     setMountNote(null);
     setDownloadProgress({ bytesReceived: 0, totalBytes: 0 });
     downloadStopRef.current = false;
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(host);
     const kind: "file" | "folder" = entry.kind === "image" ? "file" : "folder";
     // Track the download in the global activity log so the
     // ActivityBar shows live progress + "still running" while the
@@ -1690,7 +1691,7 @@ function LibraryRowImpl({
     const activityId = useActivityHistoryStore
       .getState()
       .start("library-download", `Downloading ${entry.name}`, {
-        addr: `${host}:${PS5_PAYLOAD_PORT}`,
+        addr: consoleAddr(host),
         fromPath: entry.path,
         toPath: picked,
       });
@@ -1919,7 +1920,7 @@ function LibraryRowImpl({
         "library-edit-checkout",
         `Checking out ${entry.name} for editing`,
         {
-          addr: `${host}:${PS5_PAYLOAD_PORT}`,
+          addr: consoleAddr(host),
           fromPath: entry.path,
           toPath: opts.mountPoint,
         },
@@ -1928,7 +1929,7 @@ function LibraryRowImpl({
     let errMsg: string | null = null;
     try {
       const res = await smpCheckoutBegin(
-        `${host}:${PS5_PAYLOAD_PORT}`,
+        consoleAddr(host),
         entry.path,
         opts.mountPoint,
         registeredTitle?.titleId ?? "",
@@ -1989,13 +1990,13 @@ function LibraryRowImpl({
     const activityId = useActivityHistoryStore
       .getState()
       .start("library-unmount", `Unmounting ${entry.name}`, {
-        addr: `${host}:${PS5_PAYLOAD_PORT}`,
+        addr: consoleAddr(host),
         fromPath: mountPointToUnmount,
       });
     let okOutcome = true;
     let errMsg: string | null = null;
     try {
-      const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+      const addr = consoleAddr(host);
       // 2.2.60: unregister any titles inside this image BEFORE
       // unmount. Pre-fix the kernel unmount worked but Sony's
       // app.db was left with stale rows pointing at the now-gone
@@ -2102,13 +2103,13 @@ function LibraryRowImpl({
     const activityId = useActivityHistoryStore
       .getState()
       .start("library-launch", `Launching ${entry.name}`, {
-        addr: `${host}:${PS5_PAYLOAD_PORT}`,
+        addr: consoleAddr(host),
         fromPath: entry.path,
       });
     let okOutcome = true;
     let errMsg: string | null = null;
     try {
-      const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+      const addr = consoleAddr(host);
 
       // 2.2.55: ALWAYS register first, then launch. Pre-fix the
       // flow tried launch first and registered as a fallback only
@@ -2204,7 +2205,7 @@ function LibraryRowImpl({
     const activityId = useActivityHistoryStore
       .getState()
       .start("library-register", `Registering ${entry.name}`, {
-        addr: `${host}:${PS5_PAYLOAD_PORT}`,
+        addr: consoleAddr(host),
         fromPath: entry.path,
       });
     let okOutcome = true;
@@ -2237,7 +2238,7 @@ function LibraryRowImpl({
       }
       if (!handedToSmp) {
         const res = await appRegister(
-          `${host}:${PS5_PAYLOAD_PORT}`,
+          consoleAddr(host),
           entry.path,
           {
             patchDrmType: opts.patchDrmType,
@@ -2286,7 +2287,7 @@ function LibraryRowImpl({
         ),
       });
       if (!dest || typeof dest !== "string") return;
-      const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+      const addr = consoleAddr(host);
       await startTransferDownload(entry.path, dest, addr, "folder");
       pushNotification(
         "info",
@@ -2369,13 +2370,13 @@ function LibraryRowImpl({
     const activityId = useActivityHistoryStore
       .getState()
       .start("library-unregister", `Unregistering ${entry.name}`, {
-        addr: `${host}:${PS5_PAYLOAD_PORT}`,
+        addr: consoleAddr(host),
         fromPath: entry.path,
       });
     let okOutcome = true;
     let errMsg: string | null = null;
     try {
-      await appUnregister(`${host}:${PS5_PAYLOAD_PORT}`, entry.titleId);
+      await appUnregister(consoleAddr(host), entry.titleId);
       setMountNote(
         `Unregistered ${entry.titleId}. The XMB tile is removed; the source files on disk were not touched.`,
       );
@@ -3038,7 +3039,7 @@ function LibraryRowImpl({
         <MoveModal
           entry={entry}
           volumes={volumes}
-          addr={`${host}:${PS5_PAYLOAD_PORT}`}
+          addr={consoleAddr(host)}
           onCancel={() => setMoveOpen(false)}
           onConfirm={runMove}
         />
@@ -4034,9 +4035,9 @@ function LibraryThumb({
   const wanted = !host?.trim()
     ? null
     : meta?.has_icon
-      ? gameIconUrl(`${host}:${PS5_PAYLOAD_PORT}`, entry.path)
+      ? gameIconUrl(consoleAddr(host), entry.path)
       : registeredTitleId
-        ? appIconUrl(`${host}:${PS5_PAYLOAD_PORT}`, registeredTitleId)
+        ? appIconUrl(consoleAddr(host), registeredTitleId)
         : null;
   // A 404 here is not always permanent — the console serves one client at a
   // time and the engine reports every read miss as 404. Retry a couple of
@@ -4044,16 +4045,16 @@ function LibraryThumb({
   const { src, onError } = useImageRetry(wanted, {
     // Already-held bytes short-circuit the whole chain.
     cached: meta?.has_icon
-      ? cachedGameIcon(`${host}:${PS5_PAYLOAD_PORT}`, entry.path)
+      ? cachedGameIcon(consoleAddr(host), entry.path)
       : registeredTitleId
-        ? cachedAppIcon(`${host}:${PS5_PAYLOAD_PORT}`, registeredTitleId)
+        ? cachedAppIcon(consoleAddr(host), registeredTitleId)
         : undefined,
     // Same bytes over the IPC when the webview refuses the direct URL.
     fallbackLoader: () =>
       meta?.has_icon
-        ? gameIconDataUrl(`${host}:${PS5_PAYLOAD_PORT}`, entry.path)
+        ? gameIconDataUrl(consoleAddr(host), entry.path)
         : registeredTitleId
-          ? appIconDataUrl(`${host}:${PS5_PAYLOAD_PORT}`, registeredTitleId)
+          ? appIconDataUrl(consoleAddr(host), registeredTitleId)
           : Promise.resolve(null),
   });
   return (

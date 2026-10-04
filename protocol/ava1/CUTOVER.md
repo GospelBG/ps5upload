@@ -7,16 +7,16 @@ every box is ticked and `git grep -i ftx2 -- '*.md' ':!CHANGELOG.md'` is empty.
 
 The CHANGELOG keeps its FTX2 entries: they describe releases that shipped FTX2.
 
-- [ ] `README.md` "Test" section — "in-process mock FTX2 server" → the AVA1 mock/host-C tests
-- [ ] `CONTRIBUTING.md:45` — "mock-FTX2 integration tests"
-- [ ] `engine/README.md` — `ps5upload-tests` row ("mock FTX2 server"); dev commands using `:9113` / `:9114`
-- [ ] `TESTING.md` — `PS5_ADDR=…:9113`, `make validate` waiting for `:9113`, curl examples with `:9114`
-- [ ] `tests/README.md` — "full FTX2 stack", `PS5_ADDR` default `:9113`, `--ps5-addr` description
-- [ ] `tests/lab/README.md` — `:9113`/`:9114`, `ftx2_control.py`, `ftx2_probe.py`
-- [ ] `bench/README.md` — `run-ftx2-upload.mjs`, `check-ftx2-baseline.mjs`, `ftx2-upload-main.json` baselines, `--ps5-addr=…:9113`
-- [ ] `FAQ.md` — `FTX2_ZIP_RAM_THRESHOLD_MB` and `FTX2_ARCHIVE_STAGE_MB` environment variables (rename to `PS5UPLOAD_*` and accept the old names for one release)
+- [x] `README.md` "Test" section — "in-process mock FTX2 server" → the AVA1 mock/host-C tests
+- [x] `CONTRIBUTING.md:45` — "mock-FTX2 integration tests"
+- [x] `engine/README.md` — `ps5upload-tests` row ("mock FTX2 server"); dev commands using `:9113` / `:9114`
+- [x] `TESTING.md` — `PS5_ADDR=…:9113`, `make validate` waiting for `:9113`, curl examples with `:9114`
+- [x] `tests/README.md` — "full FTX2 stack", `PS5_ADDR` default `:9113`, `--ps5-addr` description
+- [x] `tests/lab/README.md` — `:9113`/`:9114`, `ftx2_control.py`, `ftx2_probe.py`
+- [x] `bench/README.md` — `run-ftx2-upload.mjs`, `check-ftx2-baseline.mjs`, `ftx2-upload-main.json` baselines, `--ps5-addr=…:9113`
+- [x] `FAQ.md` — `FTX2_ZIP_RAM_THRESHOLD_MB` and `FTX2_ARCHIVE_STAGE_MB` environment variables (P3 Task 17: renamed to `PS5UPLOAD_ZIP_RAM_THRESHOLD_MB` / `PS5UPLOAD_ARCHIVE_STAGE_MB`; the engine still reads the old names once per process with a deprecation line, and both settings are accepted but change nothing now that archives stream)
 - [ ] `MGMT_METHODS.md` — every row `hw-verified` (or `n/a` for a retired frame) on both consoles
-- [ ] In-app strings (`client/src/i18n/locales/*.ts`) that mention FTX2, ports 9113/9114 or "transfer port"
+- [x] In-app strings (`client/src/i18n/locales/*.ts`) that mention FTX2, ports 9113/9114 or "transfer port" (Task 20; pinned by `client/src/i18n/noLegacyPorts.test.ts`)
 
 Release gate: the engine's `auto` mode must not ship before the Task 28 hardware pass.
 
@@ -96,6 +96,17 @@ kept.
       is not reachable (FTX2 sent up to 1 MiB).
 - [x] A failed multi-chunk `fs.write` (`ps5upload-ava1/src/mgmt.rs`, `write_chunks`) removes its `<path>.ps5upload.tmp` best-effort with a
   `job.run` DELETE (only after a chunk was accepted); if that fails too, the next write of the path truncates it (offset 0).
+- [x] Archives AVA1 cannot stream (P3 Task 17 follow-up): a zip, 7z or RAR the AVA1 sources refuse used to be
+      handed to the FTX2 pipeline. That fallback lost nothing: the FTX2 path decoded with the same crates
+      (`zip`, `sevenz-rust2`, `unrar`) and refused the same inputs (encryption, unsupported methods, unsafe or
+      duplicate paths, a 7z solid block with directories between its files). The engine now fails the job with
+      `zip_unsupported`, `7z_unsupported`, `ava1_7z_unsupported_layout` or `rar_unsupported`; the client maps
+      each to a message that says to extract the archive and upload the folder (`humanizeJobErrorReason`, all 20
+      locales), and auto-recovery treats them as terminal.
+- [x] File lists with destinations outside the upload root (P3 Task 17 follow-up): one AVA1 job has one root
+      (SPEC.md section 11.2), so the list is split into the root's job plus one job per other destination
+      directory, run in sequence under one call (`upload_list_in`): progress aggregates, a cancel stops the
+      rest, a failure names the first failing path.
 - [ ] `ps5_fs_move`'s same-drive rename moves to an AVA1 RPC with the `st_dev` guard (never an
       unguarded `rename()` across mounts: that panics the console's kernel).
 - [x] NAS sources: `SourceFs` now has an `mtime` (SMB, FTP and SFTP report one; a backend that does
@@ -112,28 +123,20 @@ kept.
 - [x] Zip downloads resume on a reconnect (review 003 section 5, P3 Task 15): the archive is Stored
       by default and resumes mid-entry from the receiver's journal (`SPEC.md` section 10.1). The
       optional Deflate archive cannot resume and restarts from zero on a drop.
-- [ ] Zip resume restart window: a drop after a file's last range is journaled but before the file's
-      Done record makes `StoredZipSink::position` refuse (the file is whole but unfinished) and the
-      receiver restarts the archive from zero. The window is one sync batch wide (about 250 ms per
-      file boundary). Not fixed: finishing such a file needs the receiver to commit it without any
-      new frame, which it does not do for a fully durable partial file. Finished entries' data is
-      trusted from the journal (only their headers and descriptors are re-read); the in-flight
-      entry's durable groups are re-hashed by the receiver's resume check.
+- [x] Zip resume restart window (review 005 section 5): closed. `StoredZipSink::position` accepts a file
+      whose every byte is durable (`x == size`) as in flight, and `commit(id)` writes its descriptor,
+      so the archive resumes instead of restarting. Finished entries' data is trusted from the
+      journal (only their headers and descriptors are re-read); the in-flight entry's durable
+      groups are re-hashed by the receiver's resume check.
 - [ ] A failed download into an existing folder leaves its per-file `.ava-part` behind; cleanup is
       only done for new destinations.
 - [ ] The engine never removes `<data dir>/ava/jobs/*` or `<data dir>/ava/send/*` (`SPEC.md` §14.3
       says a node removes a job directory 7 days after its last write; only the console does so, in
       `payload/src/ava1_glue.c:192`). `ava1::journal::gc` exists and has no caller in the engine.
-- [ ] The Upload screen shows the transfer's `bottleneck` (the engine already carries it in
-      `commit_ack` and `Progress`; no file in `client/src` reads it).
-- [ ] PS5 → PS5 UI wiring (the relay and `/api/transfer/ps5-to-ps5` exist and the relay is tested; the
-      screen does not offer it).
-- [ ] `PS5UPLOAD_TRANSFER`: the default today is `auto` (probe the console, use AVA1 when it
-      advertises `CAP_DATA_PLANE`, FTX2 otherwise). At the cutover `route.rs` and the variable are
-      deleted along with the FTX2 branch of every call site above. To verify which protocol a run used,
-      read the engine's startup line `transfer mode=<auto|ava1|ftx2> (<default|env PS5UPLOAD_TRANSFER=…>)
-      ava_dir=…` (`ps5upload-engine/src/lib.rs:9631`) and each transfer's `protocol=` line; the
-      benchmark harness refuses an ambiguous `PS5UPLOAD_TRANSFER`.
+- [x] The Upload screen shows the transfer's `bottleneck` (Task 20: `screens/Upload/Bottleneck.tsx`; see
+      "Client contract" below for the fields it reads).
+- [x] PS5 → PS5 UI wiring (Task 20: "From another PS5" on the Upload screen, `screens/Upload/Ps5ToPs5.tsx`).
+- [x] `PS5UPLOAD_TRANSFER` (P3 Task 17): `route.rs`, the variable and the `Mode` seam are deleted and every engine call site is AVA1 only. A console with no AVA1 listener or an older helper fails with `helper_not_ava1`; one that has not accepted this app fails with `not_paired`. The startup line is now `ava1: dir=<ava_dir> identity=<key prefix> paired=<n>`; each transfer still logs `protocol=ava1`. The benchmark harness calls each protocol directly and no longer cross-checks the variable.
 - [ ] The payload's FTX2 journal directories (`/data/ps5upload/tx`, `/data/ps5upload/spool`) are
       removed by the cutover payload on first start.
 - [ ] Engine tests that stub or assert FTX2 (list in section 1) are replaced by their AVA1
@@ -267,3 +270,161 @@ at 2 s.
 Deferred: decrypt off the lane reader thread (03 section 2) waits for the matrix above; the
 `open_us_per_mib` receiver hint (03 section 5) is optional and also waits.
 
+## 5. Payload lifecycle and the migration shim (Task 8)
+
+Three starting situations, and who handles each:
+
+1. **Older helper (any release up to v5.41, old protocol on 9113/9114 only) running, new app.** The
+   engine's `legacy_helper` shim (`engine/crates/ps5upload-engine/src/legacy_helper.rs`) recognises
+   it by its old-protocol `Hello` reply: a build from before the cutover names no AVA1 port, a new
+   build does (`"ava1_port"`, `"ava1": "starting" | "up" | "failed"`). It sends the old `Shutdown`,
+   waits up to 10 s for both ports to close, sends the stamped helper to :9021 (trust slot and launch
+   token: no pairing code) and waits up to 20 s for :9120. It never sends the new helper over a live
+   old one.
+2. **New payload loaded while an older helper is alive** (an autoloader, another sender). The new
+   payload's `legacy_takeover.c` sends the old takeover request to loopback 9114 (9113 for a
+   single-port build) and waits up to 10 s for the ports to free. If the old instance is AVA1-era
+   (it still answers on 9120), `takeover.c` writes `/data/ps5upload/runtime/takeover` holding its
+   own random nonce (kern.arandom, never a time-based id: the app moves the clock with
+   `settimeofday`). The old instance polls the file every second and exits when it holds a nonce
+   other than its own that was not already there when the poll started. The clock is never read.
+   The flag is unlinked at startup and after a successful takeover, so a leftover after a crash or
+   reboot does nothing.
+3. **AVA1-era to AVA1-era.** `node.shutdown` (method 5) over the paired session
+   (`payload_lifecycle::shutdown_running_payload`, called by every ps5upload helper send), or the flag
+   file in 2.
+
+**The exit sequence** (node.shutdown, the flag, the old shutdown frame all reach it): the reply to
+`node.shutdown` is written first; 300 ms later a deferred thread sets `shutdown_requested` and wakes
+the accept loops; `main` then runs `ava1_payload_stop`: stop accepting, end the sessions (wait up to
+2 s), wait up to 3 s for an in-flight Sony call (`sony_api_lock` free), stop the data layer (jobs
+stopped, threads joined, journals closed so durable jobs resume). The 8 s exit watchdog bounds all of it.
+
+Engine routes (Task 20 consumes these; the tokens are stable):
+
+| route | answers |
+|---|---|
+| `GET /api/ps5/helper/state?host=` | `{"state": "ava1" \| "helper_old" \| "starting" \| "ava1_failed" \| "not_running"}` (`ava1`: the AVA1 port accepts connections; `helper_old`: only a pre-cutover helper answers the old protocol; `starting` / `ava1_failed`: a new build on the old ports whose AVA1 server is not up yet / did not start; `not_running`: nothing) |
+| `POST /api/ps5/helper/replace {host}` | 200 `{"state": "ava1" \| "starting", "replaced": bool}`; 409 with `error` starting `legacy_helper_wedged` (the older helper did not exit within 10 s: show the console restart), `replace_in_progress` (one is running for this console), `replace_cooldown` (less than 60 s since the last), `helper_starting`, `ava1_failed` (restart the console; replacing would send the same build), or `helper_not_running`; 502 with the send failure. A console already on AVA1 answers `replaced:false`. Only a `helper_old` console is ever replaced. |
+
+State tokens: `helper_old`, `ava1`, `starting`, `ava1_failed`, `not_running`. Error tokens:
+`legacy_helper_wedged`, `replace_in_progress`, `replace_cooldown`, `helper_starting`, `ava1_failed`,
+`helper_not_running`. The console needs at least 60 s between helper restarts; the route enforces it per
+host (a failed attempt counts), and `replace` makes one attempt.
+
+Deleted in the release after the cutover: `payload/src/legacy_takeover.c` (+ `include/legacy_takeover.h`),
+`engine/crates/ps5upload-engine/src/legacy_helper.rs`, `legacy_helper_tests.rs`, `legacy_guard.rs` (+ the
+two routes) and the Hello `ava1` fields' reader. `payload/src/takeover_flag.c`, `ava1_stop.c` and the
+flag-file path in `takeover.c` stay.
+## 6. Client contract (Task 20)
+
+The client reads these, all optional, so an engine that does not send a field shows nothing for it.
+
+**Job snapshot** (`GET /api/jobs/{id}`, SSE `job`), fields on a `running` job unless noted:
+
+| field | type | meaning |
+|-------|------|---------|
+| `phase` | `"skipping"` | 7z/RAR resume: the decoder is discarding data the console already has. Absent otherwise. |
+| `skip_done_bytes`, `skip_total_bytes` | u64 | Progress of the skipping phase (decoded vs to skip). |
+| `bottleneck` | string | AVA1's words: `network`, `source`, `console drive`, `console workers`, `console memory`, `none`. A finished job carries the same word in `commit_ack.bottleneck` (already sent today). |
+| `settling` | bool | Files are still settling on the console after the job finished (the engine sees `unswept` > 0 in `job.status`): the client shows "Finishing on the console…". Send it on the job while it settles; absent or `false` shows nothing. |
+
+**Console status tokens** the status pill and the banners key on, read as substrings of the error
+text of `GET /api/ps5/status` (the one probe; `payload_check`):
+
+| token | state | UI |
+|-------|-------|----|
+| (a good `node.status` reply) | `connected` | green dot |
+| `ava1_not_paired`, `not_paired` | `needs_pairing` | "Pair…" banner and the pairing dialog |
+| `helper_old` | `helper_old` | "This PS5 is running an older helper. Update it." with the one-click send |
+| `legacy_helper_wedged` | `helper_old` (wedged) | the same banner without the button: "restart the console, then update" |
+| `helper_not_ava1`, anything else | `down` | the existing Send helper flow |
+
+A console in `needs_pairing` or `helper_old` is a live helper: it does not count as down, so
+the auto-redeploy loop never fires on it.
+
+**Pairing routes** (loopback-guarded like every engine route): `GET /api/ava1/pairing?addr=` starts
+or re-reads the handshake and answers `{state: "code", code: "004821", console_name}` (`code` is
+the six digits both screens show, zero-padded), `{state: "accepted"}` (already trusted),
+`{state: "closed"}` (the console's pairing window is shut) or a 502 with `error`.
+`POST /api/ava1/pairing/confirm` `{addr}` answers `accepted` or `closed`. The handshake whose code
+is on screen is held in `ps5upload_ava1::Pool` until confirmed, so asking twice shows one code.
+Tests: `engine/crates/ava1-ctest/tests/pairing.rs` (the C server).
+
+**Addresses.** The client sends the bare console host (`consoleAddr`); the engine owns the port and
+ignores any port a caller sends. While the FTX2 path still exists, `resolve_connect_targets` gives a
+bare host the default FTX2 port.
+
+### 4.2 Receive/apply path changes since those runs (perf-apply, review 003; not yet measured on hardware)
+
+Host/loopback tests only (the consoles were reserved); every row of §4 above must be re-run. What
+changed and what each is expected to move:
+
+| change | where | expected effect |
+|--------|-------|-----------------|
+| preallocation outside `j->mu` (§2.1) | `lfile_open` | removes the multi-second stall of every worker and the feeder at each new large file on a slow drive; the Phat's usb0 upload should lose its two-minute preallocation freeze for the other lanes. Preallocation and ENOSPC-first are unchanged. |
+| commits on workers (§3.3) | `ava1_apply_commit_ready` | the 1,641 large files of the 223k corpus (four fsyncs each) stop blocking every batch; they overlap with the chunk work. |
+| striped directory fsyncs (§3.3, §4) | `ava1_sync_dirset` in prepare and every batch; engine `LocalSink::sync` | prepare's serial ~3 ms x thousands of parents and the per-batch serial directory fsyncs shrink by up to the worker count; this is the expected top item for the 82.5 files/s game upload. |
+| per-chunk fsync on a slow drive (§6) | `sync_batch`, `write_chunk` | should bring the Phat's usb0 large-file upload toward FTX2's 34-35 MB/s; the line `slow drive: ... fsync per chunk from now on` shows it fired. |
+| per-job stats | `ava1_apply_summary` | one line at every job's end: share of wall time in scan / data fsync / dirs / journal (job thread) and commit / preallocate (summed over workers); plus `preallocate took N ms for M MiB` and, above 1 s per GiB, `preallocation on this drive is slow`. |
+
+The periodic per-batch line (`per batch ms: scan ... data ... dirs ...`) is now opt-in like the sender's
+stage timers: `PS5UPLOAD_AVA1_TIMING=1` on a host, or create `/data/ps5upload/debug/ava1-timing` on the
+console. The end-of-job line above is always printed. To read where a slow upload spends its time:
+turn the flag on, run it, and read `/data/ps5upload/stderr.log`.
+
+Deferred (recorded here, not done):
+
+- **Directory-fsync deferral** (review 003 §3.3's second option) was not taken: striping keeps the
+  invariant "no journal record names a file whose directory is unsynced" (SPEC 15.4) and needs no
+  `lstat` of every done file on resume. Durable-by-log (`02-design-durable-by-log.md`) supersedes both.
+- **Engine side**: `LocalSink` (downloads) still does one `fsync` per file serially and opens each file
+  under its state mutex; only its directory fsyncs are parallel now. It never preallocates, so item 1
+  has no engine counterpart. A packed-sink design belongs with durable-by-log (§3.4).
+- **Compaction while commits are in flight** is skipped for that batch (it retries after the next one);
+  on a job that always has a large file committing, the journal grows past `AVA1_JNL_COMPACT_AT` until a
+  quiet batch. Not measured; if it shows, compact between a commit's journal record and the next one's
+  start instead.
+- The slow-drive switch is one-way for the life of the job and never reverts; a drive that recovers
+  (a USB hub contention that ends) keeps paying one small flush per chunk.
+
+### 4.3 Durable-by-log small files (review 003 §3.2; not yet measured on hardware)
+
+The receiver (console and engine) appends each small file to a pack log (`<job dir>/pack.<n>`), fsyncs the log
+once per batch, journals the batch with the pack range, and makes the files durable in place later (the sweep).
+A batch costs two fsyncs (log, journal) instead of N + D + 1 (SPEC 15.7). Host/loopback tests only; every
+tiny-file and game-corpus row of §4 must be re-run on the consoles.
+
+| what | expected effect |
+|------|-----------------|
+| tiny upload to `/data`, ext, usb0 | no longer bounded by the drive's per-file fsync rate (`disk.calibrate`: /data ~290 files/s); bounded by file creation. The 223k-file game should leave the per-file fsync and the per-batch directory fsyncs of §4 behind. |
+| Phat usb0 | the 27 files/s run was fsync-bound; the log turns it into sequential appends. |
+| JobDone | arrives when the log is durable; files settle for a few seconds behind it (a merge or single file). A new-folder upload settles before its rename, so its tail waits (about the last 3 s of files). |
+
+How to read a run: the console's end-of-job line (`finished in N ms ... data fsync ... dirs ...`) should show
+`dirs` near 0 during the transfer; `recovered N logged files, M lost (resent)` appears at helper start or JobOpen
+after a crash. Knobs (`ava1_data_cfg`): `log_small` (default on; `AVA1_LOG_SMALL_OFF` restores the per-file path for
+this release), `pack_segment` (64 MiB), `unswept_max` (256 MiB), `sweep_age_ms` (3000).
+
+Engine (`LocalSink`, downloads): on by default except on macOS, where it measured slower on loopback (2,270 vs
+2,870 files/s for 2,000 tiny files; a plain fsync never reaches the drive there). `PS5UPLOAD_AVA1_LOG_SMALL=1/0`
+forces it. The engine settles every logged file before it ends a job (it has no thread to settle behind JobDone),
+so its unswept cap is soft (one credit window past `unswept_max`).
+
+Failure paths (review dbl): a failed sweep is retried with a backoff and, after five failures, reported in `Status`
+(`code`/`current`); the engine fails the upload on it, or reports a warning (`warning` in the job's `commit_ack`) when it
+stops waiting (30 s, or a cancel). Housekeeping recovers parked, reaped and crashed job directories that hold a log;
+the console's job GC never touches one. The engine's own job GC (`journal::gc`) does not special-case pack files:
+an engine download settles everything before it ends, so a directory it left behind promised nothing to anyone.
+
+Deferred:
+
+- **Pack preallocation**: segments are not preallocated (the log is fsynced every batch). If a drive shows the sparse
+  collapse FTX2 hit, add `posix_fallocate` of the segment at roll time.
+- **Syscalls per file**: the console still does open, write, fchmod, utimensat by path, close for a logged file; the design's
+  `open(mode)` + `futimens` saves two syscalls and was not done.
+- **One pack writer at a time**: the append (offset + pwrite) is under one lock so a batch's range is a run of whole
+  records; a 256 KiB record is ~100 us. If a profile shows it, shard the log per worker and journal one range per shard.
+- **The sweep on a worker**: a sweep's directory syncs are serial (a worker must not wait on other workers' stripes). If
+  `dirs` shows in the end-of-job line, give the sweep its own helper thread.
+- **Engine macOS default**: revisit once an engine-side drive where fsync is expensive (a Windows or Linux host) has numbers.

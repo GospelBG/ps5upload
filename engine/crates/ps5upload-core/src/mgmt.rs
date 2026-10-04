@@ -11,8 +11,11 @@
 //!   to and from the typed bodies; callers never see the difference.
 //! * `ps5upload-core` cannot depend on `ps5upload-ava1` (the dependency runs the other
 //!   way), so the engine registers the transport once at start ([`set_transport`]).
-//! * The transport decides per console. When it does not serve a console (an older
-//!   helper that only speaks FTX2), [`call`] runs today's FTX2 path unchanged.
+//! * A registered transport is the only path: when it does not serve a console (nothing
+//!   listening on the AVA1 port, or a helper too old to serve management) the call fails with
+//!   [`helper_not_ava1`], never with a second protocol. The FTX2 path below runs only in a
+//!   process that registered no transport at all (the lab and the benchmark harness, which
+//!   keep it until the FTX2 baseline is recorded); the engine always registers one.
 //!
 //! Errors: a refusal by the payload is a [`MgmtError`] inside the `anyhow::Error`
 //! (`payload rejected <LABEL>: <cause>`, the text callers already match on). Use
@@ -186,6 +189,27 @@ impl fmt::Display for MgmtError {
 
 impl std::error::Error for MgmtError {}
 
+/// `error_reason` / error token for a console with no AVA1 listener or an older helper.
+pub const HELPER_NOT_AVA1: &str = "helper_not_ava1";
+/// The text that goes with [`HELPER_NOT_AVA1`].
+pub const HELPER_NOT_AVA1_MESSAGE: &str = "The PS5 helper is not running or is an old version. Send the helper again from the Connection screen.";
+/// `error_reason` / error token for a console that has not accepted this app.
+pub const NOT_PAIRED: &str = "not_paired";
+/// The text that goes with [`NOT_PAIRED`].
+pub const NOT_PAIRED_MESSAGE: &str =
+    "This PS5 has not accepted this app yet. Pair it from the Connection screen.";
+
+/// The refusal for a console that has no AVA1 listener (or a helper too old to serve this):
+/// `payload rejected <label>: helper_not_ava1: <message>`. The client keys on the token.
+pub fn helper_not_ava1(label: &str) -> anyhow::Error {
+    MgmtError {
+        label: label.to_string(),
+        status: 0,
+        cause: format!("{HELPER_NOT_AVA1}: {HELPER_NOT_AVA1_MESSAGE}"),
+    }
+    .into()
+}
+
 /// The text of the error a method FTX2 never had (`fs.stat`) gets on a console whose helper
 /// does not serve AVA1 management.
 const NEEDS_AVA1: &str =
@@ -202,9 +226,9 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How a registered transport serves management calls.
 pub trait MgmtTransport: Send + Sync {
-    /// Runs one call. `Ok(None)` means this transport does not serve `addr` (for
-    /// example the console runs an older helper), and the caller uses FTX2.
-    /// A refusal by the payload is an `Err` holding a [`MgmtError`].
+    /// Runs one call. `Ok(None)` means this transport does not serve `addr` (for example the
+    /// console runs an older helper): the caller fails with [`helper_not_ava1`]. A refusal by the
+    /// payload is an `Err` holding a [`MgmtError`].
     fn call(
         &self,
         addr: &str,
@@ -371,7 +395,9 @@ pub fn call_with(
         )? {
             return Ok(reply);
         }
+        return Err(helper_not_ava1(label));
     }
+    // No transport registered (the lab and the benchmark harness).
     ftx2_call(addr, method, label, body, timeout)
 }
 
@@ -490,23 +516,32 @@ pub fn run_op(
         if let Some(reply) = t.run_job(addr, op, label, body, call)? {
             return Ok(reply);
         }
+        return Err(helper_not_ava1(label));
     }
+    // No transport registered (the lab and the benchmark harness).
     ftx2_run_op(addr, op, label, body, call)
 }
 
 /// Progress of an operation started by [`run_op`], for `/api/ps5/fs/op-status`.
-/// `Ok(None)`: not served over AVA1, ask FTX2. `Ok(Some(None))`: nothing running under `op_id`.
+/// `Ok(None)`: no transport registered (the lab asks FTX2). `Ok(Some(None))`: nothing running
+/// under `op_id`. A transport that does not serve the console is [`helper_not_ava1`].
 pub fn op_progress(addr: &str, op_id: u64) -> Result<Option<Option<JobProgress>>> {
     match current() {
-        Some(t) => t.job_progress(addr, op_id),
+        Some(t) => t
+            .job_progress(addr, op_id)?
+            .map(Some)
+            .ok_or_else(|| helper_not_ava1("JOB_STATUS")),
         None => Ok(None),
     }
 }
 
-/// Asks an operation started by [`run_op`] to stop. `Ok(None)`: not served over AVA1.
+/// Asks an operation started by [`run_op`] to stop. `Ok(None)`: no transport registered.
 pub fn op_cancel(addr: &str, op_id: u64) -> Result<Option<bool>> {
     match current() {
-        Some(t) => t.job_cancel(addr, op_id),
+        Some(t) => t
+            .job_cancel(addr, op_id)?
+            .map(Some)
+            .ok_or_else(|| helper_not_ava1("JOB_CANCEL")),
         None => Ok(None),
     }
 }
@@ -646,6 +681,32 @@ mod tests {
         assert_eq!(seen[0].1, 72);
         assert_eq!(seen[0].2, "HW_INFO");
         assert_eq!(seen[0].4, DEFAULT_TIMEOUT);
+    }
+
+    /// A registered transport that does not serve the console (nothing on the AVA1 port, an
+    /// older helper) is a `helper_not_ava1` error, never the retired protocol's frame: the
+    /// address below would only ever be dialled by that frame (a connect error would show).
+    #[test]
+    fn a_transport_that_does_not_serve_the_console_is_helper_not_ava1() {
+        let _g = scoped_transport(fake(|_, _| Ok(None)));
+        let e = call("127.0.0.1:1", m::HW_INFO, b"").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "payload rejected HW_INFO: helper_not_ava1: The PS5 helper is not running or is an old version. Send the helper again from the Connection screen."
+        );
+        assert!(e.downcast_ref::<MgmtError>().is_some());
+
+        let call_ctx = JobCall {
+            op_id: 1,
+            subject: "/x",
+            deadline: Duration::from_secs(1),
+        };
+        let e = run_op("127.0.0.1:1", ops::DELETE, "FS_DELETE", b"{}", &call_ctx).unwrap_err();
+        assert!(e.to_string().contains("helper_not_ava1"), "{e}");
+        let e = op_progress("127.0.0.1:1", 1).unwrap_err();
+        assert!(e.to_string().contains("helper_not_ava1"), "{e}");
+        let e = op_cancel("127.0.0.1:1", 1).unwrap_err();
+        assert!(e.to_string().contains("helper_not_ava1"), "{e}");
     }
 
     #[test]

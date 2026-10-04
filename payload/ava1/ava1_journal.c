@@ -34,6 +34,7 @@ static int write_all_fd(int fd, const uint8_t *p, size_t n) {
  * fail with this errno instead of reaching the disk. */
 int ava1_fsync_test_fail_n, ava1_fsync_test_errno;
 unsigned ava1_fsync_retries_total; /* retries made since start (a statistic) */
+unsigned ava1_fsync_calls_total;   /* fsync tries made since start (tests count them per batch) */
 
 /* Sony's kernel hands some errors back as 0x8002xxxx instead of an errno; the low 16 bits are the errno. */
 static int fsync_errno(int e) {
@@ -48,6 +49,7 @@ int ava1_fsync_transient(int e) {
 }
 
 static int fsync_once(int fd) {
+    __atomic_add_fetch(&ava1_fsync_calls_total, 1, __ATOMIC_RELAXED);
     int n = __atomic_load_n(&ava1_fsync_test_fail_n, __ATOMIC_SEQ_CST);
     while (n > 0) {
         if (__atomic_compare_exchange_n(&ava1_fsync_test_fail_n, &n, n - 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
@@ -369,6 +371,19 @@ static int rm_tree(const char *p) {
     return rmdir(p) == 0 ? 0 : -errno;
 }
 
+/* True when the job directory holds a pack log (a file named pack.<n>): the only copy of files not yet durable in
+ * place, so recovery must reach it before anything deletes it. */
+int ava1_dir_has_pack(const char *dir) {
+    DIR *dp = opendir(dir);
+    struct dirent *de;
+    int has = 0;
+    while (dp && !has && (de = readdir(dp)) != NULL) has = strncmp(de->d_name, "pack.", 5) == 0;
+    if (dp) closedir(dp);
+    return has;
+}
+
+#define AVA1_PACK_GC_GRACE_S (7 * 86400)
+
 int ava1_jobs_gc(const char *jobs_dir, int64_t now_unix, int64_t max_age_s) {
     DIR *d = opendir(jobs_dir);
     struct dirent *e;
@@ -384,7 +399,16 @@ int ava1_jobs_gc(const char *jobs_dir, int64_t now_unix, int64_t max_age_s) {
         last = (int64_t)st.st_mtime;
         snprintf(jp, sizeof jp, "%s/journal", p);
         if (stat(jp, &js) == 0 && (int64_t)js.st_mtime > last) last = (int64_t)js.st_mtime;
-        if (now_unix - last > max_age_s && rm_tree(p) == 0) n++;
+        /* A directory with a pack log holds the only copy of files not yet durable in place: never collected,
+         * however old (recovery finishes it, and its journal's Done then lets the pack go). */
+        if (now_unix - last > max_age_s) {
+            int packed = ava1_dir_has_pack(p);
+            /* ... and a week past the normal age even a log is given up on: recovery has had every pass since
+             * (a directory it cannot open, or that keeps failing, must not hold its segments forever) */
+            if (packed && now_unix - last <= max_age_s + AVA1_PACK_GC_GRACE_S) continue;
+            if (packed) fprintf(stderr, "[ava1] gc: giving up on %s: its log was never recovered\n", e->d_name);
+            if (rm_tree(p) == 0) n++;
+        }
     }
     closedir(d);
     return n;

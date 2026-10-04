@@ -48,6 +48,9 @@ import {
 } from "../../state/uploadQueue";
 import { isRemotePath } from "../../lib/remotePath";
 import { useTransferStore } from "../../state/transfer";
+import { BottleneckLine, JobLiveNotes, UnsettledLine } from "./Bottleneck";
+import { RarPasswordPrompt } from "./RarPasswordPrompt";
+import { rarPasswordProblem } from "../../lib/rarPassword";
 
 /** One console's slice of the queue, in first-seen order. */
 interface ConsoleGroup {
@@ -989,6 +992,9 @@ export function QueueRow({
             value={pct / 100}
             label={tr("queue_title", undefined, "Queue")}
           />
+          <div className="mt-1">
+            <JobLiveNotes live={item.live} />
+          </div>
           {isFinalizing && (
             // Always-visible explainer under the bar. The pill itself
             // ("Finalizing on PS5") is short enough to fit on the
@@ -1010,6 +1016,10 @@ export function QueueRow({
       {item.status === "done" && !isInstall && (
         <DoneStats bytesSent={item.bytesSent} bytesPerSec={item.bytesPerSec} />
       )}
+      {item.status === "done" && !isInstall && item.live?.bottleneck && (
+        <BottleneckLine cause={item.live.bottleneck} />
+      )}
+      {item.status === "done" && !isInstall && <UnsettledLine live={item.live} />}
 
       {item.status === "done" && item.installNote && (
         <div className="mt-1 text-xs text-[var(--color-muted)]">
@@ -1024,6 +1034,17 @@ export function QueueRow({
           detail={item.errorDetail}
         />
       )}
+
+      {item.status === "failed" &&
+        !isInstall &&
+        rarPasswordProblem(item.errorReason, item.error) && (
+          <RarPasswordPrompt
+            problem={rarPasswordProblem(item.errorReason, item.error)!}
+            onSubmit={(pw) =>
+              useUploadQueueStore.getState().retryWithPassword(item.id, pw)
+            }
+          />
+        )}
 
       {item.status === "failed" && isInstall && (
         <div className="mt-2 flex flex-wrap gap-2">

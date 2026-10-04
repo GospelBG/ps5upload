@@ -120,6 +120,10 @@ export interface Ps5Snapshot {
    *  single dependency the whole install fallback rests on, and it isn't
    *  ours, so a bundle should always state whether it was up. */
   ports: PortState[] | null;
+  /** The status pill's verdict when the report was taken (connected, needs_pairing,
+   *  helper_old, down; null = never probed): the one probe's answer, which says WHY the
+   *  helper port is or is not usable where a TCP connect cannot. */
+  session: string | null;
   /** Per-probe failures, keyed by probe name, so a maintainer can see what
    *  couldn't be collected and why. */
   errors: Record<string, string>;
@@ -138,11 +142,10 @@ export interface PortState {
 /** The ports a diagnosis actually turns on, with who owns each. `loader` is
  *  the console's own jailbreak loader — not ours — which is exactly why its
  *  state has to be recorded rather than assumed. */
-const PROBED_PORTS: { port: number; role: string }[] = [
+export const PROBED_PORTS: { port: number; role: string }[] = [
   { port: 9021, role: "ELF loader (console's, not ps5upload's)" },
   { port: 9115, role: "DPI install daemon" },
-  { port: 9113, role: "ps5upload transfer" },
-  { port: 9114, role: "ps5upload management" },
+  { port: 9120, role: "ps5upload helper (AVA1)" },
   { port: 2121, role: "ps5upload FTP" },
 ];
 
@@ -219,8 +222,7 @@ async function fetchPayloadLogs(host: string): Promise<{
     ["/data/ps5upload_startup.log", "startup_early.log"],
     ["/data/ps5upload/runtime/active_instance.txt", "active_instance.txt"],
     // The AVA1 job event log (open / resume / done / fail with status, bytes and lanes; the
-    // payload rolls it at 1 MiB into .old). It replaces the FTX2 transaction logs
-    // (tx/events.log, tx/runtime_tx_state.txt, tx_*.json, shards_*.log), which no longer exist.
+    // payload rolls it at 1 MiB into .old). It replaces the transaction logs of the helper's former protocol, which no longer exist.
     ["/data/ps5upload/ava/events.log.old", "ava_events_old.log"],
     ["/data/ps5upload/ava/events.log", "ava_events.log"],
     // ShadowMount+ is third-party but owns mounting and registration for
@@ -343,6 +345,7 @@ export async function buildPs5Snapshot(opts: {
     installed_apps: null,
     installed_apps_total: null,
     ports: null,
+    session: null,
     smp_status: null,
     smp_checkout: null,
     focus: null,
@@ -488,6 +491,9 @@ export async function buildPs5Snapshot(opts: {
       .map((t) => ({ title_id: t.titleId, title_name: t.titleName }));
   }
   base.ports = ports;
+  base.session =
+    useConnectionStore.getState().runtimeByHost[hostOf(host) || "_"]?.session ??
+    null;
   base.smp_status = smp;
   base.smp_checkout = checkout;
   base.focus = focus;

@@ -1,3 +1,4 @@
+import { consoleAddr } from "../lib/addr";
 import { create } from "zustand";
 
 import { pkgMkdirChain } from "../lib/pkgStorage";
@@ -41,6 +42,8 @@ import {
   type RateSample,
 } from "../lib/rollingRate";
 import { archiveFormat, type SourceKind } from "./upload";
+import { rarPasswordProblem } from "../lib/rarPassword";
+import { jobLiveFromSnapshot, type JobLive } from "../lib/jobLive";
 import {
   runPkgInstall,
   installSampleFeed,
@@ -88,7 +91,6 @@ import {
   type InstallRequest,
   type InstallResult,
 } from "./consoleQueueBridge";
-import { PS5_PAYLOAD_PORT } from "./connection";
 import { trStatic } from "../lib/trStatic";
 import { ensurePayloadCurrent } from "../lib/ensurePayloadCurrent";
 import { effectiveUploadStreams } from "../lib/uploadStreams";
@@ -154,7 +156,7 @@ export interface QueueItem {
    *  user picked these on the Upload screen at queue-add time; the
    *  runner sends the file to this exact path. */
   resolvedDest: string;
-  /** Transfer-port addr (e.g. `192.168.1.2:9113`). */
+  /** Console address (a bare host such as `192.168.1.2`). */
   addr: string;
   strategy: UploadStrategy;
   reconcileMode: ReconcileMode;
@@ -242,6 +244,10 @@ export interface QueueItem {
    *  phase and on pre-P3 payloads that don't emit APPLY_PROGRESS. */
   filesFinalized: number;
   filesFinalizingTotal: number;
+  /** Transient live notes (skipping phase, bottleneck, "finishing on the
+   *  console") forwarded from the job snapshot while running; only set when
+   *  the engine sent them. Not persisted meaningfully: stale on reload. */
+  live?: JobLive;
   /** Mount path the runner produced when `mountAfterUpload` is true and
    *  the image upload + mount succeeded. Surfaced to the row so users
    *  see where the image landed without flipping to the Volumes tab. */
@@ -352,6 +358,10 @@ interface QueueState {
   retryFailed: () => void;
   /** Retry one failed row. Returns false when the row is missing/not failed. */
   retryItem: (id: string) => boolean;
+  /** Retry one archive row that failed for a missing or wrong password, with the password
+   *  the person just typed. The password lives on the in-memory item only (the save redacts
+   *  it) and is never logged. False when the password is empty or the row is not a failed one. */
+  retryWithPassword: (id: string, password: string) => boolean;
   /** Re-drive one console's uploads that FAILED on a recoverable
    *  (connection-class) error, then restart that console's drain loop.
    *  This is the "slept past the in-loop recovery budget" case: a standby
@@ -683,6 +693,8 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     installPhase: QueueItem["installPhase"];
     installedTitle: string | null;
     installNote?: string | null;
+    /** The finished transfer's bottleneck note, when the engine reported one. */
+    live?: JobLive;
   }> => {
     if (item.sourceKind === "install") return runInstallItem(item);
     const isFolder =
@@ -811,7 +823,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     const samples: RateSample[] = [{ ts: startedAtMs, bytes: 0 }];
 
     while (isLive()) {
-      const snap = await jobStatus(jobId);
+      const snap = await jobStatus(jobId, item.addr);
       if (!isLive()) {
         throw new Error("queue stopped");
       }
@@ -1134,9 +1146,32 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             measuredAtMs: Date.now(),
           });
         }
+        // The finished transfer's bottleneck (commit ack); a stale skipping/settling
+        // note from the last running tick must not outlive the job.
+        const finishedLive = jobLiveFromSnapshot({
+          bottleneck: snap.bottleneck,
+          commit_ack: snap.commit_ack,
+        });
+        if (finishedLive?.unsettled) {
+          // The engine stopped waiting for the console to finish saving the files: not a clean success.
+          pushNotification(
+            "warning",
+            withConsolePrefix(
+              item.addr,
+              trStatic("upload_warn_unsettled_title", "Upload finished, but not confirmed saved"),
+            ),
+            {
+              body: trStatic(
+                "upload_warn_unsettled",
+                "Every byte reached the console, but it has not confirmed saving all files yet. They finish on their own; if the console loses power first, send the folder again.",
+              ),
+            },
+          );
+        }
         return {
           bytesSent: finalBytes,
           bytesPerSec: averageRate(finalBytes, elapsedMs),
+          live: finishedLive,
           mountedAt,
           mountWarnings,
           registeredAs,
@@ -1176,6 +1211,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           // OR outside the finalize phase).
           filesFinalized: snap.files_finalized ?? 0,
           filesFinalizingTotal: snap.files_finalizing_total ?? 0,
+          live: jobLiveFromSnapshot(snap),
         }),
       }));
       await sleep(POLL_INTERVAL_MS);
@@ -1279,6 +1315,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             installPhase,
             installedTitle,
             installNote,
+            live,
           } =
             await runOne(next, isLive);
           // Always flip to "done" once runOne returns success — the
@@ -1302,6 +1339,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
               installPhase,
               installedTitle,
               installNote: installNote ?? null,
+              live,
               recovering: false,
               recoverAttempt: 0,
               completedAt: Date.now(),
@@ -1343,6 +1381,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             set((s) => ({
               items: patchItem(s.items, next.id, {
                 status: "failed",
+                live: undefined,
                 bytesPerSec: 0,
                 recovering: false,
                 recoverAttempt: 0,
@@ -1404,10 +1443,10 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           }
           // Re-deploy the payload, then poll until it answers. force=true:
           // we got here from a connection-class transfer failure, so the
-          // payload is suspect — its transfer port (:9113) may be dead even
-          // if the mgmt port (:9114) still answers the version check. A
+          // payload is suspect — its transfer listener may be dead even
+          // if management still answers the version check. A
           // plain (non-force) call would see "version matches → current" and
-          // skip the redeploy, leaving the dead :9113 in place so the resume
+          // skip the redeploy, leaving the dead listener in place so the resume
           // retry fails again — the "had to re-send the ELF manually" bug.
           // Re-send is idempotent and the resume continues from committed
           // shards, so a needless redeploy on a transient blip only costs the
@@ -1577,7 +1616,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         sourcePath: installKey(input.request),
         displayName: input.displayName,
         resolvedDest: "",
-        addr: `${bare}:${PS5_PAYLOAD_PORT}`,
+        addr: consoleAddr(bare),
         strategy: "overwrite",
         reconcileMode: "fast",
         excludes: [],
@@ -1829,6 +1868,21 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         ),
       }));
       scheduleSave();
+      return true;
+    },
+
+    retryWithPassword(id, password) {
+      if (!password) return false;
+      const item = get().items.find((candidate) => candidate.id === id);
+      if (!item || item.status !== "failed") return false;
+      if (!rarPasswordProblem(item.errorReason, item.error)) return false;
+      set((s) => ({
+        items: s.items.map((candidate) =>
+          candidate.id === id ? { ...candidate, rarPassword: password } : candidate,
+        ),
+      }));
+      if (!get().retryItem(id)) return false;
+      void get().startHost(hostOf(item.addr));
       return true;
     },
 

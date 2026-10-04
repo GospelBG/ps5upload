@@ -15,6 +15,7 @@
  */
 
 import { getEngineUrl } from "../state/engine";
+import { consoleAddr } from "./addr";
 
 // ── Error types ──────────────────────────────────────────────────────────────
 
@@ -883,13 +884,13 @@ export async function browserInvoke<T>(
     // ── Payload probe ────────────────────────────────────────────────────────
 
     case "payload_check": {
-      // Rust probes.rs: GET /api/ps5/status?addr={ip}:9114, wraps the
+      // Rust probes.rs: GET /api/ps5/status?addr={ip}, wraps the
       // response as { ok, reachable, engine, status } or
       // { ok:false, reachable:false, engine, error }. Keep `engine` in step
       // with the Rust side: an engine that never answered is not evidence
       // about the console (see the 2026-09-14 post-mortem in probes.rs).
       const ip = args["ip"] as string;
-      const addr = uenc(`${ip}:9114`);
+      const addr = uenc(consoleAddr(ip));
       const url = `${getEngineUrl()}/api/ps5/status?addr=${addr}`;
       try {
         const r = await fetch(url, { signal: AbortSignal.timeout(5_000) });

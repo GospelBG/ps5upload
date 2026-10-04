@@ -664,6 +664,20 @@ fight — the payload doesn't lock by destination, it commits the
 shards each transfer ACKs in arrival order. For routine use ("one
 person uploading, another browsing"), no coordination is needed.
 
+**Q: What is the pairing code, and which ports does ps5upload use?**
+ps5upload talks to the console on one port, **9120**, plus the ELF loader's
+**9021** to load the helper. Those two are the only ones to allow in a
+firewall. Every connection is encrypted and each computer pairs with the
+console once. A helper that the app launched pairs automatically, with
+nothing to type. A helper you loaded some other way (a different loader or
+tool) shows a 6-digit code on the console; confirm it in the app to pair.
+
+**Q: How do I cap the upload speed?**
+Set `PS5UPLOAD_BANDWIDTH_MBPS` to a number of megabytes per second before
+starting the app or engine; unset, zero or an unreadable value means no
+cap. The old name from before the AVA1 release still works for one release
+and prints a deprecation line in the engine log.
+
 **Q: Can I run the transfer engine on a different machine (remote /
 self-hosted engine)? (3.3.7)**
 Yes. The app normally launches its transfer engine as a bundled background
@@ -940,26 +954,20 @@ rejected with a clear message.
 **Q: Does an archive upload need free space on my PC?**
 It depends on the format.
 
-- **`.rar` and `.7z` — no.** Both are decompressed and sent at the same
-  time: bytes go straight from the decoder onto the network, so nothing
-  is written to your disk. You only need room for the archive you already
-  have.
-- **`.zip` — sometimes.** Each file inside the zip is decompressed before
-  it is sent. Anything under **512 MB** is held in memory, but a larger
-  file is written to your temp folder first and deleted once it has been
-  sent. Only one file is held at a time, so the space you need is the
-  size of the **single biggest file inside the archive** — not the whole
-  game. A zip containing one 20 GB `.pkg` needs 20 GB free in temp; the
-  same game as a `.rar` or `.7z` needs none.
+- **`.zip`, `.rar` and `.7z` — no.** All three are decompressed and sent at
+  the same time: bytes go straight from the decoder onto the network, so
+  nothing is written to your disk. You only need room for the archive you
+  already have.
 
-If your temp drive is small and the game is large, prefer `.rar` or
-`.7z`. You can also raise the in-memory limit with the
-`FTX2_ZIP_RAM_THRESHOLD_MB` environment variable, at the cost of more RAM.
+A `.zip` entry of any size is inflated as it is sent, so nothing is held back in memory
+or written to temp. The `PS5UPLOAD_ZIP_RAM_THRESHOLD_MB` environment variable (and its old
+name from before the AVA1 release, which still works for one release and prints a deprecation line) is still accepted so an existing setup does not
+break, but it is ignored.
 
 This changed in a recent version. Older builds extracted a `.rar` in full
 first, which meant a 180 GB game needed 180 GB free on top of the archive.
-If you set `FTX2_ARCHIVE_STAGE_MB` to work around that, you can remove it —
-it no longer does anything.
+If you set `PS5UPLOAD_ARCHIVE_STAGE_MB` (or its old name from before the AVA1 release)
+to work around that, you can remove it — it no longer does anything.
 
 **Q: Which archive formats work on which system?**
 

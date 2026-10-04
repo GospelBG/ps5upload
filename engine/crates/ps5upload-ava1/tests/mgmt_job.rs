@@ -42,11 +42,6 @@ fn err(status: u16, cause: &str) -> RpcReply {
     }
 }
 
-fn force_auto() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| std::env::set_var("PS5UPLOAD_TRANSFER", "auto"));
-}
-
 /// What the scripted console does with a job.
 #[derive(Clone, Default)]
 struct Script {
@@ -99,6 +94,7 @@ fn status(job_id: [u8; 16], state: u8, polls: u32, current: Option<&str>) -> Sta
         state: Some(state),
         result: None,
         code: None,
+        unswept: None,
     }
 }
 
@@ -185,7 +181,6 @@ async fn console(
     String,
     Arc<Mutex<Console>>,
 ) {
-    force_auto();
     let base = temp(tag);
     let ava = base.join("ava");
     std::fs::create_dir_all(&ava).unwrap();
@@ -577,7 +572,7 @@ async fn a_progress_query_before_the_job_is_listed_waits_instead_of_reading_zero
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_old_helper_without_job_run_falls_back_to_ftx2_and_busy_is_a_refusal() {
+async fn an_old_helper_is_helper_not_ava1_and_busy_is_a_refusal() {
     let (t, _p, c, _st) = console(
         "old",
         Script {
@@ -586,14 +581,15 @@ async fn an_old_helper_without_job_run_falls_back_to_ftx2_and_busy_is_a_refusal(
         },
     )
     .await;
-    let r = run_op(&t, &c, ops::DELETE, r#"{"path":"/data/x"}"#, 0, "", T)
+    let e = run_op(&t, &c, ops::DELETE, r#"{"path":"/data/x"}"#, 0, "", T)
         .await
-        .unwrap();
+        .unwrap_err();
     assert!(
-        r.is_none(),
-        "no CAP_MGMT: Ok(None) sends the caller to the FTX2 frame, nothing sent"
+        e.to_string().contains("helper_not_ava1"),
+        "no CAP_MGMT: the error the person can act on, nothing sent: {e}"
     );
-    // a helper that advertises CAP_MGMT but predates job.run answers ERR_UNKNOWN_METHOD: FTX2 serves it
+    // a helper that advertises CAP_MGMT but predates job.run answers ERR_UNKNOWN_METHOD: the
+    // transport reports it as not served, which the core turns into helper_not_ava1
     let (t, _p, c, _st) = console(
         "old-job-run",
         Script {

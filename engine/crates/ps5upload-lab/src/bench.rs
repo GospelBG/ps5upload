@@ -2203,23 +2203,7 @@ async fn prepare(env: &Env, args: &BenchArgs) -> anyhow::Result<Prep> {
     Ok(prep)
 }
 
-/// `PS5UPLOAD_TRANSFER` must not contradict `--proto` (C17): an ambiguous measurement is
-/// refused, not made.
-fn check_mode(proto: Proto) -> anyhow::Result<()> {
-    use ps5upload_ava1::route::{mode, Mode};
-    match (mode(), proto) {
-        (Mode::Ftx2, Proto::Ava1) | (Mode::Ava1, Proto::Ftx2) => bail!(
-            "PS5UPLOAD_TRANSFER is set to {:?}, which contradicts --proto {}; unset it \
-             (bench calls each protocol directly and never reads it)",
-            std::env::var("PS5UPLOAD_TRANSFER").unwrap_or_default(),
-            proto.as_str()
-        ),
-        _ => Ok(()),
-    }
-}
-
 pub async fn run_bench(args: &BenchArgs) -> anyhow::Result<Vec<BenchRun>> {
-    check_mode(args.proto)?;
     let env = Env::production(args);
     run_bench_in(&env, args).await
 }

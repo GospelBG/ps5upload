@@ -31,8 +31,8 @@ check_updates: "Sprawdź aktualizacje",
 language: "Język",
 // Source
 // Destination
-// The previous upload-mode union (payload / ftp / mix / ftx2) is
-// collapsing to a single FTX2-engine path, rebranded as "Payload"
+// The previous upload-mode union (payload / ftp / mix / and the old protocol name) is
+// collapsing to a single engine path, rebranded as "Payload"
 // for users. The legacy string keys stay for config/back-compat —
 // all four point to the same label now.
 // Queues
@@ -343,7 +343,7 @@ logs_filter_all: "Wszystkie",
 status_engine: "Silnik",
 status_engine_tooltip: "ps5upload-engine — backend aplikacji ({url})",
 status_payload: "helper",
-status_payload_tooltip: "helper PS5Upload na :9113",
+status_payload_tooltip: "helper PS5Upload na :9120",
 status_kernel_ok: "kernel OK",
 status_no_active_transfers: "Brak aktywnych transferów",
 status_ps5: "PS5",
@@ -411,8 +411,7 @@ about_credits_text: "Zobacz plik LICENSE, aby poznać warunki licencji.",
 // in screens/About/index.tsx, which the i18n extractor doesn't walk, so
 // these are declared here by hand).
 about_feat_fast_transfers_title: "Szybkie transfery",
-about_feat_fast_transfers_body:
-  "Protokół binarny FTX2 z weryfikacją kawałków BLAKE3 i optymalizacją dla małych plików. Wykorzystuje sieć LAN maksymalnie.",
+about_feat_fast_transfers_body: "Protokół transferu AVA1 z weryfikacją BLAKE3, szyfrowanymi sesjami, wznawialnymi zadaniami i pakowaniem małych plików. Wykorzystuje sieć LAN maksymalnie.",
 about_feat_native_mount_title: "Natywne montowanie obrazu",
 about_feat_native_mount_body:
   "Dołącz obrazy .exfat i .ffpkg do /mnt/ps5upload/ za pomocą MDIOCATTACH + nmount — bez potrzeby zewnętrznych narzędzi.",
@@ -3137,6 +3136,10 @@ helper_mismatch_go: "Załaduj pomocnika",
 "joberr.preflight_insufficient_space": "Dysk docelowy nie ma wystarczającej ilości wolnego miejsca na ten plik. Zwolnij miejsce na PS5 (Ustawienia → Pamięć) albo wybierz inne miejsce docelowe, a następnie kliknij „Ponów”.",
 "joberr.size_mismatch": "Transfer nie zdążył się zakończyć przed przerwaniem — plik na PS5 jest niekompletny, więc nie został opublikowany (stara kopia, jeśli istniała, pozostaje nienaruszona). Zwykle oznacza to, że PS5 przeszła w tryb spoczynku albo straciła zasilanie w trakcie przesyłania. Nie pozwól konsoli zasnąć (Ustawienia → System → Oszczędzanie energii → Czas do wyłączenia PS5) i uruchom tę pozycję ponownie: „Wznów” dośle tylko brakujące pliki, a „Nadpisz” utworzy czystą kopię.",
 "joberr.tx_table_full": "Na PS5 trwa zbyt wiele jednoczesnych transferów. Poczekaj, aż część się zakończy, albo uruchom ponownie payload.",
+"joberr.zip_unsupported": "Ten plik .zip używa czegoś, czego program przesyłający nie może strumieniować (szyfrowanie, metoda kompresji inna niż Deflate lub Stored albo niebezpieczna lub zduplikowana ścieżka pliku). Rozpakuj go na komputerze i prześlij folder.",
+"joberr.sevenz_unsupported": "Ten plik .7z używa metody kompresji lub funkcji, której program przesyłający nie może strumieniować. Rozpakuj go na komputerze i prześlij folder.",
+"joberr.sevenz_unsupported_layout": "Ten plik .7z ma między plikami w jednym bloku ciągłym foldery lub puste pliki — takiego układu program przesyłający nie może strumieniować. Spakuj go ponownie w 7-Zip albo rozpakuj i prześlij folder.",
+"joberr.rar_unsupported": "Ten plik .rar ma zduplikowane lub niebezpieczne ścieżki plików albo funkcję, której program przesyłający nie może strumieniować. Rozpakuj go na komputerze i prześlij folder.",
 "bug_report_browser_note": "Archiwum ZIP pobiera się przez przeglądarkę. Zawiera ostatni dziennik silnika, a nie pełny plik na hoście silnika — po ten użyj „docker logs” na kontenerze.",
 "pkg.patch_did_not_apply": "PS5 przyjęła tę aktualizację, po czym nic z nią nie zrobiła — gra nadal jest w poprzedniej wersji. Oznacza to, że konsola nie potrafiła dopasować aktualizacji do zainstalowanej gry podstawowej. Zainstaluj grę podstawową ponownie przez ps5upload z pakietu podstawowego pasującego do tej aktualizacji (wybierz „Nadpisz”), a potem zastosuj ją jeszcze raz.",
 "pkglib.updateBaseUnknown.title": "Ta aktualizacja może się nie zastosować",
@@ -3660,6 +3663,49 @@ cheats_your_version: "Twoja wersja",
 notifications_mark_all_read: "Oznacz wszystko jako przeczytane",
 notifications_mark_read: "Oznacz jako przeczytane",
 notifications_mark_unread: "Oznacz jako nieprzeczytane",
+
+// AVA1 cutover (P3 Task 20): pairing dialog, session status, skipping/bottleneck, PS5 to PS5.
+pairing_title: "Sparuj z PS5",
+pairing_intro: "{name} prosi o sparowanie z tą aplikacją. Sprawdź, czy kod poniżej jest taki sam jak na Twojej PS5, a następnie potwierdź.",
+pairing_code_label: "Kod parowania",
+pairing_codes_differ: "Kody się różnią",
+pairing_confirm: "Kody są zgodne, sparuj",
+pairing_closed_title: "PS5 nie przyjmuje nowych sparowań",
+pairing_closed_body: "Okno parowania jest zamknięte. Na już sparowanym urządzeniu otwórz parowanie dla tej konsoli. Jeśli żadne urządzenie nie jest jeszcze sparowane, uruchom ponownie helpera na konsoli, aby ponownie otworzyć okno. Potem spróbuj jeszcze raz.",
+pairing_retry: "Spróbuj ponownie",
+pairing_error: "Parowanie nie powiodło się: {error}",
+pairing_waiting: "Łączenie z PS5…",
+session_needs_pairing: "Ta PS5 nie zaakceptowała jeszcze tej aplikacji. Sparuj je, aby kontynuować.",
+session_pair_button: "Sparuj…",
+helper_old_banner: "Ta PS5 uruchamia starszego helpera. Zaktualizuj go.",
+helper_old_wedged: "Stary helper nie zakończył działania na prośbę. Uruchom konsolę ponownie, a potem zaktualizuj helpera.",
+helper_old_update: "Zaktualizuj helpera",
+status_ps5_needs_pairing: "Wymaga sparowania",
+status_ps5_helper_old: "Starszy helper, zaktualizuj go",
+upload_phase_skipping: "Pomijanie danych, które konsola już ma: {done} z {total}",
+upload_bottleneck_label: "Ogranicza: {cause}",
+bottleneck_network: "sieć",
+bottleneck_source: "źródło (dekodowanie archiwum)",
+bottleneck_disk: "dysk konsoli",
+bottleneck_workers: "wątki robocze konsoli",
+bottleneck_memory: "pamięć konsoli",
+upload_phase_settling: "Kończenie na konsoli…",
+upload_warn_unsettled_title: "Wysyłanie zakończone, ale zapis nie jest potwierdzony",
+upload_warn_unsettled: "Każdy bajt dotarł do konsoli, ale nie potwierdziła ona jeszcze zapisu wszystkich plików. Dokończą się same; jeśli konsola straci zasilanie wcześniej, wyślij folder ponownie.",
+ps5src_title: "Z innej PS5",
+ps5src_need_two: "Dodaj drugą konsolę do listy, aby kopiować między konsolami.",
+ps5src_hint: "Kopiuje plik lub folder z innej konsoli na tę przez Twoją sieć. Dane przechodzą przez ten komputer; nic na nim nie jest zapisywane.",
+ps5src_from_console: "Konsola źródłowa",
+ps5src_from_path: "Ścieżka na konsoli źródłowej",
+ps5src_dest_path: "Ścieżka docelowa na tej konsoli",
+ps5src_start: "Kopiuj na tę PS5",
+ps5src_need_source_path: "Wpisz ścieżkę źródłową, zaczynając od /",
+ps5src_need_dest_path: "Wpisz ścieżkę docelową, zaczynając od /",
+queue_rar_password_required: "To archiwum wymaga hasła.",
+queue_rar_password_wrong: "Hasło było nieprawidłowe. Spróbuj ponownie.",
+queue_rar_password_retry: "Ponów z hasłem",
+err_replace_in_progress: "Helper na tej konsoli jest już wymieniany. Poczekaj na zakończenie i spróbuj ponownie.",
+err_replace_cooldown: "Helper na tej konsoli został wymieniony przed chwilą. Odczekaj minutę, zanim wymienisz go ponownie.",
 };
 
 export default pl;

@@ -8,8 +8,9 @@
 // the two `toMgmtAddr` calls would silently produce
 // `"192.168.1.2:9113:9114"` and connect to the wrong port.
 //
-// The PS5 listens on three different ports for three different
-// protocols. Conflating them by accident is a real silent footgun.
+// The PS5 helper now speaks ONE protocol (AVA1) on ONE port, so the
+// app addresses a console by its bare host: `consoleAddr(host)`. The
+// engine owns the port and ignores any port a caller still sends.
 // This module is the single source of truth.
 
 /** The PS5 ELF loader port. Bound by every common PS5 homebrew
@@ -17,13 +18,10 @@
  *  ELF dump — no protocol framing. */
 export const PS5_LOADER_PORT = 9021;
 
-/** ps5upload payload's bulk-transfer port. FTX2 protocol. Single-
- *  client (concurrent FTX2 connections serialize at the socket). */
-export const PS5_TRANSFER_PORT = 9113;
-
-/** ps5upload payload's management port. FS_* and miscellaneous
- *  RPCs. Multi-client. */
-export const PS5_MGMT_PORT = 9114;
+/** The port the ps5upload helper's AVA1 listener binds. Shown in copy and
+ *  used for the firewall hint; never put in an address the app sends (the
+ *  engine owns it: see `consoleAddr`). */
+export const PS5_AVA1_PORT = 9120;
 
 /** True for a bare (un-bracketed) IPv6 literal such as `fe80::1` or
  *  `2001:db8::5`: 2+ colons and no dotted-quad. We use the absence of
@@ -69,17 +67,22 @@ export function withPort(host: string, port: number): string {
   return needsBrackets ? `[${bare}]:${port}` : `${bare}:${port}`;
 }
 
-/** Address for the management port (`host:9114`). Accepts any of
- *  the three shapes. Equivalent to `withPort(host, PS5_MGMT_PORT)`
- *  but the named helper makes intent obvious at call sites. */
-export function mgmtAddr(host: string): string {
-  return withPort(host, PS5_MGMT_PORT);
+/** The console address the app sends to the engine: the bare host, with
+ *  any port (`:9113`, `:9114`, `:9120`, or a persisted `host:port:port`)
+ *  stripped. Accepts every shape `hostOf` does. */
+export function consoleAddr(host: string): string {
+  const bare = hostOf(host);
+  // An IPv6 literal keeps a bracketed port so the engine can still split
+  // host from port (it ignores the number): `fe80::1` alone is ambiguous.
+  return bare.includes(":") ? withPort(bare, PS5_AVA1_PORT) : bare;
 }
 
-/** Address for the bulk-transfer port (`host:9113`). */
-export function transferAddr(host: string): string {
-  return withPort(host, PS5_TRANSFER_PORT);
-}
+/** Alias of `consoleAddr`, kept so the ~350 call sites move in one step.
+ *  New code calls `consoleAddr`. */
+export const mgmtAddr = consoleAddr;
+
+/** Alias of `consoleAddr` (see `mgmtAddr`). */
+export const transferAddr = consoleAddr;
 
 /** Address for the loader port (`host:9021`). */
 export function loaderAddr(host: string): string {

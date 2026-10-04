@@ -693,6 +693,27 @@ async fn control(
                 }
             }
             t if is_data_type(t) => {
+                // A JobOpen for a job id that is still registered (the sender cancelled it a
+                // moment ago and is resuming it on this session) must not be routed to the old
+                // job: its receiver is draining what the old lanes buffered, ends on the
+                // JobCancel queued before this frame, and drops whatever is queued behind it,
+                // so the open would never be answered. BUSY now; the sender retries.
+                if f.ty == gen::JobOpen::TYPE {
+                    if let Some(job) = job_of(&f).filter(|j| entry.router.has_job(j)) {
+                        let busy = gen::JobOpenAck {
+                            job_id: job,
+                            status: gen::ERR_BUSY,
+                            credit: 0,
+                            staged: 0,
+                            workers: 0,
+                            message: Some("the job's previous run is still closing".into()),
+                        };
+                        if outbox.try_send(f.channel, &busy).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
                 // A known job's frames were delivered by the router; what comes back is
                 // for no job at all.
                 if let Some(f) = entry.router.route_control(f).await {

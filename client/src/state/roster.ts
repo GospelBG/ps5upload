@@ -300,7 +300,7 @@ export const useRosterStore = create<RosterState>((set, get) => ({
     const oldHost = get().profiles.find((p) => p.id === id)?.host;
     const trimmed = host.trim();
     // Only a change of the BARE host counts — re-pointing 1.2.3.4 to
-    // 1.2.3.4:9113 is the same console and must not wipe its history.
+    // 1.2.3.4 with a port is the same console and must not wipe its history.
     const hostChanged = !!oldHost && hostOf(oldHost) !== hostOf(trimmed);
     const next = get().profiles.map((p) =>
       p.id === id

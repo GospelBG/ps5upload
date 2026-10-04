@@ -7,8 +7,8 @@ import { isTauriEnv } from "./tauriEnv";
 // While any upload / download / install is in flight we ask the OS to
 // skip idle + display sleep, so a long transfer doesn't die to the
 // machine sleeping mid-stream (the originally-reported failure: a Mac
-// idle-sleeping during a multi-hour game upload dropped the FTX2
-// connection). The Rust side (`keep_awake.rs`) reference-counts holds by
+// idle-sleeping during a multi-hour game upload dropped the
+// transfer connection). The Rust side (`keep_awake.rs`) reference-counts holds by
 // reason, so this "transfer" hold is INDEPENDENT of the manual Settings
 // toggle ("manual") — releasing it can't turn off a hold the user set in
 // Settings, and vice versa.

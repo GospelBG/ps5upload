@@ -780,8 +780,6 @@ mod transport {
 
     /// `install`: the server's management table is installed (CAP_MGMT is advertised).
     pub fn rig(tag: &str, install: bool) -> T {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| std::env::set_var("PS5UPLOAD_TRANSFER", "auto"));
         let one = one();
         let base = std::env::temp_dir().join(format!("ava1-mfst-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -984,18 +982,18 @@ mod transport {
     }
 
     #[test]
-    fn a_server_without_the_dispatcher_is_routed_to_ftx2_from_its_capability_bit() {
+    fn a_server_without_the_dispatcher_is_helper_not_ava1_from_its_capability_bit() {
         let t = rig("t-nocap", false);
-        // CAP_MGMT is absent (no table installed): the transport serves nothing, so the seam would
-        // run FTX2, and no management request was sent to find that out.
+        // CAP_MGMT is absent (no table installed): the transport refuses with the error the
+        // person can act on, and no management request was sent to find that out.
         let r = ps5upload_core::mgmt::m::HW_INFO;
-        let out = {
+        let e = {
             use ps5upload_core::mgmt::MgmtTransport;
             t.transport
                 .call(&t.console, r, "HW_INFO", b"", Duration::from_secs(5))
-                .unwrap()
+                .unwrap_err()
         };
-        assert!(out.is_none());
+        assert!(e.to_string().contains("helper_not_ava1"), "{e}");
         assert_eq!(mgmt_fs::stats(), (0, 0, 0));
     }
 }

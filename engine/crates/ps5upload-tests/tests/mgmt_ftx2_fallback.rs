@@ -1,6 +1,11 @@
-//! "No behaviour change": a transport that does not serve the console (`Ok(None)`) leaves the
-//! call on the real FTX2 path. A minimal FTX2 server records the exact request frame and
-//! answers with a chosen frame; the test asserts the bytes on the wire and the error text.
+//! The FTX2 management path that survives until the FTX2 baseline is recorded: a process that
+//! registered NO transport (the lab and the benchmark harness) still speaks FTX2 frames. A
+//! minimal FTX2 server records the exact request frame and answers with a chosen frame; the
+//! test asserts the bytes on the wire and the error text.
+//!
+//! A registered transport that does not serve the console (`Ok(None)`) is a `helper_not_ava1`
+//! error and dials nothing: the last test pins that, and it is the AVA1 behaviour (the engine
+//! always registers one).
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -44,26 +49,24 @@ fn serve_once(
     (addr, h)
 }
 
-fn not_served() -> (Arc<NotServed>, mgmt::ScopedTransport) {
-    let t = Arc::new(NotServed(Mutex::new(0)));
-    (t.clone(), mgmt::scoped_transport(t))
-}
+/// The lab's situation: no transport registered in this thread (none is registered globally
+/// in this test binary either).
+fn no_transport() {}
 
 #[test]
-fn an_unserved_call_sends_the_legacy_request_frame_and_returns_the_ack_body() {
-    let (t, _g) = not_served();
+fn with_no_transport_a_call_sends_the_legacy_request_frame_and_returns_the_ack_body() {
+    no_transport();
     let (addr, srv) = serve_once((FrameType::FsMkdirAck, b""));
     let r = mgmt::call(&addr, m::FS_MKDIR, br#"{"path":"/data/x"}"#).unwrap();
     assert!(r.is_empty());
     let (hdr, body) = srv.join().unwrap();
     assert_eq!(hdr.frame_type, FrameType::FsMkdir as u16, "request frame");
     assert_eq!(body, br#"{"path":"/data/x"}"#, "request body, unchanged");
-    assert_eq!(*t.0.lock().unwrap(), 1, "the transport was asked first");
 }
 
 #[test]
-fn an_unserved_call_returns_the_ack_body_bytes() {
-    let (_t, _g) = not_served();
+fn with_no_transport_a_call_returns_the_ack_body_bytes() {
+    no_transport();
     let (addr, srv) = serve_once((FrameType::HwInfoAck, b"model=PS5\n"));
     assert_eq!(mgmt::call(&addr, m::HW_INFO, b"").unwrap(), b"model=PS5\n");
     assert_eq!(srv.join().unwrap().0.frame_type, FrameType::HwInfo as u16);
@@ -71,7 +74,7 @@ fn an_unserved_call_returns_the_ack_body_bytes() {
 
 #[test]
 fn an_error_frame_reads_payload_rejected_label_cause() {
-    let (_t, _g) = not_served();
+    no_transport();
     let (addr, srv) = serve_once((FrameType::Error, b"fs_move_cross_mount"));
     let e = mgmt::call_as(
         &addr,
@@ -91,7 +94,7 @@ fn an_error_frame_reads_payload_rejected_label_cause() {
 
 #[test]
 fn a_wrong_ack_frame_is_an_error_naming_the_expected_one() {
-    let (_t, _g) = not_served();
+    no_transport();
     let (addr, srv) = serve_once((FrameType::HwPowerAck, b""));
     let e = mgmt::call(&addr, m::HW_INFO, b"").unwrap_err();
     assert_eq!(e.to_string(), "expected HwInfoAck, got HwPowerAck");
@@ -100,7 +103,7 @@ fn a_wrong_ack_frame_is_an_error_naming_the_expected_one() {
 
 #[test]
 fn a_method_ftx2_never_had_fails_clearly_instead_of_sending_garbage() {
-    let (_t, _g) = not_served();
+    no_transport();
     let e = mgmt::call("127.0.0.1:1", m::FS_STAT, br#"{"path":"/a"}"#).unwrap_err();
     assert!(e.to_string().contains("older one"), "{e}");
 }
@@ -109,7 +112,7 @@ fn a_method_ftx2_never_had_fails_clearly_instead_of_sending_garbage() {
 
 #[test]
 fn fs_stat_on_an_ftx2_helper_is_the_one_byte_read_it_replaced() {
-    let (_t, _g) = not_served();
+    no_transport();
     let (addr, srv) = serve_once((FrameType::FsReadAck, b"x"));
     let s = ps5upload_core::fs_ops::fs_stat(&addr, "/data/f").unwrap();
     assert_eq!((s.kind.as_str(), s.size), ("file", 1));
@@ -128,7 +131,7 @@ fn fs_stat_on_an_ftx2_helper_is_the_one_byte_read_it_replaced() {
 
 #[test]
 fn shutdown_list_volumes_and_cleanup_use_their_legacy_frames_over_ftx2() {
-    let (_t, _g) = not_served();
+    no_transport();
     let (addr, srv) = serve_once((FrameType::ShutdownAck, b"{}"));
     assert!(ps5upload_core::payload_lifecycle::shutdown_running_payload(&addr).unwrap());
     assert_eq!(srv.join().unwrap().0.frame_type, FrameType::Shutdown as u16);
@@ -165,7 +168,7 @@ fn shutdown_list_volumes_and_cleanup_use_their_legacy_frames_over_ftx2() {
 
 #[test]
 fn net_reach_and_mounts_read_their_ok_false_bodies_over_ftx2() {
-    let (_t, _g) = not_served();
+    no_transport();
     // FTX2 answered an unreachable host as a SUCCESS frame with ok:false; it still parses.
     let (addr, srv) = serve_once((
         FrameType::NetReachAck,
@@ -182,4 +185,20 @@ fn net_reach_and_mounts_read_their_ok_false_bodies_over_ftx2() {
         ps5upload_core::diagnostics::pkg_direct_mount(&addr, "/mnt/ext0/x.pkg", None).unwrap_err();
     assert!(e.to_string().contains("PKG_DIRECT_MOUNT failed"), "{e}");
     srv.join().unwrap();
+}
+
+#[test]
+fn a_registered_transport_that_does_not_serve_the_console_dials_nothing() {
+    let t = Arc::new(NotServed(Mutex::new(0)));
+    let _g = mgmt::scoped_transport(t.clone());
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    l.set_nonblocking(true).unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let e = mgmt::call(&addr, m::FS_MKDIR, br#"{"path":"/data/x"}"#).unwrap_err();
+    assert!(e.to_string().contains("helper_not_ava1"), "{e}");
+    assert_eq!(*t.0.lock().unwrap(), 1, "the transport was asked");
+    assert!(
+        l.accept().is_err(),
+        "nothing connected: there is no second protocol to fall back to"
+    );
 }

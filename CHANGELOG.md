@@ -4,6 +4,20 @@ What's new in ps5upload, written for humans.
 
 ---
 
+## Unreleased: AVA1 replaces the old transfer protocol
+
+ps5upload now talks to the console over one encrypted connection on port
+9120. The old transfer and management ports (9113 and 9114) are retired, so a
+firewall needs only 9120 and 9021. Highlights: pairing (automatic for a helper
+the app launched, a 6-digit code otherwise), management actions on the same
+connection, 7z and RAR uploads that resume, zip entries above 256 MiB, zip
+download resume, faster tiny-file uploads ("Finishing on the console..."), and
+one-click "Update the helper" for consoles still running v5.41 or older.
+`FTX2_BANDWIDTH_MBPS`, `FTX2_ZIP_RAM_THRESHOLD_MB` and
+`FTX2_ARCHIVE_STAGE_MB` are now `PS5UPLOAD_*`; the old names still work for
+one release and print a deprecation line. Full notes:
+`protocol/ava1/RELEASE_NOTES_DRAFT.md`.
+
 ## 5.41.0
 
 **Installs that the PS5 used to decline now go through.** On FW 13.60 the

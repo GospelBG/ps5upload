@@ -2,6 +2,7 @@
 #define _GNU_SOURCE /* pthread_getattr_np on glibc */
 #endif
 /* Starts the payload's AVA1 server on the host with a node.info handler (tests only). */
+#include <dirent.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -13,6 +14,7 @@
 #include <unistd.h>
 
 #include "ava1_apply.h"
+#include "ava1_stop.h"
 #include "ava1_copy.h"
 #include "ava1_recv.h"
 #include "ava1_conn.h"
@@ -410,6 +412,16 @@ static int stack_probe(uint8_t *out, size_t cap, size_t *out_len) {
     return AVA1_STATUS_OK;
 }
 
+static void fire_payload_stop(void *arg) {
+    (void)arg;
+    (void)ava1_payload_stop(2000, 2000);
+}
+
+/* Off by default: only the Task 8 shutdown tests answer node.shutdown here (the shape of runtime.c's
+ * handle_node_shutdown); every other test reaches its installed management table. */
+static int g_intercept_shutdown;
+void ava1_test_intercept_shutdown(int on) { __atomic_store_n(&g_intercept_shutdown, on, __ATOMIC_SEQ_CST); }
+
 static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap,
                size_t *out_len) {
     ava1_node_info_t ni;
@@ -427,6 +439,11 @@ static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t 
     }
     if (method == 0x7703) { /* ava1_rpc_text into a 16-byte window: "%s" of the request body */
         return ava1_rpc_text(out, 16, out_len, "%.*s", (int)body_len, (const char *)body);
+    }
+    if (method == AVA1_METHOD_NODE_SHUTDOWN && __atomic_load_n(&g_intercept_shutdown, __ATOMIC_SEQ_CST)) {
+        if (ava1_shutdown_defer(300, fire_payload_stop, NULL) != 0) return AVA1_ERR_INTERNAL;
+        *out_len = 0; /* SPEC: node.shutdown answers an empty body (mgmt_call_empty) */
+        return AVA1_STATUS_OK;
     }
     if (method == 19) return stack_probe(out, cap, out_len); /* a 256 KiB-class method (the data plane's number) */
     if (method != AVA1_METHOD_NODE_INFO) return mgmt_rpc_dispatch(method, body, body_len, out, cap, out_len);
@@ -1251,7 +1268,7 @@ static size_t g_ev_len;
 static int g_ev_done; /* the recorder has seen JOB_DONE */
 static int g_same_device = 1;
 static ava1_job_t *g_job;
-static const uint8_t TEST_JOB[16] = { 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 };
+static uint8_t TEST_JOB[16] = { 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 };
 static const uint8_t TEST_OWNER[32] = { 1 };
 static int g_trace;           /* record hook points as events */
 static uint8_t *g_dup;        /* a chunk to apply again at its file's commit */
@@ -1262,11 +1279,113 @@ static uint64_t g_dup_off;
 static void ev_add(const char *s, int done);
 
 static int g_arm_point = -1, g_arm_n, g_arm_errno;
+/* Probe counters (perf-apply): what the hooks saw, read by ava1_test_apply_probe. */
+static unsigned g_pre_calls, g_pre_held, g_commit_calls, g_commit_on_job_thread;
+/* Directory syncs (hook 7 = a batch's, hook 10 = prepare's): calls, calls made on a worker, and the
+ * distinct threads that made them; `g_hook_sleep_ms` makes each one slow so striping shows. */
+static unsigned g_dir_calls[2], g_dir_on_worker[2], g_dir_nthreads[2], g_hook_sleep_ms;
+static pthread_t g_dir_threads[2][32];
+static pthread_mutex_t g_dir_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void ava1_test_apply_probe_reset(void) {
+    pthread_mutex_lock(&g_dir_mu);
+    memset(g_dir_calls, 0, sizeof g_dir_calls);
+    memset(g_dir_on_worker, 0, sizeof g_dir_on_worker);
+    memset(g_dir_nthreads, 0, sizeof g_dir_nthreads);
+    pthread_mutex_unlock(&g_dir_mu);
+    g_hook_sleep_ms = 0;
+    g_pre_calls = g_pre_held = g_commit_calls = g_commit_on_job_thread = 0;
+}
+
+static void dir_hook_note(ava1_job_t *j, int which) {
+    pthread_t me = pthread_self();
+    unsigned k;
+    int on_worker = 0;
+    pthread_mutex_lock(&g_dir_mu);
+    g_dir_calls[which]++;
+    for (k = 0; k < j->nworkers; k++)
+        if (pthread_equal(me, j->workers[k])) on_worker = 1;
+    g_dir_on_worker[which] += on_worker;
+    for (k = 0; k < g_dir_nthreads[which]; k++)
+        if (pthread_equal(me, g_dir_threads[which][k])) break;
+    if (k == g_dir_nthreads[which] && k < 32) g_dir_threads[which][g_dir_nthreads[which]++] = me;
+    pthread_mutex_unlock(&g_dir_mu);
+    if (g_hook_sleep_ms) ava1_platform_sleep_ms(g_hook_sleep_ms);
+}
+typedef struct {
+    ava1_job_t *j;
+    int acquired, refs;
+} pre_watch_t;
+
+static void *pre_watcher(void *arg) {
+    pre_watch_t *w = arg;
+    pthread_mutex_lock(&w->j->mu);
+    __atomic_store_n(&w->acquired, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&w->j->mu);
+    if (__atomic_sub_fetch(&w->refs, 1, __ATOMIC_SEQ_CST) == 0) free(w);
+    return NULL;
+}
+
+/* Durable-by-log options for the next job (ava1_test_apply_opts); 0 = default: off, or on when the
+ * environment sets AVA1_TEST_LOG_SMALL (the suite is run both ways). The sweep age defaults to 100 ms. */
+static uint32_t g_opt_mode, g_opt_seg, g_opt_age, g_opt_every, g_opt_rmax;
+static uint64_t g_opt_max, g_opt_total;
+/* v = mode, pack_segment, unswept_max, sweep_age_ms, unswept_total, recover_every_ms, recover_max, job id byte (0 = 7) */
+void ava1_test_apply_opts2(const uint64_t v[8]) {
+    g_opt_mode = (uint32_t)v[0];
+    g_opt_seg = (uint32_t)v[1];
+    g_opt_max = v[2];
+    g_opt_age = (uint32_t)v[3];
+    g_opt_total = v[4];
+    g_opt_every = (uint32_t)v[5];
+    g_opt_rmax = (uint32_t)v[6];
+    memset(TEST_JOB, v[7] ? (int)v[7] : 7, 16);
+}
+static void apply_opts(ava1_data_cfg_t *cfg) {
+    cfg->log_small = (uint8_t)(g_opt_mode ? g_opt_mode : (getenv("AVA1_TEST_LOG_SMALL") ? AVA1_LOG_SMALL_ON : AVA1_LOG_SMALL_OFF));
+    cfg->pack_segment = g_opt_seg;
+    cfg->unswept_max = g_opt_max;
+    cfg->sweep_age_ms = g_opt_age ? g_opt_age : 100;
+    cfg->unswept_total = g_opt_total;
+    cfg->recover_every_ms = g_opt_every;
+    cfg->recover_max = g_opt_rmax;
+}
+static int g_hold_commit;                           /* commits wait at COMMIT_VERIFIED while set */
+static uint32_t g_prealloc_fault = UINT32_MAX - 1;  /* a file whose preallocation answers ENOSPC */
 static void t_hook(ava1_job_t *j, int point, uint32_t id) {
     if (point == __atomic_load_n(&g_arm_point, __ATOMIC_SEQ_CST)) { /* fsync fault, armed for this point */
         ava1_fsync_test_errno = g_arm_errno;
         __atomic_store_n(&ava1_fsync_test_fail_n, g_arm_n, __ATOMIC_SEQ_CST);
         __atomic_store_n(&g_arm_point, -1, __ATOMIC_SEQ_CST);
+    }
+    if (point == AVA1_HOOK_PREALLOC) {
+        /* Called right before the preallocation. A watcher thread takes j->mu while this one
+         * waits 40 ms: if the mutex is held by this thread the watcher cannot get it in that
+         * time (another worker holding it briefly cannot take 40 ms). */
+        pre_watch_t *w = calloc(1, sizeof *w);
+        pthread_t th;
+        __atomic_add_fetch(&g_pre_calls, 1, __ATOMIC_SEQ_CST);
+        if (w) {
+            w->j = j;
+            w->refs = 2;
+            if (pthread_create(&th, NULL, pre_watcher, w) == 0) {
+                pthread_detach(th);
+                ava1_platform_sleep_ms(40);
+                if (!__atomic_load_n(&w->acquired, __ATOMIC_SEQ_CST))
+                    __atomic_add_fetch(&g_pre_held, 1, __ATOMIC_SEQ_CST);
+                if (__atomic_sub_fetch(&w->refs, 1, __ATOMIC_SEQ_CST) == 0) free(w);
+            } else {
+                free(w);
+            }
+        }
+    }
+    if (point == AVA1_HOOK_BATCH_DIR_SYNCED) dir_hook_note(j, 0);
+    if (point == AVA1_HOOK_PREP_DIR_SYNCED) dir_hook_note(j, 1);
+    if (point == AVA1_HOOK_COMMIT_VERIFIED) {
+        __atomic_add_fetch(&g_commit_calls, 1, __ATOMIC_SEQ_CST);
+        if (pthread_equal(pthread_self(), j->thread)) __atomic_add_fetch(&g_commit_on_job_thread, 1, __ATOMIC_SEQ_CST);
+        while (__atomic_load_n(&g_hold_commit, __ATOMIC_SEQ_CST) && !__atomic_load_n(&j->stopping, __ATOMIC_SEQ_CST))
+            ava1_platform_sleep_ms(2);
     }
     if (__atomic_load_n(&g_trace, __ATOMIC_SEQ_CST)) {
         char line[64];
@@ -1282,9 +1401,9 @@ static void t_hook(ava1_job_t *j, int point, uint32_t id) {
             return;
         }
         (void)ava1_apply_chunk(j, own, n, id, g_dup_off, own, n);
-        /* wait until a worker has applied it */
+        /* wait until a worker has applied it (the commit itself runs on a worker: it is the one busy) */
         pthread_mutex_lock(&j->mu);
-        while (j->q_len || j->busy) {
+        while (j->q_len || j->busy > 1) {
             pthread_mutex_unlock(&j->mu);
             ava1_platform_sleep_ms(1);
             pthread_mutex_lock(&j->mu);
@@ -1305,14 +1424,105 @@ void ava1_test_fsync_fault(int point, int n, int err) {
         __atomic_store_n(&g_arm_point, point, __ATOMIC_SEQ_CST);
     }
 }
+unsigned ava1_test_fsync_calls(void) { return __atomic_load_n(&ava1_fsync_calls_total, __ATOMIC_RELAXED); }
 unsigned ava1_test_fsync_retries(void) { return __atomic_load_n(&ava1_fsync_retries_total, __ATOMIC_RELAXED); }
 int ava1_test_fsync_pending_faults(void) { return __atomic_load_n(&ava1_fsync_test_fail_n, __ATOMIC_SEQ_CST); }
+
+/* out[0] = preallocations seen, out[1] = of those, how many ran with the job mutex held,
+ * out[2] = commits begun, out[3] = of those, how many ran on the job thread. */
+void ava1_test_apply_probe(uint64_t out[8]) {
+    memset(out, 0, 8 * sizeof out[0]);
+    out[0] = __atomic_load_n(&g_pre_calls, __ATOMIC_SEQ_CST);
+    out[1] = __atomic_load_n(&g_pre_held, __ATOMIC_SEQ_CST);
+    out[2] = __atomic_load_n(&g_commit_calls, __ATOMIC_SEQ_CST);
+    out[3] = __atomic_load_n(&g_commit_on_job_thread, __ATOMIC_SEQ_CST);
+    pthread_mutex_lock(&g_dir_mu);
+    out[4] = g_dir_calls[0];
+    out[5] = g_dir_on_worker[0];
+    out[6] = g_dir_nthreads[0];
+    out[7] = g_job ? (uint64_t)__atomic_load_n(&g_job->perchunk, __ATOMIC_SEQ_CST) : 0;
+    pthread_mutex_unlock(&g_dir_mu);
+}
+
+size_t ava1_test_apply_summary(char *out, size_t cap) { return g_job ? ava1_apply_summary(g_job, out, cap) : 0; }
+int ava1_test_apply_timing(void) { return g_job ? g_job->timing : 0; }
+
+/* The same for prepare's directory syncs: out[0..3] = calls, on a worker, distinct threads. */
+void ava1_test_apply_probe_prep(uint64_t out[3]) {
+    pthread_mutex_lock(&g_dir_mu);
+    out[0] = g_dir_calls[1];
+    out[1] = g_dir_on_worker[1];
+    out[2] = g_dir_nthreads[1];
+    pthread_mutex_unlock(&g_dir_mu);
+}
+
+/* Each directory sync the apply engine reports (hooks 7 and 10) then takes `ms` more. */
+void ava1_test_apply_hook_sleep(uint32_t ms) { __atomic_store_n(&g_hook_sleep_ms, ms, __ATOMIC_SEQ_CST); }
+
+unsigned ava1_test_house_ticks(void) { return __atomic_load_n(&ava1_house_ticks, __ATOMIC_RELAXED); }
+uint64_t ava1_test_unswept_total(void) { return ava1_unswept_total(); }
+void ava1_test_unswept_global_add(int64_t d) { ava1_unswept_add(d); }
+uint64_t ava1_test_apply_unswept_bytes(void) {
+    uint64_t n;
+    if (!g_job) return 0;
+    pthread_mutex_lock(&g_job->mu);
+    n = g_job->unswept_bytes;
+    pthread_mutex_unlock(&g_job->mu);
+    return n;
+}
+/* ava1_jobs_gc over `jobs_dir` as if `age_s` seconds had passed and the limit were `max_age_s`. */
+int ava1_test_jobs_gc(const char *jobs_dir, int64_t age_s, int64_t max_age_s) {
+    return ava1_jobs_gc(jobs_dir, (int64_t)time(NULL) + age_s, max_age_s);
+}
+uint32_t ava1_test_apply_unswept(void) {
+    uint32_t n;
+    if (!g_job) return 0;
+    pthread_mutex_lock(&g_job->mu);
+    n = g_job->unswept_n;
+    pthread_mutex_unlock(&g_job->mu);
+    return n;
+}
+/* How many pack.* files the job directory holds right now. */
+uint32_t ava1_test_apply_segments(void) {
+    uint32_t n = 0;
+    DIR *dp;
+    struct dirent *de;
+    if (!g_job || !(dp = opendir(g_job->dir))) return 0;
+    while ((de = readdir(dp)) != NULL)
+        if (strncmp(de->d_name, "pack.", 5) == 0) n++;
+    closedir(dp);
+    return n;
+}
+void ava1_test_apply_hold_commit(int on) { __atomic_store_n(&g_hold_commit, on, __ATOMIC_SEQ_CST); }
+void ava1_test_apply_fault_prealloc(uint32_t id) { __atomic_store_n(&g_prealloc_fault, id, __ATOMIC_SEQ_CST); }
+/* ava1_apply_compact's answer now (0 compacted, -1 skipped). */
+int ava1_test_apply_compact(void) { return ava1_apply_compact(g_job); }
+/* Commits queued or running. */
+uint32_t ava1_test_apply_commits_inflight(void) {
+    uint32_t n;
+    pthread_mutex_lock(&g_job->mu);
+    n = g_job->commits_inflight;
+    pthread_mutex_unlock(&g_job->mu);
+    return n;
+}
 
 void ava1_test_apply_trace(int on) { __atomic_store_n(&g_trace, on, __ATOMIC_SEQ_CST); }
 
 static uint32_t g_fault_id = UINT32_MAX - 1; /* no file: no fault */
+static int g_sweep_fail_n; /* sweeps' file syncs fail with EIO this many times (-1: until cleared) */
+int ava1_test_sweep_fail_left(void) { return __atomic_load_n(&g_sweep_fail_n, __ATOMIC_SEQ_CST); }
+void ava1_test_sweep_fail(int n) { __atomic_store_n(&g_sweep_fail_n, n, __ATOMIC_SEQ_CST); }
 static int t_fault(ava1_job_t *j, int point, uint32_t id) {
     (void)j;
+    if (point == AVA1_HOOK_SWEEP_FILE) {
+        int n = __atomic_load_n(&g_sweep_fail_n, __ATOMIC_SEQ_CST);
+        while (n != 0) {
+            if (n < 0) return EIO;
+            if (__atomic_compare_exchange_n(&g_sweep_fail_n, &n, n - 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return EIO;
+        }
+        return 0;
+    }
+    if (point == AVA1_HOOK_PREALLOC && id == __atomic_load_n(&g_prealloc_fault, __ATOMIC_SEQ_CST)) return ENOSPC;
     return point == AVA1_HOOK_DIR_SYNCED && id == __atomic_load_n(&g_fault_id, __ATOMIC_SEQ_CST) ? EIO : 0;
 }
 void ava1_test_apply_fail_dir_sync(uint32_t id) { __atomic_store_n(&g_fault_id, id, __ATOMIC_SEQ_CST); }
@@ -1410,10 +1620,20 @@ static void rec_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *
         if (ava1_job_done_decode(body, len, &d) != 0) return;
         /* one ev_add: a waiter released by the done flag also sees the message */
         if (d.has_message)
-            snprintf(line, sizeof line, "done %u\nmsg %.*s\n", d.status, (int)d.message_len, (const char *)d.message);
+            snprintf(line, sizeof line, "%sdone %u\nmsg %.*s\n", d.has_settling && d.settling ? "settling\n" : "", d.status,
+                     (int)d.message_len, (const char *)d.message);
         else
-            snprintf(line, sizeof line, "done %u\n", d.status);
+            snprintf(line, sizeof line, "%sdone %u\n", d.has_settling && d.settling ? "settling\n" : "", d.status);
         ev_add(line, 1);
+    } else if (type == AVA1_TYPE_STATUS) {
+        ava1_status_t st;
+        static uint16_t last_code;
+        if (ava1_status_decode(body, len, &st) != 0) return;
+        if (st.has_code && st.code && st.code != last_code) { /* a receiver-side failure the sender must see */
+            snprintf(line, sizeof line, "status code=%u unswept=%u\n", st.code, st.has_unswept ? st.unswept : 0);
+            ev_add(line, 0);
+        }
+        last_code = st.has_code ? st.code : 0;
     } else if (type == AVA1_TYPE_JOB_MAP) {
         ava1_job_map_t m;
         ava1_r_t it;
@@ -1453,6 +1673,7 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
     ava1_test_set_same_device(1); /* a test that died mid-way must not leak its override */
     __atomic_store_n(&ava1_fsync_test_fail_n, 0, __ATOMIC_SEQ_CST); /* ... or its fsync fault */
     __atomic_store_n(&g_arm_point, -1, __ATOMIC_SEQ_CST);
+    ava1_test_apply_probe_reset();
     memset(&cfg, 0, sizeof cfg);
     snprintf(cfg.jobs_dir, sizeof cfg.jobs_dir, "%s", jobs_dir);
     cfg.may_write = t_allow;
@@ -1461,6 +1682,7 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
     cfg.same_device = t_same_device;
     cfg.fsync_delay_us = fsync_delay_us;
     cfg.crash_at = crash_at;
+    apply_opts(&cfg);
     if (ava1_data_start(&cfg) != 0) return -1;
     g_trace = 0;
     ava1_apply_hook = t_hook;
@@ -1620,6 +1842,14 @@ size_t ava1_test_apply_events(char *out, size_t cap) {
 }
 
 void ava1_test_apply_end(void) {
+    {
+        static const uint64_t none[8] = { 0 };
+        ava1_test_apply_opts2(none);
+    }
+    __atomic_store_n(&g_sweep_fail_n, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_hold_commit, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_prealloc_fault, UINT32_MAX - 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_hook_sleep_ms, 0, __ATOMIC_SEQ_CST);
     if (g_job) ava1_job_put(g_job);
     g_job = NULL;
     ava1_data_stop();
@@ -1675,6 +1905,7 @@ static int recv_open_now(void) {
 }
 
 static int recv_start(int crash_at) {
+    ava1_test_apply_probe_reset(); /* the counters cover the run since the last (re)open */
     g_cfg.crash_at = crash_at;
     ev_reset();
     if (ava1_data_start(&g_cfg) != 0) return -100;
@@ -1693,6 +1924,7 @@ int ava1_test_recv_open(const char *jobs_dir, const char *root, uint32_t flags, 
     g_cfg.may_read = t_allow_read;
     g_cfg.refuse_link = t_refuse_link;
     g_cfg.same_device = t_same_device;
+    apply_opts(&g_cfg);
     snprintf(g_root, sizeof g_root, "%s", root);
     g_flags = flags;
     g_policy = policy;
@@ -1704,6 +1936,53 @@ int ava1_test_recv_open(const char *jobs_dir, const char *root, uint32_t flags, 
 uint8_t ava1_test_recv_staged(void) { return g_ack.staged; }
 
 /* A payload restart: every job and thread gone, the disk kept. */
+/* A JobOpen for job id byte*16 (root `root`, the kinds/flags of the last open) as a session would send it: 0 if it
+ * opened (the job is freed again), else the refusal's status. */
+int ava1_test_probe_open(uint8_t byte, const char *root) {
+    ava1_recv_spec_t s;
+    ava1_job_open_ack_t ack;
+    char msg[160];
+    ava1_job_t *j;
+    memset(&s, 0, sizeof s);
+    memset(s.id, byte, 16);
+    memcpy(s.owner, TEST_OWNER, 32);
+    s.owner[0] = (uint8_t)g_owner;
+    s.kind = AVA1_JOB_UPLOAD;
+    s.policy = g_policy;
+    s.flags = g_flags;
+    s.root = root;
+    s.emit = rec_emit;
+    j = ava1_recv_open(&s, &ack, msg, sizeof msg);
+    if (!j) return (int)ack.status;
+    ava1_job_free_one(j->id);
+    ava1_job_put(j);
+    return 0;
+}
+/* The data layer stops (the job dropped first), and nothing starts it again. */
+void ava1_test_data_stop_only(void) {
+    if (g_job) ava1_job_put(g_job);
+    g_job = NULL;
+    ava1_data_stop();
+}
+
+/* A helper restart where no JobOpen follows: only the start-time recovery runs. 0, or the start's error. */
+int ava1_test_recv_restart_noopen(void) {
+    if (g_job) ava1_job_put(g_job);
+    g_job = NULL;
+    ava1_data_stop();
+    g_cfg.crash_at = 0;
+    ev_reset();
+    return ava1_data_start(&g_cfg);
+}
+
+/* The housekeeping reap as if an hour had passed, then the shim's own reference too: a settling job is
+ * destroyed with its files unswept (the directory stays for recovery). */
+void ava1_test_reap_and_drop(void) {
+    ava1_job_reap(ava1_mono_ms() + 3600u * 1000u);
+    if (g_job) ava1_job_put(g_job);
+    g_job = NULL;
+}
+
 int ava1_test_recv_restart(int crash_at) {
     if (g_job) ava1_job_put(g_job);
     g_job = NULL;
@@ -1728,6 +2007,13 @@ int ava1_test_recv_end(uint32_t files, uint64_t bytes, const uint8_t hash[32]) {
 }
 
 int ava1_test_recv_resume(const uint8_t hash[32]) { return ava1_recv_resume(g_job, hash); }
+
+/* Holds job.run's reply until the operation it started has finished: the race where an op ends
+ * while its "running" reply is being built (it must stay listed for the next job.status). */
+static void wait_op_finished(ava1_job_t *j) {
+    for (int i = 0; i < 2000 && !__atomic_load_n(&j->finished, __ATOMIC_ACQUIRE); i++) usleep(1000);
+}
+void ava1_test_op_hold_reply_until_finished(int on) { ava1_op_test_pre_encode = on ? wait_op_finished : NULL; }
 
 int ava1_test_job_stopped(void) {
     int s;
@@ -1920,6 +2206,7 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     dc.refuse_link = t_refuse_link;
     dc.same_device = t_same_device;
     dc.fsync_delay_us = fsync_delay_us;
+    apply_opts(&dc);
     dc.workers_start = dc.workers_min = dc.workers_max = workers;
     ava1_test_set_same_device(1);
     __atomic_store_n(&ava1_send_test_fail_sends, 0, __ATOMIC_SEQ_CST); /* the download sender's knobs */
@@ -1955,6 +2242,11 @@ void ava1_test_server_stop_data(void) {
     ava1_server_stop();
     ava1_data_stop();
 }
+
+#include "sony_api_lock.h"
+int ava1_test_payload_stop(int conn_ms, int sony_ms) { return ava1_payload_stop(conn_ms, sony_ms); }
+void ava1_test_sony_lock(void) { pthread_mutex_lock(&sony_api_lock); }
+void ava1_test_sony_unlock(void) { pthread_mutex_unlock(&sony_api_lock); }
 
 /* UINT32_MAX keeps a value. */
 void ava1_test_data_delays(uint32_t open_ms, uint32_t map_ms) {

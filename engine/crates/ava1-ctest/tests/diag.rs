@@ -126,16 +126,8 @@ fn untext(b: &[u8]) -> MgmtText {
     MgmtText::decode(b).expect("a MgmtText reply")
 }
 
-/// The C test server has no data hooks, so it advertises no data-plane capability and the
-/// auto mode's probe would send every call to FTX2; this binary pins the AVA1 route instead.
-fn force_ava1() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| std::env::set_var("PS5UPLOAD_TRANSFER", "ava1"));
-}
-
 /// The engine's transport over its own pool, aimed at the C server.
 fn transport(r: &Rig) -> Arc<AvaTransport> {
-    force_ava1();
     let pool: &'static Pool = Box::leak(Box::new(Pool::new(r.ava.clone()).with_addr(r.srv.addr())));
     Arc::new(AvaTransport::with_pool(pool))
 }

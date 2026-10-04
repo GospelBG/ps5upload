@@ -67,6 +67,8 @@
 #include "mgmt_fs.h"
 #include "path_policy.h"
 #include "cross_device.h"
+#include "ava1_stop.h"
+#include "ava1_glue.h"
 
 /* PS5 SDK's `<fcntl.h>` hides `posix_fadvise` and its POSIX_FADV_* constants
  * behind `__POSIX_VISIBLE >= 200112`, but defining `_POSIX_C_SOURCE` to unlock
@@ -15739,14 +15741,6 @@ abort_done:
 __thread volatile unsigned int g_inflight_frame_type = 0;
 
 /* node.shutdown (the FTX2 SHUTDOWN frame's body, a handler of its own for the AVA1 table). */
-static int handle_shutdown(runtime_state_t *state, int client_fd, uint64_t trace_id) {
-    if (!state) return -1;
-    runtime_mark_active_transactions(state, "interrupted");
-    state->shutdown_requested = 1;
-    (void)runtime_append_tx_event(state, "shutdown");
-    return send_frame(client_fd, FTX2_FRAME_SHUTDOWN_ACK, 0, trace_id, "{}", 2);
-}
-
 /* The native filesystem methods (mgmt_fs.c) take their policy from here: the same allowlist, the same
  * read carve-outs and the same command counter the FTX2 handlers use. */
 static runtime_state_t *g_mgmt_fs_state;
@@ -15884,6 +15878,55 @@ static int mgmt_w_toast_send(runtime_state_t *st, int fd, uint64_t t, const char
 }
 
 /* The AVA1 management table (mgmt_table.def) and its thread environment. */
+/*
+ * Nudge the OTHER accept loop so it notices shutdown_requested. The transfer
+ * loop runs on the main thread, blocked in accept(); nothing wakes it but a
+ * connection. The host's own status polls would do it within seconds, and so
+ * does main closing the mgmt listener, but a loopback connect makes the exit
+ * prompt. Best effort: a process that has lost its network may not manage it.
+ */
+static void wake_other_listener(runtime_state_t *state, int failing_port) {
+    int other = (failing_port == state->mgmt_port) ? state->runtime_port
+                                                    : state->mgmt_port;
+    struct sockaddr_in sa;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)other);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    (void)connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    close(fd);
+}
+
+/* Asks this instance to exit: node.shutdown, the old shutdown frame, and the takeover flag file all
+ * land here. Marks open transactions interrupted (so they resume), sets the flag every loop
+ * checks, then nudges both accept loops: the transfer loop sits in accept() and nothing but a
+ * connection wakes it. Safe to call from any thread, more than once. */
+static void shutdown_common(runtime_state_t *state, const char *why) {
+    if (!state) return;
+    runtime_mark_active_transactions(state, "interrupted");
+    state->shutdown_requested = 1;
+    (void)runtime_append_tx_event(state, why ? why : "shutdown");
+    wake_other_listener(state, state->mgmt_port);
+    wake_other_listener(state, state->runtime_port);
+}
+
+void runtime_request_shutdown(runtime_state_t *state, const char *why) {
+    shutdown_common(state, why);
+}
+
+static void node_shutdown_fire(void *arg) { shutdown_common((runtime_state_t *)arg, "node_shutdown"); }
+
+/* node.shutdown (AVA1 method 5). The handler runs under the capture sink: its reply leaves only after
+ * it returns. So the exit is DEFERRED to a short thread (like power.control): the caller receives the
+ * acknowledgement first, then the instance stops (main.c runs ava1_payload_stop after the server loop). */
+static int handle_node_shutdown(runtime_state_t *state, int client_fd, uint64_t trace_id) {
+    int rc = send_frame(client_fd, FTX2_FRAME_SHUTDOWN_ACK, 0, trace_id, "{}", 2);
+    if (ava1_shutdown_defer(300, node_shutdown_fire, state) != 0) node_shutdown_fire(state);
+    return rc;
+}
+
 #include "mgmt_install.inc"
 
 static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
@@ -16058,10 +16101,11 @@ static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
     /* ── HELLO ── */
     if (hdr.frame_type == FTX2_FRAME_HELLO) {
         int len = snprintf(body, sizeof(body),
-                           "{\"version\":%u,\"instance_id\":%llu,\"runtime_port\":%d}",
+                           "{\"version\":%u,\"instance_id\":%llu,\"runtime_port\":%d,"
+                           "\"ava1_port\":%d,\"ava1\":\"%s\"}",
                            FTX2_VERSION,
                            (unsigned long long)state->instance_id,
-                           state->runtime_port);
+                           state->runtime_port, (int)AVA1_DEFAULT_PORT, ava1_payload_state());
         /* snprintf returns the length that *would* have been written
          * (excluding NUL). A return > sizeof(body) means truncation;
          * clamp so we don't ask send_frame to read past the buffer. */
@@ -16102,7 +16146,8 @@ static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
 
     /* ── SHUTDOWN ── */
     if (hdr.frame_type == FTX2_FRAME_SHUTDOWN) {
-        return handle_shutdown(state, client_fd, hdr.trace_id);
+        runtime_request_shutdown(state, "shutdown");
+        return send_frame(client_fd, FTX2_FRAME_SHUTDOWN_ACK, 0, hdr.trace_id, "{}", 2);
     }
 
     /* ── CLEANUP ── */
@@ -16718,27 +16763,6 @@ static void *transfer_client_thread(void *arg) {
     return NULL;
 }
 
-
-/*
- * Nudge the OTHER accept loop so it notices shutdown_requested. The transfer
- * loop runs on the main thread, blocked in accept(); nothing wakes it but a
- * connection. The host's own status polls would do it within seconds, and so
- * does main closing the mgmt listener, but a loopback connect makes the exit
- * prompt. Best effort: a process that has lost its network may not manage it.
- */
-static void wake_other_listener(runtime_state_t *state, int failing_port) {
-    int other = (failing_port == state->mgmt_port) ? state->runtime_port
-                                                    : state->mgmt_port;
-    struct sockaddr_in sa;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t)other);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    (void)connect(fd, (struct sockaddr *)&sa, sizeof(sa));
-    close(fd);
-}
 
 /*
  * accept() failed on a listener. Decide how to carry on — never by giving up.

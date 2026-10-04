@@ -31,8 +31,8 @@ check_updates: "Frissítések keresése",
 language: "Nyelv",
 // Forrás
 // Cél
-// Az előző feltöltési-mód union (payload / ftp / mix / ftx2) egyetlen
-// FTX2-motor útvonallá olvad össze, a felhasználók felé "Payload" néven.
+// Az előző feltöltési-mód union (payload / ftp / mix / a régi protokollnév) egyetlen
+// motor-útvonallá olvad össze, a felhasználók felé "Payload" néven.
 // A régi kulcsok maradnak a konfig-visszafelé-kompatibilitás miatt —
 // mind a négy ugyanarra a címkére mutat most.
 // Várólisták
@@ -358,7 +358,7 @@ logs_filter_all: "Összes",
 status_engine: "Motor",
 status_engine_tooltip: "ps5upload-engine — az app háttérrendszere ({url})",
 status_payload: "segédprogram",
-status_payload_tooltip: "PS5Upload segédprogram a :9113-on",
+status_payload_tooltip: "PS5Upload segédprogram a :9120-on",
 status_kernel_ok: "kernel OK",
 status_no_active_transfers: "Nincs aktív átvitel",
 status_ps5: "PS5",
@@ -428,8 +428,7 @@ about_credits_text: "A licencfeltételekért lásd a LICENSE fájlt.",
 // renderelve a screens/About/index.tsx-ben, amit az i18n extraktor nem
 // jár be, így ezeket itt kézzel deklaráljuk).
 about_feat_fast_transfers_title: "Gyors átvitel",
-about_feat_fast_transfers_body:
-  "FTX2 bináris protokoll BLAKE3 shard-ellenőrzéssel + kis fájlok csomagolási optimalizációval. A LAN-od maximumon kihasználja.",
+about_feat_fast_transfers_body: "AVA1 átviteli protokoll BLAKE3-ellenőrzéssel, titkosított munkamenetekkel, folytatható feladatokkal és kis fájlok csomagolásával. A LAN-od maximumon kihasználja.",
 about_feat_native_mount_title: "Natív képcsatolás",
 about_feat_native_mount_body:
   "Csatolja a .exfat és .ffpkg képeket a /mnt/ps5upload/ alá MDIOCATTACH + nmount segítségével — harmadik féltől származó segédprogram nélkül.",
@@ -3385,6 +3384,10 @@ helper_mismatch_go: "Segédprogram újratöltése",
 "joberr.preflight_insufficient_space": "A célmeghajtón nincs elég szabad hely ehhez a fájlhoz. Szabadíts fel helyet a PS5-ön (Beállítások → Tárhely) vagy válassz másik célt, majd kattints az Újrapróbálkozásra.",
 "joberr.size_mismatch": "Az átvitel megszakadt, mielőtt befejeződött volna — egy fájl hiányos a PS5-ön, ezért nem lett közzétéve (a régi másolatod, ha volt, érintetlen). Ez általában azt jelenti, hogy a PS5 pihenő módba lépett vagy áramot vesztett feltöltés közben. Tartsd ébren a konzolt (Beállítások → Rendszer → Energiatakarékosság → PS5 kikapcsolásáig eltelő idő beállítása), majd futtasd újra ezt az elemet — a Folytatás most csak a hiányzó fájlokat küldi újra, vagy válaszd a Felülírást egy tiszta másolathoz.",
 "joberr.tx_table_full": "Túl sok egyidejű átvitel van folyamatban a PS5-ön. Várj, amíg néhány befejeződik, vagy indítsd újra a payloadot.",
+"joberr.zip_unsupported": "Ez a .zip olyasmit használ, amit a feltöltő nem tud folyamként átvinni (titkosítás, a Deflate-től vagy Stored-tól eltérő tömörítési mód, vagy nem biztonságos vagy ismétlődő fájlútvonal). Csomagold ki a számítógépeden, és töltsd fel a mappát.",
+"joberr.sevenz_unsupported": "Ez a .7z olyan tömörítési módot vagy funkciót használ, amit a feltöltő nem tud folyamként átvinni. Csomagold ki a számítógépeden, és töltsd fel a mappát.",
+"joberr.sevenz_unsupported_layout": "Ebben a .7z-ben egyetlen tömör blokkon belül mappák vagy üres fájlok vannak a fájlok között, ezt az elrendezést a feltöltő nem tudja folyamként átvinni. Csomagold újra 7-Zippel, vagy csomagold ki, és töltsd fel a mappát.",
+"joberr.rar_unsupported": "Ebben a .rar-ban ismétlődő vagy nem biztonságos fájlútvonalak vannak, vagy olyan funkció, amit a feltöltő nem tud folyamként átvinni. Csomagold ki a számítógépeden, és töltsd fel a mappát.",
 "bug_report_browser_note": "A zip a böngésződön keresztül töltődik le. A motor legutóbbi naplóját tartalmazza, nem a teljes fájlt a motor hosztján — ahhoz használd a docker logs parancsot a konténeren.",
 "pkg.patch_did_not_apply": "A PS5 elfogadta ezt a frissítést, majd nem csinált vele semmit — a játék még mindig az előző verzióján van. Ez azt jelenti, hogy a konzol nem tudta a frissítést párosítani a telepített alapjátékoddal. Telepítsd újra az alapjátékot a ps5upload-on keresztül az ehhez a frissítéshez tartozó alapcsomagból (válaszd a Felülírást), majd alkalmazd újra a frissítést.",
 "pkglib.updateBaseUnknown.title": "Előfordulhat, hogy ez a frissítés nem alkalmazódik",
@@ -3729,6 +3732,49 @@ cheats_your_version: "A te verziód",
 notifications_mark_all_read: "Összes megjelölése olvasottként",
 notifications_mark_read: "Megjelölés olvasottként",
 notifications_mark_unread: "Megjelölés olvasatlanként",
+
+// AVA1 cutover (P3 Task 20): pairing dialog, session status, skipping/bottleneck, PS5 to PS5.
+pairing_title: "Párosítás a PS5-tel",
+pairing_intro: "{name} párosítást kér ezzel az alkalmazással. Ellenőrizd, hogy az alábbi kód megegyezik-e a PS5-ön láthatóval, majd erősítsd meg.",
+pairing_code_label: "Párosítási kód",
+pairing_codes_differ: "A kódok eltérnek",
+pairing_confirm: "A kódok egyeznek, párosítás",
+pairing_closed_title: "A PS5 nem fogad új párosítást",
+pairing_closed_body: "A párosítási ablak zárva van. Egy már párosított eszközön nyisd meg a párosítást ehhez a konzolhoz. Ha még egy eszköz sincs párosítva, indítsd újra a segédprogramot a konzolon az ablak újranyitásához. Aztán próbáld újra.",
+pairing_retry: "Próbáld újra",
+pairing_error: "A párosítás sikertelen: {error}",
+pairing_waiting: "Kapcsolódás a PS5-höz…",
+session_needs_pairing: "Ez a PS5 még nem fogadta el ezt az alkalmazást. A folytatáshoz párosítsd őket.",
+session_pair_button: "Párosítás…",
+helper_old_banner: "Ezen a PS5-ön régebbi segédprogram fut. Frissítsd.",
+helper_old_wedged: "A régi segédprogram nem lépett ki a kérésre. Indítsd újra a konzolt, majd frissítsd a segédprogramot.",
+helper_old_update: "Segédprogram frissítése",
+status_ps5_needs_pairing: "Párosítás szükséges",
+status_ps5_helper_old: "Régebbi segédprogram, frissítsd",
+upload_phase_skipping: "A konzolon már meglévő adatok átugrása: {done} / {total}",
+upload_bottleneck_label: "Korlátozó tényező: {cause}",
+bottleneck_network: "hálózat",
+bottleneck_source: "forrás (archívum kicsomagolása)",
+bottleneck_disk: "konzol meghajtója",
+bottleneck_workers: "konzol munkaszálai",
+bottleneck_memory: "konzol memóriája",
+upload_phase_settling: "Befejezés a konzolon…",
+upload_warn_unsettled_title: "A feltöltés kész, de a mentés nincs megerősítve",
+upload_warn_unsettled: "Minden bájt megérkezett a konzolra, de az még nem erősítette meg az összes fájl mentését. Maguktól befejeződnek; ha előtte elmegy az áram, küldd el újra a mappát.",
+ps5src_title: "Másik PS5-ről",
+ps5src_need_two: "Adj hozzá egy második konzolt a listához, hogy konzolok között másolhass.",
+ps5src_hint: "Fájlt vagy mappát másol egy másik konzolról erre a hálózaton át. Az adatok átmennek ezen a számítógépen; semmi sem marad rajta.",
+ps5src_from_console: "Forráskonzol",
+ps5src_from_path: "Útvonal a forráskonzolon",
+ps5src_dest_path: "Célútvonal ezen a konzolon",
+ps5src_start: "Másolás erre a PS5-re",
+ps5src_need_source_path: "Add meg a forrás útvonalát, / jellel kezdve",
+ps5src_need_dest_path: "Add meg a cél útvonalát, / jellel kezdve",
+queue_rar_password_required: "Ehhez az archívumhoz jelszó kell.",
+queue_rar_password_wrong: "Rossz volt a jelszó. Próbáld újra.",
+queue_rar_password_retry: "Újra jelszóval",
+err_replace_in_progress: "A konzol segédprogramját már cserélik. Várd meg, amíg végez, majd próbáld újra.",
+err_replace_cooldown: "A konzol segédprogramját az imént cserélték le. Várj egy percet, mielőtt újra lecserélnéd.",
 };
 
 export default hu;

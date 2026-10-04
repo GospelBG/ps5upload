@@ -242,6 +242,13 @@ describe("humanizeJobErrorReason i18n", () => {
       "fs_list_dir_path_denied",
       "fs_read_path_not_allowed",
       "tx_table_full",
+      "zip_unsupported",
+      "7z_unsupported",
+      "7z_unsupported_layout",
+      "ava1_7z_unsupported",
+      "ava1_7z_unsupported_layout",
+      "rar_unsupported",
+      "ava1_rar_unsupported",
       "fs_write_failed_errno_28",
       "fs_write_failed_errno_27",
       "fs_write_failed",
@@ -251,6 +258,25 @@ describe("humanizeJobErrorReason i18n", () => {
       expect(msg, `reason ${r}`).toBeTruthy();
       expect(msg, `reason ${r}`).not.toContain("joberr.");
     }
+  });
+
+  it("tells the user what to do about an archive the uploader cannot stream", () => {
+    for (const [reason, mustMention] of [
+      ["zip_unsupported", /\.zip/],
+      ["7z_unsupported", /\.7z/],
+      ["7z_unsupported_layout", /Re-pack|extract/i],
+      ["ava1_7z_unsupported_layout", /Re-pack|extract/i],
+      ["rar_unsupported", /\.rar/],
+    ] as const) {
+      const msg = humanizeJobErrorReason(reason)!;
+      expect(msg, reason).toMatch(mustMention);
+      expect(msg, reason).toMatch(/[Ee]xtract/);
+      expect(msg, reason).not.toContain("joberr.");
+    }
+    // The layout failure is its own message, not the generic 7z one.
+    expect(humanizeJobErrorReason("7z_unsupported_layout")).not.toBe(
+      humanizeJobErrorReason("7z_unsupported"),
+    );
   });
 
   it("still returns null for an unknown reason so callers fall back", () => {

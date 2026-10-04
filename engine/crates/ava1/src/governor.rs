@@ -182,6 +182,9 @@ pub fn inflight_cap(chunk: u32, lane_rate: f64) -> u64 {
     ((lane_rate * 2.0) as u64).max(chunk as u64)
 }
 
+/// Per-tick decay of the best rate seen.
+const BEST_DECAY: f64 = 0.99;
+
 impl Governor {
     pub fn new() -> Self {
         Self::with_options(GovernorOptions::default())
@@ -251,7 +254,9 @@ impl Governor {
             BN_NETWORK
         };
 
-        self.best_rate = self.best_rate.max(rate);
+        // The best rate fades 1 % a tick, so after a capacity drop (a Wi-Fi roam) the stricter
+        // near-the-best bar stops applying and the two bars stay symmetric.
+        self.best_rate = (self.best_rate * BEST_DECAY).max(rate);
         let gain = if self.opts.lanes_first && rate < self.best_rate * NEAR_BEST {
             GAIN_BELOW_BEST
         } else {
@@ -679,6 +684,26 @@ mod tests {
         assert_eq!(g.tick(&steady(100e6, 3)).lanes, 2, "9.9 % < 10 %");
         let mut g = probing(GovernorOptions::default(), 90e6, 100e6);
         assert_eq!(g.tick(&steady(100e6, 3)).lanes, 3, "11 % keeps it");
+    }
+
+    #[test]
+    fn the_best_rate_fades_one_percent_a_tick_and_never_below_the_current_rate() {
+        let mut g = Governor::new();
+        g.best_rate = 100e6;
+        g.tick(&steady(50e6, 2));
+        assert!((g.best_rate - 99e6).abs() < 1.0, "{}", g.best_rate);
+        for _ in 0..80 {
+            g.tick(&steady(50e6, 2));
+        }
+        assert!(
+            g.best_rate < 50e6 * 1.001,
+            "decayed to the rate: {}",
+            g.best_rate
+        );
+        assert!(g.best_rate >= 50e6, "never below the rate");
+        // A faster tick takes over at once.
+        g.tick(&steady(120e6, 2));
+        assert!((g.best_rate - 120e6).abs() < 1.0);
     }
 
     /// Ticks a clean link where the network is the limit, with `lanes` held.

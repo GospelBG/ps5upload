@@ -182,8 +182,13 @@ fn inflate_error(e: io::Error) -> io::Error {
     }
 }
 
+/// A zip library error as an `io::Error`: its own I/O errors keep their kind (so a read that
+/// failed is not mistaken for a bad archive); everything else is a format problem.
 fn invalid_zip(e: zip::result::ZipError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, e)
+    match e {
+        zip::result::ZipError::Io(io) => io,
+        other => io::Error::new(io::ErrorKind::InvalidData, other),
+    }
 }
 
 /// One open entry. Reads are sequential in practice (`run_upload` walks a file front

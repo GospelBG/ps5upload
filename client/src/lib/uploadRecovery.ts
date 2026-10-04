@@ -55,6 +55,16 @@ const FATAL_REASON_SUBSTRINGS = [
   "corrupt", // direct_tx_corrupt etc. — data integrity, not transport
   "source_missing",
   "src_not_found",
+  // The console has not accepted this app / the archive needs a password: only a person
+  // can fix either (the pairing dialog, the password prompt). `helper_not_ava1` is NOT
+  // here: no AVA1 listener means the helper is not running, and re-sending it is the fix.
+  "not_paired",
+  "password_needed",
+  // An archive the uploader cannot stream fails the same way every time (the engine's
+  // zip_unsupported / 7z_unsupported / rar_unsupported and the ava1_7z_* / ava1_zip_* source reasons).
+  "zip_unsupported",
+  "7z_unsupported",
+  "rar_unsupported",
 ] as const;
 
 const AVA1_FATAL_REASON_PREFIXES = [
@@ -71,6 +81,8 @@ const AVA1_FATAL_REASON_PREFIXES = [
   // the same password fails the same way. The password ones mean "ask for the
   // password again" (UI prompt: Task 20); until then they are terminal.
   "ava1_rar_",
+  "ava1_7z_",
+  "ava1_zip_",
   "rar_password_required",
   "rar_password_wrong",
 ] as const;

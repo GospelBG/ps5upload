@@ -1,3 +1,4 @@
+import { consoleAddr } from "../../lib/addr";
 import { useEffect, useMemo, useState } from "react";
 import { PackagePanel } from "../../components/PackagePanel";
 import {
@@ -14,6 +15,7 @@ import {
   Plus,
   type LucideIcon,
   ListPlus,
+  ArrowRightLeft,
 } from "lucide-react";
 import clsx from "clsx";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -50,7 +52,7 @@ import {
   type TransferPhase,
   type UploadStrategy,
 } from "../../state/transfer";
-import { useConnectionStore, PS5_PAYLOAD_PORT } from "../../state/connection";
+import { useConnectionStore } from "../../state/connection";
 import { log } from "../../state/logs";
 import { hostOf } from "../../lib/addr";
 import { useScrollLock } from "../../lib/useScrollLock";
@@ -98,6 +100,8 @@ import { useUploadBatch, type BatchEntry, type BatchRow } from "../../state/uplo
 import { BatchReview } from "./BatchReview";
 import { resolveUploadDest } from "../../lib/uploadDest";
 import { QueuePanel } from "./QueuePanel";
+import { BottleneckLine, JobLiveNotes, UnsettledLine } from "./Bottleneck";
+import { Ps5ToPs5Card } from "./Ps5ToPs5";
 import { humanizePs5Error } from "../../lib/humanizeError";
 import { formatBytes } from "../../lib/format";
 import { useTr, type Translator } from "../../state/lang";
@@ -213,6 +217,7 @@ export default function UploadScreen() {
   );
 
   const [dropActive, setDropActive] = useState(false);
+  const [showPs5Source, setShowPs5Source] = useState(false);
 
   // For a `.zip` source: wrap its contents in a folder named after the
   // zip ("subfolder", the default) or extract them straight into the
@@ -421,7 +426,7 @@ export default function UploadScreen() {
     }
     const settings = useInstallSettingsStore.getState();
     return {
-      addr: `${host}:${PS5_PAYLOAD_PORT}`,
+      addr: consoleAddr(host),
       destinationVolume,
       destinationSubpath,
       archiveIntoSubfolder,
@@ -466,7 +471,7 @@ export default function UploadScreen() {
    */
   const handleQueueAllParts = (paths: string[]) => {
     if (!host?.trim() || paths.length === 0) return;
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(host);
     for (const partPath of paths) {
       const { dest } = resolveUploadDest(
         destinationVolume,
@@ -533,7 +538,7 @@ export default function UploadScreen() {
       return;
     }
     let cancelled = false;
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(host);
     fetchVolumes(addr)
       .then((vols) => {
         if (cancelled) return;
@@ -613,7 +618,7 @@ export default function UploadScreen() {
       source.kind === "archive",
       archiveIntoSubfolder,
     );
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(host);
 
     // Pre-flight: does the destination already have content? If no,
     // just go. If yes, the user needs to pick Override / Resume / Cancel
@@ -740,7 +745,15 @@ export default function UploadScreen() {
         onRemoteFile={(p) => (batchRows.length > 0 ? addToBatch([{ path: p, isDir: false }]) : void pickFile(p))}
         onRemoteFolder={(p) => (batchRows.length > 0 ? addToBatch([{ path: p, isDir: true }]) : void pickFolder(p))}
         onScanFolder={() => void handleScanFolder()}
+        onFromPs5={() => setShowPs5Source((v) => !v)}
       />
+
+      {showPs5Source && !source && batchRows.length === 0 && (
+        <Ps5ToPs5Card
+          host={host?.trim() ?? ""}
+          status={<TransferStatus phase={transferPhase} />}
+        />
+      )}
 
       {batchRows.length > 0 && (
         <BatchReview
@@ -854,6 +867,7 @@ function Step1Picker({
   onRemoteFile,
   onRemoteFolder,
   onScanFolder,
+  onFromPs5,
 }: {
   active: boolean;
   dropActive: boolean;
@@ -863,6 +877,8 @@ function Step1Picker({
   onRemoteFolder: (path: string) => void;
   /** Add a folder's games (its immediate children) to the review list. */
   onScanFolder: () => void;
+  /** Toggle the "From another PS5" source card. */
+  onFromPs5: () => void;
 }) {
   const tr = useTr();
   return (
@@ -914,6 +930,9 @@ function Step1Picker({
         />
         <Button variant="ghost" leftIcon={<ListPlus size={14} />} onClick={onScanFolder}>
           {tr("batch_scan", undefined, "Add games from a folder…")}
+        </Button>
+        <Button variant="ghost" leftIcon={<ArrowRightLeft size={14} />} onClick={onFromPs5}>
+          {tr("ps5src_title", undefined, "From another PS5")}
         </Button>
       </div>
       <p className="mx-auto mt-3 max-w-md text-xs text-[var(--color-muted)]">
@@ -1097,7 +1116,7 @@ function Step2Options(props: {
   const inFlight =
     transferPhase.kind === "starting" || transferPhase.kind === "running";
   // (2.11.0) Mutual-exclusion with QueuePanel. The PS5 payload's
-  // transfer port is single-client — concurrent FTX2 connections
+  // transfer port is single-client — concurrent transfer connections
   // serialize at the socket, but the UI would say both are
   // "running" while one silently waits. Worse: a user clicking
   // "Upload" with a queue already running can stack work the user
@@ -1669,7 +1688,7 @@ function MirrorToRosterButton({
         archiveIntoSubfolder,
       );
       const tasks = others.map(async (p) => {
-        const addr = `${p.host}:${PS5_PAYLOAD_PORT}`;
+        const addr = consoleAddr(p.host);
         try {
           // startTransferFile/Dir only ENQUEUE the job; pre-fix we
           // fired a success notification here and walked away. A
@@ -2002,6 +2021,7 @@ function TransferStatus({ phase }: { phase: TransferPhase }) {
             </button>
           </div>
         </div>
+        <JobLiveNotes live={phase.live} />
         {isFinalizing && (
           // Explanatory line so users with big multi-file uploads
           // understand that 100% is not the end — the PS5 still has
@@ -2111,6 +2131,10 @@ function TransferStatus({ phase }: { phase: TransferPhase }) {
             </>
           )}
         </dl>
+        <div className="mt-2">
+          <BottleneckLine cause={phase.live?.bottleneck ?? null} />
+        </div>
+        <UnsettledLine live={phase.live} />
         {phase.mountWarnings && phase.mountWarnings.length > 0 && (
           <ul className="mt-2 space-y-1 rounded-md border border-[var(--color-warn)] bg-[var(--color-surface)] p-2 text-xs text-[var(--color-warn)]">
             {phase.mountWarnings.map((w) => (
@@ -2560,7 +2584,7 @@ function PreflightEtaBanner({
   const host = useConnectionStore((s) => s.host);
   const mode = useMemo(() => pickBannerMode(fileCount), [fileCount]);
   const hostMetrics = useRecentHostMetricsStore((s) =>
-    host?.trim() ? s.lookup(`${host}:${PS5_PAYLOAD_PORT}`) : undefined,
+    host?.trim() ? s.lookup(consoleAddr(host)) : undefined,
   );
   // Staleness aging (MAX_AGE_MS, 7 days) is intentionally not applied
   // here — Date.now() in render trips the react-hooks/purity rule, and
@@ -3125,7 +3149,7 @@ function FolderDiffSlot({
     <FolderDiffPanel
       srcDir={source.path}
       destRoot={dest}
-      transferAddr={`${host.trim()}:${PS5_PAYLOAD_PORT}`}
+      transferAddr={consoleAddr(host.trim())}
       excludes={enabledPatterns}
     />
   );

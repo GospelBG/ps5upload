@@ -3,6 +3,8 @@ import { Outlet, useLocation, useNavigate } from "react-router";
 import { useEffect, useRef, useState } from "react";
 import { Lock, RefreshCw, X } from "lucide-react";
 import StatusBar from "./StatusBar";
+import SessionBanner from "./SessionBanner";
+import { PairingDialog } from "../screens/Connection/PairingDialog";
 import ConsoleTabs from "./ConsoleTabs";
 import ActivityBar from "./ActivityBar";
 import UpdateToast from "./UpdateToast";
@@ -11,7 +13,6 @@ import {
   useConnectionStore,
   EMPTY_HOST_RUNTIME,
   PS5_LOADER_PORT,
-  PS5_PAYLOAD_PORT,
 } from "../state/connection";
 import { usePayloadPlaylistsStore } from "../state/payloadPlaylists";
 import { log } from "../state/logs";
@@ -24,6 +25,10 @@ import {
 import { useUpdateStore } from "../state/update";
 import { engineApi } from "../api/engine";
 import { payloadCheck, portCheck } from "../api/ps5";
+import {
+  isLegacyHelperWedged,
+  sessionNeedsAttention,
+} from "../lib/consoleSession";
 import { installActivityWiring } from "../state/activityWiring";
 import { installTaskWiring } from "../state/taskWiring";
 import {
@@ -64,8 +69,7 @@ import { useWindowStatePersistence } from "../lib/windowState";
 import {
   mgmtAddr,
   hostOf,
-  PS5_MGMT_PORT,
-  PS5_TRANSFER_PORT,
+  PS5_AVA1_PORT,
 } from "../lib/addr";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { useUploadQueueStore } from "../state/uploadQueue";
@@ -91,7 +95,7 @@ installConvertRunner();
  *  reflect current state regardless of which screen is visible.
  *
  *  - Engine: localhost `/api/jobs`, every 5s. Fast; doesn't touch PS5.
- *  - Payload: the PS5's :9113 via `payload_check`, every 10s, and only
+ *  - Payload: the PS5's :9120 via `payload_check`, every 10s, and only
  *    when a host is configured (no point spamming DOWN probes against
  *    the default IP if the user hasn't entered theirs). */
 /** Consecutive failed payload probes required before the UI flips a host
@@ -166,12 +170,6 @@ function useStatusPolling() {
    *  Lets the poller use transfer progress as a liveness signal instead
    *  of competing with the very upload it is trying to monitor. */
   const transferProgressRef = useRef<Record<string, number>>({});
-  // Last transfer-port (:9113) liveness result per host. Used to log the
-  // up→down TRANSITION only (not every poll) when the transfer listener
-  // dies while mgmt stays up — the "uploads fail but the dot is green"
-  // wedge state. See HostRuntime.transferAlive for why this is tracked
-  // separately from the mgmt-port STATUS probe.
-  const transferAliveRef = useRef<Record<string, boolean>>({});
   // Auto-loader: last wall-clock ms we auto-ran the playlist for a host, used
   // to suppress re-triggering. The playlist itself sends ELFs to the loader,
   // which momentarily drops the helper (down→up flap) — without a cooldown
@@ -253,7 +251,6 @@ function useStatusPolling() {
       autoLoaderFiredAtRef,
       missCountRef,
       transferProgressRef,
-      transferAliveRef,
       warnedMismatchRef,
       warnedNoUcredRef,
     ]) {
@@ -268,7 +265,7 @@ function useStatusPolling() {
       // ── Transfer progress IS the liveness signal ────────────────────
       //
       // While an upload to this console is moving bytes, polling it is both
-      // redundant and harmful. Redundant because shards landing on :9113
+      // redundant and harmful. Redundant because shards landing on :9120
       // prove the helper is alive far better than a probe does. Harmful
       // because a saturating upload starves the console's network stack —
       // a user bundle showed a 150 MB/s upload making even :9021 (the ELF
@@ -344,7 +341,10 @@ function useStatusPolling() {
         // unreachable one only flips to "down" after MISS_THRESHOLD misses in
         // a row, so one busy/jittery poll holds the last-known "up".
         let newStatus: "up" | "down";
-        if (s.reachable) {
+        // A console that answers but wants pairing, or runs an older helper, HAS a helper
+        // running: calling it down would arm the auto-redeploy loop below against a live
+        // console. Only the session state says what the person has to do about it.
+        if (s.reachable || sessionNeedsAttention(s.session)) {
           missCountRef.current[key] = 0;
           newStatus = "up";
         } else {
@@ -365,7 +365,7 @@ function useStatusPolling() {
         //
         // Not at the instant it comes up, though. Reading then was followed,
         // every time, by the helper dropping mid-reply (FW 12.70 report,
-        // 2026-09-23: up, first read reset 114 ms later, :9114 refused 27 ms
+        // 2026-09-23: up, first read reset 114 ms later, the port refused 27 ms
         // after that). Let it settle, and read only if it is still up.
         if (
           newStatus === "up" &&
@@ -491,57 +491,16 @@ function useStatusPolling() {
           maxTransferStreams: carryOver
             ? prev.maxTransferStreams
             : s.maxTransferStreams,
+          // The one probe's verdict. Never carried over: a stale "connected" would
+          // hide a console that needs pairing or an update.
+          session: s.session,
+          helperWedged: isLegacyHelperWedged(s.error),
         });
         // Clear the active console's "rechecking…" flag once its probe lands.
         if (isActive(key)) setStatus({ payloadProbing: false });
-        // Transfer-port (:9113) liveness — only worth probing when the
-        // mgmt probe says the helper is up. A refused/timeout here while
-        // mgmt answers is the "uploads fail but the dot is green" wedge:
-        // the transfer listener died (or never came up) while the mgmt
-        // thread is still serving STATUS. Log the up→down TRANSITION so
-        // the bug bundle has a smoking gun before the user files an
-        // "upload refused" issue. Skipped entirely when mgmt is down —
-        // no point probing :9113 when :9114 is already dark.
-        if (s.reachable && newStatus === "up") {
-          // Skip the transfer-port liveness probe while an upload to THIS
-          // console is running: portCheck opens a TCP connection to :9113,
-          // the same port the transfer is bursting data over. Even a bare
-          // connect adds contention during a large upload (issue #164:
-          // "upload speed drops until it fails"). The liveness state from
-          // the last poll is retained; it refreshes on the next poll after
-          // the transfer finishes.
-          if (transferScreenBusy(probedHost)) return;
-          try {
-            const alive = await portCheck(probedHost, PS5_PAYLOAD_PORT);
-            if (cancelled) return;
-            const was = transferAliveRef.current[key];
-            transferAliveRef.current[key] = alive;
-            setHostStatus(probedHost, { transferAlive: alive });
-            if (!alive && was !== false) {
-              log.warn(
-                "connection",
-                `transfer port :${PS5_PAYLOAD_PORT} DOWN on ${probedHost} (mgmt still up) — uploads will fail until the payload is redeployed`,
-              );
-            } else if (alive && was === false) {
-              log.info(
-                "connection",
-                `transfer port :${PS5_PAYLOAD_PORT} recovered on ${probedHost}`,
-              );
-            }
-          } catch {
-            // portCheck best-effort — leave transferAlive unchanged.
-          }
-          // The install daemon (:9115) is no longer pre-armed or liveness-polled
-          // from the client — the engine brings it up per-install during
-          // `POST /api/pkg/install` and restores the main payload afterward.
-        } else if (!s.reachable) {
-          // mgmt down ⇒ transfer port state unknown; clear so the next
-          // reachable poll reports a fresh transition.
-          if (transferAliveRef.current[key] !== undefined) {
-            delete transferAliveRef.current[key];
-          }
-          setHostStatus(probedHost, { transferAlive: null });
-        }
+        // The install daemon (:9115) is no longer pre-armed or liveness-polled
+        // from the client — the engine brings it up per-install during
+        // `POST /api/pkg/install` and restores the main payload afterward.
         if (s.reachable) {
           // Update the matching roster row's cached firmware/payload.
           const roster = useRosterStore.getState();
@@ -687,7 +646,7 @@ function useAutoRedeployDownHelpers() {
         // the ENGINE answered and said the console did not. An engine that
         // can't be reached holds the send: it has no verdict to give, and its
         // absence is not evidence about the console.
-        let fresh: { reachable: boolean; engineReachable: boolean };
+        let fresh: Awaited<ReturnType<typeof payloadCheck>>;
         try {
           fresh = await payloadCheck(host);
         } catch {
@@ -695,7 +654,7 @@ function useAutoRedeployDownHelpers() {
           return;
         }
         if (cancelled) return;
-        if (fresh.reachable) {
+        if (fresh.reachable || sessionNeedsAttention(fresh.session)) {
           log.info(
             "connection",
             `auto-redeploy: ${host} answered a fresh probe — nothing to restore (the down verdict was stale)`,
@@ -717,7 +676,7 @@ function useAutoRedeployDownHelpers() {
         // connects only, never an RPC.
         const portsOpen = (
           await Promise.all(
-            [PS5_TRANSFER_PORT, PS5_MGMT_PORT].map((port) =>
+            [PS5_AVA1_PORT].map((port) =>
               portCheck(hostOf(host) || host, port).catch(() => false),
             ),
           )
@@ -1327,6 +1286,7 @@ export default function AppShell() {
         <span className="text-base font-bold tracking-tight">PS5Upload</span>
       </div>
       <HelperVersionBanner />
+      <SessionBanner />
       <AndroidStorageAccessBanner />
 
       <div className="flex min-h-0 flex-1">
@@ -1381,6 +1341,7 @@ export default function AppShell() {
       {/* v5 Toaster — critical-toast overlay. Mounted last so it
           sits above all other chrome in DOM order. */}
       <Toaster />
+      <PairingDialog />
     </div>
   );
 }

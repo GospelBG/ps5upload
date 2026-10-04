@@ -24,12 +24,24 @@ pub fn ava1_addr(console: &str) -> String {
 
 /// The console string without its port (the pool's key).
 pub(crate) fn host_of(console: &str) -> String {
-    console
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(console)
-        .to_string()
+    // `[v6]` and `[v6]:port` keep their brackets; `host:port` loses the port; a bare IPv6
+    // literal (several colons, no brackets) has no port to lose.
+    if let Some(rest) = console.strip_prefix('[') {
+        if let Some(i) = rest.find(']') {
+            return format!("[{}]", &rest[..i]);
+        }
+        return console.to_string();
+    }
+    match console.split_once(':') {
+        Some((h, port)) if !port.contains(':') => h.to_string(),
+        _ => console.to_string(),
+    }
 }
+
+/// `ERR_BUSY` on a `JobOpen` is retried this many times (jittered doubling backoff, 250 ms to 5 s: about 45 s in
+/// all) before the transfer fails with a clear reason. The console says BUSY while it recovers a job's files or
+/// has no room for another job; it is never a verdict on the transfer.
+pub(crate) const DEFAULT_BUSY_TRIES: u32 = 12;
 
 pub struct Pool {
     dir: PathBuf,
@@ -54,6 +66,40 @@ pub struct Pool {
     /// second concurrent connect would end the first one's session (SPEC.md §8). Callers that
     /// find no session wait here and then find the winner's.
     connecting: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Connections whose pairing a person has not confirmed yet, one per console: the code on
+    /// screen belongs to that handshake, so it is held (not redone) until `confirm_pairing`.
+    pending: tokio::sync::Mutex<HashMap<String, Session>>,
+    /// Recent session failures by console host, so a client that polls many endpoints does not
+    /// open a handshake (an unpaired console may show a pairing code per handshake, and the
+    /// console caps connections per IP) or block on an unreachable console for every call.
+    refusals: Mutex<HashMap<String, Refusal>>,
+    refusal_ttl: Duration,
+    /// How many times a `JobOpen` answered `ERR_BUSY` is retried before the transfer gives up.
+    busy_tries: u32,
+    /// Overrides the JobOpenAck timeout (tests).
+    open_ack_timeout: Option<Duration>,
+}
+
+/// A remembered session failure: when it happened and the reason/detail to repeat.
+#[derive(Clone)]
+struct Refusal {
+    at: Instant,
+    reason: String,
+    detail: String,
+}
+
+/// How long a failed session attempt is repeated without trying again.
+pub const REFUSAL_TTL: Duration = Duration::from_secs(5);
+
+/// Where a console stands for the pairing dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pairing {
+    /// The console trusts this engine (or was launched by it): nothing to compare.
+    Paired,
+    /// A person must compare `code` with the console's screen, then confirm.
+    Code { code: u32, peer_name: String },
+    /// The console is not accepting new pairings (its window is closed).
+    Closed,
 }
 
 /// Sessions that ended under us this many times within `Churn::window` mean something else
@@ -188,7 +234,33 @@ impl Pool {
             attempts: AtomicUsize::new(0),
             live: Mutex::default(),
             connecting: Mutex::default(),
+            pending: Default::default(),
+            refusals: Mutex::default(),
+            refusal_ttl: REFUSAL_TTL,
+            busy_tries: DEFAULT_BUSY_TRIES,
+            open_ack_timeout: None,
         }
+    }
+
+    /// Overrides how many times a BUSY `JobOpen` is retried (tests; the default suits a console that is
+    /// finishing another job's files).
+    pub fn with_busy_tries(mut self, n: u32) -> Pool {
+        self.busy_tries = n;
+        self
+    }
+
+    /// Overrides how long an upload waits for a JobOpenAck before retrying it (tests).
+    pub fn with_open_ack_timeout(mut self, t: Duration) -> Pool {
+        self.open_ack_timeout = Some(t);
+        self
+    }
+
+    pub(crate) fn open_ack_timeout(&self) -> Option<Duration> {
+        self.open_ack_timeout
+    }
+
+    pub(crate) fn busy_tries(&self) -> u32 {
+        self.busy_tries
     }
 
     pub fn new(dir: PathBuf) -> Pool {
@@ -214,6 +286,11 @@ impl Pool {
             attempts: AtomicUsize::new(0),
             live: Mutex::default(),
             connecting: Mutex::default(),
+            pending: Default::default(),
+            refusals: Mutex::default(),
+            refusal_ttl: REFUSAL_TTL,
+            busy_tries: DEFAULT_BUSY_TRIES,
+            open_ack_timeout: None,
         }
     }
 
@@ -222,6 +299,52 @@ impl Pool {
     pub fn with_addr(mut self, addr: impl Into<String>) -> Pool {
         self.addr = Some(addr.into());
         self
+    }
+
+    /// Test seam: how long a failed session attempt is remembered.
+    pub fn with_refusal_ttl(mut self, ttl: Duration) -> Pool {
+        self.refusal_ttl = ttl;
+        self
+    }
+
+    /// The failure (`reason`, `detail`) of a session attempt to `console` within the last
+    /// [`REFUSAL_TTL`], if any.
+    pub(crate) fn recent_refusal(&self, console: &str) -> Option<(String, String)> {
+        let host = host_of(console);
+        let mut m = self.refusals.lock().unwrap_or_else(|e| e.into_inner());
+        match m.get(&host) {
+            Some(r) if r.at.elapsed() < self.refusal_ttl => {
+                Some((r.reason.clone(), r.detail.clone()))
+            }
+            Some(_) => {
+                m.remove(&host);
+                None
+            }
+            None => None,
+        }
+    }
+
+    pub(crate) fn note_refusal(&self, console: &str, reason: &str, detail: &str) {
+        self.refusals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                host_of(console),
+                Refusal {
+                    at: Instant::now(),
+                    reason: reason.to_string(),
+                    detail: detail.to_string(),
+                },
+            );
+    }
+
+    /// Forgets a remembered failure: a pairing or any successful session just proved the
+    /// console usable, so the next call must not repeat the old answer.
+    pub fn clear_refusal(&self, console: &str) {
+        self.refusals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&host_of(console));
     }
 
     pub fn ava_dir(&self) -> &Path {
@@ -266,6 +389,24 @@ impl Pool {
 
     pub fn has_identity(&self) -> bool {
         self.me.is_ok()
+    }
+
+    /// The first eight hex digits of this engine's public key, for the startup line (`none`
+    /// when there is no identity).
+    pub fn identity_prefix(&self) -> String {
+        match &self.me {
+            Ok(me) => ava1::hex::encode(&me.public())[..8].to_string(),
+            Err(_) => "none".to_string(),
+        }
+    }
+
+    /// How many consoles have accepted this engine (its paired peers).
+    pub fn paired_count(&self) -> usize {
+        self.peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .list()
+            .len()
     }
 
     /// The address `session()` connects to: the per-pool override first (A1: the
@@ -318,6 +459,120 @@ impl Pool {
         }
     }
 
+    /// One handshake with the console, pairing not yet settled; and the key it was pinned to.
+    async fn connect_raw(&self, console: &str) -> Result<(Session, Option<[u8; 32]>), Ava1Error> {
+        let me = self
+            .me
+            .clone()
+            .map_err(|why| Ava1Error::Io(io::Error::other(why)))?;
+        let pin = self.pinned(&host_of(console));
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        let s = connect_expecting(
+            &self.addr_for(console),
+            pin,
+            me,
+            self.peers.clone(),
+            "ps5upload",
+            Timing::default(),
+        )
+        .await?;
+        Ok((s, pin))
+    }
+
+    /// For the pairing dialog: is this console paired, and if a person must compare codes,
+    /// which code? The handshake that produced the code is kept until `confirm_pairing`, so
+    /// asking again shows the same code (the console's screen shows the one it made).
+    pub async fn pairing_status(&self, console: &str) -> Result<Pairing, Ava1Error> {
+        let host = host_of(console);
+        let one_at_a_time = self
+            .connecting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(host.clone())
+            .or_default()
+            .clone();
+        {
+            let _connecting = one_at_a_time.lock().await;
+            let mut pending = self.pending.lock().await;
+            if let Some(s) = pending.get(&host) {
+                if !s.is_closed() {
+                    if let Some(code) = s.pairing_code() {
+                        return Ok(Pairing::Code {
+                            code,
+                            peer_name: s.peer_name().to_string(),
+                        });
+                    }
+                }
+                pending.remove(&host);
+            }
+            drop(pending);
+            let live = {
+                let map = self.sessions.lock().await;
+                map.get(&host).is_some_and(|c| !c.session.is_closed())
+            };
+            if live {
+                return Ok(Pairing::Paired);
+            }
+            match self.connect_raw(console).await {
+                Ok((s, _)) if s.needs_user_pairing() => {
+                    let code = s.pairing_code().unwrap_or(0);
+                    let peer_name = s.peer_name().to_string();
+                    self.pending.lock().await.insert(host.clone(), s);
+                    return Ok(Pairing::Code { code, peer_name });
+                }
+                Ok((s, _)) => s.close().await, // already trusted: the cached path below
+                Err(Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CLOSED => {
+                    return Ok(Pairing::Closed)
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.session(console).await?;
+        Ok(Pairing::Paired)
+    }
+
+    /// The user confirmed that the codes match: stores the console's key (and tells it ours),
+    /// then opens the session every job will share.
+    pub async fn confirm_pairing(&self, console: &str) -> Result<(), Ava1Error> {
+        let host = host_of(console);
+        let one_at_a_time = self
+            .connecting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(host.clone())
+            .or_default()
+            .clone();
+        {
+            let _connecting = one_at_a_time.lock().await;
+            let taken = self.pending.lock().await.remove(&host);
+            let Some(mut s) = taken.filter(|s| !s.is_closed()) else {
+                return Err(Ava1Error::NotPaired);
+            };
+            s.confirm_pairing().await?;
+            if self.pinned(&host).is_none() {
+                self.pin(&host, s.peer_key());
+            }
+            s.close().await;
+        }
+        // The console now trusts this engine: an ordinary connect, no code.
+        self.session(console).await?;
+        Ok(())
+    }
+
+    /// A confirm that never fails just because nothing is pending: a late or concurrent
+    /// confirm (the handshake was already confirmed, or it timed out) answers with the
+    /// console's current state (`Paired`, a fresh `Code`, or `Closed`) instead of an error.
+    pub async fn confirm_or_status(&self, console: &str) -> Result<Pairing, Ava1Error> {
+        match self.confirm_pairing(console).await {
+            Ok(()) => Ok(Pairing::Paired),
+            Err(Ava1Error::NotPaired) => self.pairing_status(console).await,
+            Err(Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CLOSED => {
+                Ok(Pairing::Closed)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// One live session for the console, connecting when there is none. C17: the lock
     /// is never held across the handshake (up to `Timing::handshake`) — one
     /// unreachable console must not stall every other console's transfer. If another
@@ -349,21 +604,7 @@ impl Pool {
         // C4: no identity is an `Io` error, not `NotPaired` — the latter's message
         // ("the devices are not paired yet") would misdescribe a missing identity
         // file; both fall back to FTX2 under Auto, so the honest error wins.
-        let me = self
-            .me
-            .clone()
-            .map_err(|why| Ava1Error::Io(io::Error::other(why)))?;
-        let pin = self.pinned(&host);
-        self.attempts.fetch_add(1, Ordering::Relaxed);
-        let mut s = connect_expecting(
-            &self.addr_for(console),
-            pin,
-            me,
-            self.peers.clone(),
-            "ps5upload",
-            Timing::default(),
-        )
-        .await?;
+        let (mut s, pin) = self.connect_raw(console).await?;
         if s.needs_user_pairing() {
             // A person must compare codes (SPEC.md §5), not a transfer.
             return Err(Ava1Error::NotPaired);
@@ -376,6 +617,7 @@ impl Pool {
             self.pin(&host, s.peer_key());
         }
         let s = Arc::new(s);
+        self.clear_refusal(&host);
         let mut map = self.sessions.lock().await;
         let kept = match map.get(&host) {
             Some(kept) if !kept.session.is_closed() => Some(kept.session.clone()),
@@ -474,11 +716,42 @@ pub fn pool() -> &'static Pool {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "ava1: no PS5Upload data directory (set PS5UPLOAD_DATA_DIR or HOME); using FTX2"
+                "ava1: no PS5Upload data directory (set PS5UPLOAD_DATA_DIR or HOME); AVA1 is unavailable"
             );
             Pool::unavailable()
         }
     })
+}
+
+#[cfg(test)]
+mod identity_summary_tests {
+    use super::*;
+
+    #[test]
+    fn the_startup_summary_names_the_key_and_the_paired_count() {
+        let d = std::env::temp_dir().join(format!("p5a-summary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let p = Pool::new(d.join("ava"));
+        assert_eq!(p.identity_prefix().len(), 8);
+        assert_eq!(p.paired_count(), 0);
+        assert_eq!(Pool::unavailable().identity_prefix(), "none");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod host_of_tests {
+    use super::host_of;
+
+    #[test]
+    fn the_pool_key_is_the_host_for_every_spelling() {
+        assert_eq!(host_of("10.0.0.2"), "10.0.0.2");
+        assert_eq!(host_of("10.0.0.2:9113"), "10.0.0.2");
+        assert_eq!(host_of("ps5.lan:9120"), "ps5.lan");
+        assert_eq!(host_of("[::1]"), "[::1]");
+        assert_eq!(host_of("[::1]:9113"), "[::1]");
+        assert_eq!(host_of("fe80::1"), "fe80::1");
+    }
 }
 
 #[cfg(test)]

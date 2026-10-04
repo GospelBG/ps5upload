@@ -8,6 +8,7 @@
 //! runtime" behaviour — C15).
 
 mod archive_time;
+pub mod console;
 pub mod copy;
 pub mod download;
 pub mod mgmt;
@@ -18,7 +19,6 @@ pub mod progress;
 #[cfg(not(target_os = "android"))]
 pub mod rar_source;
 pub mod relay;
-pub mod route;
 pub mod seq;
 pub mod source;
 pub mod upload;
@@ -26,7 +26,7 @@ pub mod zip_source;
 mod zip_stored;
 pub use zip_stored::StoredZipSink;
 
-pub use pool::{pool, Pool, JOURNAL_GC_EVERY, JOURNAL_MAX_AGE_S};
+pub use pool::{pool, Pairing, Pool, JOURNAL_GC_EVERY, JOURNAL_MAX_AGE_S};
 pub use upload::{PostCommitError, PostCommitKind};
 
 /// Runs a future from blocking code (C15): a runtime handle's `block_on` when the

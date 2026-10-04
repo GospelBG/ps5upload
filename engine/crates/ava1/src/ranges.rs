@@ -78,9 +78,18 @@ pub fn runs(set: &BTreeSet<u32>) -> Vec<FileRun> {
     out
 }
 
+/// The most file ids any one list of runs may name (16 Mi: a game is ~223 k). Longer is hostile or corrupt.
+pub const MAX_RUN_IDS: u64 = 1 << 24;
+
+/// Whether the runs name no more than `MAX_RUN_IDS` ids in all (a journal record that names more is refused).
+pub fn runs_within_limit(runs: &[FileRun]) -> bool {
+    runs.iter().map(|r| r.count as u64).sum::<u64>() <= MAX_RUN_IDS
+}
+
 pub fn from_runs(runs: &[FileRun]) -> BTreeSet<u32> {
     runs.iter()
         .flat_map(|r| r.first..r.first.saturating_add(r.count))
+        .take(MAX_RUN_IDS as usize)
         .collect()
 }
 

@@ -348,11 +348,35 @@ pub mod ffi {
         pub fn ava1_test_apply_end();
         pub fn ava1_test_apply_bundle_raw(d: *const u8, len: usize, count: u32) -> c_int;
         pub fn ava1_test_apply_trace(on: c_int);
+        pub fn ava1_test_apply_probe(out: *mut u64);
+        pub fn ava1_test_apply_probe_prep(out: *mut u64);
+        pub fn ava1_test_apply_opts2(v: *const u64);
+        pub fn ava1_test_sweep_fail(n: c_int);
+        pub fn ava1_test_sweep_fail_left() -> c_int;
+        pub fn ava1_test_apply_unswept_bytes() -> u64;
+        pub fn ava1_test_probe_open(byte: u8, root: *const c_char) -> c_int;
+        pub fn ava1_test_house_ticks() -> u32;
+        pub fn ava1_test_unswept_total() -> u64;
+        pub fn ava1_test_unswept_global_add(d: i64);
+        pub fn ava1_test_jobs_gc(jobs: *const c_char, age_s: i64, max_age_s: i64) -> c_int;
+        pub fn ava1_test_recv_restart_noopen() -> c_int;
+        pub fn ava1_test_data_stop_only();
+        pub fn ava1_test_reap_and_drop();
+        pub fn ava1_test_apply_unswept() -> u32;
+        pub fn ava1_test_apply_segments() -> u32;
+        pub fn ava1_test_apply_hold_commit(on: c_int);
+        pub fn ava1_test_apply_fault_prealloc(id: u32);
+        pub fn ava1_test_apply_compact() -> c_int;
+        pub fn ava1_test_apply_commits_inflight() -> u32;
+        pub fn ava1_test_apply_summary(out: *mut u8, cap: usize) -> usize;
+        pub fn ava1_test_apply_timing() -> c_int;
+        pub fn ava1_test_apply_hook_sleep(ms: u32);
         pub fn ava1_test_apply_dup_on_commit(id: u32, off: u64, d: *const u8, len: usize) -> c_int;
         pub fn ava1_test_apply_fail_dir_sync(id: u32);
         pub fn ava1_test_apply_hold(on: c_int);
         pub fn ava1_test_fsync_fault(point: c_int, n: c_int, err: c_int);
         pub fn ava1_test_fsync_retries() -> u32;
+        pub fn ava1_test_fsync_calls() -> u32;
         pub fn ava1_test_fsync_pending_faults() -> c_int;
         pub fn ava1_test_apply_pending() -> u32;
         pub fn ava1_test_recv_open(
@@ -369,6 +393,7 @@ pub mod ffi {
         pub fn ava1_test_recv_end(files: u32, bytes: u64, hash: *const u8) -> c_int;
         pub fn ava1_test_recv_resume(hash: *const u8) -> c_int;
         pub fn ava1_test_job_stopped() -> c_int;
+        pub fn ava1_test_op_hold_reply_until_finished(on: c_int);
         pub fn ava1_test_recv_reopen(drop_old: c_int) -> c_int;
         pub fn ava1_test_recv_last_open() -> c_int;
         pub fn ava1_test_recv_ack_credit() -> u64;
@@ -388,6 +413,10 @@ pub mod ffi {
             workers: u8,
         ) -> c_int;
         pub fn ava1_test_server_stop_data();
+        pub fn ava1_test_payload_stop(conn_ms: c_int, sony_ms: c_int) -> c_int;
+        pub fn ava1_test_intercept_shutdown(on: c_int);
+        pub fn ava1_test_sony_lock();
+        pub fn ava1_test_sony_unlock();
         pub fn ava1_test_data_delays(open_ms: u32, map_ms: u32);
         pub fn ava1_test_job_attached(id: *const u8) -> c_int;
         pub fn ava1_test_reap_rules(jobs_dir: *const c_char) -> c_int;
@@ -761,7 +790,34 @@ impl CServer {
         fsync_delay_us: u32,
         workers: u8,
     ) -> Self {
+        Self::start_data_opts(
+            secret,
+            peers,
+            jobs,
+            ping_ms,
+            dead_ms,
+            hs_ms,
+            fsync_delay_us,
+            workers,
+            LogOpts::default(),
+        )
+    }
+
+    /// `start_data_with` and the durable-by-log options of the data layer (see `LogOpts`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_data_opts(
+        secret: [u8; 32],
+        peers: &Path,
+        jobs: &Path,
+        ping_ms: u32,
+        dead_ms: u32,
+        hs_ms: u32,
+        fsync_delay_us: u32,
+        workers: u8,
+        opts: LogOpts,
+    ) -> Self {
         let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        opts.apply();
         let a = DataArgs {
             secret,
             peers: CString::new(peers.to_str().unwrap()).unwrap(),
@@ -782,6 +838,29 @@ impl CServer {
     pub fn stop_data_only(&mut self) {
         self.data.as_ref().expect("stop_data_only needs start_data");
         unsafe { ffi::ava1_test_server_stop_data() };
+    }
+
+    /// The payload's real exit sequence (`ava1_payload_stop`): returns its result bits.
+    pub fn payload_stop(&mut self, conn_ms: i32, sony_ms: i32) -> i32 {
+        self.data.as_ref().expect("payload_stop needs start_data");
+        unsafe { ffi::ava1_test_payload_stop(conn_ms, sony_ms) }
+    }
+
+    /// Answer `node.shutdown` with the payload's real shape (reply, then `ava1_payload_stop` 300 ms
+    /// later) instead of the installed management table. Process-wide; off by default.
+    pub fn intercept_shutdown(&self, on: bool) {
+        unsafe { ffi::ava1_test_intercept_shutdown(c_int::from(on)) }
+    }
+
+    /// Holds / releases the Sony API lock, as a handler in the middle of a Sony call does.
+    pub fn sony_lock(&self, held: bool) {
+        unsafe {
+            if held {
+                ffi::ava1_test_sony_lock()
+            } else {
+                ffi::ava1_test_sony_unlock()
+            }
+        }
     }
 
     pub fn start_data_again(&mut self) {
@@ -1343,6 +1422,76 @@ impl Drop for CSendWindow {
     }
 }
 
+/// Counters the C test hooks keep while an apply job runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Probe {
+    /// Part files preallocated.
+    pub prealloc_calls: u64,
+    /// ... of which with the job mutex held (the slow part under the lock this guards against).
+    pub prealloc_with_job_mutex_held: u64,
+    /// Large-file commits begun.
+    pub commits: u64,
+    /// ... of which on the job thread (a batch's commits must run on the workers).
+    pub commits_on_job_thread: u64,
+    /// Directory syncs of sync batches (hook 7), how many ran on a worker, and by how many threads.
+    pub batch_dir_syncs: u64,
+    pub batch_dir_syncs_on_workers: u64,
+    pub batch_dir_sync_threads: u64,
+    /// The job switched to an fsync after every chunk (a drive too slow for batch fsyncs).
+    pub per_chunk_fsync: bool,
+}
+
+/// Durable-by-log options for the next job begun or opened (zero = the engine's defaults; the
+/// test default is off unless AVA1_TEST_LOG_SMALL is set in the environment).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LogOpts {
+    /// 0 default, 1 on, 2 off.
+    pub mode: u32,
+    pub pack_segment: u32,
+    pub unswept_max: u64,
+    pub sweep_age_ms: u32,
+    /// The cap across all jobs (0 = the default).
+    pub unswept_total: u64,
+    /// How often housekeeping recovers job directories nobody holds (0 = the default, 10 s).
+    pub recover_every_ms: u32,
+    /// Job directories one recovery pass takes (0 = the default).
+    pub recover_max: u32,
+    /// The first byte of the test job's id repeated (0 = 7).
+    pub job_byte: u8,
+}
+
+impl LogOpts {
+    pub const ON: LogOpts = LogOpts {
+        mode: 1,
+        pack_segment: 0,
+        unswept_max: 0,
+        sweep_age_ms: 0,
+        unswept_total: 0,
+        recover_every_ms: 0,
+        recover_max: 0,
+        job_byte: 0,
+    };
+    pub const OFF: LogOpts = LogOpts {
+        mode: 2,
+        ..LogOpts::ON
+    };
+
+    /// Hands the options to the C shim (the next job begun or opened takes them).
+    pub fn apply(&self) {
+        let v = [
+            self.mode as u64,
+            self.pack_segment as u64,
+            self.unswept_max,
+            self.sweep_age_ms as u64,
+            self.unswept_total,
+            self.recover_every_ms as u64,
+            self.recover_max as u64,
+            self.job_byte as u64,
+        ];
+        unsafe { ffi::ava1_test_apply_opts2(v.as_ptr()) }
+    }
+}
+
 /// The payload's apply engine on a hand-built job (one at a time: it shares the C
 /// server lock, since both use the data layer's globals).
 pub struct CApplyJob {
@@ -1368,7 +1517,28 @@ impl CApplyJob {
         fsync_delay_us: u32,
         crash_at: i32,
     ) -> Self {
+        Self::begin_opts(
+            jobs,
+            root,
+            flags,
+            m,
+            fsync_delay_us,
+            crash_at,
+            LogOpts::default(),
+        )
+    }
+
+    pub fn begin_opts(
+        jobs: &Path,
+        root: &Path,
+        flags: u32,
+        m: &ava1::manifest::Manifest,
+        fsync_delay_us: u32,
+        crash_at: i32,
+        opts: LogOpts,
+    ) -> Self {
         let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        opts.apply();
         let dir = std::env::temp_dir().join(format!("ava1-blob-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         ava1::journal::write_manifest(&dir, m).unwrap();
@@ -1413,6 +1583,11 @@ impl CApplyJob {
     /// at once when `point` is None, else when the apply engine next reaches that hook.
     pub fn fault_fsync(&self, point: Option<i32>, n: i32, err: i32) {
         unsafe { ffi::ava1_test_fsync_fault(point.unwrap_or(-1), n, err) }
+    }
+
+    /// fsync tries (every file, directory and journal sync) made by the C engine since the process started.
+    pub fn fsync_calls(&self) -> u32 {
+        unsafe { ffi::ava1_test_fsync_calls() }
     }
 
     /// fsync retries made by the C engine since the process started.
@@ -1461,6 +1636,98 @@ impl CApplyJob {
     /// ava1_apply_bundle's answer for raw record bytes claiming `count` records.
     pub fn raw_bundle(&self, records: &[u8], count: u32) -> i32 {
         unsafe { ffi::ava1_test_apply_bundle_raw(records.as_ptr(), records.len(), count) }
+    }
+
+    /// What the hooks have seen since this job began (see `Probe`).
+    pub fn probe(&self) -> Probe {
+        let mut o = [0u64; 8];
+        unsafe { ffi::ava1_test_apply_probe(o.as_mut_ptr()) };
+        Probe {
+            prealloc_calls: o[0],
+            prealloc_with_job_mutex_held: o[1],
+            commits: o[2],
+            commits_on_job_thread: o[3],
+            batch_dir_syncs: o[4],
+            batch_dir_syncs_on_workers: o[5],
+            batch_dir_sync_threads: o[6],
+            per_chunk_fsync: o[7] != 0,
+        }
+    }
+
+    /// Files done but not yet durable in place (the job's `unswept`).
+    pub fn unswept(&self) -> u32 {
+        unsafe { ffi::ava1_test_apply_unswept() }
+    }
+
+    /// Pack bytes counted against the cross-job cap, all jobs together (the data layer is one process-wide
+    /// counter, so this is a method: only the test holding the C server lock may look at it).
+    pub fn unswept_total(&self) -> u64 {
+        unsafe { ffi::ava1_test_unswept_total() }
+    }
+
+    /// Pins (or releases, negative) bytes on the cross-job counter: other jobs' stuck log bytes.
+    pub fn pin_unswept_total(&self, delta: i64) {
+        unsafe { ffi::ava1_test_unswept_global_add(delta) }
+    }
+
+    /// Pack bytes of files not yet swept (pending ones included).
+    pub fn unswept_bytes(&self) -> u64 {
+        unsafe { ffi::ava1_test_apply_unswept_bytes() }
+    }
+
+    /// Pack segment files currently on disk in the job directory.
+    pub fn segments(&self) -> u32 {
+        unsafe { ffi::ava1_test_apply_segments() }
+    }
+
+    /// The next `n` file syncs of a sweep fail with EIO (-1: until set to 0).
+    pub fn fail_sweeps(&self, n: i32) {
+        unsafe { ffi::ava1_test_sweep_fail(n) }
+    }
+
+    /// While on, every commit waits as it is verified (so commits stay in flight).
+    pub fn hold_commits(&self, on: bool) {
+        unsafe { ffi::ava1_test_apply_hold_commit(on as c_int) }
+    }
+
+    /// The preallocation of file `id` answers ENOSPC.
+    pub fn fault_prealloc(&self, id: u32) {
+        unsafe { ffi::ava1_test_apply_fault_prealloc(id) }
+    }
+
+    /// Runs a journal compaction now: 0 compacted, -1 skipped.
+    pub fn compact_now(&self) -> i32 {
+        unsafe { ffi::ava1_test_apply_compact() }
+    }
+
+    /// Commits queued or running.
+    pub fn commits_inflight(&self) -> u32 {
+        unsafe { ffi::ava1_test_apply_commits_inflight() }
+    }
+
+    /// The one-line summary the job prints when it ends (where its time went).
+    pub fn summary(&self) -> String {
+        let mut b = vec![0u8; 1024];
+        let n = unsafe { ffi::ava1_test_apply_summary(b.as_mut_ptr(), b.len()) };
+        String::from_utf8_lossy(&b[..n]).into_owned()
+    }
+
+    /// Whether this job's periodic stats line is on (the timing opt-in, read at its start).
+    pub fn timing_on(&self) -> bool {
+        unsafe { ffi::ava1_test_apply_timing() != 0 }
+    }
+
+    /// The same for prepare's directory syncs: (calls, on a worker, distinct threads).
+    pub fn probe_prepare_dirs(&self) -> (u64, u64, u64) {
+        let mut o = [0u64; 3];
+        unsafe { ffi::ava1_test_apply_probe_prep(o.as_mut_ptr()) };
+        (o[0], o[1], o[2])
+    }
+
+    /// Makes every directory sync the engine reports (hooks 7 and 10) take `ms` more, so
+    /// whether they run concurrently shows. Reset by the next open and by the end.
+    pub fn hook_sleep(&self, ms: u32) {
+        unsafe { ffi::ava1_test_apply_hook_sleep(ms) }
     }
 
     /// Record the apply engine's test hooks as "hook <point> <file id>" event lines.
@@ -1555,7 +1822,19 @@ pub struct CRecv {
 
 impl CRecv {
     pub fn open(jobs: &Path, root: &Path, flags: u32, policy: u8, crash_at: i32) -> Self {
+        Self::open_opts(jobs, root, flags, policy, crash_at, LogOpts::default())
+    }
+
+    pub fn open_opts(
+        jobs: &Path,
+        root: &Path,
+        flags: u32,
+        policy: u8,
+        crash_at: i32,
+        opts: LogOpts,
+    ) -> Self {
         let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        opts.apply();
         let inner = CApplyJob::from_lock(lock); // from here on, Drop stops the data layer
         assert_eq!(
             recv_open_raw(jobs, root, flags, policy, 0, crash_at),
@@ -1588,6 +1867,25 @@ impl CRecv {
     /// The fast path: `Resume{manifest_hash}`.
     pub fn resume(&self, hash: [u8; 32]) {
         assert_eq!(unsafe { ffi::ava1_test_recv_resume(hash.as_ptr()) }, 0);
+    }
+
+    /// Stops the data layer and nothing else; how long that took.
+    pub fn stop_data_timed(&self) -> std::time::Duration {
+        let t = std::time::Instant::now();
+        unsafe { ffi::ava1_test_data_stop_only() };
+        t.elapsed()
+    }
+
+    /// A helper restart with no JobOpen after it: only the start-time recovery runs.
+    pub fn restart_without_open(self) -> Self {
+        assert_eq!(unsafe { ffi::ava1_test_recv_restart_noopen() }, 0);
+        self
+    }
+
+    /// Housekeeping's reap as if an hour had passed, then the job is dropped: a settling job is
+    /// destroyed with its files unswept (its directory stays).
+    pub fn reap_and_drop(&self) {
+        unsafe { ffi::ava1_test_reap_and_drop() }
     }
 
     /// Simulates a payload restart; the returned value replaces `self`.
@@ -1816,4 +2114,49 @@ pub mod t7 {
     pub fn reset_peak() {
         unsafe { ffi::ava1_test_t7_reset_peak() }
     }
+}
+
+/// Holds the Sony API lock on another thread for `ms`, as a worker inside a Sony call does. Returns once
+/// the lock is held; join the handle to know it was released.
+pub fn sony_hold(ms: u64) -> std::thread::JoinHandle<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || {
+        unsafe { ffi::ava1_test_sony_lock() };
+        tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        unsafe { ffi::ava1_test_sony_unlock() };
+    });
+    rx.recv().unwrap();
+    h
+}
+
+/// A JobOpen for the job whose id is `byte` repeated, root `root`, as a session would send it: 0 when it
+/// opened (the job is freed again), else the refusal's status.
+pub fn probe_open(byte: u8, root: &Path) -> i32 {
+    let r = CString::new(root.to_str().unwrap()).unwrap();
+    unsafe { ffi::ava1_test_probe_open(byte, r.as_ptr()) }
+}
+
+/// Sweep failures still armed (see `sweep_failures`).
+pub fn sweep_failures_left() -> i32 {
+    unsafe { ffi::ava1_test_sweep_fail_left() }
+}
+
+/// Housekeeping loop iterations since the data layer started.
+pub fn house_ticks() -> u32 {
+    unsafe { ffi::ava1_test_house_ticks() }
+}
+
+/// The next `n` file syncs of any console sweep fail with EIO (-1: until set to 0): the wire tests' lever for a
+/// receiver that cannot make its files durable.
+pub fn sweep_failures(n: i32) {
+    unsafe { ffi::ava1_test_sweep_fail(n) }
+}
+
+/// `ava1_jobs_gc` over `jobs` as if `age_s` seconds had passed and the limit were `max_age_s`: how
+/// many job directories it removed.
+pub fn jobs_gc(jobs: &Path, age_s: i64, max_age_s: i64) -> i32 {
+    let _lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+    let j = CString::new(jobs.to_str().unwrap()).unwrap();
+    unsafe { ffi::ava1_test_jobs_gc(j.as_ptr(), age_s, max_age_s) }
 }

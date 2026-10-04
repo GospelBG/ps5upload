@@ -48,6 +48,11 @@ pub struct SendOptions {
     /// replaces the random-access readers and `run_upload`'s `Source` is used only for
     /// its `close()`.
     pub seq: Option<Arc<dyn crate::seq::SeqSource>>,
+    /// How long to wait for a receiver's files to settle after its JobDone (SPEC.md §15.7); `None` =
+    /// `SETTLE_MAX`. Tests shorten it.
+    pub settle_max: Option<Duration>,
+    /// How long `open_upload` waits for the JobOpenAck; `None` = `OPEN_ACK_TIMEOUT`. Tests shorten it.
+    pub open_ack_timeout: Option<Duration>,
 }
 
 impl SendOptions {
@@ -64,6 +69,8 @@ impl SendOptions {
             cancel: Arc::default(),
             bandwidth_cap: None,
             seq: None,
+            settle_max: None,
+            open_ack_timeout: None,
         }
     }
 }
@@ -87,6 +94,16 @@ pub struct Progress {
     pub skipped_files: AtomicU64,
     pub skipped_bytes: AtomicU64,
     pub skip_recorded: AtomicBool,
+    /// Sequential sources (7z/RAR resume): 1 while the decoder discards data the receiver
+    /// already holds (`skip_done_bytes` of `skip_total_bytes`), else 0.
+    pub phase: AtomicU8,
+    pub skip_done_bytes: AtomicU64,
+    pub skip_total_bytes: AtomicU64,
+    /// Files are still settling on the receiver after the job's last byte (it reports
+    /// unswept files); false until the receiver says so.
+    pub settling: AtomicBool,
+    /// The receiver's last reported `unswept` count while the sender waits for it to settle.
+    pub unswept: AtomicU32,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +126,10 @@ pub enum SendError {
     Refused { status: u16, message: String },
     #[error("cancelled")]
     Cancelled,
+    /// The receiver did not answer a JobOpen in time (SPEC.md: it must answer OK or BUSY). The sender
+    /// retries like a BUSY answer, within the same bound.
+    #[error("the console did not answer the job open within {0:?}")]
+    OpenTimeout(Duration),
     #[error("reading the source: {0}")]
     Source(#[from] std::io::Error),
     #[error("protocol: {0}")]
@@ -487,6 +508,10 @@ pub(crate) async fn next_ctl(link: &mut JobLink) -> Result<Frame, SendError> {
     }
 }
 
+/// How long a sender waits for a JobOpenAck before it treats the open as lost. Generous: a receiver replays a
+/// journal and may hold the open behind other work, but it answers.
+pub const OPEN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// JobOpen → ack → manifest pages → ManifestEnd → map pages. Returns (credit, need).
 pub async fn open_upload(
     link: &mut JobLink,
@@ -505,10 +530,26 @@ pub async fn open_upload(
             credit: None,
         })
         .await?;
+    // A receiver answers a JobOpen promptly, OK or BUSY. One that stays silent (the open lost behind
+    // a job it was closing) must not hold the sender forever: bounded wait, cancel honoured.
+    let wait = o.open_ack_timeout.unwrap_or(OPEN_ACK_TIMEOUT);
+    let deadline = Instant::now() + wait;
     let ack: JobOpenAck = loop {
-        let f = next_ctl(link).await?;
-        if f.ty == JobOpenAck::TYPE {
-            break f.decode().map_err(|e| SendError::Protocol(e.to_string()))?;
+        if o.cancel.load(Ordering::Relaxed) {
+            return Err(SendError::Cancelled);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(SendError::OpenTimeout(wait));
+        }
+        match tokio::time::timeout(left.min(Duration::from_millis(100)), next_ctl(link)).await {
+            Err(_) => continue, // re-check the cancel flag and the deadline
+            Ok(f) => {
+                let f = f?;
+                if f.ty == JobOpenAck::TYPE {
+                    break f.decode().map_err(|e| SendError::Protocol(e.to_string()))?;
+                }
+            }
         }
     };
     if ack.status != gen::STATUS_OK {
@@ -1217,6 +1258,8 @@ pub async fn run_upload(
     // every pass would fight a target the governor has since lowered, one open and one
     // close per tick).
     let mut opened_start = false;
+    // The receiver's JobDone carried `settling`: files are still being made durable in place.
+    let mut settle_after = false;
     let result = 'job: loop {
         if opts.cancel.load(Ordering::Relaxed) {
             let _ = link
@@ -1437,7 +1480,9 @@ pub async fn run_upload(
                         Err(e) => break Err(SendError::Protocol(e.to_string())),
                     },
                     JobDone::TYPE => match f.decode::<JobDone>() {
-                        Ok(d) => break Ok(SendReport {
+                        Ok(d) => {
+                            settle_after = d.settling == Some(1);
+                            break Ok(SendReport {
                             status: d.status,
                             message: d.message,
                             files: d.files,
@@ -1446,7 +1491,8 @@ pub async fn run_upload(
                             max_lanes,
                             bottleneck: last_bn,
                             sequential,
-                        }),
+                            });
+                        }
                         Err(e) => break Err(SendError::Protocol(e.to_string())),
                     },
                     // The receiver ended the job (cancel, disk full, verify...): its
@@ -1529,6 +1575,33 @@ pub async fn run_upload(
             }
         }
     };
+    let mut result = result;
+    if settle_after && result.is_ok() {
+        let max = opts.settle_max.unwrap_or(SETTLE_MAX);
+        let why = settle_wait(link, &pg, &opts.cancel, max).await;
+        match (&why, result.as_mut()) {
+            (Settled::Failed(code, msg), Ok(_)) => {
+                eprintln!("[ava1] upload: the console cannot make its files durable: {msg}");
+                result = Err(SendError::Refused {
+                    status: *code,
+                    message: if msg.is_empty() {
+                        "the console cannot make its files durable".into()
+                    } else {
+                        msg.clone()
+                    },
+                });
+            }
+            (_, Ok(rep)) => {
+                if let Some(w) = settle_warning(&why) {
+                    rep.message = Some(match rep.message.take() {
+                        Some(m) => format!("{m}; {w}"),
+                        None => w,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
     // Every exit: stop the readers' flag, wake the sleepers, cancel and join every
     // lane task still held (correction 5; a dead lane's task was detached at its
     // LaneDown and exits on its own) — and then the readers (I1): close the read-ahead
@@ -1563,6 +1636,85 @@ pub async fn run_upload(
         let _ = writeln!(std::io::stderr(), "{line}");
     }
     result
+}
+
+/// How long a sender waits for a receiver's files to finish settling (SPEC.md §15.7) before it
+/// reports anyway: the report is true either way (every byte is durable through the receiver's log).
+pub const SETTLE_MAX: Duration = Duration::from_secs(30);
+
+/// How a settle wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Settled {
+    /// The receiver reported `unswept` = 0.
+    Done,
+    /// `settle_max` passed with files still unswept.
+    TimedOut,
+    /// The job was cancelled while waiting.
+    Cancelled,
+    /// The session closed first.
+    Closed,
+    /// The receiver reported it cannot make the files durable (Status `code`).
+    Failed(u16, String),
+}
+
+/// The receiver said files are still settling: keep the job alive while its `Status` reports `unswept`, so
+/// the engine can show "finishing on the console". Ends when it reaches 0, the receiver reports a failure
+/// (Status `code`, the sweep's sticky error), the job is cancelled, the session closes, or after `max`.
+/// Polls `cancel` every 100 ms.
+async fn settle_wait(
+    link: &mut JobLink,
+    pg: &Progress,
+    cancel: &AtomicBool,
+    max: Duration,
+) -> Settled {
+    pg.settling.store(true, Ordering::Relaxed);
+    let t0 = Instant::now();
+    let out = loop {
+        if cancel.load(Ordering::Relaxed) {
+            break Settled::Cancelled;
+        }
+        let Some(left) = max.checked_sub(t0.elapsed()) else {
+            break Settled::TimedOut;
+        };
+        match tokio::time::timeout(left.min(Duration::from_millis(100)), link.rx.recv()).await {
+            Ok(Some(Inbound::Control(f))) if f.ty == Status::TYPE => {
+                let Ok(st) = f.decode::<Status>() else {
+                    continue;
+                };
+                if let Some(code) = st.code.filter(|c| *c != 0) {
+                    break Settled::Failed(code, st.current.unwrap_or_default());
+                }
+                let n = st.unswept.unwrap_or(0);
+                pg.unswept.store(n, Ordering::Relaxed);
+                if n == 0 {
+                    break Settled::Done;
+                }
+            }
+            Ok(Some(Inbound::Closed(_))) | Ok(None) => break Settled::Closed,
+            Ok(Some(_)) | Err(_) => {}
+        }
+    };
+    pg.unswept.store(0, Ordering::Relaxed);
+    pg.settling.store(false, Ordering::Relaxed);
+    out
+}
+
+/// The warning a report carries when the receiver's files were not confirmed durable in place: the bytes
+/// are safe in its log (an upload is never resent for this), but the job did not end clean.
+fn settle_warning(why: &Settled) -> Option<String> {
+    let w = match why {
+        Settled::Done => return None,
+        Settled::TimedOut => "files are still being made durable on the console",
+        Settled::Cancelled => {
+            "cancelled while files were still being made durable on the console (they are safe in its log)"
+        }
+        Settled::Closed => {
+            "the console closed the session while files were still being made durable (they are safe in its log)"
+        }
+        Settled::Failed(..) => return None,
+    };
+    eprintln!("[ava1] upload: {w}");
+    Some(w.to_string())
 }
 
 /// One upload from open to report: `open_upload` then `run_upload`.
@@ -2813,8 +2965,7 @@ mod tests {
                                     status: 0,
                                     files: manifest_files,
                                     bytes: manifest_bytes,
-                                    message: None,
-                                }).await;
+                                    message: None, settling: None,}).await;
                             }
                         }
                         Ok(_) => {}
@@ -3337,8 +3488,7 @@ mod tests {
                                     status: 0,
                                     files: manifest_files,
                                     bytes: manifest_bytes,
-                                    message: None,
-                                }).await;
+                                    message: None, settling: None,}).await;
                             }
                         }
                         None => return,
