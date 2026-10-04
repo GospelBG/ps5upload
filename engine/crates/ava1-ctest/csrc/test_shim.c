@@ -541,6 +541,76 @@ int ava1_test_conn_open_frame(const uint8_t key[32], const uint8_t *frame, size_
     return rc;
 }
 
+/* Review 006 #1, C side. Two keyed ends of a socketpair: (1) frames of every kind (plain,
+ * ignorable, a ping) keep both counters in lockstep and distinct; (2) at the nonce ceiling
+ * the last counter value still seals and opens, the next send is refused (nothing written,
+ * counter unspent, connection broken) and a reader at the ceiling refuses to open.
+ * 0 = ok, negative = which check failed. */
+int ava1_test_conn_nonce_ceiling(const uint8_t key[32]) {
+    int sv[2], rc = 0, i;
+    ava1_conn_t a, b;
+    uint8_t type, flags, buf[64];
+    uint32_t ch;
+    size_t n;
+    char junk;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -100;
+    ava1_conn_init(&a, sv[0]);
+    ava1_conn_init(&b, sv[1]);
+    memcpy(a.send_key, key, 32);
+    memcpy(b.recv_key, key, 32);
+    a.keyed = b.keyed = 1;
+    for (i = 0; i < 12 && rc == 0; i++) {
+        if (a.send_ctr != (uint64_t)i || b.recv_ctr != (uint64_t)i) rc = -1;
+        else if (i % 3 == 0 && ava1_conn_send(&a, AVA1_TYPE_CHUNK, 1, (const uint8_t *)"same", 4) != 0) rc = -2;
+        else if (i % 3 == 1 && ava1_conn_send_flags(&a, AVA1_TYPE_CHUNK, AVA1_FLAG_IGNORABLE, 1,
+                                                    (const uint8_t *)"same", 4) != 0) rc = -3;
+        else if (i % 3 == 2 && ava1_conn_send(&a, AVA1_TYPE_PING, 0, NULL, 0) != 0) rc = -4;
+        else if (ava1_conn_recv(&b, &type, &flags, &ch, buf, sizeof buf, &n) != 0) rc = -5;
+        else if (a.send_ctr != (uint64_t)i + 1 || b.recv_ctr != (uint64_t)i + 1) rc = -6;
+    }
+    if (rc == 0) {
+        a.send_ctr = AVA1_NONCE_CEILING - 1;
+        b.recv_ctr = AVA1_NONCE_CEILING - 1;
+        if (ava1_conn_send(&a, AVA1_TYPE_CHUNK, 1, (const uint8_t *)"last", 4) != 0) rc = -10;
+        else if (ava1_conn_recv(&b, &type, &flags, &ch, buf, sizeof buf, &n) != 0) rc = -11;
+        else if (a.send_ctr != AVA1_NONCE_CEILING || b.recv_ctr != AVA1_NONCE_CEILING) rc = -12;
+        else if (ava1_conn_send(&a, AVA1_TYPE_CHUNK, 1, (const uint8_t *)"more", 4) == 0) rc = -13;
+        else if (a.send_ctr != AVA1_NONCE_CEILING) rc = -14; /* no nonce was spent */
+        else if (!a.broken) rc = -15;
+        else if (ava1_conn_send(&a, AVA1_TYPE_PING, 0, NULL, 0) == 0) rc = -16;
+    }
+    if (rc == 0) {
+        /* Nothing more reached the peer: the socket carries only EOF now. */
+        if (recv(sv[1], &junk, 1, MSG_DONTWAIT) > 0) rc = -17;
+    }
+    ava1_conn_destroy(&a);
+    ava1_conn_destroy(&b);
+    close(sv[0]);
+    close(sv[1]);
+    if (rc == 0) {
+        /* A reader already at the ceiling refuses the next frame (sealed under a lower
+         * counter here, so it would otherwise open). */
+        int sv2[2];
+        ava1_conn_t s, r;
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) != 0) return -100;
+        ava1_conn_init(&s, sv2[0]);
+        ava1_conn_init(&r, sv2[1]);
+        memcpy(s.send_key, key, 32);
+        memcpy(r.recv_key, key, 32);
+        s.keyed = r.keyed = 1;
+        s.send_ctr = AVA1_NONCE_CEILING - 1;
+        r.recv_ctr = AVA1_NONCE_CEILING;
+        if (ava1_conn_send(&s, AVA1_TYPE_CHUNK, 1, (const uint8_t *)"last", 4) != 0) rc = -20;
+        else if (ava1_conn_recv(&r, &type, &flags, &ch, buf, sizeof buf, &n) == 0) rc = -21;
+        else if (r.recv_ctr != AVA1_NONCE_CEILING) rc = -22;
+        ava1_conn_destroy(&s);
+        ava1_conn_destroy(&r);
+        close(sv2[0]);
+        close(sv2[1]);
+    }
+    return rc;
+}
+
 /* The generated per-struct records helpers (SPEC.md §3), which nothing else on the host
  * executes: count the items in `blob`, read each with _next, re-append them with _append
  * (which is also what drives ava1_w_len_begin/_len_end). 0 = ok, -1 = bad blob,

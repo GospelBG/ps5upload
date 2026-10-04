@@ -66,8 +66,12 @@ handshake, with cn = sn = 16 zero bytes. `vectors/keys.txt` pins these derivatio
 
 4.4 Sealed frames: body = ChaCha20-Poly1305(lane key of this direction, nonce =
 4 zero bytes ‖ u64le(counter), AD = header bytes 0..11) followed by the 16-byte
-MAC; the counter is per lane and direction from 0. A frame that fails to open
-closes the connection.
+MAC; the counter is per lane and direction from 0, advances by one on every sealed
+frame of any type (Ping and ignorable frames included), and is never reset or rewound
+while a key is in use. A frame resent on another lane after a lane death is sealed again
+under that lane's own key and counter. A counter that reaches 2^64 - 2 may not seal or
+open another frame: the sender refuses and the receiver closes the connection, so a
+nonce can never repeat under one key. A frame that fails to open closes the connection.
 
 4.5 Join proofs: BLAKE2b-128(key = BLAKE2b-256(key = dir, "AVA1 join"), m):
 the Join tag uses dir = c2s and m = "join" ‖ session_id ‖ u16le(lane) ‖ cn; the

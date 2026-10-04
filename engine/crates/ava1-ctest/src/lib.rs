@@ -86,6 +86,9 @@ pub mod ffi {
         /// Feeds `frame` to the C reader of a connection keyed with `key` (counter 0).
         /// 0 = opened; AVA1_E_* otherwise.
         pub fn ava1_test_conn_open_frame(key: *const u8, frame: *const u8, len: usize) -> c_int;
+        /// Review 006 #1: counters in lockstep across frame kinds, and the nonce ceiling
+        /// refuses to seal or open. 0 = ok, negative = which check failed.
+        pub fn ava1_test_conn_nonce_ceiling(key: *const u8) -> c_int;
         pub fn ava1_pairing_code(hash: *const u8, nonce_c: *const u8, nonce_s: *const u8) -> u32;
         pub fn ava1_pair_commit(nonce_s: *const u8, out: *mut u8);
         pub fn ava1_noise_init(

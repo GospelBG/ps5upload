@@ -26,6 +26,11 @@ typedef struct ava1_qitem {
     size_t len;
 } ava1_qitem_t;
 
+/* The first counter value no frame may be sealed or opened with. A direction's counter is the
+ * AEAD nonce (SPEC.md 4.4); a wrap would reuse nonces under one key. 2^64 frames are
+ * unreachable, so reaching this breaks the connection cleanly (review 006 #1). */
+#define AVA1_NONCE_CEILING (UINT64_MAX - 1)
+
 typedef struct {
     int fd;
     int keyed;

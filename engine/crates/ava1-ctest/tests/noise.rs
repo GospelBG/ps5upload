@@ -386,3 +386,14 @@ fn low_order_keys_are_refused_by_c_and_rust() {
         }
     }
 }
+
+/// Review 006 #1: the C connection's counters stay in lockstep across frame kinds and the
+/// nonce ceiling refuses to seal or open (payload/ava1/ava1_conn.c).
+#[test]
+fn the_c_connection_counts_every_frame_and_stops_at_the_nonce_ceiling() {
+    let key = [0x6bu8; 32];
+    assert_eq!(
+        unsafe { ffi::ava1_test_conn_nonce_ceiling(key.as_ptr()) },
+        0
+    );
+}
