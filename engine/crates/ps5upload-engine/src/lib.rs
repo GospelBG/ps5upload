@@ -1048,7 +1048,7 @@ fn spawn_progress_ticker(
             };
             match maybe_snapshot {
                 Some(Some(state)) => {
-                    let msg = serde_json::json!({ "job_id": job_id.to_string(), "job": state });
+                    let msg = serde_json::json!({ "job_id": job_id.to_string(), "job": with_live_notes(job_id, serde_json::json!(state)) });
                     let _ = events_tx.send(msg.to_string());
                 }
                 _ => break,
@@ -1110,7 +1110,7 @@ fn spawn_verify_stage(
                 }
             };
             let Some(state) = snapshot else { break };
-            let msg = serde_json::json!({ "job_id": job_id.to_string(), "job": state });
+            let msg = serde_json::json!({ "job_id": job_id.to_string(), "job": with_live_notes(job_id, serde_json::json!(state)) });
             let _ = events_tx.send(msg.to_string());
             if finished {
                 break;
@@ -1253,6 +1253,72 @@ fn cancel_registry() -> &'static Mutex<HashMap<Uuid, Weak<AtomicBool>>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Live notes of running AVA1 jobs, weakly held: the transfer's config owns the `Arc`, so the
+/// entry dies with the transfer and a finished job never reports stale notes.
+fn live_registry() -> &'static Mutex<HashMap<Uuid, Weak<ps5upload_core::transfer::LiveNotes>>> {
+    static REG: OnceLock<Mutex<HashMap<Uuid, Weak<ps5upload_core::transfer::LiveNotes>>>> =
+        OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The live notes for `job_id` (to thread into `TransferConfig::progress_live`).
+pub(crate) fn live_notes_for(job_id: Uuid) -> Arc<ps5upload_core::transfer::LiveNotes> {
+    let notes = Arc::new(ps5upload_core::transfer::LiveNotes::default());
+    let mut g = live_registry().lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|_, v| v.strong_count() > 0);
+    g.insert(job_id, Arc::downgrade(&notes));
+    notes
+}
+
+/// Adds a running job's live notes to its snapshot JSON: `phase` (`"skipping"` with
+/// `skip_done_bytes` / `skip_total_bytes`), `bottleneck` (AVA1's word) and `settling`. Fields
+/// that do not apply are absent, so the client shows nothing for them. A snapshot that is not
+/// `running` is returned as it is.
+pub(crate) fn merge_live_notes(
+    notes: Option<&ps5upload_core::transfer::LiveNotes>,
+    mut v: serde_json::Value,
+) -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (Some(n), Some(o)) = (notes, v.as_object_mut()) else {
+        return v;
+    };
+    if o.get("status").and_then(|s| s.as_str()) != Some("running") {
+        return v;
+    }
+    if n.phase.load(Relaxed) == ps5upload_core::transfer::LIVE_PHASE_SKIPPING {
+        o.insert("phase".into(), "skipping".into());
+        o.insert(
+            "skip_done_bytes".into(),
+            n.skip_done_bytes.load(Relaxed).into(),
+        );
+        o.insert(
+            "skip_total_bytes".into(),
+            n.skip_total_bytes.load(Relaxed).into(),
+        );
+    }
+    let bn = n.bottleneck.load(Relaxed);
+    if bn != 0 {
+        o.insert(
+            "bottleneck".into(),
+            ps5upload_ava1::progress::bottleneck_name(bn).into(),
+        );
+    }
+    if n.settling.load(Relaxed) {
+        o.insert("settling".into(), true.into());
+    }
+    v
+}
+
+/// `merge_live_notes` for a job id looked up in the registry.
+pub(crate) fn with_live_notes(job_id: Uuid, v: serde_json::Value) -> serde_json::Value {
+    let notes = live_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&job_id)
+        .and_then(|w| w.upgrade());
+    merge_live_notes(notes.as_deref(), v)
+}
+
 /// Register a fresh cancel flag for `job_id` and return it to thread into
 /// `TransferConfig::cancel`. Prunes flags whose transfer has finished.
 pub(crate) fn register_transfer_cancel(job_id: Uuid) -> Arc<AtomicBool> {
@@ -1321,7 +1387,7 @@ pub(crate) fn set_job(
         }
         g.insert(job_id, state.clone());
     }
-    let msg = serde_json::json!({ "job_id": job_id.to_string(), "job": state });
+    let msg = serde_json::json!({ "job_id": job_id.to_string(), "job": with_live_notes(job_id, serde_json::json!(state)) });
     let _ = events_tx.send(msg.to_string());
 }
 
@@ -1508,6 +1574,7 @@ async fn ps5_to_ps5_handler(
     let files = Arc::new(AtomicU64::new(0));
     let durable_bytes = Arc::new(AtomicU64::new(0));
     let total = Arc::new(AtomicU64::new(0));
+    let live = live_notes_for(job_id);
     let stop_ticker = spawn_progress_ticker(
         Arc::clone(&jobs),
         events_tx.clone(),
@@ -1542,6 +1609,10 @@ async fn ps5_to_ps5_handler(
             );
             total.store(
                 mirror_progress.bytes_total.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            live.bottleneck.store(
+                mirror_progress.bottleneck.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -5195,6 +5266,7 @@ async fn transfer_file_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, bandwidth_cap);
 
         if fail_job_if_capacity_insufficient(
@@ -5545,6 +5617,7 @@ async fn transfer_dir_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes. Folder uploads
         // previously used only 2 retries while single-file used 5, so a single
@@ -6109,6 +6182,7 @@ async fn transfer_zip_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes, matching the file
         // and folder routes. The archive routes used to hard-code 2, so a
@@ -7622,6 +7696,7 @@ async fn transfer_7z_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes, matching the file
         // and folder routes. The archive routes used to hard-code 2, so a
@@ -7882,6 +7957,7 @@ async fn transfer_rar_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes, matching the file
         // and folder routes. The archive routes used to hard-code 2, so a
@@ -8151,6 +8227,7 @@ async fn transfer_file_list_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // All transfer endpoints share the same 3-attempt resume policy
         // (1 fresh + 2 resumes). See `transfer_dir_handler` for rationale.
@@ -9338,6 +9415,7 @@ async fn transfer_dir_reconcile_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes. Covers several
         // payload hiccups mid-transfer (incl. the serial accept loop briefly
@@ -9437,7 +9515,11 @@ async fn get_job(State(state): State<AppState>, Path(id): Path<String>) -> impl 
         .get(&uuid)
         .cloned()
     {
-        Some(job) => (StatusCode::OK, Json(job)).into_response(),
+        Some(job) => (
+            StatusCode::OK,
+            Json(with_live_notes(uuid, serde_json::json!(job))),
+        )
+            .into_response(),
         None => json_err(StatusCode::NOT_FOUND, "job not found").into_response(),
     }
 }
@@ -9969,6 +10051,11 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         .route("/api/ps5/pkg/metadata", get(ps5_pkg_metadata))
         .route("/api/ps5/list-dir", get(ps5_list_dir))
         .route("/api/ava1/identity", get(ava1_api::identity_handler))
+        .route("/api/ava1/pairing", get(ava1_api::pairing_handler))
+        .route(
+            "/api/ava1/pairing/confirm",
+            post(ava1_api::pairing_confirm_handler),
+        )
         .route("/api/game/inspect", post(inspect::inspect_handler))
         .route(
             "/api/game/inspect/image",
@@ -11076,6 +11163,38 @@ mod helpers_tests {
             external_pkg_header(&head),
             (String::new(), String::new(), String::new())
         );
+    }
+
+    #[test]
+    fn a_running_snapshot_carries_the_live_notes_and_a_finished_one_does_not() {
+        use ps5upload_core::transfer::{LiveNotes, LIVE_PHASE_SKIPPING};
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = LiveNotes::default();
+        let running = serde_json::json!({"status": "running", "bytes_sent": 1});
+        // Nothing reported: the snapshot is unchanged (the client shows nothing).
+        assert_eq!(merge_live_notes(Some(&n), running.clone()), running);
+        n.bottleneck.store(ava1::gen::BN_DISK, Relaxed);
+        n.phase.store(LIVE_PHASE_SKIPPING, Relaxed);
+        n.skip_done_bytes.store(5, Relaxed);
+        n.skip_total_bytes.store(20, Relaxed);
+        let v = merge_live_notes(Some(&n), running.clone());
+        assert_eq!(v["bottleneck"], "console drive");
+        assert_eq!(v["phase"], "skipping");
+        assert_eq!(
+            (
+                v["skip_done_bytes"].as_u64(),
+                v["skip_total_bytes"].as_u64()
+            ),
+            (Some(5), Some(20))
+        );
+        assert!(
+            v.get("settling").is_none(),
+            "settling stays absent until the receiver says so"
+        );
+        n.settling.store(true, Relaxed);
+        assert_eq!(merge_live_notes(Some(&n), running)["settling"], true);
+        let done = serde_json::json!({"status": "done"});
+        assert_eq!(merge_live_notes(Some(&n), done.clone()), done);
     }
 
     #[test]

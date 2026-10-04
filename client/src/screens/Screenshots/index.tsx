@@ -1,3 +1,4 @@
+import { consoleAddr } from "../../lib/addr";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Image as ImageIcon,
@@ -19,7 +20,7 @@ import {
   saveArchiveCleanupTemp,
   type ScreenshotEntry,
 } from "../../api/ps5";
-import { useConnectionStore, PS5_PAYLOAD_PORT } from "../../state/connection";
+import { useConnectionStore } from "../../state/connection";
 import { mgmtAddr } from "../../lib/addr";
 import { useScrollLock } from "../../lib/useScrollLock";
 import { useStaleHostGuard } from "../../lib/staleHostGuard";
@@ -75,7 +76,7 @@ async function buildThumb(
       const jobId = await startTransferDownload(
         srcPath,
         dir,
-        `${host.trim()}:${PS5_PAYLOAD_PORT}`,
+        consoleAddr(host.trim()),
         "file",
       );
       await waitForJob(jobId);
@@ -248,7 +249,7 @@ export default function ScreenshotsScreen() {
           const jobId = await startTransferDownload(
             path,
             dest,
-            `${host.trim()}:${PS5_PAYLOAD_PORT}`,
+            consoleAddr(host.trim()),
             "file",
           );
           await waitForJob(jobId);
@@ -330,7 +331,7 @@ export default function ScreenshotsScreen() {
       const jobId = await startTransferDownload(
         item.path,
         dest,
-        `${host.trim()}:${PS5_PAYLOAD_PORT}`,
+        consoleAddr(host.trim()),
         "file",
       );
       await waitForJob(jobId);
@@ -369,7 +370,7 @@ export default function ScreenshotsScreen() {
       const jobId = await startTransferDownload(
         item.path,
         dest,
-        `${host.trim()}:${PS5_PAYLOAD_PORT}`,
+        consoleAddr(host.trim()),
         "file",
       );
       await waitForJob(jobId);
@@ -419,7 +420,7 @@ export default function ScreenshotsScreen() {
       const jobId = await startTransferDownload(
         item.path,
         tempDir,
-        `${host.trim()}:${PS5_PAYLOAD_PORT}`,
+        consoleAddr(host.trim()),
         "file",
       );
       await waitForJob(jobId);

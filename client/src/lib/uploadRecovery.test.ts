@@ -63,6 +63,17 @@ describe("isAutoRecoverable", () => {
     expect(isAutoRecoverable(r, "")).toBe(false);
   });
 
+  it.each(["not_paired", "password_needed"])(
+    "does NOT recover the bare token %s (a person must act: pair, or type the password)",
+    (r) => {
+      expect(isAutoRecoverable(r, "")).toBe(false);
+    },
+  );
+
+  it("DOES recover helper_not_ava1: re-sending the helper is the recovery", () => {
+    expect(isAutoRecoverable("helper_not_ava1", "")).toBe(true);
+  });
+
   it.each([
     "ava1_rar_password_required",
     "ava1_rar_password_wrong",

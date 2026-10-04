@@ -1,3 +1,4 @@
+import { consoleAddr } from "../../lib/addr";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { usePackageViewer } from "../../state/packageViewer";
@@ -43,7 +44,7 @@ import {
 } from "../../components/ConfirmDialog";
 import { useTr } from "../../state/lang";
 
-import { useConnectionStore, PS5_PAYLOAD_PORT } from "../../state/connection";
+import { useConnectionStore } from "../../state/connection";
 import {
   fsDelete,
   fsMove,
@@ -517,7 +518,7 @@ export default function FileSystemScreen() {
     let cancelled = false;
     (async () => {
       try {
-        const vols = await fetchVolumes(`${host}:${PS5_PAYLOAD_PORT}`);
+        const vols = await fetchVolumes(consoleAddr(host));
         if (!cancelled) {
           // Only show writable, non-placeholder volumes — the picker
           // is for navigation, and a placeholder ("disk not yet
@@ -734,7 +735,7 @@ export default function FileSystemScreen() {
       // The activity bar reads the task store; a big folder can take minutes to delete.
       await trackTask(
         { kind: "fs-delete", origin: "files.delete", label: `Delete ${name}`, consoleId: host },
-        () => fsDelete(`${host}:${PS5_PAYLOAD_PORT}`, itemPath),
+        () => fsDelete(consoleAddr(host), itemPath),
       );
       await refresh();
     } catch (e) {
@@ -792,7 +793,7 @@ export default function FileSystemScreen() {
     setError(null);
     try {
       await fsMove(
-        `${host}:${PS5_PAYLOAD_PORT}`,
+        consoleAddr(host),
         joinPath(path, oldName),
         joinPath(path, newName),
       );
@@ -944,7 +945,7 @@ export default function FileSystemScreen() {
     for (const r of renames) {
       try {
         await fsMove(
-          `${host}:${PS5_PAYLOAD_PORT}`,
+          consoleAddr(host),
           joinPath(path, r.from),
           joinPath(path, r.to),
         );
@@ -1007,7 +1008,7 @@ export default function FileSystemScreen() {
     setBusyEntry({ name, op: "mkdir" });
     setError(null);
     try {
-      await fsMkdir(`${host}:${PS5_PAYLOAD_PORT}`, joinPath(path, name));
+      await fsMkdir(consoleAddr(host), joinPath(path, name));
       setMkdirDraft(null);
       await refresh();
     } catch (e) {
@@ -1044,7 +1045,7 @@ export default function FileSystemScreen() {
     replaceRemoteName?: string,
   ) => {
     if (srcPaths.length === 0) return;
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(host);
     setError(null);
     for (const src of srcPaths) {
       const localName = src.split(/[\\/]/).pop() || "file";
@@ -1204,7 +1205,7 @@ export default function FileSystemScreen() {
       const sizeByName = new Map<string, number>(
         (entries ?? []).map((e) => [e.name, e.size]),
       );
-      const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+      const addr = consoleAddr(host);
       // Same op_id-tracked deleter shape as the cut/copy/paste loop:
       // mint a fresh 64-bit op_id per item, register it with the
       // bulk-op store, spawn a parallel poller that scrapes
@@ -1394,7 +1395,7 @@ export default function FileSystemScreen() {
       fromPath: clipboard.sourceLabel ?? "",
       toPath: path,
     });
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(host);
     const errors: string[] = [];
     const duplicated: string[] = [];
     try {
@@ -1719,7 +1720,7 @@ export default function FileSystemScreen() {
     // Single-flight per console: only one download at a time on THIS
     // console (others download concurrently into their own slots).
     if (fsDownload.active) return;
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(host);
     const remote = joinPath(path, entry.name);
     const kind: "file" | "folder" = entry.kind === "dir" ? "folder" : "file";
 

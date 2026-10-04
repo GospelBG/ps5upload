@@ -446,7 +446,7 @@ describe("rest mode after upload", () => {
     expect(itemsByStatus("done")).toHaveLength(1);
     // Standby targets the mgmt addr of the drained host.
     expect(mockedStandby).toHaveBeenCalledTimes(1);
-    expect(mockedStandby).toHaveBeenCalledWith("192.168.1.10:9114");
+    expect(mockedStandby).toHaveBeenCalledWith("192.168.1.10");
   });
 
   it("sleeps EACH console that drains, independently", async () => {
@@ -457,7 +457,7 @@ describe("rest mode after upload", () => {
     await vi.advanceTimersByTimeAsync(5000);
     await p;
     const called = mockedStandby.mock.calls.map((c) => c[0]).sort();
-    expect(called).toEqual(["192.168.1.10:9114", "192.168.1.20:9114"]);
+    expect(called).toEqual(["192.168.1.10", "192.168.1.20"]);
   });
 
   it("does NOT sleep a console that was Stopped mid-drain", async () => {
@@ -627,6 +627,33 @@ describe("queue recovery and persistence visibility", () => {
     });
     expect(untouched.id).toBe(pending.id);
     expect(useUploadQueueStore.getState().retryItem(pending.id)).toBe(false);
+  });
+
+  it("retries a password-failed archive with the typed password, in memory only", async () => {
+    addItem("192.168.1.10:9113", "game.rar");
+    const [it0] = useUploadQueueStore.getState().items;
+    useUploadQueueStore.setState({
+      items: [
+        {
+          ...it0,
+          sourceKind: "archive",
+          status: "failed",
+          error: "rar_password_required",
+          errorReason: "ava1_rar_password_required",
+        },
+      ],
+    });
+    expect(
+      useUploadQueueStore.getState().retryWithPassword(it0.id, "s3cret"),
+    ).toBe(true);
+    const [r] = useUploadQueueStore.getState().items;
+    expect(r).toMatchObject({ status: "pending", error: null, rarPassword: "s3cret" });
+    // The password reaches the live item, never the saved document.
+    await vi.advanceTimersByTimeAsync(400);
+    const saved = JSON.stringify(mockedQueueSave.mock.calls[mockedQueueSave.mock.calls.length - 1] ?? []);
+    expect(saved).not.toContain("s3cret");
+    // An empty password retries nothing; a row that did not fail for a password is refused.
+    expect(useUploadQueueStore.getState().retryWithPassword(it0.id, "")).toBe(false);
   });
 
   it("surfaces a failed save and clears the warning after a successful save", async () => {

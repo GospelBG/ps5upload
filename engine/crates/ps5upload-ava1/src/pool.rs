@@ -54,6 +54,20 @@ pub struct Pool {
     /// second concurrent connect would end the first one's session (SPEC.md §8). Callers that
     /// find no session wait here and then find the winner's.
     connecting: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Connections whose pairing a person has not confirmed yet, one per console: the code on
+    /// screen belongs to that handshake, so it is held (not redone) until `confirm_pairing`.
+    pending: tokio::sync::Mutex<HashMap<String, Session>>,
+}
+
+/// Where a console stands for the pairing dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pairing {
+    /// The console trusts this engine (or was launched by it): nothing to compare.
+    Paired,
+    /// A person must compare `code` with the console's screen, then confirm.
+    Code { code: u32, peer_name: String },
+    /// The console is not accepting new pairings (its window is closed).
+    Closed,
 }
 
 /// Sessions that ended under us this many times within `Churn::window` mean something else
@@ -188,6 +202,7 @@ impl Pool {
             attempts: AtomicUsize::new(0),
             live: Mutex::default(),
             connecting: Mutex::default(),
+            pending: Default::default(),
         }
     }
 
@@ -214,6 +229,7 @@ impl Pool {
             attempts: AtomicUsize::new(0),
             live: Mutex::default(),
             connecting: Mutex::default(),
+            pending: Default::default(),
         }
     }
 
@@ -318,6 +334,120 @@ impl Pool {
         }
     }
 
+    /// One handshake with the console, pairing not yet settled; and the key it was pinned to.
+    async fn connect_raw(&self, console: &str) -> Result<(Session, Option<[u8; 32]>), Ava1Error> {
+        let me = self
+            .me
+            .clone()
+            .map_err(|why| Ava1Error::Io(io::Error::other(why)))?;
+        let pin = self.pinned(&host_of(console));
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        let s = connect_expecting(
+            &self.addr_for(console),
+            pin,
+            me,
+            self.peers.clone(),
+            "ps5upload",
+            Timing::default(),
+        )
+        .await?;
+        Ok((s, pin))
+    }
+
+    /// For the pairing dialog: is this console paired, and if a person must compare codes,
+    /// which code? The handshake that produced the code is kept until `confirm_pairing`, so
+    /// asking again shows the same code (the console's screen shows the one it made).
+    pub async fn pairing_status(&self, console: &str) -> Result<Pairing, Ava1Error> {
+        let host = host_of(console);
+        let one_at_a_time = self
+            .connecting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(host.clone())
+            .or_default()
+            .clone();
+        {
+            let _connecting = one_at_a_time.lock().await;
+            let mut pending = self.pending.lock().await;
+            if let Some(s) = pending.get(&host) {
+                if !s.is_closed() {
+                    if let Some(code) = s.pairing_code() {
+                        return Ok(Pairing::Code {
+                            code,
+                            peer_name: s.peer_name().to_string(),
+                        });
+                    }
+                }
+                pending.remove(&host);
+            }
+            drop(pending);
+            let live = {
+                let map = self.sessions.lock().await;
+                map.get(&host).is_some_and(|c| !c.session.is_closed())
+            };
+            if live {
+                return Ok(Pairing::Paired);
+            }
+            match self.connect_raw(console).await {
+                Ok((s, _)) if s.needs_user_pairing() => {
+                    let code = s.pairing_code().unwrap_or(0);
+                    let peer_name = s.peer_name().to_string();
+                    self.pending.lock().await.insert(host.clone(), s);
+                    return Ok(Pairing::Code { code, peer_name });
+                }
+                Ok((s, _)) => s.close().await, // already trusted: the cached path below
+                Err(Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CLOSED => {
+                    return Ok(Pairing::Closed)
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.session(console).await?;
+        Ok(Pairing::Paired)
+    }
+
+    /// The user confirmed that the codes match: stores the console's key (and tells it ours),
+    /// then opens the session every job will share.
+    pub async fn confirm_pairing(&self, console: &str) -> Result<(), Ava1Error> {
+        let host = host_of(console);
+        let one_at_a_time = self
+            .connecting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(host.clone())
+            .or_default()
+            .clone();
+        {
+            let _connecting = one_at_a_time.lock().await;
+            let taken = self.pending.lock().await.remove(&host);
+            let Some(mut s) = taken.filter(|s| !s.is_closed()) else {
+                return Err(Ava1Error::NotPaired);
+            };
+            s.confirm_pairing().await?;
+            if self.pinned(&host).is_none() {
+                self.pin(&host, s.peer_key());
+            }
+            s.close().await;
+        }
+        // The console now trusts this engine: an ordinary connect, no code.
+        self.session(console).await?;
+        Ok(())
+    }
+
+    /// A confirm that never fails just because nothing is pending: a late or concurrent
+    /// confirm (the handshake was already confirmed, or it timed out) answers with the
+    /// console's current state (`Paired`, a fresh `Code`, or `Closed`) instead of an error.
+    pub async fn confirm_or_status(&self, console: &str) -> Result<Pairing, Ava1Error> {
+        match self.confirm_pairing(console).await {
+            Ok(()) => Ok(Pairing::Paired),
+            Err(Ava1Error::NotPaired) => self.pairing_status(console).await,
+            Err(Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CLOSED => {
+                Ok(Pairing::Closed)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// One live session for the console, connecting when there is none. C17: the lock
     /// is never held across the handshake (up to `Timing::handshake`) — one
     /// unreachable console must not stall every other console's transfer. If another
@@ -349,21 +479,7 @@ impl Pool {
         // C4: no identity is an `Io` error, not `NotPaired` — the latter's message
         // ("the devices are not paired yet") would misdescribe a missing identity
         // file; both fall back to FTX2 under Auto, so the honest error wins.
-        let me = self
-            .me
-            .clone()
-            .map_err(|why| Ava1Error::Io(io::Error::other(why)))?;
-        let pin = self.pinned(&host);
-        self.attempts.fetch_add(1, Ordering::Relaxed);
-        let mut s = connect_expecting(
-            &self.addr_for(console),
-            pin,
-            me,
-            self.peers.clone(),
-            "ps5upload",
-            Timing::default(),
-        )
-        .await?;
+        let (mut s, pin) = self.connect_raw(console).await?;
         if s.needs_user_pairing() {
             // A person must compare codes (SPEC.md §5), not a transfer.
             return Err(Ava1Error::NotPaired);

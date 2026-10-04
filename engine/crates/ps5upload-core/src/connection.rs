@@ -234,7 +234,18 @@ fn write_all_parts<W: Write>(stream: &mut W, parts: &[&[u8]]) -> io::Result<()> 
 /// The IP-literal fast path is kept ahead of `to_socket_addrs` so the common
 /// case (the address the app stores after discovery) never touches the
 /// resolver at all.
+/// The port a bare host is given; the same constant the engine's `mgmt_addr_for` family uses.
+const DEFAULT_PORT: u16 = 9113;
+
 pub(crate) fn resolve_connect_targets(addr: &str) -> Result<Vec<SocketAddr>> {
+    // A bare host (no port) means the client left the port to the engine.
+    let with_port;
+    let addr = if !addr.contains(':') || (addr.starts_with('[') && addr.ends_with(']')) {
+        with_port = format!("{addr}:{DEFAULT_PORT}");
+        with_port.as_str()
+    } else {
+        addr
+    };
     if let Ok(sa) = addr.parse::<SocketAddr>() {
         return Ok(vec![sa]);
     }
@@ -786,6 +797,19 @@ mod addr_resolution_tests {
         assert_eq!(
             out,
             vec!["192.168.1.131:9114".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_bare_host_gets_the_default_port() {
+        // The client now sends the console's bare host (the engine owns the ports).
+        assert_eq!(
+            resolve_connect_targets("192.168.1.131").unwrap(),
+            vec!["192.168.1.131:9113".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            resolve_connect_targets("[::1]").unwrap(),
+            vec!["[::1]:9113".parse::<SocketAddr>().unwrap()]
         );
     }
 

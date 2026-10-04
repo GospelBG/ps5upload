@@ -1,3 +1,4 @@
+import { consoleAddr } from "../../lib/addr";
 import { useCallback, useEffect, useMemo, useState } from "react";
 // useEffect is consumed inside SaveThumbnail below.
 import { useNavigate } from "react-router";
@@ -28,7 +29,7 @@ import {
 } from "../../api/ps5";
 import { beginTask, type TaskHandle } from "../../state/trackTask";
 import { localFs } from "../../api/localFs";
-import { useConnectionStore, PS5_PAYLOAD_PORT } from "../../state/connection";
+import { useConnectionStore } from "../../state/connection";
 import { getSavePath } from "../../state/saveSettings";
 import { backupTimestamp } from "../../lib/backupTimestamp";
 import {
@@ -186,7 +187,7 @@ export default function SavesScreen() {
       const jobId = await startTransferDownload(
         entry.path,
         tempDir,
-        `${host.trim()}:${PS5_PAYLOAD_PORT}`,
+        consoleAddr(host.trim()),
         "folder",
       );
       await waitForJob(jobId);
@@ -303,7 +304,7 @@ export default function SavesScreen() {
             "Aborted before wipe — your other console's saves are untouched.",
         );
       }
-      const addr = `${restoreHost}:${PS5_PAYLOAD_PORT}`;
+      const addr = consoleAddr(restoreHost);
       const children = await fsListDir(addr, entry.path, { limit: 4096 });
       for (const child of children) {
         const childPath = entry.path.endsWith("/")
@@ -368,7 +369,7 @@ export default function SavesScreen() {
     if (!host?.trim()) return;
     if (isBusy(entry.path)) return;
     const backupHost = host.trim();
-    const addr = `${backupHost}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(backupHost);
     const base = getSavePath();
     markBusy(entry.path, true);
     let tempDir: string | null = null;
@@ -511,7 +512,7 @@ export default function SavesScreen() {
     if (!host?.trim()) return "no-backup";
     if (isBusy(entry.path)) return "no-backup";
     const restoreHost = host.trim();
-    const addr = `${restoreHost}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(restoreHost);
     const base = getSavePath();
     // Claim before any async work — same reasoning as handleRestore.
     markBusy(entry.path, true);
@@ -631,7 +632,7 @@ export default function SavesScreen() {
   async function handleRestoreAllFromUsb() {
     if (!host?.trim() || !saves || saves.length === 0 || bulkRestoreBusy) return;
     const restoreHost = host.trim();
-    const addr = `${restoreHost}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(restoreHost);
     const base = getSavePath();
     setBulkRestoreBusy(true);
     try {
@@ -718,7 +719,7 @@ export default function SavesScreen() {
   async function handleBackupAllToUsb() {
     if (!host?.trim() || !saves || saves.length === 0 || bulkBackupBusy) return;
     const backupHost = host.trim();
-    const addr = `${backupHost}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(backupHost);
     const base = getSavePath();
     setBulkBackupBusy(true);
     try {
