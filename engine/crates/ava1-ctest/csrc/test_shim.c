@@ -1307,6 +1307,8 @@ static void *pre_watcher(void *arg) {
     return NULL;
 }
 
+static int g_hold_commit;                           /* commits wait at COMMIT_VERIFIED while set */
+static uint32_t g_prealloc_fault = UINT32_MAX - 1;  /* a file whose preallocation answers ENOSPC */
 static void t_hook(ava1_job_t *j, int point, uint32_t id) {
     if (point == __atomic_load_n(&g_arm_point, __ATOMIC_SEQ_CST)) { /* fsync fault, armed for this point */
         ava1_fsync_test_errno = g_arm_errno;
@@ -1339,6 +1341,8 @@ static void t_hook(ava1_job_t *j, int point, uint32_t id) {
     if (point == AVA1_HOOK_COMMIT_VERIFIED) {
         __atomic_add_fetch(&g_commit_calls, 1, __ATOMIC_SEQ_CST);
         if (pthread_equal(pthread_self(), j->thread)) __atomic_add_fetch(&g_commit_on_job_thread, 1, __ATOMIC_SEQ_CST);
+        while (__atomic_load_n(&g_hold_commit, __ATOMIC_SEQ_CST) && !__atomic_load_n(&j->stopping, __ATOMIC_SEQ_CST))
+            ava1_platform_sleep_ms(2);
     }
     if (__atomic_load_n(&g_trace, __ATOMIC_SEQ_CST)) {
         char line[64];
@@ -1411,11 +1415,25 @@ void ava1_test_apply_probe_prep(uint64_t out[3]) {
 /* Each directory sync the apply engine reports (hooks 7 and 10) then takes `ms` more. */
 void ava1_test_apply_hook_sleep(uint32_t ms) { __atomic_store_n(&g_hook_sleep_ms, ms, __ATOMIC_SEQ_CST); }
 
+void ava1_test_apply_hold_commit(int on) { __atomic_store_n(&g_hold_commit, on, __ATOMIC_SEQ_CST); }
+void ava1_test_apply_fault_prealloc(uint32_t id) { __atomic_store_n(&g_prealloc_fault, id, __ATOMIC_SEQ_CST); }
+/* ava1_apply_compact's answer now (0 compacted, -1 skipped). */
+int ava1_test_apply_compact(void) { return ava1_apply_compact(g_job); }
+/* Commits queued or running. */
+uint32_t ava1_test_apply_commits_inflight(void) {
+    uint32_t n;
+    pthread_mutex_lock(&g_job->mu);
+    n = g_job->commits_inflight;
+    pthread_mutex_unlock(&g_job->mu);
+    return n;
+}
+
 void ava1_test_apply_trace(int on) { __atomic_store_n(&g_trace, on, __ATOMIC_SEQ_CST); }
 
 static uint32_t g_fault_id = UINT32_MAX - 1; /* no file: no fault */
 static int t_fault(ava1_job_t *j, int point, uint32_t id) {
     (void)j;
+    if (point == AVA1_HOOK_PREALLOC && id == __atomic_load_n(&g_prealloc_fault, __ATOMIC_SEQ_CST)) return ENOSPC;
     return point == AVA1_HOOK_DIR_SYNCED && id == __atomic_load_n(&g_fault_id, __ATOMIC_SEQ_CST) ? EIO : 0;
 }
 void ava1_test_apply_fail_dir_sync(uint32_t id) { __atomic_store_n(&g_fault_id, id, __ATOMIC_SEQ_CST); }
@@ -1715,6 +1733,8 @@ size_t ava1_test_apply_events(char *out, size_t cap) {
 }
 
 void ava1_test_apply_end(void) {
+    __atomic_store_n(&g_hold_commit, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_prealloc_fault, UINT32_MAX - 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_hook_sleep_ms, 0, __ATOMIC_SEQ_CST);
     if (g_job) ava1_job_put(g_job);
     g_job = NULL;

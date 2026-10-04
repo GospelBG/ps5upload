@@ -50,7 +50,8 @@ void ava1_apply_status(ava1_job_t *j);                  /* emit one Status now *
  * outboard). Requires j->lf[id] != NULL. `reason == 0` resets silently (no FileRetry). */
 void ava1_apply_reset(ava1_job_t *j, uint32_t id, uint16_t reason);
 /* Rewrite the journal as Open + Snapshot of the job's state (mid-job: no Done). */
-void ava1_apply_compact(ava1_job_t *j);
+/* 0 when compacted, -1 when skipped (a commit is in flight, or out of memory: it is retried). */
+int ava1_apply_compact(ava1_job_t *j);
 /* Job thread only: waits until no work is queued or running, then makes what was applied
  * durable (one sync batch) and drops what could not be, so the manifest can change. */
 void ava1_apply_quiesce(ava1_job_t *j);

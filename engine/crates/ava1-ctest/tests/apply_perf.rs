@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use ava1::gen::{self, ENTRY_DIR, ENTRY_FILE};
+use ava1::journal::{job_dir, Journal, Record};
 use ava1::manifest::{Entry, Manifest};
 use ava1::verify::GROUP;
 use ava1_ctest::*;
@@ -381,4 +382,148 @@ fn a_fast_drive_keeps_the_batch_fsync() {
         "switched on a drive that keeps up"
     );
     assert_eq!(std::fs::read(root.join("a.bin")).unwrap(), a);
+}
+
+// ---- fix round (review perf-apply) ----
+
+fn six_large(tag: &str) -> (PathBuf, Vec<Vec<u8>>, Manifest) {
+    let t = tmp(tag);
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let files: Vec<Vec<u8>> = (0..6)
+        .map(|i| data(2 * GROUP as usize + 3 + i, 70 + i as u8))
+        .collect();
+    let m = Manifest {
+        entries: files
+            .iter()
+            .enumerate()
+            .map(|(i, d)| file(&format!("f{i}.bin"), d.len() as u64))
+            .collect(),
+    };
+    (t, files, m)
+}
+
+fn wait_commits(job: &CApplyJob, n: u64) {
+    let t0 = std::time::Instant::now();
+    while job.probe().commits < n.min(4) {
+        assert!(t0.elapsed().as_secs() < 10, "commits never started");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_failing_commit_leaves_no_journal_record_or_durable_after_the_jobs_end() {
+    let (t, files, m) = six_large("failcommit");
+    // file 0's final path is a folder: its rename fails with ERR_EXISTS while five siblings are
+    // in flight
+    std::fs::create_dir_all(t.join("dest/f0.bin")).unwrap();
+    std::fs::write(t.join("dest/f0.bin/keep"), b"k").unwrap();
+    let job = CApplyJob::begin(&t.join("jobs"), &t.join("dest"), 0, &m, 0);
+    job.hold_commits(true);
+    for (i, d) in files.iter().enumerate() {
+        send_large(&job, i as u32, d);
+    }
+    wait_commits(&job, 6);
+    job.hold_commits(false);
+    assert_eq!(
+        job.wait(15_000),
+        ava1::gen::ERR_EXISTS as i32,
+        "{}",
+        job.events()
+    );
+    let ev = job.events();
+    let done_at = ev.find("\ndone ").or_else(|| ev.find("done ")).unwrap();
+    assert!(
+        !ev[done_at..].contains("durable"),
+        "a Durable after JobDone: {ev}"
+    );
+    drop(job);
+    let recs = Journal::open(&job_dir(&t.join("jobs"), &[7; 16]))
+        .unwrap()
+        .1;
+    let first_done = recs
+        .iter()
+        .position(|r| matches!(r, Record::Done(_)))
+        .expect("Done journaled");
+    assert_eq!(first_done, recs.len() - 1, "a record after Done: {recs:?}");
+    // whatever committed is byte-exact; the blocked one is untouched
+    for (i, d) in files.iter().enumerate().skip(1) {
+        let p = t.join(format!("dest/f{i}.bin"));
+        if p.exists() {
+            assert_eq!(&std::fs::read(p).unwrap(), d, "file {i}");
+        }
+    }
+    assert!(t.join("dest/f0.bin/keep").exists());
+}
+
+#[test]
+fn compaction_is_skipped_while_a_commit_is_in_flight_and_happens_once_it_drains() {
+    let t = tmp("compact-commit");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let d = data(2 * GROUP as usize + 1, 9);
+    let m = Manifest {
+        entries: vec![file("a.bin", d.len() as u64), file("never.bin", 10)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &t.join("dest"), 0, &m, 0);
+    job.hold_commits(true);
+    send_large(&job, 0, &d);
+    wait_commits(&job, 1);
+    assert!(job.commits_inflight() >= 1);
+    assert_eq!(job.compact_now(), -1, "compacted with a commit in flight");
+    job.hold_commits(false);
+    let t0 = std::time::Instant::now();
+    while job.commits_inflight() != 0 {
+        assert!(t0.elapsed().as_secs() < 10, "the commit never drained");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(job.compact_now(), 0, "not compacted once drained");
+    assert_eq!(std::fs::read(t.join("dest/a.bin")).unwrap(), d);
+}
+
+#[test]
+fn a_waiter_on_an_opening_file_gets_the_openers_enospc_and_does_not_hang() {
+    let t = tmp("opening-enospc");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let g = GROUP as usize;
+    let d = data(3 * g, 1);
+    let m = Manifest {
+        entries: vec![file("x.bin", d.len() as u64)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &t.join("dest"), 0, &m, 0);
+    job.fault_prealloc(0); // the first open's preallocation reports a full drive (the hook pauses 40 ms)
+    for o in (0..d.len()).step_by(g) {
+        job.chunk(0, o as u64, &d[o..o + g]); // several workers want the same file at once
+    }
+    assert_eq!(
+        job.wait(15_000),
+        ava1::gen::ERR_NO_SPACE as i32,
+        "{}",
+        job.events()
+    );
+}
+
+#[test]
+fn a_durable_for_a_file_is_never_sent_before_its_own_commit_finished() {
+    let (t, files, m) = six_large("durable-order");
+    let job = CApplyJob::begin(&t.join("jobs"), &t.join("dest"), 0, &m, 0);
+    job.trace(true);
+    for (i, d) in files.iter().enumerate() {
+        send_large(&job, i as u32, d);
+    }
+    assert_eq!(job.wait(15_000), 0, "{}", job.events());
+    let ev = job.events();
+    let lines: Vec<&str> = ev.lines().collect();
+    for i in 0..files.len() {
+        let journaled = lines
+            .iter()
+            .position(|l| *l == format!("hook 5 {i}")) // outboard unlinked: after the journal record
+            .unwrap();
+        let durable = lines
+            .iter()
+            .position(|l| l.starts_with(&format!("durable files={i}+1")))
+            .unwrap_or_else(|| panic!("no durable for {i}: {ev}"));
+        assert!(
+            journaled < durable,
+            "Durable for {i} before its commit: {ev}"
+        );
+    }
 }

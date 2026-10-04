@@ -349,6 +349,10 @@ pub mod ffi {
         pub fn ava1_test_apply_trace(on: c_int);
         pub fn ava1_test_apply_probe(out: *mut u64);
         pub fn ava1_test_apply_probe_prep(out: *mut u64);
+        pub fn ava1_test_apply_hold_commit(on: c_int);
+        pub fn ava1_test_apply_fault_prealloc(id: u32);
+        pub fn ava1_test_apply_compact() -> c_int;
+        pub fn ava1_test_apply_commits_inflight() -> u32;
         pub fn ava1_test_apply_summary(out: *mut u8, cap: usize) -> usize;
         pub fn ava1_test_apply_timing() -> c_int;
         pub fn ava1_test_apply_hook_sleep(ms: u32);
@@ -1477,6 +1481,26 @@ impl CApplyJob {
             batch_dir_sync_threads: o[6],
             per_chunk_fsync: o[7] != 0,
         }
+    }
+
+    /// While on, every commit waits as it is verified (so commits stay in flight).
+    pub fn hold_commits(&self, on: bool) {
+        unsafe { ffi::ava1_test_apply_hold_commit(on as c_int) }
+    }
+
+    /// The preallocation of file `id` answers ENOSPC.
+    pub fn fault_prealloc(&self, id: u32) {
+        unsafe { ffi::ava1_test_apply_fault_prealloc(id) }
+    }
+
+    /// Runs a journal compaction now: 0 compacted, -1 skipped.
+    pub fn compact_now(&self) -> i32 {
+        unsafe { ffi::ava1_test_apply_compact() }
+    }
+
+    /// Commits queued or running.
+    pub fn commits_inflight(&self) -> u32 {
+        unsafe { ffi::ava1_test_apply_commits_inflight() }
     }
 
     /// The one-line summary the job prints when it ends (where its time went).

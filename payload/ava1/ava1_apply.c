@@ -402,6 +402,10 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
         credit = j->credit;
         j->credit = 0;
     }
+    /* Commits already queued or running must finish (a queued one starts, sees `finished` and
+     * returns) before Done is appended and JobDone sent: nothing may be journaled or acknowledged
+     * after the job's end. Not while stopping: workers no longer run then. */
+    while (first && j->commits_inflight && !j->stopping) pthread_cond_wait(&j->cv, &j->mu);
     pthread_mutex_unlock(&j->mu);
     if (!first) return;
     ava1_log_job_event(status == AVA1_STATUS_OK ? "done" : "fail", j, status);
@@ -659,7 +663,8 @@ static int lfile_open_fds(ava1_job_t *j, uint32_t id, int create, int *fdp, int 
         int rc;
         HOOK(j, AVA1_HOOK_PREALLOC, id);
         t0 = mono_us();
-        rc = ava1_platform_preallocate(fd, e->size);
+        rc = ava1_apply_fault ? ava1_apply_fault(j, AVA1_HOOK_PREALLOC, id) : 0; /* tests: an injected errno */
+        if (!rc) rc = ava1_platform_preallocate(fd, e->size);
         dt = mono_us() - t0;
         __atomic_add_fetch(&j->pre_us, dt, __ATOMIC_RELAXED);
         __atomic_add_fetch(&j->pre_bytes, e->size, __ATOMIC_RELAXED);
@@ -1349,7 +1354,7 @@ static void sync_batch(ava1_job_t *j) {
     }
     HOOK(j, AVA1_HOOK_BATCH_SYNCED, UINT32_MAX);
     u2 = mono_us();
-    slow_drive_check(j, bytes_in - j->rate_bytes0, t0 - j->last_batch_end_ms, (u2 - u1) / 1000u);
+    slow_drive_check(j, bytes_in > j->rate_bytes0 ? bytes_in - j->rate_bytes0 : 0, t0 - j->last_batch_end_ms, (u2 - u1) / 1000u);
     if (cfg->crash_at == AVA1_CRASH_AFTER_DATA) {
         ava1_apply_crash(j);
         goto out;
@@ -1461,7 +1466,15 @@ static void sync_batch(ava1_job_t *j) {
     }
     if (ava1_jnl_len(&j->jnl) > AVA1_JNL_COMPACT_AT) {
         uint64_t c0 = mono_us();
-        ava1_apply_compact(j);
+        /* A compaction waits for commits in flight and is retried each batch; a job that always has
+         * one would never compact. Past twice the limit, drain them first (new commits are queued
+         * only by this thread, so the wait ends). */
+        if (ava1_jnl_len(&j->jnl) > 2ull * AVA1_JNL_COMPACT_AT) {
+            pthread_mutex_lock(&j->mu);
+            while (j->commits_inflight && !j->stopping) pthread_cond_wait(&j->cv, &j->mu);
+            pthread_mutex_unlock(&j->mu);
+        }
+        (void)ava1_apply_compact(j);
         j->st_compact_us += mono_us() - c0;
         j->st_compacts++;
     }
@@ -1492,7 +1505,7 @@ out:
     free(body);
 }
 
-void ava1_apply_compact(ava1_job_t *j) {
+int ava1_apply_compact(ava1_job_t *j) {
     ava1_jnl_open_t o;
     ava1_jnl_snapshot_t s;
     ava1_w_t ow, fw, rw, tw, sw;
@@ -1508,20 +1521,20 @@ void ava1_apply_compact(ava1_job_t *j) {
     o.root = (const uint8_t *)j->root;
     o.root_len = (uint16_t)strlen(j->root);
     ava1_w_init(&ow, ob, sizeof ob);
-    if (ava1_jnl_open_encode(&o, &ow) != 0) return;
+    if (ava1_jnl_open_encode(&o, &ow) != 0) return -1;
     pthread_mutex_lock(&j->jnl_mu); /* no append races the rewrite; lock order jnl_mu, mu */
     pthread_mutex_lock(&j->mu);
     if (j->commits_inflight) { /* a commit between its rename and its journal record would be
                                 * dropped from the snapshot: try again after the batch */
         pthread_mutex_unlock(&j->mu);
         pthread_mutex_unlock(&j->jnl_mu);
-        return;
+        return -1;
     }
     snap = lfl_snapshot(j, &nsnap);
     if (nsnap == UINT32_MAX) { /* out of memory: keep the longer journal, it is still whole */
         pthread_mutex_unlock(&j->mu);
         pthread_mutex_unlock(&j->jnl_mu);
-        return;
+        return -1;
     }
     for (k = 0; k < nsnap; k++) nr += j->lf[snap[k]]->durable.n + 1;
     cap = 16u * (size_t)j->m.n + 8;
@@ -1570,6 +1583,7 @@ void ava1_apply_compact(ava1_job_t *j) {
     free(rb);
     free(tb);
     free(sb);
+    return 0;
 }
 
 /* ---- commit ------------------------------------------------------------------------ */
@@ -1639,6 +1653,11 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
     uint8_t root[32], want[32];
     int err = 0;
     pthread_mutex_lock(&j->mu);
+    if (j->finished || j->final_status) { /* the job already ended or a sibling failed: do nothing more */
+        lf->committing = 0;
+        pthread_mutex_unlock(&j->mu);
+        return;
+    }
     if (cfg->crash_at == AVA1_CRASH_BEFORE_COMMIT) {
         pthread_mutex_unlock(&j->mu);
         ava1_apply_crash(j);
