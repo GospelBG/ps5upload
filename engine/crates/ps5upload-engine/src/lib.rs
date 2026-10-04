@@ -105,9 +105,9 @@ use ps5upload_core::{
     },
     transfer::{
         inspect_7z, inspect_zip, sevenz_plan_preview, transfer_7z_resumable,
-        transfer_dir_resumable, transfer_file_list_multistream, transfer_file_list_resumable,
-        transfer_zip_resumable, zip_plan_preview, FileListEntry, TransferConfig,
-        DEFAULT_RESUME_RETRIES, DEFAULT_ZIP_ENTRY_RAM_THRESHOLD, TX_FLAG_RESUME,
+        transfer_file_list_multistream, transfer_file_list_resumable, transfer_zip_resumable,
+        zip_plan_preview, FileListEntry, TransferConfig, DEFAULT_RESUME_RETRIES,
+        DEFAULT_ZIP_ENTRY_RAM_THRESHOLD, TX_FLAG_RESUME,
     },
     users::{user_list, UserList},
     volumes::{list_volumes, VolumeList},
@@ -5406,11 +5406,6 @@ async fn transfer_dir_handler(
         Ok(id) => id,
         Err(e) => return json_err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    let initial_flags = if caller_supplied_tx_id {
-        TX_FLAG_RESUME
-    } else {
-        0
-    };
 
     let skip_existing = match req.skip_existing.as_deref() {
         None => None,
@@ -5562,6 +5557,10 @@ async fn transfer_dir_handler(
             files_sent_count,
             total_bytes
         );
+        if fail_job_unless_console_ready(&jobs, &events_tx, job_id, started_at_ms, &addr) {
+            fail_guard.mark_succeeded();
+            return;
+        }
         if fail_job_if_capacity_insufficient(
             &jobs,
             &events_tx,
@@ -5635,21 +5634,8 @@ async fn transfer_dir_handler(
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
         cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
-        // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes. Folder uploads
-        // previously used only 2 retries while single-file used 5, so a single
-        // transient blip (or the payload's serial accept loop briefly busy
-        // draining the dropped connection) killed a multi-hour folder upload.
-        // Now on equal footing with single-file + headroom. See
-        // DEFAULT_RESUME_RETRIES.
-        // AVA1 (Task 22) or FTX2 for this job. The probe may take up to
-        // ~3 s on the first AUTO job per console; it runs here, on the
-        // blocking thread, and its session is reused by the transfer.
-        let use_ava1 = ps5upload_ava1::route::use_ava1(&addr);
-        crate::log_info!(
-            "transfer_dir: job={job_id} protocol={}",
-            if use_ava1 { "ava1" } else { "ftx2" }
-        );
-        if use_ava1 && skip_existing.is_some() {
+        crate::log_info!("transfer_dir: job={job_id} protocol=ava1");
+        if skip_existing.is_some() {
             let hashed = Arc::new(AtomicU64::new(0));
             cfg.progress_verify = Some(Arc::clone(&hashed));
             spawn_verify_stage(
@@ -5661,29 +5647,18 @@ async fn transfer_dir_handler(
                 Arc::clone(&_stop_guard.0),
             );
         }
-        let result = if use_ava1 {
-            // Resume is by job_id (the sender reopens with JobOpen); retries
-            // live in the adapter's loop, so no flags/retry count here (C3).
-            match skip_existing {
-                // The user's "skip existing" choice: the receiver compares (SPEC §11.4).
-                Some(mode) => ps5upload_ava1::upload::upload_dir_skip_existing(
-                    &cfg,
-                    tx_id,
-                    &req.dest_root,
-                    &src_path,
-                    mode,
-                ),
-                None => ps5upload_ava1::upload::upload_dir(&cfg, tx_id, &req.dest_root, &src_path),
-            }
-        } else {
-            transfer_dir_resumable(
+        // Resume is by job_id (the sender reopens with JobOpen); retries live in the
+        // adapter's loop.
+        let result = match skip_existing {
+            // The user's "skip existing" choice: the receiver compares (SPEC §11.4).
+            Some(mode) => ps5upload_ava1::upload::upload_dir_skip_existing(
                 &cfg,
                 tx_id,
                 &req.dest_root,
                 &src_path,
-                DEFAULT_RESUME_RETRIES,
-                initial_flags,
-            )
+                mode,
+            ),
+            None => ps5upload_ava1::upload::upload_dir(&cfg, tx_id, &req.dest_root, &src_path),
         };
         let skipped_files_count: u64 = 0;
         let skipped_bytes_count: u64 = 0;

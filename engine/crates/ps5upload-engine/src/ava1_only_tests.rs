@@ -64,6 +64,37 @@ async fn no_ava1_listener_surfaces_helper_not_running() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+const NOT_RUNNING: &str = "The PS5 helper is not running or is an old version. Send the helper again from the Connection screen.";
+
+async fn assert_helper_not_ava1(jobs: &Arc<Mutex<HashMap<Uuid, JobState>>>) {
+    let (error, reason, _) = wait_failed(jobs).await;
+    assert_eq!(reason.as_deref(), Some("helper_not_ava1"), "{error}");
+    assert_eq!(error, NOT_RUNNING);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transfer_dir_with_no_ava1_listener_is_helper_not_ava1() {
+    let dir = std::env::temp_dir().join(format!("p5-ava1only-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.bin"), b"hello").unwrap();
+    let jobs: Arc<Mutex<HashMap<Uuid, JobState>>> = Arc::new(Mutex::new(HashMap::new()));
+    let req = TransferDirReq {
+        addr: Some("127.0.0.1:9113".to_string()),
+        tx_id: None,
+        dest_root: "/data/x".to_string(),
+        src_dir: dir.to_string_lossy().into_owned(),
+        excludes: vec![],
+        bandwidth_cap_mbps: None,
+        skip_existing: None,
+    };
+    let resp = transfer_dir_handler(State(state_for(&jobs)), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_helper_not_ava1(&jobs).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A console that has not accepted this app fails with `not_paired` (the pairing dialog's
 /// trigger), as a job failure and as a management refusal.
 #[test]
