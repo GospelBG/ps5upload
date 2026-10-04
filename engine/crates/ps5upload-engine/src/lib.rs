@@ -9391,7 +9391,11 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
     let app = if let Ok(base) = std::env::var("PS5UPLOAD_BASE_URL") {
         let base = base.trim_end_matches('/');
         if !base.is_empty() {
-            let base = if !base.starts_with('/') { format!("/{}", base) } else { base.to_string() };
+            let base = if !base.starts_with('/') {
+                format!("/{}", base)
+            } else {
+                base.to_string()
+            };
             axum::Router::new().nest(&base, app)
         } else {
             app
