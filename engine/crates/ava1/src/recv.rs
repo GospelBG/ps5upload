@@ -737,7 +737,7 @@ fn proto(e: impl std::fmt::Display) -> SendError {
 /// (`ERR_PATH`). Used for manifest validation on the receiver path.
 fn wire_path(e: manifest::PathError) -> SendError {
     let status = match e {
-        manifest::PathError::Gap(_) => gen::ERR_PROTOCOL,
+        manifest::PathError::Gap(_) | manifest::PathError::SizeOverflow => gen::ERR_PROTOCOL,
         _ => gen::ERR_PATH,
     };
     SendError::Refused {
