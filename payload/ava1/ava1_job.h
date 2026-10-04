@@ -124,6 +124,7 @@ struct ava1_job {
     uint32_t usw_head, usw_n, usw_cap;
     uint32_t unswept_n;             /* usw + the ones a sweep holds */
     uint64_t unswept_bytes;         /* pack bytes of files not yet swept (pending ones included) */
+    int ub_excluded;                /* those bytes do not count against the cross-job cap (a sticky sweep error, a recovery pass) */
     uint32_t sweeps_inflight;       /* sweeps queued or running (a compaction waits for none) */
     int sweep_queued, settled;
     uint32_t sweep_fail_n;          /* consecutive failed sweeps */

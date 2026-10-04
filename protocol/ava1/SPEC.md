@@ -944,7 +944,12 @@ the unswept files cannot be settled first (the sweep queue names ids, which the 
 Nobody holding the job. A job directory that holds a pack log is never garbage-collected. A settling job that is
 reaped (after the park age) is destroyed with its log on disk; the receiver's housekeeping takes such directories (and
 those a crash left) through the same recovery as `JobOpen`, a bounded number per pass, every few seconds and at start.
-Beside the per-job `UNSWEPT_MAX` there is a cap across jobs (512 MiB).
+Beside the per-job `UNSWEPT_MAX` there is a cap across jobs (512 MiB); it gates a job only past its own share (4 MiB),
+and the bytes of a job in a sticky sweep error, or of a recovery pass, do not count against the others. Recovery runs on a
+thread of its own (the reaper is never held up), takes a bounded number of directories per pass and moves on from one it
+cannot settle, so a stuck directory never starves the rest; while it holds a job id a `JobOpen` for it is answered
+`BUSY` (the sender retries and then resumes). A log nobody could recover is garbage-collected a week after the normal
+age, with a log line.
 
 ## 16. Governor
 

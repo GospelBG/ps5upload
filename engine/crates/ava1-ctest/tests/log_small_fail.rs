@@ -364,7 +364,7 @@ fn a_reaped_settling_job_is_recovered_by_housekeeping_not_lost() {
 }
 
 #[test]
-fn gc_never_removes_a_job_directory_that_holds_a_log() {
+fn gc_never_removes_a_job_directory_that_holds_a_log_until_a_long_ceiling() {
     let t = tmp("gc");
     std::fs::create_dir_all(t.join("dest")).unwrap();
     let m = small(10, false);
@@ -390,11 +390,35 @@ fn gc_never_removes_a_job_directory_that_holds_a_log() {
     assert!(packs(&jobs, 7) > 0);
     // a second, idle directory with no log is collected as before
     std::fs::create_dir_all(jobs.join("00000000000000000000000000000001")).unwrap();
-    let removed = jobs_gc(&jobs, 30 * 86_400, 86_400);
+    let removed = jobs_gc(&jobs, 3 * 86_400, 86_400);
     assert_eq!(removed, 1, "only the directory without a log goes");
     assert!(
         job_dir(&jobs, &[7; 16]).exists(),
         "gc removed a job that still holds its log"
+    );
+    // a log that recovery could not settle in a week beyond the normal age is given up on, and says so
+    let removed = jobs_gc(&jobs, 20 * 86_400, 86_400);
+    assert_eq!(removed, 1, "the ceiling never came");
+    assert!(!job_dir(&jobs, &[7; 16]).exists());
+}
+
+#[test]
+fn a_directory_recovery_cannot_open_is_kept_for_a_while_and_then_given_up() {
+    let t = tmp("gc-unopenable");
+    let jobs = t.join("jobs");
+    let d = jobs.join("abababababababababababababababab");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("journal"), b"not a journal").unwrap(); // peek fails: recovery cannot open it
+    std::fs::write(d.join("pack.0"), b"AVA1PCK1").unwrap();
+    assert_eq!(
+        jobs_gc(&jobs, 3 * 86_400, 86_400),
+        0,
+        "kept: it holds a log"
+    );
+    assert_eq!(
+        jobs_gc(&jobs, 20 * 86_400, 86_400),
+        1,
+        "given up after the ceiling"
     );
 }
 
@@ -659,4 +683,187 @@ fn after_crash_point_10_the_sweep_was_durable_and_its_files_are_whole() {
         );
     }
     drop(r);
+}
+
+// ---- review dbl round 2 ----------------------------------------------------------------------
+
+fn bad_dir(t: &Path, byte: u8) {
+    // a crashed job whose manifest is gone: its journal opens (so recovery tries it) but it cannot load
+    crashed_dir(t, byte);
+    let hex = job_dir(&t.join(format!("jobs{byte}")), &[byte; 16]);
+    std::fs::remove_file(hex.join("manifest")).unwrap();
+    std::fs::rename(&hex, job_dir(&t.join("jobs"), &[byte; 16])).unwrap();
+}
+
+#[test]
+fn directories_that_cannot_be_recovered_do_not_starve_the_ones_that_can() {
+    let t = tmp("starve");
+    let jobs = t.join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    for b in [1u8, 2, 3, 4, 5, 6, 7, 8] {
+        bad_dir(&t, b);
+    }
+    crashed_dir(&t, 0xd0);
+    std::fs::rename(
+        job_dir(&t.join("jobs208"), &[0xd0; 16]),
+        job_dir(&jobs, &[0xd0; 16]),
+    )
+    .unwrap();
+    let opts = LogOpts {
+        recover_max: 1,
+        recover_every_ms: 150,
+        job_byte: 0x9a,
+        ..slow()
+    };
+    let r = CRecv::open_opts(&jobs, &t.join("dest9a"), 0, gen::POLICY_REPLACE, 0, opts);
+    let t0 = std::time::Instant::now();
+    while packs(&jobs, 0xd0) > 0 {
+        assert!(
+            t0.elapsed().as_secs() < 40,
+            "eight unrecoverable directories blocked the recoverable one forever"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(r);
+}
+
+#[test]
+fn a_jobopen_during_a_recovery_pass_is_told_to_retry_and_then_resumes() {
+    let t = tmp("openrace");
+    let jobs = t.join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    crashed_dir(&t, 1);
+    let opts = LogOpts {
+        recover_every_ms: 200,
+        job_byte: 9,
+        ..slow()
+    };
+    let r = CRecv::open_opts(&jobs, &t.join("dest9"), 0, gen::POLICY_REPLACE, 0, opts);
+    // the data layer is up with nothing to recover; the crashed directory appears now, and its recovery
+    // is slow: four sweep failures cost ~750 ms of retries
+    r.fail_sweeps(4);
+    std::fs::rename(
+        job_dir(&t.join("jobs1"), &[1; 16]),
+        job_dir(&jobs, &[1; 16]),
+    )
+    .unwrap();
+    let dest = t.join("dest1");
+    let (mut busy, mut other, mut ticks_in_pass) = (0, vec![], 0);
+    let t0 = std::time::Instant::now();
+    // housekeeping's pass has started once a sweep of the recovery has failed (and is being retried)
+    while sweep_failures_left() == 4 {
+        assert!(
+            t0.elapsed().as_secs() < 10,
+            "housekeeping never began the pass"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    loop {
+        assert!(
+            t0.elapsed().as_secs() < 30,
+            "never resumed: busy {busy} other {other:?}"
+        );
+        assert_eq!(
+            unswept_total(),
+            0,
+            "a recovery throwaway's bytes count against the cap"
+        );
+        match probe_open(1, &dest) {
+            0 => break,
+            s if s == gen::ERR_BUSY as i32 => {
+                if busy == 0 {
+                    ticks_in_pass = house_ticks();
+                }
+                busy += 1;
+            }
+            s => other.push(s),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    assert!(
+        other.is_empty(),
+        "a JobOpen in the window was answered {other:?}, not BUSY"
+    );
+    assert!(
+        busy > 0,
+        "the window was never seen (the recovery pass was too quick)"
+    );
+    // the reaper kept running while recovery did (recovery has its own thread)
+    assert!(
+        house_ticks() - ticks_in_pass >= 4,
+        "housekeeping stalled behind the recovery pass ({} ticks since it began)",
+        house_ticks() - ticks_in_pass
+    );
+    all_files(&dest, 10);
+    drop(r);
+}
+
+fn all_files(dest: &Path, n: usize) {
+    for i in 0..n {
+        assert_eq!(
+            std::fs::read(dest.join(format!("d/{i}"))).unwrap(),
+            body(i),
+            "file {i}"
+        );
+    }
+}
+
+#[test]
+fn a_healthy_job_is_not_gated_by_other_jobs_stuck_log_bytes() {
+    let t = tmp("pinned");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    pin_unswept_total(600 << 20); // other jobs hold more than the 512 MiB cap (their sweeps keep failing)
+    let job = CApplyJob::begin_opts(
+        &t.join("jobs"),
+        &root,
+        0,
+        &small(50, false),
+        0,
+        0,
+        LogOpts::ON,
+    );
+    for i in 0..50 {
+        send(&job, i);
+    }
+    let r = job.wait(20_000);
+    pin_unswept_total(-(600 << 20));
+    assert_eq!(
+        r,
+        0,
+        "the job stalled behind other jobs' bytes: {}",
+        job.events()
+    );
+    settled(&job, 20);
+}
+
+#[test]
+fn a_job_in_a_sticky_sweep_error_does_not_count_against_the_others() {
+    let t = tmp("excluded");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let job = CApplyJob::begin_opts(
+        &t.join("jobs"),
+        &root,
+        0,
+        &small(20, false),
+        0,
+        0,
+        LogOpts::ON,
+    );
+    job.fail_sweeps(-1);
+    for i in 0..20 {
+        send(&job, i);
+    }
+    assert_eq!(job.wait(15_000), 0, "{}", job.events());
+    job.wait_event(&format!("status code={}", gen::ERR_IO), 20_000);
+    assert!(job.unswept_bytes() > 0);
+    assert_eq!(
+        unswept_total(),
+        0,
+        "a stuck job's bytes keep other jobs waiting"
+    );
+    job.fail_sweeps(0);
+    settled(&job, 20);
+    assert_eq!(unswept_total(), 0);
 }

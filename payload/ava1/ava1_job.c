@@ -218,7 +218,7 @@ static void job_destroy(ava1_job_t *j) {
     ava1_pend_release(j->pend_n_fd);
     for (i = 0; i < j->npsegs; i++)
         if (j->psegs[i].fd >= 0) close(j->psegs[i].fd); /* the files stay: recovery sweeps them */
-    ava1_unswept_add(-(int64_t)j->unswept_bytes); /* the cross-job cap no longer counts what this job held */
+    if (!j->ub_excluded) ava1_unswept_add(-(int64_t)j->unswept_bytes); /* the cross-job cap no longer counts what this job held */
     free(j->psegs);
     free(j->usw);
     free(j->pend_loc);

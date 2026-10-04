@@ -47,7 +47,7 @@ static struct {
     int bg;            /* ava1_data_spawn threads running */
     int fb;            /* Received waiting-sends spawned (bounded, see RECV_FB_MAX) */
     volatile int running;
-    pthread_t house;
+    pthread_t house, recover;
 } D = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
 
 const ava1_data_cfg_t *ava1_data_cfg(void) { return &D.cfg; }
@@ -116,19 +116,31 @@ void ava1_unswept_add(int64_t delta) {
 }
 uint64_t ava1_unswept_total(void) { return __atomic_load_n(&g_unswept_total, __ATOMIC_RELAXED); }
 
+unsigned ava1_house_ticks;
+
 static void *house_main(void *arg) {
-    uint64_t last_recover = ava1_mono_ms();
+    (void)arg;
+    while (D.running) {
+        __atomic_add_fetch(&ava1_house_ticks, 1, __ATOMIC_RELAXED);
+        ava1_job_reap(ava1_mono_ms());
+        ava1_platform_sleep_ms(100);
+    }
+    return NULL;
+}
+
+/* A reaped settling job, or one a crash left, has its log recovered here: the only copy of its files must
+ * never wait for the next helper start. A thread of its own, so a slow recovery (a sweep that keeps failing,
+ * a large log) never delays the reaper. */
+static void *recover_main(void *arg) {
+    uint64_t last = ava1_mono_ms();
     (void)arg;
     while (D.running) {
         uint64_t now = ava1_mono_ms();
-        ava1_job_reap(now);
-        /* A reaped settling job, or one a crash left, has its log recovered here: the only copy of its
-         * files must never wait for the next helper start. */
-        if (D.cfg.jobs_dir[0] && now - last_recover >= D.cfg.recover_every_ms) {
-            last_recover = now;
+        if (D.cfg.jobs_dir[0] && now - last >= D.cfg.recover_every_ms) {
             (void)ava1_recv_recover_pass(D.cfg.jobs_dir, D.cfg.recover_max);
+            last = ava1_mono_ms();
         }
-        ava1_platform_sleep_ms(100);
+        ava1_platform_sleep_ms(50);
     }
     return NULL;
 }
@@ -307,6 +319,11 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
         D.running = 0;
         return -EAGAIN;
     }
+    if (ava1_thread_start(recover_main, NULL, &D.recover) != 0) {
+        D.running = 0;
+        pthread_join(D.house, NULL);
+        return -EAGAIN;
+    }
     /* A helper that died (or was stopped) with files not yet durable in place finishes them now,
      * before any session can ask: re-materialise from the pack log and sweep. */
     if (D.cfg.jobs_dir[0]) (void)ava1_recv_recover_pass(D.cfg.jobs_dir, D.cfg.recover_max);
@@ -320,6 +337,7 @@ void ava1_data_stop(void) {
     while (D.bg) pthread_cond_wait(&D.cv, &D.mu);
     pthread_mutex_unlock(&D.mu);
     pthread_join(D.house, NULL);
+    pthread_join(D.recover, NULL);
     ava1_job_free_all();
 }
 

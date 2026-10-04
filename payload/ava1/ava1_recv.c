@@ -336,24 +336,39 @@ static int load_from_disk(ava1_job_t *j) {
     return 0;
 }
 
-/* One recovery pass (SPEC.md §15.7): up to `max` job directories under `jobs_dir` that hold a pack log and
- * nobody has open. Each is loaded into a throwaway job exactly as a JobOpen would load it (load_from_disk
- * runs the recovery) and freed again; a directory whose job is listed (create refuses its id) is skipped.
- * Bounded so a start never replays a whole disk of journals: housekeeping takes the rest. Returns how many
- * it took. */
+/* The owner key recovery's throwaway jobs carry: all zero, which no peer's public key is. */
+static int owner_is_recovery(const uint8_t owner[32]) {
+    static const uint8_t zero[32];
+    return memcmp(owner, zero, 32) == 0;
+}
+
+static int name_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
+
+/* One recovery pass (SPEC.md §15.7): job directories under `jobs_dir` that hold a pack log and nobody has
+ * open. Each is loaded into a throwaway job exactly as a JobOpen would load it (load_from_disk runs the
+ * recovery) and freed again; a directory whose job is listed (create refuses its id) is skipped. Bounded so
+ * a start never replays a whole disk of journals: it stops after `max` directories that settled (their log is
+ * gone) or 2*max that were tried, and the next pass starts after the last one tried, so a directory that
+ * cannot be recovered never starves the ones behind it. While a throwaway is listed a JobOpen for its id is
+ * answered BUSY. Returns how many settled. */
 uint32_t ava1_recv_recover_pass(const char *jobs_dir, uint32_t max) {
     static pthread_mutex_t pass_mu = PTHREAD_MUTEX_INITIALIZER;
+    static uint32_t cursor;
+    enum { MAX_CAND = 512 };
+    static const uint8_t zero_owner[32];
+    char (*names)[33] = NULL;
+    uint32_t n = 0, settled = 0, tried = 0, start, k;
     DIR *dp;
     struct dirent *de;
-    static const uint8_t zero_owner[32];
-    uint32_t took = 0;
     if (pthread_mutex_trylock(&pass_mu) != 0) return 0; /* another pass is running */
+    if (!(names = malloc(MAX_CAND * sizeof *names))) {
+        pthread_mutex_unlock(&pass_mu);
+        return 0;
+    }
     dp = opendir(jobs_dir);
-    while (dp && took < max && (de = readdir(dp)) != NULL) {
-        uint8_t id[16], buf[AVA1_MAX_PATH + 256];
+    while (dp && n < MAX_CAND && (de = readdir(dp)) != NULL) {
         char dir[sizeof ((ava1_job_t *)0)->dir];
-        ava1_jnl_open_t o;
-        ava1_job_t *j;
+        uint8_t id[16];
         size_t i;
         if (strlen(de->d_name) != 32) continue;
         for (i = 0; i < 16; i++) {
@@ -363,23 +378,46 @@ uint32_t ava1_recv_recover_pass(const char *jobs_dir, uint32_t max) {
         }
         if (i != 16) continue;
         ava1_job_dir(jobs_dir, id, dir, sizeof dir);
-        if (!ava1_dir_has_pack(dir)) continue;
-        if (ava1_jnl_peek_open(dir, buf, sizeof buf, &o) != 0 || o.kind != AVA1_JOB_UPLOAD || o.root_len >= AVA1_MAX_PATH)
+        if (ava1_dir_has_pack(dir)) memcpy(names[n++], de->d_name, 33);
+    }
+    if (dp) closedir(dp);
+    qsort(names, n, sizeof *names, name_cmp);
+    start = n ? cursor % n : 0;
+    for (k = 0; k < n && settled < max && tried < 2u * max; k++) {
+        uint32_t at = (start + k) % n;
+        uint8_t id[16], buf[AVA1_MAX_PATH + 256];
+        char dir[sizeof ((ava1_job_t *)0)->dir];
+        ava1_jnl_open_t o;
+        ava1_job_t *j;
+        size_t i;
+        for (i = 0; i < 16; i++) {
+            unsigned v;
+            (void)sscanf(names[at] + 2 * i, "%2x", &v);
+            id[i] = (uint8_t)v;
+        }
+        ava1_job_dir(jobs_dir, id, dir, sizeof dir);
+        cursor = at + 1; /* the next pass starts behind this one, whatever came of it */
+        tried++;
+        if (ava1_jnl_peek_open(dir, buf, sizeof buf, &o) != 0 || o.kind != AVA1_JOB_UPLOAD || o.root_len >= AVA1_MAX_PATH) {
+            fprintf(stderr, "[ava1] recovery: %s holds a log but its journal cannot be opened; left for the GC ceiling\n", names[at]);
             continue;
-        if (!(j = ava1_job_create(id, zero_owner))) continue;
+        }
+        if (!(j = ava1_job_create(id, zero_owner))) continue; /* listed: a real session owns it */
         j->kind = o.kind;
         j->flags = o.flags;
         memcpy(j->root, o.root, o.root_len);
         j->root[o.root_len] = 0;
         snprintf(j->dir, sizeof j->dir, "%s", dir);
+        j->ub_excluded = 1; /* a throwaway's log bytes are no other job's business (the cross-job cap) */
         (void)load_from_disk(j); /* recovers; a job that is not ours or has nothing unswept changes nothing */
         ava1_job_free_one(j->id);
         ava1_job_put(j);
-        took++;
+        if (!ava1_dir_has_pack(dir)) settled++;
+        else fprintf(stderr, "[ava1] recovery: %s still holds its log; tried again later\n", names[at]);
     }
-    if (dp) closedir(dp);
+    free(names);
     pthread_mutex_unlock(&pass_mu);
-    return took;
+    return settled;
 }
 
 /* ---- messages ---------------------------------------------------------------------- */
@@ -497,6 +535,12 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
         return refuse(ack, AVA1_ERR_PATH, msg, cap, "writing there is not allowed");
     if (s->entries > AVA1_MAX_ENTRIES) return refuse(ack, AVA1_ERR_PROTOCOL, msg, cap, "the manifest has too many entries");
     j = ava1_job_find(s->id);
+    if (j && owner_is_recovery(j->owner)) {
+        /* recovery's throwaway job (housekeeping, seconds at most): the sender retries on BUSY and then
+         * resumes a settled job, instead of being told the job belongs to another device */
+        ava1_job_put(j);
+        return refuse(ack, AVA1_ERR_BUSY, msg, cap, "the console is finishing this job's files; try again");
+    }
     if (j && memcmp(j->owner, s->owner, 32) != 0) {
         ava1_job_put(j);
         return refuse(ack, AVA1_ERR_UNKNOWN_JOB, msg, cap, "this job belongs to another device");
@@ -550,7 +594,7 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
         peek_staged = peeked ? o.staged : 0;
     }
     j = ava1_job_create_attached(s->id, s->owner, s->sid);
-    if (!j) return refuse(ack, AVA1_ERR_BUSY, msg, cap, "too many jobs");
+    if (!j) return refuse(ack, AVA1_ERR_BUSY, msg, cap, "too many jobs, or this job is still closing; try again");
     j->kind = s->kind;
     j->policy = s->policy;
     j->flags = s->flags;

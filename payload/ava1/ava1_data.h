@@ -55,6 +55,8 @@ uint32_t ava1_recv_recover_pass(const char *jobs_dir, uint32_t max);
 /* Pack bytes of files not yet swept, all jobs together (the cross-job cap's counter). */
 void ava1_unswept_add(int64_t delta);
 uint64_t ava1_unswept_total(void);
+/* Housekeeping loop iterations since start (tests: a slow recovery must not stall the reaper). */
+extern unsigned ava1_house_ticks;
 
 int ava1_data_start(const ava1_data_cfg_t *cfg);  /* starts housekeeping; 0 or -errno */
 void ava1_data_stop(void);                         /* stops and frees every job */

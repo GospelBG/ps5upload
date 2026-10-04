@@ -352,7 +352,12 @@ pub mod ffi {
         pub fn ava1_test_apply_probe_prep(out: *mut u64);
         pub fn ava1_test_apply_opts2(v: *const u64);
         pub fn ava1_test_sweep_fail(n: c_int);
+        pub fn ava1_test_sweep_fail_left() -> c_int;
         pub fn ava1_test_apply_unswept_bytes() -> u64;
+        pub fn ava1_test_probe_open(byte: u8, root: *const c_char) -> c_int;
+        pub fn ava1_test_house_ticks() -> u32;
+        pub fn ava1_test_unswept_total() -> u64;
+        pub fn ava1_test_unswept_global_add(d: i64);
         pub fn ava1_test_jobs_gc(jobs: *const c_char, age_s: i64, max_age_s: i64) -> c_int;
         pub fn ava1_test_recv_restart_noopen() -> c_int;
         pub fn ava1_test_reap_and_drop();
@@ -2104,6 +2109,33 @@ pub fn sony_hold(ms: u64) -> std::thread::JoinHandle<()> {
     });
     rx.recv().unwrap();
     h
+}
+
+/// A JobOpen for the job whose id is `byte` repeated, root `root`, as a session would send it: 0 when it
+/// opened (the job is freed again), else the refusal's status.
+pub fn probe_open(byte: u8, root: &Path) -> i32 {
+    let r = CString::new(root.to_str().unwrap()).unwrap();
+    unsafe { ffi::ava1_test_probe_open(byte, r.as_ptr()) }
+}
+
+/// Sweep failures still armed (see `sweep_failures`).
+pub fn sweep_failures_left() -> i32 {
+    unsafe { ffi::ava1_test_sweep_fail_left() }
+}
+
+/// Housekeeping loop iterations since the data layer started.
+pub fn house_ticks() -> u32 {
+    unsafe { ffi::ava1_test_house_ticks() }
+}
+
+/// Pack bytes counted against the cross-job cap, all jobs together.
+pub fn unswept_total() -> u64 {
+    unsafe { ffi::ava1_test_unswept_total() }
+}
+
+/// Pins (or releases, negative) bytes on the cross-job counter: other jobs' stuck log bytes.
+pub fn pin_unswept_total(delta: i64) {
+    unsafe { ffi::ava1_test_unswept_global_add(delta) }
 }
 
 /// The next `n` file syncs of any console sweep fail with EIO (-1: until set to 0): the wire tests' lever for a

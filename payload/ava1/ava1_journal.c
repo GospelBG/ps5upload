@@ -382,6 +382,8 @@ int ava1_dir_has_pack(const char *dir) {
     return has;
 }
 
+#define AVA1_PACK_GC_GRACE_S (7 * 86400)
+
 int ava1_jobs_gc(const char *jobs_dir, int64_t now_unix, int64_t max_age_s) {
     DIR *d = opendir(jobs_dir);
     struct dirent *e;
@@ -399,7 +401,14 @@ int ava1_jobs_gc(const char *jobs_dir, int64_t now_unix, int64_t max_age_s) {
         if (stat(jp, &js) == 0 && (int64_t)js.st_mtime > last) last = (int64_t)js.st_mtime;
         /* A directory with a pack log holds the only copy of files not yet durable in place: never collected,
          * however old (recovery finishes it, and its journal's Done then lets the pack go). */
-        if (now_unix - last > max_age_s && !ava1_dir_has_pack(p) && rm_tree(p) == 0) n++;
+        if (now_unix - last > max_age_s) {
+            int packed = ava1_dir_has_pack(p);
+            /* ... and a week past the normal age even a log is given up on: recovery has had every pass since
+             * (a directory it cannot open, or that keeps failing, must not hold its segments forever) */
+            if (packed && now_unix - last <= max_age_s + AVA1_PACK_GC_GRACE_S) continue;
+            if (packed) fprintf(stderr, "[ava1] gc: giving up on %s: its log was never recovered\n", e->d_name);
+            if (rm_tree(p) == 0) n++;
+        }
     }
     closedir(d);
     return n;

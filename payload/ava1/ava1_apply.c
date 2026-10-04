@@ -881,6 +881,27 @@ static uint8_t *pack_frame(const ava1_bundle_record_t *r, size_t *n) {
     return buf;
 }
 
+/* The job's unswept bytes and the cross-job counter move together, except while the job is excluded from the
+ * cap (a sticky sweep error, or a recovery pass's throwaway): then only the job's own count moves, so a stuck
+ * job's bytes never keep other jobs waiting. Caller holds j->mu. */
+static void ub_delta_locked(ava1_job_t *j, int64_t d) {
+    if (d >= 0) {
+        j->unswept_bytes += (uint64_t)d;
+    } else {
+        uint64_t sub = (uint64_t)(-d);
+        if (sub > j->unswept_bytes) sub = j->unswept_bytes;
+        j->unswept_bytes -= sub;
+        d = -(int64_t)sub;
+    }
+    if (!j->ub_excluded) ava1_unswept_add(d);
+}
+
+static void ub_exclude_locked(ava1_job_t *j, int on) {
+    if (on == j->ub_excluded) return;
+    ava1_unswept_add(on ? -(int64_t)j->unswept_bytes : (int64_t)j->unswept_bytes);
+    j->ub_excluded = on;
+}
+
 /* Drops one file's claim on its segment (caller holds j->mu); a closed segment nobody claims is
  * deleted (I3: its files are swept and the sweep is journaled, or they never were journaled). */
 static void pack_unref_locked(ava1_job_t *j, uint32_t seg, uint32_t len) {
@@ -888,11 +909,7 @@ static void pack_unref_locked(ava1_job_t *j, uint32_t seg, uint32_t len) {
     if (seg >= j->npsegs) return;
     p = &j->psegs[seg];
     if (p->nusw) p->nusw--;
-    {
-        uint64_t sub = j->unswept_bytes >= len ? len : j->unswept_bytes;
-        j->unswept_bytes -= sub;
-        ava1_unswept_add(-(int64_t)sub);
-    }
+    ub_delta_locked(j, -(int64_t)len);
     if (p->closed && !p->nusw && !p->removed) {
         char path[PATH_CAP];
         if (p->fd >= 0) close(p->fd);
@@ -987,8 +1004,7 @@ static int pack_append(ava1_job_t *j, const ava1_bundle_record_t *r, ava1_ploc_t
     off = j->psegs[seg].tail;
     j->psegs[seg].tail += n;
     j->psegs[seg].nusw++;
-    j->unswept_bytes += n;
-    ava1_unswept_add((int64_t)n);
+    ub_delta_locked(j, (int64_t)n);
     pthread_mutex_unlock(&j->mu);
     if ((rc = pwrite_all(fd, rec, n, off)) != 0) {
         pthread_mutex_lock(&j->mu);
@@ -1108,9 +1124,12 @@ static int apply_record_logged(ava1_job_t *j, const ava1_bundle_record_t *r, con
         stop = j->stopping || j->finished || j->final_status;
         pthread_mutex_unlock(&j->mu);
         if (stop) return 0;
-        if (b + r->data_len + 128u <= cfg->unswept_max &&
-            ava1_unswept_total() + r->data_len + 128u <= cfg->unswept_total)
-            break;
+        /* The cross-job cap gates a job only past its own share (4 MiB, or half the cap when that is smaller):
+         * a job that holds little is never held up by other jobs' bytes, however stuck they are. */
+        {
+            uint64_t need = r->data_len + 128u, floor = cfg->unswept_total / 2 < (4ull << 20) ? cfg->unswept_total / 2 : (4ull << 20);
+            if (b + need <= cfg->unswept_max && (b < floor || ava1_unswept_total() + need <= cfg->unswept_total)) break;
+        }
         if (sweep_step(j, 1) <= 0) pend_gate_idle(j);
     }
     if ((rc = pack_append(j, r, &loc)) != 0) return rc;
@@ -1697,6 +1716,7 @@ static int sweep_step(ava1_job_t *j, int force) {
         j->sweep_fail_n = 0;
         j->sweep_err = 0;
         j->sweep_msg[0] = 0;
+        ub_exclude_locked(j, 0);
     } else if (!j->stopping) {
         /* A failed sweep loses nothing: the files go back to the front of the queue and are tried again
          * after a backoff. After SWEEP_FAIL_MAX in a row the error is sticky (Status reports it) and a job
@@ -1707,6 +1727,7 @@ static int sweep_step(ava1_job_t *j, int force) {
         if (j->sweep_fail_n >= SWEEP_FAIL_MAX && rc > 0) {
             int first = !j->sweep_err;
             j->sweep_err = rc;
+            ub_exclude_locked(j, 1); /* its bytes stop counting against the other jobs' cap */
             snprintf(j->sweep_msg, sizeof j->sweep_msg, "making files durable on the console failed: %s", strerror(rc));
             if (first)
                 fprintf(stderr, "[ava1] job %02x%02x%02x%02x: %s\n", j->id[0], j->id[1], j->id[2], j->id[3], j->sweep_msg);
@@ -1763,8 +1784,7 @@ static void pack_forget_all(ava1_job_t *j) {
         }
     }
     j->npsegs = 0;
-    ava1_unswept_add(-(int64_t)j->unswept_bytes);
-    j->unswept_bytes = 0;
+    ub_delta_locked(j, -(int64_t)j->unswept_bytes);
     pthread_mutex_unlock(&j->mu);
 }
 
@@ -1849,8 +1869,7 @@ int ava1_pack_recover(ava1_job_t *j, const ava1_bits_t *unswept, const ava1_pack
                         j->usw[j->usw_head + j->usw_n++] = u;
                         j->psegs[seg].nusw++;
                         j->unswept_n++;
-                        j->unswept_bytes += u.len;
-                        ava1_unswept_add((int64_t)u.len);
+                        ub_delta_locked(j, (int64_t)u.len);
                     } else {
                         rc = -1;
                     }

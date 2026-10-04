@@ -1459,6 +1459,9 @@ void ava1_test_apply_probe_prep(uint64_t out[3]) {
 /* Each directory sync the apply engine reports (hooks 7 and 10) then takes `ms` more. */
 void ava1_test_apply_hook_sleep(uint32_t ms) { __atomic_store_n(&g_hook_sleep_ms, ms, __ATOMIC_SEQ_CST); }
 
+unsigned ava1_test_house_ticks(void) { return __atomic_load_n(&ava1_house_ticks, __ATOMIC_RELAXED); }
+uint64_t ava1_test_unswept_total(void) { return ava1_unswept_total(); }
+void ava1_test_unswept_global_add(int64_t d) { ava1_unswept_add(d); }
 uint64_t ava1_test_apply_unswept_bytes(void) {
     uint64_t n;
     if (!g_job) return 0;
@@ -1507,6 +1510,7 @@ void ava1_test_apply_trace(int on) { __atomic_store_n(&g_trace, on, __ATOMIC_SEQ
 
 static uint32_t g_fault_id = UINT32_MAX - 1; /* no file: no fault */
 static int g_sweep_fail_n; /* sweeps' file syncs fail with EIO this many times (-1: until cleared) */
+int ava1_test_sweep_fail_left(void) { return __atomic_load_n(&g_sweep_fail_n, __ATOMIC_SEQ_CST); }
 void ava1_test_sweep_fail(int n) { __atomic_store_n(&g_sweep_fail_n, n, __ATOMIC_SEQ_CST); }
 static int t_fault(ava1_job_t *j, int point, uint32_t id) {
     (void)j;
@@ -1932,6 +1936,28 @@ int ava1_test_recv_open(const char *jobs_dir, const char *root, uint32_t flags, 
 uint8_t ava1_test_recv_staged(void) { return g_ack.staged; }
 
 /* A payload restart: every job and thread gone, the disk kept. */
+/* A JobOpen for job id byte*16 (root `root`, the kinds/flags of the last open) as a session would send it: 0 if it
+ * opened (the job is freed again), else the refusal's status. */
+int ava1_test_probe_open(uint8_t byte, const char *root) {
+    ava1_recv_spec_t s;
+    ava1_job_open_ack_t ack;
+    char msg[160];
+    ava1_job_t *j;
+    memset(&s, 0, sizeof s);
+    memset(s.id, byte, 16);
+    memcpy(s.owner, TEST_OWNER, 32);
+    s.owner[0] = (uint8_t)g_owner;
+    s.kind = AVA1_JOB_UPLOAD;
+    s.policy = g_policy;
+    s.flags = g_flags;
+    s.root = root;
+    s.emit = rec_emit;
+    j = ava1_recv_open(&s, &ack, msg, sizeof msg);
+    if (!j) return (int)ack.status;
+    ava1_job_free_one(j->id);
+    ava1_job_put(j);
+    return 0;
+}
 /* A helper restart where no JobOpen follows: only the start-time recovery runs. 0, or the start's error. */
 int ava1_test_recv_restart_noopen(void) {
     if (g_job) ava1_job_put(g_job);
