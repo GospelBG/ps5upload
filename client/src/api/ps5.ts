@@ -4256,6 +4256,11 @@ export function humanizeJobErrorReason(
         "joberr.size_mismatch",
         "The transfer didn't finish before being interrupted — a file on the PS5 is incomplete, so it wasn't published (your old copy, if any, is untouched). This usually means the PS5 went into rest mode or lost power mid-upload. Keep the console awake (Settings → System → Power Saving → Set Time Until PS5 Turns Off), then re-run this item — Resume now re-sends only the missing files, or choose Override for a clean copy.",
       );
+    case "ava1_stalled":
+      return trStatic(
+        "joberr.ava1_stalled",
+        "The transfer stopped making progress (the source stopped sending data). Retry; if it repeats, check the source drive or network share.",
+      );
     case "fs_delete_path_not_allowed":
     case "fs_mkdir_path_not_allowed":
     case "fs_list_dir_path_denied":

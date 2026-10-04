@@ -113,6 +113,7 @@ fn opts(jobs: &std::path::Path, ordered: bool) -> RecvOptions {
         ordered,
         progress: Arc::default(),
         cancel: Arc::default(),
+        progress_deadline: None,
     }
 }
 
@@ -205,6 +206,7 @@ impl JobHost for CreditHost {
                 ordered: open.flags & gen::JF_ORDERED != 0,
                 progress: Arc::default(),
                 cancel: Arc::default(),
+                progress_deadline: None,
             };
             let _ = receive_job(&mut link, open, sink, o).await;
         });
@@ -992,4 +994,425 @@ async fn a_sequential_source_uploads_into_a_folder_host() {
             "{p}"
         );
     }
+}
+
+// ---- review 006 #2: the receiver's progress watchdog ---------------------------------
+
+/// A sink that makes every sync batch slow (a slow drive), over a real folder sink.
+struct SlowSyncSink {
+    inner: LocalSink,
+    delay: Duration,
+}
+
+impl Sink for SlowSyncSink {
+    fn prepare(&self, m: &Manifest) -> std::io::Result<()> {
+        self.inner.prepare(m)
+    }
+    fn write_at(&self, id: u32, off: u64, d: &[u8]) -> std::io::Result<()> {
+        self.inner.write_at(id, off, d)
+    }
+    fn write_whole(&self, id: u32, d: &[u8]) -> std::io::Result<()> {
+        self.inner.write_whole(id, d)
+    }
+    fn sync(&self, ids: &[u32]) -> std::io::Result<()> {
+        std::thread::sleep(self.delay);
+        self.inner.sync(ids)
+    }
+    fn read_at(&self, id: u32, off: u64, b: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read_at(id, off, b)
+    }
+    fn commit(&self, id: u32) -> std::io::Result<()> {
+        self.inner.commit(id)
+    }
+    fn finish(&self) -> std::io::Result<()> {
+        self.inner.finish()
+    }
+}
+
+/// Receives with a short progress deadline and reports how the job ended.
+struct DeadlineHost {
+    root: std::path::PathBuf,
+    jobs: std::path::PathBuf,
+    deadline: Duration,
+    sync_delay: Option<Duration>,
+    ended: tokio::sync::mpsc::UnboundedSender<Result<u32, String>>,
+}
+
+impl JobHost for DeadlineHost {
+    fn accept(&self, mut link: JobLink, first: Frame, _peer: [u8; 32]) {
+        let (root, jobs, deadline, delay) = (
+            self.root.clone(),
+            self.jobs.clone(),
+            self.deadline,
+            self.sync_delay,
+        );
+        let ended = self.ended.clone();
+        tokio::spawn(async move {
+            let Ok(open) = first.decode::<JobOpen>() else {
+                return;
+            };
+            let inner = LocalSink::new(root.join(&open.root), false);
+            let sink: Arc<dyn Sink> = match delay {
+                Some(delay) => Arc::new(SlowSyncSink { inner, delay }),
+                None => Arc::new(inner),
+            };
+            let o = RecvOptions {
+                credit: 1 << 20,
+                flags: open.flags,
+                jobs_dir: jobs,
+                ordered: false,
+                progress: Arc::default(),
+                cancel: Arc::default(),
+                progress_deadline: Some(deadline),
+            };
+            let r = receive_job(&mut link, open, sink, o).await;
+            let _ = ended.send(r.map(|r| r.files).map_err(|e| e.to_string()));
+        });
+    }
+}
+
+fn small_files(n: u32) -> Manifest {
+    Manifest {
+        entries: (0..n)
+            .map(|i| Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: 4,
+                mtime: 0,
+                path: format!("f{i}.bin"),
+                root: None,
+            })
+            .collect(),
+    }
+}
+
+async fn deadline_job(
+    tag: &str,
+    job: u8,
+    files: u32,
+    deadline: Duration,
+    sync_delay: Option<Duration>,
+) -> (
+    JobLink,
+    ava1::session::Session,
+    tokio::sync::mpsc::UnboundedReceiver<Result<u32, String>>,
+    std::path::PathBuf,
+    u32,
+) {
+    let d = common::temp_dir(tag);
+    let (ended, rx) = tokio::sync::mpsc::unbounded_channel();
+    let host = Arc::new(DeadlineHost {
+        root: d.join("share"),
+        jobs: d.join("hjobs"),
+        deadline,
+        sync_delay,
+        ended,
+    });
+    let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(host)).await;
+    let s = connect(&addr.to_string(), id, peers, "client", common::fast())
+        .await
+        .unwrap();
+    let mut link = s.job([job; 16]);
+    let m = small_files(files);
+    let (ack, _map) = open_and_map(&mut link, [job; 16], "in", &m).await;
+    assert_eq!(ack.credit, 1 << 20);
+    (link, s, rx, d, files)
+}
+
+/// A sender that heartbeats (the session pings on its own) but never sends file data: the
+/// receiver ends the job with ERR_STALLED instead of waiting on the byte-level watchdog
+/// forever, and says why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sender_that_only_pings_is_cancelled_with_err_stalled() {
+    let (mut link, _s, mut ended, _d, _n) =
+        deadline_job("rr-stall", 0x91, 2, Duration::from_millis(800), None).await;
+    let _lane = link.opener().unwrap().open().await.unwrap();
+    let t0 = std::time::Instant::now();
+    let cancel = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let f = next_control(&mut link).await;
+            if f.ty == gen::JobCancel::TYPE {
+                break f.decode::<gen::JobCancel>().unwrap();
+            }
+        }
+    })
+    .await
+    .expect("the receiver cancelled the stalled job within 10 s");
+    assert_eq!(cancel.reason, gen::ERR_STALLED);
+    assert!(
+        t0.elapsed() >= Duration::from_millis(700),
+        "not before the deadline: {:?}",
+        t0.elapsed()
+    );
+    let why = tokio::time::timeout(Duration::from_secs(5), ended.recv())
+        .await
+        .expect("the receiver returned")
+        .expect("a result")
+        .expect_err("a stalled job is an error");
+    assert!(why.contains("stalled"), "{why}");
+}
+
+/// A slow-but-moving sender is never cut: one small file every half deadline keeps the job
+/// alive across several deadlines and it completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_but_moving_sender_is_not_cut() {
+    let (link, _s, mut ended, d, n) =
+        deadline_job("rr-slow-moving", 0x92, 4, Duration::from_millis(800), None).await;
+    let lane = link.opener().unwrap().open().await.unwrap();
+    for i in 0..n {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        link.lane(lane)
+            .unwrap()
+            .tx
+            .send_raw(Bundle::TYPE, 0, i + 1, bundle_body([0x92; 16], i, b"data"))
+            .await
+            .unwrap();
+    }
+    let files = tokio::time::timeout(Duration::from_secs(20), ended.recv())
+        .await
+        .expect("the job ended")
+        .expect("a result")
+        .expect("it completed, was not cut");
+    assert_eq!(files, n);
+    assert_eq!(
+        std::fs::read(d.join("share/in/f3.bin")).unwrap(),
+        b"data".to_vec()
+    );
+}
+
+/// Disk work in flight is progress too: a sync batch that outlasts the deadline (a slow
+/// drive) must not read as a stalled sender.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_disk_batch_is_not_a_stall() {
+    let (mut link, _s, mut ended, _d, _n) = deadline_job(
+        "rr-slow-disk",
+        0x93,
+        2,
+        Duration::from_millis(800),
+        Some(Duration::from_millis(2000)),
+    )
+    .await;
+    let lane = link.opener().unwrap().open().await.unwrap();
+    link.lane(lane)
+        .unwrap()
+        .tx
+        .send_raw(Bundle::TYPE, 0, 1, bundle_body([0x93; 16], 0, b"one!"))
+        .await
+        .unwrap();
+    // Wait for f0's Durable (the 2 s batch), then send the last file well inside a deadline.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let f = next_control(&mut link).await;
+            if f.ty == Durable::TYPE {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the slow batch finished");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    link.lane(lane)
+        .unwrap()
+        .tx
+        .send_raw(Bundle::TYPE, 0, 2, bundle_body([0x93; 16], 1, b"two!"))
+        .await
+        .unwrap();
+    let files = tokio::time::timeout(Duration::from_secs(30), ended.recv())
+        .await
+        .expect("the job ended")
+        .expect("a result")
+        .expect("a slow disk was not cut");
+    assert_eq!(files, 2);
+}
+
+/// Review 006 #4 (checklist T): job admission is bounded. A paired peer that opens more jobs
+/// than the host admits at once is refused `ERR_BUSY` for the extra ones; the session and the
+/// admitted jobs go on, and a slot freed by a finished job admits the next open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flood_of_job_opens_is_bounded_with_err_busy() {
+    let d = common::temp_dir("rr-admission");
+    let host = Arc::new(CreditHost {
+        root: d.join("share"),
+        jobs: d.join("hjobs"),
+        credit: 1 << 20,
+    });
+    let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(host)).await;
+    let s = connect(&addr.to_string(), id, peers, "client", common::fast())
+        .await
+        .unwrap();
+    let cap = ava1::server::MAX_JOBS_PER_SESSION;
+    let mut links = Vec::new();
+    for n in 0..cap {
+        let job = [n as u8 + 1; 16];
+        let mut link = s.job(job);
+        link.control
+            .send(&JobOpen {
+                job_id: job,
+                kind: gen::JOB_UPLOAD,
+                policy: 0,
+                flags: 0,
+                root: format!("in{n}"),
+                src: None,
+                credit: None,
+            })
+            .await
+            .unwrap();
+        let ack: JobOpenAck = next_control(&mut link).await.decode().unwrap();
+        assert_eq!(ack.status, 0, "job {n} is within the cap");
+        links.push(link);
+    }
+    // One more is refused, not queued: BUSY, and the session stays.
+    let over = [0xee; 16];
+    let mut extra = s.job(over);
+    extra
+        .control
+        .send(&JobOpen {
+            job_id: over,
+            kind: gen::JOB_UPLOAD,
+            policy: 0,
+            flags: 0,
+            root: "over".into(),
+            src: None,
+            credit: None,
+        })
+        .await
+        .unwrap();
+    let ack: JobOpenAck = next_control(&mut extra).await.decode().unwrap();
+    assert_eq!(ack.status, gen::ERR_BUSY);
+    assert!(!s.is_closed());
+    // An admitted job still works: finishing one (an empty manifest) frees a slot for the next
+    // open, which the host admits once the finished job has unregistered.
+    let first = [1u8; 16];
+    let m = Manifest::default();
+    let l0 = &mut links[0];
+    for p in m.pages(first) {
+        l0.control.send(&p).await.unwrap();
+    }
+    l0.control
+        .send(&ManifestEnd {
+            job_id: first,
+            files: 0,
+            bytes: 0,
+            manifest_hash: m.hash(),
+        })
+        .await
+        .unwrap();
+    loop {
+        let f = next_control(l0).await;
+        if f.ty == JobDone::TYPE {
+            break;
+        }
+    }
+    drop(extra);
+    let mut again = s.job(over);
+    again
+        .control
+        .send(&JobOpen {
+            job_id: over,
+            kind: gen::JOB_UPLOAD,
+            policy: 0,
+            flags: 0,
+            root: "over".into(),
+            src: None,
+            credit: None,
+        })
+        .await
+        .unwrap();
+    let mut ack: JobOpenAck = next_control(&mut again).await.decode().unwrap();
+    // The finished job unregisters a moment after its JobDone: BUSY until then.
+    for _ in 0..40 {
+        if ack.status == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        again
+            .control
+            .send(&JobOpen {
+                job_id: over,
+                kind: gen::JOB_UPLOAD,
+                policy: 0,
+                flags: 0,
+                root: "over".into(),
+                src: None,
+                credit: None,
+            })
+            .await
+            .unwrap();
+        ack = next_control(&mut again).await.decode().unwrap();
+    }
+    assert_eq!(ack.status, 0, "a freed slot admits the next open");
+}
+
+/// Review 006 follow-up: a resume whose journal holds only finished files waits the longer
+/// resume deadline (25 x), so a sender that spends several fresh deadlines hashing or skipping
+/// what is durable, sending no frame, is not cut; a fresh job with the same silence is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_done_only_resume_outlives_the_fresh_deadline() {
+    let d = common::temp_dir("rr-resume-silent");
+    let (ended, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let host = Arc::new(DeadlineHost {
+        root: d.join("share"),
+        jobs: d.join("hjobs"),
+        deadline: Duration::from_millis(400),
+        sync_delay: None,
+        ended,
+    });
+    let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(host)).await;
+    let job = [0x94u8; 16];
+    let m = small_files(3);
+    // First run: file 0 lands and is durable, then the sender goes away.
+    {
+        let s = connect(
+            &addr.to_string(),
+            id.clone(),
+            peers.clone(),
+            "c",
+            common::fast(),
+        )
+        .await
+        .unwrap();
+        let mut link = s.job(job);
+        let _ = open_and_map(&mut link, job, "in", &m).await;
+        let lane = link.opener().unwrap().open().await.unwrap();
+        link.lane(lane)
+            .unwrap()
+            .tx
+            .send_raw(Bundle::TYPE, 0, 1, bundle_body(job, 0, b"zero"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if next_control(&mut link).await.ty == Durable::TYPE {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("file 0 became durable");
+    }
+    // The receiver of the first run ends with the session.
+    let _ = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+    // Second run: done-only resume. The sender is silent for 3 s (7 fresh deadlines), then sends.
+    let s = connect(&addr.to_string(), id, peers, "c", common::fast())
+        .await
+        .unwrap();
+    let mut link = s.job(job);
+    let (_, need) = open_and_map(&mut link, job, "in", &m).await;
+    assert!(need.done.contains(&0), "the resume sees file 0 done");
+    let lane = link.opener().unwrap().open().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for i in 1..3u32 {
+        link.lane(lane)
+            .unwrap()
+            .tx
+            .send_raw(Bundle::TYPE, 0, i, bundle_body(job, i, b"data"))
+            .await
+            .unwrap();
+    }
+    let files = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .expect("the resumed job ended")
+        .expect("a result")
+        .expect("it completed, was not cut during the silence");
+    assert_eq!(files, 3);
 }

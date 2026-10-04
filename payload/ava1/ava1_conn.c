@@ -184,6 +184,12 @@ static int send_frame_locked(ava1_conn_t *c, uint8_t type, uint8_t flags, uint32
     h.channel = channel;
     h.body_len = (uint32_t)(len + mac);
     ava1_header_encode(&h, frame);
+    if (c->keyed && c->send_ctr >= AVA1_NONCE_CEILING) {
+        /* Nonce space exhausted: never seal again under this key. */
+        c->broken = 1;
+        shutdown(c->fd, SHUT_RDWR);
+        return AVA1_E_IO;
+    }
     if (c->keyed) {
         ava1_seal(c->send_key, c->send_ctr++, frame, 12, frame + AVA1_HEADER_LEN, len,
                   frame + AVA1_HEADER_LEN + len);
@@ -270,6 +276,7 @@ int ava1_conn_recv_body(ava1_conn_t *c, uint8_t *buf, size_t body_len) {
     c->deadline_ms = saved;
     if (rc != 0) return rc;
     if (c->keyed) {
+        if (c->recv_ctr >= AVA1_NONCE_CEILING) return AVA1_E_TAG; /* never open past the ceiling */
         if (ava1_open(c->recv_key, c->recv_ctr, c->rx_hdr, 12, buf, body_len, mac) != 0) return AVA1_E_TAG;
         c->recv_ctr++;
     }

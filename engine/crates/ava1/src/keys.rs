@@ -225,7 +225,10 @@ fn mac16(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 16] {
 /// "AVA1 lane" ‖ u16le(lane) ‖ client_nonce ‖ server_nonce). Both nonces are fresh
 /// random per lane join, so a re-join (or a replayed Join) of the same lane id never
 /// reuses a key with its counters restarted at 0. The control connection (lane 0) is
-/// keyed once per handshake and uses all-zero nonces (`control_key`).
+/// keyed once per handshake; `control_key` feeds all-zero client/server nonces into this
+/// *key derivation* (the Noise session already makes that key unique per handshake). That
+/// is about the derivation inputs only: every sealed frame, control frames included, still
+/// uses the AEAD nonce `0^4 ‖ u64le(counter)` and the counter advances on every frame.
 pub fn lane_key(
     dir: &[u8; 32],
     lane: u16,

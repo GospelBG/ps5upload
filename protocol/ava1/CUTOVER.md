@@ -123,11 +123,18 @@ kept.
 - [x] Zip downloads resume on a reconnect (review 003 section 5, P3 Task 15): the archive is Stored
       by default and resumes mid-entry from the receiver's journal (`SPEC.md` section 10.1). The
       optional Deflate archive cannot resume and restarts from zero on a drop.
-- [x] Zip resume restart window (review 005 section 5): closed. `StoredZipSink::position` accepts a file
+- [x] Zip resume restart window (review 005 section 5; review 006 #3): done in be78641a and 0f45ceeb.
+      `StoredZipSink::position` accepts a file
       whose every byte is durable (`x == size`) as in flight, and `commit(id)` writes its descriptor,
       so the archive resumes instead of restarting. Finished entries' data is trusted from the
       journal (only their headers and descriptors are re-read); the in-flight entry's durable
-      groups are re-hashed by the receiver's resume check.
+      groups are re-hashed by the receiver's resume check. Checked against the 006 guide 04 in
+      this pass: `position` accepts `x == size` as in flight and rejects `x > size`, `commit` writes
+      the descriptor, a re-sent file is `zip_restart`, and 0f45ceeb extends it to several whole files
+      without a `Done` (so a hole or a second prefix is still refused); the unit tests
+      `a_whole_but_unfinished_file_resumes_and_commit_writes_its_descriptor`,
+      `several_whole_files_*` and `a_hole_or_a_second_prefix_is_still_refused` cover every case the
+      guide names. Nothing missing.
 - [ ] A failed download into an existing folder leaves its per-file `.ava-part` behind; cleanup is
       only done for new destinations.
 - [ ] The engine never removes `<data dir>/ava/jobs/*` or `<data dir>/ava/send/*` (`SPEC.md` §14.3
@@ -152,6 +159,12 @@ kept.
 
 ## 3. Release gates
 
+- [x] **AEAD nonce/counter audit** (review 006 #1, release gate): PASS, `protocol/ava1/AUDIT-nonce.md`.
+      Counter ceiling on both stacks, no mid-stream re-key, resends are resealed on the new lane.
+- [x] **Receiver progress watchdog** (review 006 #2): a sender that pings but sends no data is ended
+      with `ERR_STALLED` after 3 x `dead_after` (`SPEC.md` §12.8), on the engine receiver and the
+      console receiver. The optional sender-side source-read deadline was not done (a blocking read
+      cannot be cancelled; the receiver guard closes the hang).
 - [ ] **Hardware pass on both consoles at the release commit.** The numbers below are from a mix of
       commits: the Pro's part 2 ran at `a0afe3d1`, the Phat's part 1 at `4876e512` (before the
       download fix `b1be8059`), and the Phat never ran part 2. Re-run the whole table on both, on all

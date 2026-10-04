@@ -333,6 +333,9 @@ static int load_from_disk(ava1_job_t *j) {
     }
     replay_free(&r);
     recount(j);
+    /* Decided once, here, from the replayed journal: a job that already holds done or partial files is a
+     * resume, and its sender may hash or skip them for a long time without a frame (review 006). */
+    j->resumed = j->files_done > 0 || j->bytes_durable > 0;
     return 0;
 }
 

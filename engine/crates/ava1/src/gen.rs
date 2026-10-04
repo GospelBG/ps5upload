@@ -34,6 +34,7 @@ pub const ERR_EXISTS: u16 = 14;
 pub const ERR_CANCELLED: u16 = 15;
 pub const ERR_CROSS_DEVICE: u16 = 16;
 pub const ERR_CREDIT: u16 = 17;
+pub const ERR_STALLED: u16 = 18;
 pub const JOB_UPLOAD: u8 = 1;
 pub const JOB_DOWNLOAD: u8 = 2;
 pub const JOB_COPY: u8 = 3;
