@@ -13,8 +13,8 @@ use blake2::Blake2bMac;
 pub const TOKEN_LEN: usize = 16;
 /// Tokens kept; issuing past this drops the oldest.
 pub const MAX_TOKENS: usize = 32;
-/// A token is accepted for this long after it was issued.
-pub const TOKEN_TTL_S: u64 = 24 * 3600;
+/// A token is accepted for this long after it was issued (and once: see `recognises`).
+pub const TOKEN_TTL_S: u64 = 10 * 60;
 /// A token "issued" further in the future than this (a clock that moved back) is
 /// treated as expired, not as live for longer.
 const FUTURE_SLACK_S: u64 = 300;
@@ -198,21 +198,35 @@ impl LaunchTokens {
     }
 
     /// Whether `proof` (from a Welcome on handshake `h`) was made with one of the
-    /// unexpired tokens. An unreadable file recognises nothing: the session pairs the
-    /// usual way.
+    /// unexpired tokens. A recognised token is spent: it is removed (and the removal
+    /// saved) before this returns true, so a token a sniffer took off the unauthenticated
+    /// ELF cannot be used again; nothing needs it twice, because a proof only counts from
+    /// a server not yet known. If the removal cannot be saved the proof is not accepted.
+    /// An unreadable file recognises nothing: the session pairs the usual way.
     pub fn recognises(&self, h: &[u8; 64], proof_: &[u8; 16]) -> bool {
-        let mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
         let now = now_unix();
         let Ok(all) = self.load(&mem) else {
             return false;
         };
         // Every live token is tried (no early exit), so the time taken says nothing
         // about which one matched.
-        all.iter()
-            .filter(|i| live_at(i, now))
-            .fold(false, |hit, i| {
-                crate::keys::ct_eq16(&proof(&i.token, h), proof_) | hit
-            })
+        let mut hit = None;
+        for (n, i) in all.iter().enumerate() {
+            if live_at(i, now) & crate::keys::ct_eq16(&proof(&i.token, h), proof_) {
+                hit = Some(n);
+            }
+        }
+        let Some(n) = hit else {
+            return false;
+        };
+        let rest: Vec<Issued> = all
+            .into_iter()
+            .enumerate()
+            .filter(|(k, i)| *k != n && live_at(i, now))
+            .map(|(_, i)| i)
+            .collect();
+        self.save(&mut mem, rest).is_ok()
     }
 }
 
@@ -258,7 +272,66 @@ mod tests {
     }
 
     #[test]
-    fn tokens_expire_after_a_day_and_the_oldest_go_past_the_cap() {
+    fn a_token_is_good_for_one_proof_and_ten_minutes() {
+        assert_eq!(TOKEN_TTL_S, 600);
+        let (t, h) = ([1u8; 16], [2u8; 64]);
+        let tokens = LaunchTokens::in_memory();
+        tokens.record(t, now_unix()).unwrap();
+        assert!(tokens.recognises(&h, &proof(&t, &h)), "the first use");
+        // A sniffer that captured the unauthenticated ELF holds the token: replaying it
+        // (even on the very same handshake) fails once the launcher has used it.
+        assert!(!tokens.recognises(&h, &proof(&t, &h)), "the second use");
+        assert!(
+            !tokens.recognises(&[9; 64], &proof(&t, &[9; 64])),
+            "another handshake"
+        );
+        assert_eq!(tokens.live(), 0);
+    }
+
+    #[test]
+    fn a_wrong_proof_does_not_spend_the_token() {
+        let (t, h) = ([1u8; 16], [2u8; 64]);
+        let tokens = LaunchTokens::in_memory();
+        tokens.record(t, now_unix()).unwrap();
+        assert!(!tokens.recognises(&h, &[0; 16]));
+        assert_eq!(tokens.live(), 1);
+        assert!(tokens.recognises(&h, &proof(&t, &h)));
+    }
+
+    #[test]
+    fn use_is_final_across_stores_on_one_file() {
+        let d = std::env::temp_dir().join(format!("ava1-launch-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let path = d.join("ava").join("launch_tokens");
+        let a = LaunchTokens::at(&path);
+        let t = a.issue().unwrap();
+        let other = a.issue().unwrap();
+        let b = LaunchTokens::at(&path);
+        let h = [7u8; 64];
+        assert!(a.recognises(&h, &proof(&t, &h)));
+        assert!(
+            !b.recognises(&h, &proof(&t, &h)),
+            "another process sees it spent"
+        );
+        assert!(
+            b.recognises(&h, &proof(&other, &h)),
+            "the others are untouched"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_expired_token_fails_and_a_ten_minute_old_one_is_just_expired() {
+        let tokens = LaunchTokens::in_memory();
+        let (h, now) = ([5u8; 64], now_unix());
+        tokens.record([1; 16], now - TOKEN_TTL_S - 1).unwrap();
+        assert!(!tokens.recognises(&h, &proof(&[1; 16], &h)));
+        tokens.record([2; 16], now - TOKEN_TTL_S + 60).unwrap();
+        assert!(tokens.recognises(&h, &proof(&[2; 16], &h)), "9 minutes old");
+    }
+
+    #[test]
+    fn tokens_expire_and_the_oldest_go_past_the_cap() {
         let tokens = LaunchTokens::in_memory();
         let h = [5u8; 64];
         let now = now_unix();
@@ -293,7 +366,6 @@ mod tests {
         // Another process (a second store on the same file) sees both.
         let b = LaunchTokens::at(&path);
         let h = [7u8; 64];
-        assert!(b.recognises(&h, &proof(&t1, &h)) && b.recognises(&h, &proof(&t2, &h)));
         assert_eq!(b.live(), 2);
         #[cfg(unix)]
         {
@@ -306,6 +378,9 @@ mod tests {
         text.insert_str(0, "not a token\n");
         std::fs::write(&path, text).unwrap();
         assert_eq!(b.live(), 2);
+        // Another process (a second store on the same file) recognises both, once each.
+        assert!(b.recognises(&h, &proof(&t1, &h)) && b.recognises(&h, &proof(&t2, &h)));
+        assert_eq!(b.live(), 0);
         let _ = std::fs::remove_dir_all(&d);
     }
 

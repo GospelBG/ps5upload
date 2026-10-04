@@ -176,7 +176,7 @@ peers at startup. Exactly one slot must exist. A slot counts as a slot in states
 5.2 Launch token: whoever stamps the ELF may also write a fresh random 16-byte
 token into it (state 2) and keep it for itself — the reference side stores them in
 `<data dir>/ava/launch_tokens`, one `<32 hex token> <unix seconds>` per line, mode
-0600, written atomically, at most 32 kept (oldest dropped) and each good for 24 h.
+0600, written atomically, at most 32 kept (oldest dropped), each good for 10 minutes and for one proof.
 The payload keeps the token in memory only. When the handshake's client static key
 equals the slot's key, and the client is one the server knows — a helper whose
 peers file could not be written knows nobody and sends no proof — the server adds an
@@ -187,16 +187,20 @@ proof, a proof differs every handshake, and the token itself never travels.
 `vectors/launch.txt` pins the derivation.
 
 A client that recognises the proof — one of its unexpired tokens, on this
-handshake — stores the server's key and treats the session as paired with no
+handshake — spends that token (removes it and saves the removal before it trusts
+anything; if the removal cannot be saved, the proof is not accepted) and stores the server's key and treats the session as paired with no
 pairing code. A proof counts only from a server it does not already know and
 whose `Welcome` says it knows the client (`knows_you` ≠ 0); a server that does not
 know the client was never given a proof, so one presenting a proof anyway is not
 trusted. A client that does not recognise it (another token, expired, an old proof
-replayed under a new h, or a `knows_you` of 0) pairs with the code as usual. The token proves
-"this console is the helper I launched" to the side that sent it; an attacker who
-read the ELF in transit can forge a proof, but that attacker could have replaced
-the ELF outright — it is sent unauthenticated — so the token grants nothing a
-pairing code would not, and removes one prompt from the common case.
+replayed under a new h, a token already spent, or a `knows_you` of 0) pairs with the code as usual
+(§5.5: the user types the code the console shows). The token proves "this console is the helper I
+launched" to the side that sent it. The ELF is sent unauthenticated, so a sniffer on the path holds
+the token too and could answer as the console to the launching engine: that is why a token is
+single-use and short-lived. The first proof wins, and the real helper normally connects within
+seconds of the launch, so a replay after that finds the token gone; an attacker who answers first
+(before the real helper, within 10 minutes) gets the one silent pairing and nothing more. A proof is
+needed only from a server not yet known, so nothing uses a token twice.
 
 ## 6. Liveness
 Every connection sends `Ping{seq, t_us}` every 2 s (default) on channel 0, also

@@ -158,3 +158,32 @@ async fn a_client_without_tokens_pairs_as_before() {
         .unwrap();
     assert!(s.pairing_code().is_some());
 }
+
+#[tokio::test]
+async fn a_sniffed_token_cannot_impersonate_the_console_after_the_real_one_used_it() {
+    let tokens = LaunchTokens::in_memory();
+    let token = tokens.issue().unwrap();
+    let (me, peers) = client_with(tokens);
+    let (real, _c1, real_key) = launched_server(me.public(), Some(token)).await;
+    let s = connect(
+        &real.to_string(),
+        me.clone(),
+        peers.clone(),
+        "laptop",
+        fast(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.pairing_code(), None, "the real helper pairs silently");
+    // A sniffer read the unauthenticated ELF, so it holds the token and the launcher's key.
+    let (fake, _c2, fake_key) = launched_server(me.public(), Some(token)).await;
+    assert_ne!(real_key, fake_key);
+    let s = connect(&fake.to_string(), me, peers.clone(), "laptop", fast())
+        .await
+        .unwrap();
+    assert!(
+        s.pairing_code().is_some(),
+        "the replayed proof is not accepted"
+    );
+    assert!(!peers.lock().unwrap().contains(&fake_key));
+}
