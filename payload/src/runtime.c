@@ -6679,6 +6679,8 @@ static int chmod_rf(const char *path, mode_t mode, int depth) {
 
     if (depth > 64) return -1;
     if (lstat(path, &st) != 0) return -1;
+    /* A link that leads into the trust store is not chmod'ed (chmod follows it). */
+    if (S_ISLNK(st.st_mode) && path_in_protected(path)) return 0;
     /* chmod first, then descend — so even if recursion fails partially
      * we've at least updated the top. */
     if (chmod(path, mode) != 0) rc = -1;
@@ -7488,7 +7490,7 @@ static int handle_fs_delete(runtime_state_t *state, int client_fd,
     path[0] = '\0';
     if (request_body) extract_json_string_field(request_body, "path", path, sizeof(path));
     /* Deleting a directory that contains the AVA1 trust store deletes the store. */
-    if (!is_path_allowed(path) || path_contains_protected(path)) {
+    if (!is_path_allowed(path) || path_tree_op_refused(path)) {
         return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
                           "fs_delete_path_not_allowed", 26);
     }
@@ -7575,7 +7577,8 @@ static int handle_fs_move(runtime_state_t *state, int client_fd,
         extract_json_string_field(request_body, "from", from, sizeof(from));
         extract_json_string_field(request_body, "to", to, sizeof(to));
     }
-    if (!is_path_allowed(from) || !is_path_allowed(to) || path_contains_protected(from)) {
+    if (!is_path_allowed(from) || !is_path_allowed(to) ||
+        path_tree_op_refused(from) || path_tree_op_refused(to)) {
         return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
                           "fs_move_path_not_allowed", 24);
     }
@@ -7617,7 +7620,7 @@ static int handle_fs_chmod(runtime_state_t *state, int client_fd,
         /* recursive is an unsigned field: 1 = recurse, 0 = top only. */
         recursive = extract_json_uint64_field(request_body, "recursive") != 0;
     }
-    if (!is_path_allowed(path)) {
+    if (!is_path_allowed(path) || path_tree_op_refused(path)) {
         return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
                           "fs_chmod_path_not_allowed", 25);
     }
@@ -7899,7 +7902,10 @@ static int handle_fs_copy(runtime_state_t *state, int client_fd,
         overwrite =
             (extract_json_uint64_field(request_body, "overwrite") != 0) ? 1 : 0;
     }
-    if (!is_path_allowed(from) || !is_path_allowed(to)) {
+    /* The AVA1 trust store: a copy FROM an ancestor (/data/ps5upload) carries identity+peers out, a copy ONTO
+     * one (overwrite) replaces them. cp_rf_op walks with no per-child check, so the roots are the gate. */
+    if (!is_path_allowed(from) || !is_path_allowed(to) ||
+        path_tree_op_refused(from) || path_tree_op_refused(to)) {
         return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
                           "fs_copy_path_not_allowed", 24);
     }

@@ -22,7 +22,8 @@
 #include "ava1_trust.h"
 #include "config.h"
 #include "mgmt_rpc.h"
-#include "cross_device.h" /* payload/include, not next to the AVA1 sources */
+#include "cross_device.h"
+#include "path_policy.h" /* payload/include, not next to the AVA1 sources */
 #include "monocypher.h"
 #include "ps5_firmware.h"
 #include "runtime.h"
@@ -34,11 +35,14 @@
  * Without it the data plane's methods are unknown here, matching the missing CAP. */
 static int g_data_on;
 
-static int may_write(const char *p) { return is_path_allowed(p); }
+/* Data-plane jobs (upload root, download root, job.copy source and destination) walk trees, so they refuse the
+ * trust store AND its ancestors (path_policy.h: path_tree_op_refused). */
+static int may_write(const char *p) { return is_path_allowed(p) && !path_tree_op_refused(p); }
 
 /* The same rule the FTX2 read handlers use (runtime.c): the writable allowlist, or a system
  * partition read when the peer asked for an unsafe read. */
 static int may_read(const char *p, int unsafe_read) {
+    if (path_tree_op_refused(p)) return 0;
     return is_path_allowed(p) || (unsafe_read && is_safe_unsafe_read_path(p));
 }
 

@@ -75,6 +75,7 @@ static void canonical_of(const char *p, char *out, size_t cap) {
 static int under(const char *p, const char *dir) {
     size_t n = strlen(dir);
     while (n > 1 && dir[n - 1] == '/') n--;
+    if (n == 1) return p[0] == '/'; /* "/" contains every absolute path */
     return strncasecmp(p, dir, n) == 0 && (p[n] == '\0' || p[n] == '/');
 }
 
@@ -128,3 +129,5 @@ int path_resolve_allowed(const char *p, int (*lexical_ok)(const char *)) {
     }
     return lexical_ok(joined);
 }
+
+int path_tree_op_refused(const char *p) { return path_in_protected(p) || path_contains_protected(p); }

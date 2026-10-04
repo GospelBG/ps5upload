@@ -1085,28 +1085,22 @@ fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) {
     std::os::unix::fs::symlink(target, link).unwrap();
 }
 
-/// A REAL symlink and the REAL lstat-based device lookup (no injection): the link lives on the
-/// temp root's device and points at /dev/null, which is on another. Renaming it into /dev (the
-/// link's TARGET's device) must be refused before any rename(2): a stat()-based guard compares
-/// /dev with /dev, says "same", and moves the link across devices (the kernel panic).
+/// DISCRIMINATING: a link on device 1 whose target is on device 2, renamed into a directory on device 2.
+/// A stat()-based guard compares 2 with 2, says "same", and rename(2) would move the LINK across devices
+/// (the kernel panic); the lstat-based one sees device 1 against 2 and refuses. The devices are injected
+/// (a host cannot give us two writable ones), but the rename itself is real: on the host it would SUCCEED,
+/// so a guard that lets it through is observable as the link having moved.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_symlink_source_is_judged_by_its_own_device() {
     let r = rig("xdevlink").await;
-    let dev_of = |p: &Path| std::fs::metadata(p).unwrap().dev();
-    if dev_of(&r.root) == dev_of(Path::new("/dev")) {
-        eprintln!("skipped: the temp root and /dev share a device on this host");
-        return;
-    }
-    mgmt_fs::allow_dev(true);
-    symlink("/dev/null", r.path("lnk"));
+    std::fs::create_dir_all(r.path("mnt2")).unwrap();
+    std::fs::write(r.path("mnt2/real"), b"r").unwrap();
+    symlink(r.path("mnt2/real"), r.path("lnk"));
+    mgmt_fs::set_link_devices();
     let (st, b) = r
         .rpc(
             gen::METHOD_FS_RENAME,
-            &gen::FsRename {
-                from: r.p("lnk"),
-                to: "/dev/ava1-should-never-exist".into(),
-                overwrite: 1,
-            },
+            &rename(&r, "lnk", "mnt2/lnk-moved", 1),
         )
         .await;
     assert_eq!(
@@ -1115,22 +1109,60 @@ async fn a_symlink_source_is_judged_by_its_own_device() {
     );
     assert!(
         std::fs::symlink_metadata(r.path("lnk")).is_ok(),
-        "the link did not move"
+        "rename(2) was never called: the link is still there"
     );
-    assert!(!Path::new("/dev/ava1-should-never-exist").exists());
-    // a link moved inside its own directory is fine (same device as itself)
+    assert!(std::fs::symlink_metadata(r.path("mnt2/lnk-moved")).is_err());
+    // the same-device control: the link moves inside its own directory (device 1 to device 1)
+    mgmt_fs::set_link_devices();
     let (st, _) = r
-        .rpc(gen::METHOD_FS_RENAME, &rename(&r, "lnk", "lnk2", 1))
+        .rpc(gen::METHOD_FS_RENAME, &rename(&r, "lnk", "lnk-renamed", 1))
         .await;
     assert_eq!(st, OK);
-    assert!(std::fs::symlink_metadata(r.path("lnk2"))
+    assert!(std::fs::symlink_metadata(r.path("lnk-renamed"))
         .unwrap()
         .file_type()
         .is_symlink());
 }
 
+/// Real lstat and a real link, no injection. It does NOT discriminate by itself (rename(2) across /dev gives
+/// EXDEV, which maps to the same status and cause), so it is a smoke test of the real lookups: a link to
+/// /dev/null and a plain file are both refused when moved into /dev, EACCES-or-EXDEV never reaching the user as
+/// anything but ERR_CROSS_DEVICE, and nothing appears in /dev.
+#[tokio::test(flavor = "multi_thread")]
+async fn real_lstat_refuses_a_move_into_another_device() {
+    let r = rig("xdevreal").await;
+    let dev_of = |p: &Path| std::fs::metadata(p).unwrap().dev();
+    if dev_of(&r.root) == dev_of(Path::new("/dev")) {
+        eprintln!("skipped: the temp root and /dev share a device on this host");
+        return;
+    }
+    mgmt_fs::allow_dev(true);
+    symlink("/dev/null", r.path("lnk"));
+    std::fs::write(r.path("plain"), b"p").unwrap();
+    for from in ["lnk", "plain"] {
+        let (st, b) = r
+            .rpc(
+                gen::METHOD_FS_RENAME,
+                &gen::FsRename {
+                    from: r.p(from),
+                    to: "/dev/ava1-should-never-exist".into(),
+                    overwrite: 1,
+                },
+            )
+            .await;
+        assert_eq!(
+            (st, cause(&b).as_str()),
+            (gen::ERR_CROSS_DEVICE, "fs_move_cross_mount"),
+            "{from}"
+        );
+        assert!(std::fs::symlink_metadata(r.path(from)).is_ok());
+    }
+    assert!(!Path::new("/dev/ava1-should-never-exist").exists());
+}
+
+/// LINT (a source check, not behaviour): every caller of the guard passes the lstat lookup for the source.
 #[test]
-fn the_guard_header_judges_a_source_link_by_lstat() {
+fn lint_the_guard_header_judges_a_source_link_by_lstat() {
     let src = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../payload/include/cross_device.h"),
     )
@@ -1447,4 +1479,90 @@ async fn s2_the_trust_store_is_found_through_every_spelling() {
     let (st, _) = r.write("plant", 0, 0, b"evil", None).await;
     assert_eq!(st, gen::ERR_PATH);
     assert_eq!(std::fs::read(r.path("d/ava/peers")).unwrap(), b"trusted");
+}
+
+// ---- review S2, round 2: ancestors and recursive operations ----
+
+/// LINT (a source check, not a behavioural test: runtime.c and ava1_glue.c are SDK-only and cannot be
+/// built on the host). Every entry point that walks a tree, or that moves/replaces one, refuses a path that
+/// is the trust store or an ancestor of it through the shared `path_tree_op_refused`. The behaviour of that
+/// function itself is pinned by `s2_tree_op_refusal_covers_ancestors_and_the_store`, the FTP handlers by
+/// payload/tests/ftp_trust_store_selftest.c (run by the root Makefile's payload selftests and by
+/// `s2_ftp_selftest_passes` below).
+#[test]
+fn s2_lint_recursive_entry_points_use_the_shared_refusal() {
+    let payload = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../payload");
+    let rt = std::fs::read_to_string(payload.join("src/runtime.c")).unwrap();
+    let body = |name: &str| -> String {
+        let a = rt
+            .find(&format!("static int {name}("))
+            .unwrap_or_else(|| panic!("{name} missing"));
+        let rest = &rt[a..];
+        rest[..rest.find("\n}\n").unwrap()].to_string()
+    };
+    for f in [
+        "handle_fs_copy",
+        "handle_fs_chmod",
+        "handle_fs_delete",
+        "handle_fs_move",
+    ] {
+        assert!(
+            body(f).contains("path_tree_op_refused("),
+            "{f} must refuse trust-store ancestors"
+        );
+    }
+    let glue = std::fs::read_to_string(payload.join("src/ava1_glue.c")).unwrap();
+    assert!(
+        glue.contains("path_tree_op_refused("),
+        "the AVA1 data-plane hooks must too (copy, upload root, download root)"
+    );
+}
+
+/// The shared refusal: the store, anything below it AND every ancestor are refused; siblings are not.
+#[test]
+fn s2_tree_op_refusal_covers_ancestors_and_the_store() {
+    let _g = one();
+    let base = std::env::temp_dir().join(format!("ava1-s2-tree-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("d/ava")).unwrap();
+    let base = base.canonicalize().unwrap();
+    assert_eq!(mgmt_fs::install(&base), 0);
+    let p = |s: &str| format!("{}/{s}", base.display());
+    for refused in ["d/ava", "d/ava/peers", "d", "", "d/ava/new/deeper"] {
+        assert!(
+            mgmt_fs::tree_op_refused(&p(refused)),
+            "{refused:?} must be refused"
+        );
+    }
+    assert!(mgmt_fs::tree_op_refused("/"), "the root is an ancestor");
+    for ok in ["other", "d/other", "d/ava2", "dd"] {
+        assert!(!mgmt_fs::tree_op_refused(&p(ok)), "{ok} is fine");
+    }
+    mgmt_fs::uninstall();
+}
+
+#[test]
+fn s2_ftp_selftest_passes() {
+    let payload = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../payload");
+    let exe = std::env::temp_dir().join(format!("ava1-ftp-s2-{}", std::process::id()));
+    let cc = std::process::Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread", "-I"])
+        .arg(payload.join("include"))
+        .arg("-o")
+        .arg(&exe)
+        .arg(payload.join("tests/ftp_trust_store_selftest.c"))
+        .output()
+        .unwrap();
+    assert!(
+        cc.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cc.stderr)
+    );
+    let run = std::process::Command::new(&exe).output().unwrap();
+    assert!(
+        run.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
 }

@@ -30,6 +30,13 @@ int path_resolve_allowed(const char *p, int (*lexical_ok)(const char *));
  * /data/ps5upload takes the trust store with it): destructive operations on a source path refuse these too. */
 int path_in_protected(const char *p);
 int path_contains_protected(const char *p);
+/* The one rule for every operation that walks a tree or moves/replaces one (copy, recursive chmod and
+ * delete, move, an upload/download/copy root of a data-plane job): refuse a path that IS the trust store,
+ * is below it, or is an ANCESTOR of it, because a walk from an ancestor reaches the store and an
+ * overwrite of an ancestor replaces it. 1 = refuse. Callers apply it to every path they are handed
+ * (source and destination), after their own allowlist. Trade-off, deliberate: a whole-/data or / root
+ * is refused; per-entry filtering inside the walkers would be needed to allow it. */
+int path_tree_op_refused(const char *p);
 /* Test hook: the protected directory (NULL restores /data/ps5upload/ava). */
 void path_policy_set_protected(const char *dir);
 

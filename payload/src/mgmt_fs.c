@@ -269,7 +269,7 @@ int mgmt_run_fs_rename(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx) {
     if ((rc = take_path(cx, q.to, q.to_len, to, "fs_move_path_not_allowed")) != AVA1_STATUS_OK) return rc;
     if (!write_ok(from) || !write_ok(to)) return mgmt_reply_error(cx, AVA1_ERR_PATH, "fs_move_path_not_allowed");
     /* Moving a directory that CONTAINS the trust store moves the store with it. */
-    if (path_contains_protected(from)) return mgmt_reply_error(cx, AVA1_ERR_PATH, "fs_move_path_not_allowed");
+    if (path_tree_op_refused(from) || path_tree_op_refused(to)) return mgmt_reply_error(cx, AVA1_ERR_PATH, "fs_move_path_not_allowed");
     /* NEVER rename(2) across devices: on this kernel it does not fail with EXDEV, it panics the
      * console. Compare the source's OWN device (lstat: a link is judged by where it lives, not by
      * its target) with the destination's parent before any rename; a

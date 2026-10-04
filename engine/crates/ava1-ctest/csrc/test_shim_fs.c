@@ -49,6 +49,10 @@ static void t_count(void) { __atomic_add_fetch(&g_counted, 1, __ATOMIC_SEQ_CST);
 
 /* With fake_dev set both lookups are injected; otherwise p.dev_of/src_dev_of are NULL (the real stat/lstat). */
 static int t_dev_of(const char *path, unsigned long long *out) {
+    if (g_fake_dev == 2) { /* a link named "lnk" points INTO the other device: stat() (follows it) says 2 */
+        *out = (strstr(path, "/mnt2") || strstr(path, "/lnk")) ? 2u : 1u;
+        return 0;
+    }
     if (g_fake_dev) {
         *out = strstr(path, "/mnt2") ? 2u : 1u;
         return 0;
@@ -56,6 +60,10 @@ static int t_dev_of(const char *path, unsigned long long *out) {
     return xdev_stat_dev(path, out);
 }
 static int t_src_dev_of(const char *path, unsigned long long *out) {
+    if (g_fake_dev == 2) { /* lstat(): the link itself lives on device 1, whatever it points at */
+        *out = strstr(path, "/mnt2") ? 2u : 1u;
+        return 0;
+    }
     if (g_fake_dev) return t_dev_of(path, out);
     return xdev_lstat_dev(path, out);
 }
@@ -226,3 +234,4 @@ void ava1_test_mgmtfs_stats(uint32_t *counted, uint32_t *shutdowns, uint32_t *un
 
 int ava1_test_path_in_protected(const char *p) { return path_in_protected(p); }
 int ava1_test_path_contains_protected(const char *p) { return path_contains_protected(p); }
+int ava1_test_path_tree_op_refused(const char *p) { return path_tree_op_refused(p); }
