@@ -57,8 +57,10 @@ int ava1_op_encode_status(ava1_job_t *j, uint8_t *out, size_t cap, size_t *out_l
 /* job.cancel on an operation job: raises the flag and returns (never waits); the worker stops at
  * its next check and the job stays listed (finished, ERR_CANCELLED) so a poller reads how it ended. */
 void ava1_op_cancel(ava1_job_t *j);
-/* A status reply was produced for `j`: when it was terminal and the operation is repeatable, the job
- * is released (unlisted) now instead of holding a table slot until the reaper. `was_finished` is
+/* A status reply was produced for `j`: when it was terminal and the operation is repeatable, the
+ * job stays listed for a grace (AVA1_OP_GRACE_MS) after the FIRST such reply, so a lost reply still
+ * gets the stored answer and a repeat job.run does not re-run it; it is then released by the reaper
+ * or by the next read after the grace, and at once (the oldest first) when the table is full. `was_finished` is
  * `ava1_op_finished_before(j)` read BEFORE the reply was encoded: an operation that finished while
  * a "running" reply was being built must stay listed, or the next job.status finds no job. */
 int ava1_op_finished_before(ava1_job_t *j);
@@ -67,5 +69,10 @@ extern void (*ava1_op_test_pre_encode)(ava1_job_t *j);
 void ava1_op_status_delivered(ava1_job_t *j, int was_finished);
 /* How long a finished operation that is not released on read stays listed (ms). */
 #define AVA1_OP_DONE_AGE_MS 30000u
+/* How long a releasable operation stays listed after its terminal status was first delivered (ms). */
+#define AVA1_OP_GRACE_MS 10000u
+/* The reaper's keep time for a finished operation (ms): the grace once delivered, else the done-age;
+ * both are capped by the configured park age. */
+uint64_t ava1_op_keep_ms(int delivered);
 
 #endif

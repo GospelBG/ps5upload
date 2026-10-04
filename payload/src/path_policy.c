@@ -40,7 +40,11 @@ static void lex_normalize(const char *src, char *out, size_t cap) {
             continue;
         }
         if (o + 1 + len + 1 > cap) {
-            /* too long to judge: make it look protected-adjacent by failing closed in callers */
+            /* Too long to judge: the result is "/", which path_in_protected does NOT flag. That
+             * is safe because every caller fails closed on such a path anyway:
+             * path_resolve_allowed refuses it (its `len >= sizeof tmp` check) and
+             * path_contains_protected flags it (the protected dir is "inside" "/"). Do not
+             * "fix" this by returning the truncated prefix: that would judge a different path. */
             snprintf(out, cap, "%s", "/");
             return;
         }

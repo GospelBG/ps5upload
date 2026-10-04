@@ -232,12 +232,60 @@ void (*ava1_op_test_pre_encode)(ava1_job_t *j);
 
 int ava1_op_finished_before(ava1_job_t *j) { return __atomic_load_n(&j->finished, __ATOMIC_ACQUIRE) != 0; }
 
+uint64_t ava1_op_keep_ms(int delivered) {
+    uint64_t age = ava1_data_cfg()->park_ms ? ava1_data_cfg()->park_ms : AVA1_PARK_MS;
+    uint64_t keep = delivered ? AVA1_OP_GRACE_MS : AVA1_OP_DONE_AGE_MS;
+    return age < keep ? age : keep;
+}
+
 void ava1_op_status_delivered(ava1_job_t *j, int was_finished) {
     op_t *o = op_of(j);
     uint8_t id[16];
+    uint64_t now;
     if (!o || !was_finished || !releasable(o)) return;
+    now = ava1_mono_ms();
+    if (!__atomic_load_n(&j->op_delivered, __ATOMIC_ACQUIRE)) {
+        /* The first terminal delivery starts the grace: restamp, then flag (the reaper reads the
+         * flag first, so it never sees the flag with the old stamp). */
+        __atomic_store_n(&j->parked_at_ms, now, __ATOMIC_RELEASE);
+        __atomic_store_n(&j->op_delivered, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    if (now - __atomic_load_n(&j->parked_at_ms, __ATOMIC_ACQUIRE) < ava1_op_keep_ms(1)) return;
     memcpy(id, j->id, 16);
     ava1_job_free_one(id); /* unlists; the caller's reference still holds it until it returns */
+}
+
+typedef struct {
+    uint8_t id[AVA1_MAX_JOBS][16];
+    uint64_t at[AVA1_MAX_JOBS];
+    unsigned n;
+} evict_t;
+
+static void evict_one(ava1_job_t *j, void *ctx) {
+    evict_t *e = ctx;
+    if (j->kind != AVA1_JOB_OPKIND || !__atomic_load_n(&j->op_delivered, __ATOMIC_ACQUIRE) ||
+        !__atomic_load_n(&j->finished, __ATOMIC_ACQUIRE) || e->n >= AVA1_MAX_JOBS) return;
+    memcpy(e->id[e->n], j->id, 16);
+    e->at[e->n++] = __atomic_load_n(&j->parked_at_ms, __ATOMIC_ACQUIRE);
+}
+
+/* The table is full: free the slot of the operation whose terminal status was delivered longest
+ * ago, grace or not (a loop of hashes must never fill the table). 1 when one was freed. */
+static int evict_delivered(void) {
+    evict_t *e = calloc(1, sizeof *e);
+    unsigned i, best = 0;
+    int ok = 0;
+    if (!e) return 0;
+    ava1_job_foreach(evict_one, e);
+    if (e->n) {
+        for (i = 1; i < e->n; i++)
+            if (e->at[i] < e->at[best]) best = i;
+        ava1_job_free_one(e->id[best]);
+        ok = 1;
+    }
+    free(e);
+    return ok;
 }
 
 int ava1_op_run_rpc(const uint8_t *body, uint32_t len, const uint8_t owner[32], uint8_t *out, size_t cap,
@@ -283,6 +331,7 @@ int ava1_op_run_rpc(const uint8_t *body, uint32_t len, const uint8_t owner[32], 
         return AVA1_ERR_BUSY;
     }
     j = ava1_job_create(r.job_id, owner);
+    if (!j && evict_delivered()) j = ava1_job_create(r.job_id, owner);
     if (!j) {
         pthread_mutex_unlock(&g_run_mu);
         ava1_rpc_msg(out, cap, out_len, "the job table is full");

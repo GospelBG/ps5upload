@@ -549,7 +549,23 @@ impl Sink for StoredZipSink {
         Ok(buf.len())
     }
 
-    fn commit(&self, _id: u32) -> io::Result<()> {
+    /// Finishes a file that was whole but unfinished at a resume: writes its descriptor
+    /// with the rebuilt CRC. Any other commit is a no-op (`append` finishes a file itself).
+    fn commit(&self, id: u32) -> io::Result<()> {
+        let mut st = self.st.lock().unwrap();
+        let layout = st.layout.clone();
+        let Some(&k) = layout.by_id.get(&id) else {
+            return Ok(());
+        };
+        let slot = &layout.slots[k];
+        if st.current == Some(k) && st.written == slot.size {
+            let file = Self::file(&st)?;
+            let crc = st.crc.clone().finalize();
+            write_all_at(&file, &slot.descriptor(crc), st.pos)?;
+            st.pos += DESC_LEN;
+            st.crcs[k] = Some(crc);
+            st.current = None;
+        }
         Ok(())
     }
 
@@ -590,8 +606,10 @@ impl Sink for StoredZipSink {
             let [(0, x)] = runs[..] else {
                 return Err(bad(format!("file {id}'s durable bytes are not a prefix")));
             };
-            if x >= layout.slots[pk].size {
-                return Err(bad(format!("file {id} is whole but not finished")));
+            // x == size: every byte is durable but the Done is not; the descriptor was
+            // never written (or is cut), and `commit` writes it (review 005 section 5).
+            if x > layout.slots[pk].size {
+                return Err(bad(format!("file {id} is longer than its size")));
             }
             partial_bytes = x;
             cut = layout.slots[pk].data_off + x;
@@ -1099,17 +1117,41 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_but_unfinished_last_file_is_not_resumable() {
-        // The restart window (CUTOVER): every byte of the file is journaled but its Done is
-        // not. The sink refuses, so the receiver starts the archive over.
+    fn a_whole_but_unfinished_file_resumes_and_commit_writes_its_descriptor() {
+        // The restart window (review 005 section 5): every byte of file 2 is journaled but
+        // its Done is not. The sink takes it as in flight with written == size; the
+        // receiver's commit(2) (the FileRoot path) writes the descriptor and the archive
+        // carries on with file 3, never starting over.
         let d = dir("whole");
         let m = manifest();
+        {
+            let s = StoredZipSink::new(d.join("o.zip"), "P");
+            s.prepare(&m).unwrap();
+            s.position(&BTreeSet::new(), &BTreeMap::new()).unwrap();
+            feed(&s, &m, 0, 0, 3000);
+            feed(&s, &m, 2, 0, 5000);
+            s.sync(&[]).unwrap();
+            std::mem::forget(s);
+        }
         let s = StoredZipSink::new(d.join("o.zip"), "P");
         s.prepare(&m).unwrap();
-        s.position(&BTreeSet::new(), &BTreeMap::new()).unwrap();
-        feed(&s, &m, 0, 0, 3000);
-        feed(&s, &m, 2, 0, 5000);
-        assert!(s.position(&done(&[0]), &part(2, 5000)).is_err());
+        s.position(&done(&[0]), &part(2, 5000)).unwrap();
+        let lay = s.layout_of(&m).unwrap();
+        // Cut at the end of the data: the descriptor was never written.
+        assert_eq!(
+            std::fs::metadata(d.join("o.zip.ava-part")).unwrap().len(),
+            lay[1].2 + lay[1].3
+        );
+        assert!(
+            s.write_at(2, 0, &[0]).is_err(),
+            "the whole file is not rewritable"
+        );
+        assert!(s.position(&done(&[0]), &part(2, 5001)).is_err());
+        s.write_whole(1, &[]).unwrap();
+        s.commit(2).unwrap();
+        feed(&s, &m, 3, 0, 1234);
+        s.finish().unwrap();
+        check_zip(&d.join("o.zip"), &m);
     }
 
     #[test]
