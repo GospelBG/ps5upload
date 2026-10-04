@@ -45,6 +45,14 @@ static int is_stopping(ava1_job_t *j) {
     return s;
 }
 
+int ava1_apply_jnl_append(ava1_job_t *j, uint8_t kind, const uint8_t *body, size_t len) {
+    int rc;
+    pthread_mutex_lock(&j->jnl_mu);
+    rc = ava1_jnl_append(&j->jnl, kind, body, len);
+    pthread_mutex_unlock(&j->jnl_mu);
+    return rc;
+}
+
 int ava1_sync_dir(const char *dir) {
     int fd = open(dir, O_RDONLY | O_DIRECTORY), rc = 0;
     if (fd < 0) return errno;
@@ -170,6 +178,7 @@ void ava1_lflist_reset(ava1_job_t *j, int release) {
 }
 
 static int u32cmp(const void *a, const void *b);
+static void run_commit(ava1_job_t *j, uint32_t id);
 
 /* A lf with nothing left for a batch, a commit or a snapshot to do. */
 static int lf_idle(const ava1_job_t *j, uint32_t id, const ava1_lfile_t *lf) {
@@ -388,7 +397,7 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
         ava1_w_t w;
         d.status = status;
         ava1_w_init(&w, b, sizeof b);
-        if (ava1_jnl_done_encode(&d, &w) == 0 && ava1_jnl_append(&j->jnl, AVA1_JNL_DONE, b, w.len) == 0)
+        if (ava1_jnl_done_encode(&d, &w) == 0 && ava1_apply_jnl_append(j, AVA1_JNL_DONE, b, w.len) == 0)
             done_written = 1;
     }
     pthread_mutex_lock(&j->mu);
@@ -694,12 +703,12 @@ static int write_chunk(ava1_job_t *j, uint32_t id, uint64_t off, const uint8_t *
     int err, fd, ob;
     uint64_t size = j->m.e[id].size, g;
     pthread_mutex_lock(&j->mu);
-    if (ava1_bits_get(&j->done, id) || (j->lf[id] && j->lf[id]->committed)) {
+    if (ava1_bits_get(&j->done, id) || (j->lf[id] && (j->lf[id]->committed || j->lf[id]->committing))) {
         pthread_mutex_unlock(&j->mu);
         return 0; /* a late duplicate */
     }
     lf = lfile_open(j, id, &err, 1);
-    if (lf && (lf->committed || ava1_bits_get(&j->done, id))) { /* committed while we opened it */
+    if (lf && (lf->committed || lf->committing || ava1_bits_get(&j->done, id))) { /* committed while we opened it */
         pthread_mutex_unlock(&j->mu);
         return 0;
     }
@@ -861,6 +870,10 @@ static int apply_record(ava1_job_t *j, const ava1_bundle_record_t *r) {
 
 static void run_work(ava1_job_t *j, ava1_work_t *w) {
     int rc = 0;
+    if (w->kind == AVA1_W_COMMIT) {
+        run_commit(j, w->file_id);
+        return;
+    }
     if (w->kind == AVA1_W_CHUNK) {
         rc = write_chunk(j, w->file_id, w->offset, w->data, w->len);
     } else if (w->kind == AVA1_W_BUNDLE) {
@@ -1131,7 +1144,7 @@ static void sync_batch(ava1_job_t *j) {
     }
     for (k = 0; k < nsnap; k++) {
         ava1_lfile_t *lf = j->lf[snap[k]];
-        if (lf->committed || lf->fd < 0) {
+        if (lf->committed || lf->committing || lf->fd < 0) {
             ava1_rset_clear(&lf->written); /* a late duplicate's range: nothing left to sync */
         } else if (lf->written.n) {
             cap_g += (uint32_t)lf->written.n;
@@ -1263,7 +1276,7 @@ static void sync_batch(ava1_job_t *j) {
         b.roots_len = (uint32_t)ow.len;
         ava1_w_init(&w, body, cap);
         i = (uint32_t)ava1_jnl_batch_encode(&b, &w);
-        if (i == 0 && ava1_jnl_append(&j->jnl, AVA1_JNL_BATCH, body, w.len) != 0) i = 1;
+        if (i == 0 && ava1_apply_jnl_append(j, AVA1_JNL_BATCH, body, w.len) != 0) i = 1;
         free(fb);
         free(rb);
         free(ob);
@@ -1355,10 +1368,18 @@ void ava1_apply_compact(ava1_job_t *j) {
     o.root_len = (uint16_t)strlen(j->root);
     ava1_w_init(&ow, ob, sizeof ob);
     if (ava1_jnl_open_encode(&o, &ow) != 0) return;
+    pthread_mutex_lock(&j->jnl_mu); /* no append races the rewrite; lock order jnl_mu, mu */
     pthread_mutex_lock(&j->mu);
+    if (j->commits_inflight) { /* a commit between its rename and its journal record would be
+                                * dropped from the snapshot: try again after the batch */
+        pthread_mutex_unlock(&j->mu);
+        pthread_mutex_unlock(&j->jnl_mu);
+        return;
+    }
     snap = lfl_snapshot(j, &nsnap);
     if (nsnap == UINT32_MAX) { /* out of memory: keep the longer journal, it is still whole */
         pthread_mutex_unlock(&j->mu);
+        pthread_mutex_unlock(&j->jnl_mu);
         return;
     }
     for (k = 0; k < nsnap; k++) nr += j->lf[snap[k]]->durable.n + 1;
@@ -1402,6 +1423,7 @@ void ava1_apply_compact(ava1_job_t *j) {
         if (ava1_jnl_snapshot_encode(&s, &sw) == 0) (void)ava1_jnl_compact(&j->jnl, ob, ow.len, sb, sw.len, NULL, 0);
     }
     pthread_mutex_unlock(&j->mu);
+    pthread_mutex_unlock(&j->jnl_mu);
     free(snap);
     free(fb);
     free(rb);
@@ -1418,12 +1440,13 @@ void ava1_apply_reset(ava1_job_t *j, uint32_t id, uint16_t reason) {
     ava1_lfile_t *lf = j->lf[id];
     r.file_id = id;
     ava1_w_init(&w, b, sizeof b);
-    if (ava1_jnl_reset_encode(&r, &w) == 0) (void)ava1_jnl_append(&j->jnl, AVA1_JNL_RESET, b, w.len);
+    if (ava1_jnl_reset_encode(&r, &w) == 0) (void)ava1_apply_jnl_append(j, AVA1_JNL_RESET, b, w.len);
     pthread_mutex_lock(&j->mu);
     j->bytes_durable -= ava1_rset_covered(&lf->durable);
     ava1_rset_clear(&lf->written);
     ava1_rset_clear(&lf->durable);
     lf->has_root = lf->root_journaled = 0;
+    lf->committing = 0; /* a commit that found its bytes wrong starts the file over */
     pthread_mutex_unlock(&j->mu);
     if (lf->ob_fd >= 0) {
         uint64_t n = groups_of(j->m.e[id].size) * 32u;
@@ -1455,6 +1478,18 @@ static int read_root(ava1_job_t *j, uint32_t id, uint8_t root[32]) {
     return k == (ssize_t)(n * 32u) ? 0 : -EIO;
 }
 
+/* A commit runs on a worker, and workers never end the job themselves (see worker_fail): the
+ * failure is recorded and the job thread ends it, journaling Done when `journal_done`. */
+static void commit_fail(ava1_job_t *j, uint16_t status, const char *what, int err, int journal_done) {
+    pthread_mutex_lock(&j->mu);
+    if (!j->finished && !j->final_status) {
+        j->final_status = status;
+        j->fail_journal = journal_done;
+        snprintf(j->message, sizeof j->message, "%s%s%s", what, err ? ": " : "", err ? strerror(err) : "");
+    }
+    pthread_mutex_unlock(&j->mu);
+}
+
 static void commit_large(ava1_job_t *j, uint32_t id) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
     ava1_lfile_t *lf = j->lf[id];
@@ -1474,13 +1509,13 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
             ava1_apply_reset(j, id, AVA1_RETRY_IO);
             return;
         }
-        ava1_apply_fail(j, AVA1_ERR_IO, "reopen for commit failed", err, 0);
+        commit_fail(j, AVA1_ERR_IO, "reopen for commit failed", err, 0);
         return;
     }
     memcpy(want, lf->root, 32); /* ava1_apply_root may replace it from another thread */
     pthread_mutex_unlock(&j->mu);
     if (read_root(j, id, root) != 0) {
-        ava1_apply_fail(j, AVA1_ERR_IO, "reading the outboard failed", EIO, 0);
+        commit_fail(j, AVA1_ERR_IO, "reading the outboard failed", EIO, 0);
         return;
     }
     if (memcmp(root, want, 32) != 0) {
@@ -1490,7 +1525,7 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
     ava1_apply_path(j, id, 1, part, sizeof part);
     ava1_apply_path(j, id, 0, fin, sizeof fin);
     if (!part[0] || !fin[0]) {
-        ava1_apply_fail(j, AVA1_ERR_IO, "path too long", ENAMETOOLONG, 0);
+        commit_fail(j, AVA1_ERR_IO, "path too long", ENAMETOOLONG, 0);
         return;
     }
     HOOK(j, AVA1_HOOK_COMMIT_VERIFIED, id);
@@ -1504,12 +1539,12 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
      * itself sets the mtime. The fsync makes all three durable. */
     (void)fchmod(lf->fd, (mode_t)(e->mode & 07777));
     if (ftruncate(lf->fd, (off_t)e->size) != 0) {
-        ava1_apply_fail(j, AVA1_ERR_IO, "final truncate failed", errno, 0);
+        commit_fail(j, AVA1_ERR_IO, "final truncate failed", errno, 0);
         return;
     }
     ava1_platform_set_mtime(lf->fd, part, e->mtime);
     if ((err = ava1_fsync_retry(lf->fd, stopping_cb, j, NULL)) != 0) {
-        ava1_apply_fail(j, AVA1_ERR_IO, "final sync failed", err, 0);
+        commit_fail(j, AVA1_ERR_IO, "final sync failed", err, 0);
         return;
     }
     close(lf->fd);
@@ -1520,18 +1555,18 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
         parent_of(fin, parent, sizeof parent);
         /* Same directory by construction; checked anyway (SPEC.md §12.6, the kernel panic). */
         if (cfg->same_device && cfg->same_device(part, parent) == 0) {
-            ava1_apply_fail(j, AVA1_ERR_CROSS_DEVICE, "the destination is on another drive", 0, 1);
+            commit_fail(j, AVA1_ERR_CROSS_DEVICE, "the destination is on another drive", 0, 1);
             return;
         }
         if (rename(part, fin) != 0) {
             int e = errno;
-            if (in_the_way(e)) ava1_apply_fail(j, AVA1_ERR_EXISTS, "something is already where the file goes", e, 1);
-            else ava1_apply_fail(j, AVA1_ERR_IO, "rename into place failed", e, 1);
+            if (in_the_way(e)) commit_fail(j, AVA1_ERR_EXISTS, "something is already where the file goes", e, 1);
+            else commit_fail(j, AVA1_ERR_IO, "rename into place failed", e, 1);
             return;
         }
         HOOK(j, AVA1_HOOK_RENAMED, id);
         if ((err = sync_dir(parent)) != 0) {
-            ava1_apply_fail(j, AVA1_ERR_IO, "syncing the folder failed", err, 1);
+            commit_fail(j, AVA1_ERR_IO, "syncing the folder failed", err, 1);
             return;
         }
         HOOK(j, AVA1_HOOK_DIR_SYNCED, id);
@@ -1551,8 +1586,8 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
         b.files = rb;
         b.files_len = (uint32_t)rw.len;
         ava1_w_init(&w, body, sizeof body);
-        if (ava1_jnl_batch_encode(&b, &w) != 0 || ava1_jnl_append(&j->jnl, AVA1_JNL_BATCH, body, w.len) != 0) {
-            ava1_apply_fail(j, AVA1_ERR_IO, "journal append failed", EIO, 0);
+        if (ava1_jnl_batch_encode(&b, &w) != 0 || ava1_apply_jnl_append(j, AVA1_JNL_BATCH, body, w.len) != 0) {
+            commit_fail(j, AVA1_ERR_IO, "journal append failed", EIO, 0);
             return;
         }
         HOOK(j, AVA1_HOOK_JOURNALED, id);
@@ -1568,6 +1603,19 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
     }
 }
 
+/* Runs on a worker (or inline when the queue item could not be allocated). */
+static void run_commit(ava1_job_t *j, uint32_t id) {
+    uint64_t t0 = mono_us();
+    commit_large(j, id);
+    __atomic_add_fetch(&j->st_commit_us, mono_us() - t0, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&j->mu);
+    j->commits_inflight--;
+    pthread_cond_broadcast(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+}
+
+/* commit_large on a worker: queued here, run by run_work. The queue item names the file;
+ * `committing` (set under mu when it is queued) keeps the next scan from queueing it again. */
 void ava1_apply_commit_ready(ava1_job_t *j) {
     uint32_t *snap, n, k;
     pthread_mutex_lock(&j->mu);
@@ -1578,12 +1626,26 @@ void ava1_apply_commit_ready(ava1_job_t *j) {
         uint32_t i = snap[k];
         ava1_lfile_t *lf;
         int ready;
+        ava1_work_t *w;
         pthread_mutex_lock(&j->mu);
-        lf = j->lf[i]; /* the same lf the snapshot saw: only this thread frees one at a commit */
-        ready = lf && !lf->committed && !ava1_bits_get(&j->done, i) && lf->has_root && lf->root_journaled &&
-                !lf->written.n && (j->m.e[i].size == 0 || ava1_rset_covers(&lf->durable, 0, j->m.e[i].size));
+        lf = j->lf[i]; /* the same lf the snapshot saw: only a commit or a reset frees one, never this scan */
+        ready = lf && !lf->committed && !lf->committing && !ava1_bits_get(&j->done, i) && lf->has_root &&
+                lf->root_journaled && !lf->written.n &&
+                (j->m.e[i].size == 0 || ava1_rset_covers(&lf->durable, 0, j->m.e[i].size));
+        if (ready) {
+            lf->committing = 1;
+            j->commits_inflight++;
+        }
         pthread_mutex_unlock(&j->mu);
-        if (ready) commit_large(j, i);
+        if (!ready) continue;
+        w = calloc(1, sizeof *w);
+        if (!w) { /* run it here rather than lose it */
+            run_commit(j, i);
+            continue;
+        }
+        w->kind = AVA1_W_COMMIT;
+        w->file_id = i;
+        enqueue(j, w, 0);
     }
     free(snap);
 }
@@ -1729,7 +1791,7 @@ static void *job_main(void *arg) {
     ava1_job_t *j = arg;
     for (;;) {
         uint64_t now, flush;
-        int ev, batch, failed;
+        int ev, batch, failed, fail_journal = 0;
         uint16_t fail_status = 0;
         char fail_msg[sizeof j->message];
         ava1_platform_sleep_ms(TICK_MS);
@@ -1751,24 +1813,21 @@ static void *job_main(void *arg) {
         failed = !j->finished && j->final_status != 0; /* a worker's failure (worker_fail) */
         if (failed) {
             fail_status = j->final_status;
+            fail_journal = j->fail_journal;
             memcpy(fail_msg, j->message, sizeof fail_msg);
         }
         batch = j->prepared && !j->finished && !failed && !__atomic_load_n(&ava1_apply_hold_batches, __ATOMIC_SEQ_CST) &&
                 ((j->pend_n && (j->pend_n >= j->batch_max || ava1_pend_full())) || j->unsynced_bytes >= BATCH_BYTES ||
                  ((j->pend_n || j->unsynced_bytes || j->roots_new) && now - j->last_batch_ms >= BATCH_MS));
         pthread_mutex_unlock(&j->mu);
-        if (failed) ava1_apply_fail(j, fail_status, fail_msg, 0, 0);
+        if (failed) ava1_apply_fail(j, fail_status, fail_msg, 0, fail_journal);
         if (ev && j->on_events) j->on_events(j);
         if (j->on_tick) j->on_tick(j);
         if (flush) emit_credit(j, flush);
         if (batch) {
             sync_batch(j);
             j->last_batch_ms = now;
-            if (!j->stopping) {
-                uint64_t c0 = mono_us();
-                ava1_apply_commit_ready(j);
-                j->st_commit_us += mono_us() - c0;
-            }
+            if (!j->stopping) ava1_apply_commit_ready(j);
         }
         if (j->st_batches && now - j->st_log_ms >= 10000) log_stats(j, now);
         if (all_done(j)) finish(j);

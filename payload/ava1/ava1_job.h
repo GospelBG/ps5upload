@@ -49,6 +49,7 @@ typedef struct {        /* one large file being assembled */
     int dir_synced;        /* its part file's directory entry is durable (Task 13) */
     int in_list;           /* its id is in the job's lfl list (the batch scans' index) */
     int opening;           /* a worker is opening/preallocating it with j->mu released */
+    int committing;        /* its commit is queued or running on a worker (review 003 §3.3) */
 } ava1_lfile_t;
 
 typedef struct ava1_work { /* a unit for the worker pool */
@@ -103,6 +104,14 @@ struct ava1_job {
         st_compact_us, st_compacts, st_log_ms;
     /* Preallocation, all workers (atomics): microseconds, bytes and files; one "slow" line per job. */
     uint64_t pre_us, pre_bytes;
+    /* Commits run on the workers (review 003 §3.3): `commits_inflight` (under mu) counts the
+     * queued and running ones; a journal compaction waits until there are none. `jnl_mu`
+     * serialises every journal append (the file offset and fsync order are one critical
+     * section) and compaction; lock order: jnl_mu then mu. A commit's failure is recorded like
+     * any worker's, `fail_journal` saying whether its Done must be journaled. */
+    pthread_mutex_t jnl_mu;
+    uint32_t commits_inflight;
+    int fail_journal;
     uint32_t pre_files;
     int pre_slow_logged;
     ava1_file_range_t *last_ranges; /* the last journal batch's ranges (resume check, Task 13) */

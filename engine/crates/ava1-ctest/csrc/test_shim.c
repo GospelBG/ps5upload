@@ -1261,7 +1261,38 @@ static void ev_add(const char *s, int done);
 
 static int g_arm_point = -1, g_arm_n, g_arm_errno;
 /* Probe counters (perf-apply): what the hooks saw, read by ava1_test_apply_probe. */
-static unsigned g_pre_calls, g_pre_held;
+static unsigned g_pre_calls, g_pre_held, g_commit_calls, g_commit_on_job_thread;
+/* Directory syncs (hook 7 = a batch's, hook 10 = prepare's): calls, calls made on a worker, and the
+ * distinct threads that made them; `g_hook_sleep_ms` makes each one slow so striping shows. */
+static unsigned g_dir_calls[2], g_dir_on_worker[2], g_dir_nthreads[2], g_hook_sleep_ms;
+static pthread_t g_dir_threads[2][32];
+static pthread_mutex_t g_dir_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void ava1_test_apply_probe_reset(void) {
+    pthread_mutex_lock(&g_dir_mu);
+    memset(g_dir_calls, 0, sizeof g_dir_calls);
+    memset(g_dir_on_worker, 0, sizeof g_dir_on_worker);
+    memset(g_dir_nthreads, 0, sizeof g_dir_nthreads);
+    pthread_mutex_unlock(&g_dir_mu);
+    g_hook_sleep_ms = 0;
+    g_pre_calls = g_pre_held = g_commit_calls = g_commit_on_job_thread = 0;
+}
+
+static void dir_hook_note(ava1_job_t *j, int which) {
+    pthread_t me = pthread_self();
+    unsigned k;
+    int on_worker = 0;
+    pthread_mutex_lock(&g_dir_mu);
+    g_dir_calls[which]++;
+    for (k = 0; k < j->nworkers; k++)
+        if (pthread_equal(me, j->workers[k])) on_worker = 1;
+    g_dir_on_worker[which] += on_worker;
+    for (k = 0; k < g_dir_nthreads[which]; k++)
+        if (pthread_equal(me, g_dir_threads[which][k])) break;
+    if (k == g_dir_nthreads[which] && k < 32) g_dir_threads[which][g_dir_nthreads[which]++] = me;
+    pthread_mutex_unlock(&g_dir_mu);
+    if (g_hook_sleep_ms) ava1_platform_sleep_ms(g_hook_sleep_ms);
+}
 static void t_hook(ava1_job_t *j, int point, uint32_t id) {
     if (point == AVA1_HOOK_PREALLOC) {
         /* Called right before the preallocation: the job mutex must NOT be held here. */
@@ -1273,6 +1304,12 @@ static void t_hook(ava1_job_t *j, int point, uint32_t id) {
         ava1_fsync_test_errno = g_arm_errno;
         __atomic_store_n(&ava1_fsync_test_fail_n, g_arm_n, __ATOMIC_SEQ_CST);
         __atomic_store_n(&g_arm_point, -1, __ATOMIC_SEQ_CST);
+    }
+    if (point == AVA1_HOOK_BATCH_DIR_SYNCED) dir_hook_note(j, 0);
+    if (point == AVA1_HOOK_PREP_DIR_SYNCED) dir_hook_note(j, 1);
+    if (point == AVA1_HOOK_COMMIT_VERIFIED) {
+        __atomic_add_fetch(&g_commit_calls, 1, __ATOMIC_SEQ_CST);
+        if (pthread_equal(pthread_self(), j->thread)) __atomic_add_fetch(&g_commit_on_job_thread, 1, __ATOMIC_SEQ_CST);
     }
     if (__atomic_load_n(&g_trace, __ATOMIC_SEQ_CST)) {
         char line[64];
@@ -1288,9 +1325,9 @@ static void t_hook(ava1_job_t *j, int point, uint32_t id) {
             return;
         }
         (void)ava1_apply_chunk(j, own, n, id, g_dup_off, own, n);
-        /* wait until a worker has applied it */
+        /* wait until a worker has applied it (the commit itself runs on a worker: it is the one busy) */
         pthread_mutex_lock(&j->mu);
-        while (j->q_len || j->busy) {
+        while (j->q_len || j->busy > 1) {
             pthread_mutex_unlock(&j->mu);
             ava1_platform_sleep_ms(1);
             pthread_mutex_lock(&j->mu);
@@ -1314,12 +1351,33 @@ void ava1_test_fsync_fault(int point, int n, int err) {
 unsigned ava1_test_fsync_retries(void) { return __atomic_load_n(&ava1_fsync_retries_total, __ATOMIC_RELAXED); }
 int ava1_test_fsync_pending_faults(void) { return __atomic_load_n(&ava1_fsync_test_fail_n, __ATOMIC_SEQ_CST); }
 
-/* out[0] = preallocations seen, out[1] = of those, how many ran with the job mutex held. */
+/* out[0] = preallocations seen, out[1] = of those, how many ran with the job mutex held,
+ * out[2] = commits begun, out[3] = of those, how many ran on the job thread. */
 void ava1_test_apply_probe(uint64_t out[8]) {
     memset(out, 0, 8 * sizeof out[0]);
     out[0] = __atomic_load_n(&g_pre_calls, __ATOMIC_SEQ_CST);
     out[1] = __atomic_load_n(&g_pre_held, __ATOMIC_SEQ_CST);
+    out[2] = __atomic_load_n(&g_commit_calls, __ATOMIC_SEQ_CST);
+    out[3] = __atomic_load_n(&g_commit_on_job_thread, __ATOMIC_SEQ_CST);
+    pthread_mutex_lock(&g_dir_mu);
+    out[4] = g_dir_calls[0];
+    out[5] = g_dir_on_worker[0];
+    out[6] = g_dir_nthreads[0];
+    out[7] = 0;
+    pthread_mutex_unlock(&g_dir_mu);
 }
+
+/* The same for prepare's directory syncs: out[0..3] = calls, on a worker, distinct threads. */
+void ava1_test_apply_probe_prep(uint64_t out[3]) {
+    pthread_mutex_lock(&g_dir_mu);
+    out[0] = g_dir_calls[1];
+    out[1] = g_dir_on_worker[1];
+    out[2] = g_dir_nthreads[1];
+    pthread_mutex_unlock(&g_dir_mu);
+}
+
+/* Each directory sync the apply engine reports (hooks 7 and 10) then takes `ms` more. */
+void ava1_test_apply_hook_sleep(uint32_t ms) { __atomic_store_n(&g_hook_sleep_ms, ms, __ATOMIC_SEQ_CST); }
 
 void ava1_test_apply_trace(int on) { __atomic_store_n(&g_trace, on, __ATOMIC_SEQ_CST); }
 
@@ -1458,7 +1516,7 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
     ava1_test_set_same_device(1); /* a test that died mid-way must not leak its override */
     __atomic_store_n(&ava1_fsync_test_fail_n, 0, __ATOMIC_SEQ_CST); /* ... or its fsync fault */
     __atomic_store_n(&g_arm_point, -1, __ATOMIC_SEQ_CST);
-    g_pre_calls = g_pre_held = 0;
+    ava1_test_apply_probe_reset();
     memset(&cfg, 0, sizeof cfg);
     snprintf(cfg.jobs_dir, sizeof cfg.jobs_dir, "%s", jobs_dir);
     cfg.may_write = t_allow;
@@ -1625,6 +1683,7 @@ size_t ava1_test_apply_events(char *out, size_t cap) {
 }
 
 void ava1_test_apply_end(void) {
+    __atomic_store_n(&g_hook_sleep_ms, 0, __ATOMIC_SEQ_CST);
     if (g_job) ava1_job_put(g_job);
     g_job = NULL;
     ava1_data_stop();
@@ -1680,6 +1739,7 @@ static int recv_open_now(void) {
 }
 
 static int recv_start(int crash_at) {
+    ava1_test_apply_probe_reset(); /* the counters cover the run since the last (re)open */
     g_cfg.crash_at = crash_at;
     ev_reset();
     if (ava1_data_start(&g_cfg) != 0) return -100;

@@ -201,7 +201,7 @@ void ava1_copy_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *b
                 ava1_w_t w;
                 ava1_w_init(&w, encoded, sizeof encoded);
                 if (ava1_jnl_done_encode(&terminal, &w) == 0)
-                    (void)ava1_jnl_append(&j->jnl, AVA1_JNL_DONE, encoded, w.len);
+                    (void)ava1_apply_jnl_append(j, AVA1_JNL_DONE, encoded, w.len);
             }
             pthread_mutex_lock(&j->mu);
             if (left) {

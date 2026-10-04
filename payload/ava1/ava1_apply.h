@@ -13,6 +13,7 @@
 #define AVA1_W_CHUNK 1
 #define AVA1_W_BUNDLE 2
 #define AVA1_W_CALL 3
+#define AVA1_W_COMMIT 4 /* commit_large of one file (review 003 §3.3), run by a worker */
 #define AVA1_PEND_MAX 512u          /* small-file fds held open until their batch */
 #define AVA1_CRASH_AFTER_SYNC 1     /* tests: die after fsync, before the journal */
 #define AVA1_CRASH_AFTER_JOURNAL 2  /* tests: die after the journal, before Durable */
@@ -21,6 +22,8 @@
 #define AVA1_CRASH_BEFORE_COMMIT 5  /* tests: die as a fully durable file's commit starts */
 #define AVA1_CRASH_STAGED_RENAMED 6 /* tests: die after the staging rename + sync, before Done */
 #define AVA1_CRASH_MID_REMAP 7      /* tests: die after a remap's outboard renames */
+#define AVA1_CRASH_AFTER_DATA 8     /* tests: die after the batch's data fsync, before any directory sync */
+#define AVA1_CRASH_MID_DIRS 9       /* tests: die once the first of a batch's directories is synced */
 
 /* `owned` buffers are freed by the apply engine (always, including on error); their
  * length returns to the sender as credit. */
@@ -38,6 +41,9 @@ int ava1_apply_parallel(ava1_job_t *j, void (*fn)(ava1_job_t *, void *, uint32_t
 void ava1_apply_path(const ava1_job_t *j, uint32_t id, int part, char *out, size_t cap);
 /* Ends the job once (also the success path, status AVA1_STATUS_OK): journal Done when
  * asked, then JobDone. */
+/* The only way to append to a job's journal once workers run (they append commits): the
+ * appends are serialised on the job. Returns ava1_jnl_append's. */
+int ava1_apply_jnl_append(ava1_job_t *j, uint8_t kind, const uint8_t *body, size_t len);
 void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, int journal_done);
 void ava1_apply_status(ava1_job_t *j);                  /* emit one Status now */
 /* Forget a large file's progress (journal Reset, clear its ranges and root, blank its
@@ -48,7 +54,8 @@ void ava1_apply_compact(ava1_job_t *j);
 /* Job thread only: waits until no work is queued or running, then makes what was applied
  * durable (one sync batch) and drops what could not be, so the manifest can change. */
 void ava1_apply_quiesce(ava1_job_t *j);
-/* Job thread only: commits every large file whose ranges and root are all durable. */
+/* Queues the commit of every large file whose ranges and root are all durable onto the
+ * workers and returns at once (a commit is four fsyncs; it must not stop the job thread). */
 void ava1_apply_commit_ready(ava1_job_t *j);
 /* Sends a finished job's JobDone again (a sender that lost the first one asks again). */
 void ava1_apply_done_again(ava1_job_t *j);
@@ -67,6 +74,7 @@ void ava1_apply_finish_landed(ava1_job_t *j);
 #define AVA1_HOOK_BATCH_SYNCED 6    /* the batch's file data fsynced */
 #define AVA1_HOOK_BATCH_DIR_SYNCED 7 /* one directory that gained an entry, fsynced */
 #define AVA1_HOOK_BATCH_JOURNALED 8 /* the batch appended to the journal */
+#define AVA1_HOOK_PREP_DIR_SYNCED 10 /* one directory prepare synced (job thread's wait, workers' sync) */
 #define AVA1_HOOK_PREALLOC 9        /* a part file is about to be preallocated (job mutex NOT held) */
 extern void (*ava1_apply_hook)(ava1_job_t *j, int point, uint32_t id);
 /* Tests only (NULL in the payload): an errno to inject at a point instead of doing the work.

@@ -348,6 +348,8 @@ pub mod ffi {
         pub fn ava1_test_apply_bundle_raw(d: *const u8, len: usize, count: u32) -> c_int;
         pub fn ava1_test_apply_trace(on: c_int);
         pub fn ava1_test_apply_probe(out: *mut u64);
+        pub fn ava1_test_apply_probe_prep(out: *mut u64);
+        pub fn ava1_test_apply_hook_sleep(ms: u32);
         pub fn ava1_test_apply_dup_on_commit(id: u32, off: u64, d: *const u8, len: usize) -> c_int;
         pub fn ava1_test_apply_fail_dir_sync(id: u32);
         pub fn ava1_test_apply_hold(on: c_int);
@@ -1327,6 +1329,14 @@ pub struct Probe {
     pub prealloc_calls: u64,
     /// ... of which with the job mutex held (the slow part under the lock this guards against).
     pub prealloc_with_job_mutex_held: u64,
+    /// Large-file commits begun.
+    pub commits: u64,
+    /// ... of which on the job thread (a batch's commits must run on the workers).
+    pub commits_on_job_thread: u64,
+    /// Directory syncs of sync batches (hook 7), how many ran on a worker, and by how many threads.
+    pub batch_dir_syncs: u64,
+    pub batch_dir_syncs_on_workers: u64,
+    pub batch_dir_sync_threads: u64,
 }
 
 /// The payload's apply engine on a hand-built job (one at a time: it shares the C
@@ -1456,7 +1466,25 @@ impl CApplyJob {
         Probe {
             prealloc_calls: o[0],
             prealloc_with_job_mutex_held: o[1],
+            commits: o[2],
+            commits_on_job_thread: o[3],
+            batch_dir_syncs: o[4],
+            batch_dir_syncs_on_workers: o[5],
+            batch_dir_sync_threads: o[6],
         }
+    }
+
+    /// The same for prepare's directory syncs: (calls, on a worker, distinct threads).
+    pub fn probe_prepare_dirs(&self) -> (u64, u64, u64) {
+        let mut o = [0u64; 3];
+        unsafe { ffi::ava1_test_apply_probe_prep(o.as_mut_ptr()) };
+        (o[0], o[1], o[2])
+    }
+
+    /// Makes every directory sync the engine reports (hooks 7 and 10) take `ms` more, so
+    /// whether they run concurrently shows. Reset by the next open and by the end.
+    pub fn hook_sleep(&self, ms: u32) {
+        unsafe { ffi::ava1_test_apply_hook_sleep(ms) }
     }
 
     /// Record the apply engine's test hooks as "hook <point> <file id>" event lines.

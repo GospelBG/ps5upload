@@ -83,6 +83,7 @@ static ava1_job_t *create(const uint8_t id[16], const uint8_t owner[32], const u
         j->parked_at_ms = ava1_mono_ms(); /* nobody holds it yet: it ages like a parked job */
     }
     pthread_mutex_init(&j->mu, NULL);
+    pthread_mutex_init(&j->jnl_mu, NULL);
     pthread_cond_init(&j->cv, NULL);
     pthread_mutex_init(&j->cmu, NULL);
     pthread_cond_init(&j->ccv, NULL);
@@ -108,6 +109,7 @@ static ava1_job_t *create(const uint8_t id[16], const uint8_t owner[32], const u
     pthread_mutex_unlock(&T.mu);
     if (slot < 0) {
         pthread_mutex_destroy(&j->mu);
+        pthread_mutex_destroy(&j->jnl_mu);
         pthread_cond_destroy(&j->cv);
         pthread_mutex_destroy(&j->cmu);
         pthread_cond_destroy(&j->ccv);
@@ -233,6 +235,7 @@ static void job_destroy(ava1_job_t *j) {
     if (j->in_bytes) ava1_ctl_give(j->in_bytes); /* its inbox's frames were charged */
     free_frames(j->in_head);
     pthread_mutex_destroy(&j->mu);
+    pthread_mutex_destroy(&j->jnl_mu);
     pthread_cond_destroy(&j->cv);
     pthread_mutex_destroy(&j->cmu);
     pthread_cond_destroy(&j->ccv);

@@ -728,7 +728,7 @@ static int journal_files(ava1_job_t *j, const ava1_bits_t *b) {
             jb.files = fb;
             jb.files_len = (uint32_t)fw.len;
             ava1_w_init(&w, body, cap + 64);
-            if (ava1_jnl_batch_encode(&jb, &w) == 0) rc = ava1_jnl_append(&j->jnl, AVA1_JNL_BATCH, body, w.len);
+            if (ava1_jnl_batch_encode(&jb, &w) == 0) rc = ava1_apply_jnl_append(j, AVA1_JNL_BATCH, body, w.len);
         }
     }
     free(fb);
