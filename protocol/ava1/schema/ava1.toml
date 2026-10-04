@@ -283,6 +283,10 @@ value = 16
 name = "ERR_CREDIT"
 ty = "u16"
 value = 17
+[[const]]
+name = "ERR_STALLED"   # a receiver ended a job whose sender kept the link alive but sent no data
+ty = "u16"
+value = 18
 # Job kinds, as seen by the node that receives JobOpen.
 [[const]]
 name = "JOB_UPLOAD"     # it receives the files

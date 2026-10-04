@@ -633,6 +633,11 @@ pub struct RecvOptions {
     pub ordered: bool,
     pub progress: Arc<Progress>,
     pub cancel: Arc<AtomicBool>,
+    /// How long a job may go without any progress (a data frame, a root, a finished disk
+    /// batch or write) while the sender still owes bytes before the receiver ends it with
+    /// `ERR_STALLED` (review 006 #2). `None` = `PROGRESS_DEADLINE` (3 x the default
+    /// `dead_after`), or `RESUME_PROGRESS_DEADLINE` for a resumed job.
+    pub progress_deadline: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -1217,6 +1222,13 @@ async fn run_loop(
     // not (SPEC.md §12.4, ledger row 19).
     let mut outstanding = granted;
     let mut last_batch = Instant::now();
+    // The last moment the job moved: a data frame, a root, a finished write or batch.
+    let mut last_progress = Instant::now();
+    let progress_deadline = o.progress_deadline.unwrap_or(if need.partial.is_empty() {
+        PROGRESS_DEADLINE
+    } else {
+        RESUME_PROGRESS_DEADLINE
+    });
     // Out-of-order frames are bounded by the credit granted in JobOpen: the sender cannot
     // have more than one window in flight (SPEC.md §12.4). `whole` says the entry is a
     // root-checked bundle record rather than a chunk.
@@ -1257,6 +1269,7 @@ async fn run_loop(
             w = writes.join_next(), if !writes.is_empty() => {
                 let w = w.expect("guarded by `!is_empty`").map_err(proto)??;
                 tm.write_time += w.took;
+                last_progress = Instant::now();
                 credit_back += w.credit;
                 for id in w.ok {
                     pending_small.push(id);
@@ -1275,6 +1288,15 @@ async fn run_loop(
                 tm.batch_done();
                 match b {
                     Ok(out) => {
+                        // An empty batch runs every SYNC_EVERY and moved nothing: only one
+                        // that made files or ranges durable is progress.
+                        if !(out.small.is_empty()
+                            && out.committed.is_empty()
+                            && out.reset.is_empty()
+                            && out.ranges.is_empty())
+                        {
+                            last_progress = Instant::now();
+                        }
                         fold_batch(&mut done, &mut large, &pg, &m, &out);
                         inflight_small = 0;
                         jnl = Some(out.jnl);
@@ -1323,6 +1345,7 @@ async fn run_loop(
                     .await
                     .map_err(|e| SendError::Disconnected(e.to_string()))?;
                 outstanding -= len;
+                last_progress = Instant::now();
 
                 match frame.ty {
                     Chunk::TYPE => {
@@ -1488,6 +1511,7 @@ async fn run_loop(
                             id = r.file_id
                         )));
                     }
+                    last_progress = Instant::now();
                     large
                         .entry(r.file_id)
                         .or_insert_with(|| new_large(&dir, &m, r.file_id))
@@ -1505,6 +1529,36 @@ async fn run_loop(
             // `next` maps Closed to an error; this arm documents the shape.
             Some(Inbound::Closed(why)) => return Err(SendError::Disconnected(why)),
             None => {}
+        }
+        // Review 006 #2: the sender owes bytes (a file is neither written nor in a batch),
+        // nothing of ours is in flight (no sync batch, no bundle write: a slow drive is not a
+        // stall), and nothing has moved for the whole deadline although the link is alive:
+        // end the job. The sender sees `ERR_STALLED` and can resume; a wedged source read
+        // there is its problem, not a reason to hold this job open forever.
+        if idle
+            && last_progress.elapsed() > progress_deadline
+            && done.len() + pending_small.len() + inflight_small < total_files
+            && batch_handle.is_none()
+            && writes.is_empty()
+        {
+            let why = format!(
+                "progress stalled: no file data for {:.1} s while the sender is still connected",
+                last_progress.elapsed().as_secs_f64()
+            );
+            let _ = writeln!(
+                std::io::stderr(),
+                "ava1: job {}: {why}",
+                crate::hex::encode(&job_id)
+            );
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                link.control.send(&JobCancel {
+                    job_id,
+                    reason: gen::ERR_STALLED,
+                }),
+            )
+            .await;
+            return Err(SendError::Disconnected(why));
         }
         if credit_back >= 4 << 20 || (credit_back > 0 && idle) {
             link.control
@@ -1604,6 +1658,18 @@ async fn run_loop(
         }
     }
 }
+
+/// A job that makes no progress for this long while the sender owes bytes is stalled: the
+/// receiver ends it rather than wait on the byte-level watchdog forever, since a Ping is a
+/// byte and a sender that heartbeats with a wedged data pump (a source read stuck on a
+/// network share) keeps the link alive indefinitely (review 006 #2). 3 x the SPEC default
+/// `dead_after` (12 s): generous, so a slow-but-moving link or drive is never cut.
+pub const PROGRESS_DEADLINE: Duration = Duration::from_secs(36);
+
+/// The same for a resumed job that already holds partial files: the sender may spend a long
+/// time hashing the durable groups it will not resend (no data frame is produced for them),
+/// so the clock is far more patient there.
+pub const RESUME_PROGRESS_DEADLINE: Duration = Duration::from_secs(900);
 
 /// Concurrent bundle writes. The Mac's file creation scales to a few threads; more only
 /// adds contention.

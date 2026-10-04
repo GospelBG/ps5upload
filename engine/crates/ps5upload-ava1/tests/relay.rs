@@ -820,6 +820,7 @@ impl ava1::router::JobHost for EndsItsJob {
             ordered: open.flags & gen::JF_ORDERED != 0,
             progress: progress.clone(),
             cancel: cancel.clone(),
+            progress_deadline: None,
         };
         let sink = Arc::new(ava1::recv::LocalSink::new(
             self.inner.root.join(&open.root),

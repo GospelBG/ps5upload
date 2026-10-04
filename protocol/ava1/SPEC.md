@@ -284,6 +284,7 @@ normative table; the second column names the constant in the generated code.
 | 15 | `ERR_CANCELLED` | the job was cancelled (`job.cancel`, or a `JobCancel` carrying this reason) |
 | 16 | `ERR_CROSS_DEVICE` | a staged or part-file rename whose two sides are on different devices (`st_dev`); never attempted, because a cross-device `rename` panics the console's kernel |
 | 17 | `ERR_CREDIT` | a lane frame larger than the credit the receiver granted (§12.4) |
+| 18 | `ERR_STALLED` | the receiver ended a job whose sender sent no file data for the progress deadline while heartbeating (§12.8) |
 
 7.3 Management methods (the console operations FTX2 carried on :9114). Numbers are assigned by
 block; the tracked list, one row per FTX2 frame with its payload handler and engine caller, is
@@ -737,6 +738,20 @@ The console-local copy and move (§15.5) use the same standard in memory: a copy
 fed by an in-process reader, with no read-back of the destination; a move deletes a source file only
 after every destination group of that file is verified in memory, the file and its directory are
 fsynced and the destination's `Done` is journaled; a copy that fails deletes nothing.
+
+12.8 Progress watchdog (review 006 #2). A Ping is a byte, so §6 cannot see a sender that heartbeats
+while its data pump is wedged (a source read stuck on a network share): such a job would stay open
+with no byte of file data moving. A receiver therefore ends a job that has made no progress for
+the progress deadline while the sender still owes bytes: a file is neither written nor in a sync
+batch, the receiver has nothing of its own in flight, and the sender is attached. Progress is a
+lane data frame admitted, a `FileRoot`, a finished bundle write, or a sync batch that made
+something durable. The deadline is 3 x `dead_after` (36 s at the default 12 s); a job that resumed
+holding durable bytes gets 15 minutes, since its sender may hash the groups it will not resend for
+a long time without producing a frame. A slow drive never counts: any queued or running write, or a
+running sync batch, holds the clock. The engine's receiver sends `JobCancel{reason: ERR_STALLED}`
+and fails the job (the engine's session retry resumes it); the console ends it with `JobDone`
+status `ERR_STALLED` and keeps the journal, as for every console-side failure. The sender
+observes the code like any receiver-ended job and may resume.
 
 ## 13. Verification
 

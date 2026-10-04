@@ -34,6 +34,7 @@ fn ro(jobs: &std::path::Path, ordered: bool) -> RecvOptions {
         ordered,
         progress: Arc::default(),
         cancel: Arc::default(),
+        progress_deadline: None,
     }
 }
 

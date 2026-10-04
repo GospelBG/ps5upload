@@ -2460,6 +2460,7 @@ int ava1_test_data_knob(const char *name, uint32_t v) {
     else if (!strcmp(name, "copy_delete_delay_ms")) __atomic_store_n(&ava1_copy_test_delete_delay_ms, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "copy_crash_before_delete"))
         __atomic_store_n(&ava1_copy_test_crash_before_delete, (int)v, __ATOMIC_SEQ_CST);
+    else if (!strcmp(name, "progress_ms")) __atomic_store_n(&c->progress_ms, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "ctl_cap")) __atomic_store_n(&c->ctl_cap, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "send_fail")) __atomic_store_n(&ava1_send_test_fail_sends, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "writer_start_fail"))
