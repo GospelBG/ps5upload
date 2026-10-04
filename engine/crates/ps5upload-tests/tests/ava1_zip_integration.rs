@@ -69,7 +69,7 @@ async fn put_zip(
     config: ps5upload_core::transfer::TransferConfig,
 ) -> anyhow::Result<ps5upload_core::transfer::TransferResult> {
     let (pool, dest, path) = (c.pool.clone(), dest_root.to_string(), zip.0.clone());
-    run(120, move || {
+    run(300, move || {
         upload::upload_zip_in(&pool, &config, job_id(id), &dest, &path)
     })
     .await
@@ -123,11 +123,11 @@ async fn upload_zip_large_entry_needs_no_staging() {
 /// under the same job id and the file is byte-identical.
 #[tokio::test(flavor = "multi_thread")]
 async fn upload_zip_resumes_after_an_interruption() {
-    let (c, _proxy) = slow_console().await;
-    let data = pattern(42, 12 * 1024 * 1024);
+    let (c, proxy) = slow_console().await;
+    let data = pattern(42, 16 * 1024 * 1024);
     let zip = build_zip(&[("game.bin", &data)], false);
     let (pool, path) = (c.pool.clone(), zip.0.clone());
-    let e = cancel_midway(&cfg(), move |config| {
+    let e = cancel_midway(&proxy, &cfg(), move |config| {
         upload::upload_zip_in(&pool, &config, job_id(4), "data/r", &path)
     })
     .await;

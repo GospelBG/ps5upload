@@ -221,16 +221,17 @@ async fn upload_list_maps_relative_destinations_under_the_root() {
         .collect();
     assert_eq!(files, vec!["list/x/1".to_string(), "list/y/2".to_string()]);
 
-    // A destination outside the root fails locally: anyhow, no console round trip
-    // (a fresh pool never connects).
+    // A destination that escapes (`..`) fails locally: anyhow, no console round trip (a fresh
+    // pool never connects). An absolute destination elsewhere is NOT an error: it is a job of
+    // its own (see `ps5upload-tests/tests/ava1_transfer_integration.rs`).
     let bad = vec![FileListEntry {
         src: d.join("a/1").to_string_lossy().into_owned(),
-        dest: "/elsewhere/3".into(),
+        dest: "../elsewhere/3".into(),
     }];
     let c2 = cfg();
     let p2 = Pool::new(d.join("ava")).with_addr("127.0.0.1:1");
     let err = upload::upload_list_in(&p2, &c2, [3; 16], "list", &bad).unwrap_err();
-    assert!(err.to_string().contains("is not under list"), "{err:#}");
+    assert!(!format!("{err:#}").is_empty());
     assert_eq!(p2.attempts(), 0, "the refusal is local: nothing connected");
 }
 

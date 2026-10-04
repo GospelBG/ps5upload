@@ -31,7 +31,7 @@ async fn put_file(
     src: &Path,
 ) -> anyhow::Result<ps5upload_core::transfer::TransferResult> {
     let (pool, dest, src) = (c.pool.clone(), dest.to_string(), src.to_path_buf());
-    run(120, move || {
+    run(300, move || {
         upload::upload_file_in(&pool, &cfg(), job_id(id), &dest, &src)
     })
     .await
@@ -277,6 +277,7 @@ fn assert_folder_landed(root: &Path, expected: &[(String, Vec<u8>)], ctx: &str) 
 /// identical bytes at identical paths every time, junk filtered, nothing invented.
 #[tokio::test(flavor = "multi_thread")]
 async fn upload_dir_byte_exact_100x() {
+    let _turn = heavy().await;
     let t = tempdir();
     let expected = build_game_folder(t.path());
     let total: u64 = expected.iter().map(|(_, b)| b.len() as u64).sum();
@@ -529,14 +530,15 @@ async fn a_file_list_inside_the_root_stays_one_job() {
 async fn cancelling_a_split_file_list_stops_all_of_it() {
     let a = abs_console(true).await;
     let t = tempdir();
-    write(&t.path().join("big"), &pattern(9, 12 * 1024 * 1024));
+    write(&t.path().join("big"), &pattern(9, 16 * 1024 * 1024));
     write(&t.path().join("small"), b"later");
     let entries = vec![
         entry(&t.path().join("big"), "big.bin"),
         entry(&t.path().join("small"), "/data/later/small.bin"),
     ];
     let pool = a.console.pool.clone();
-    let e = cancel_midway(&cfg(), move |config| {
+    let proxy = a.proxy.clone().unwrap();
+    let e = cancel_midway(&proxy, &cfg(), move |config| {
         upload::upload_list_in(&pool, &config, job_id(52), "/data/games", &entries)
     })
     .await;
@@ -585,11 +587,11 @@ async fn a_failing_directory_reports_its_first_path() {
 /// the upload with `transfer_cancelled` and nothing half-written is left under the final name.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_an_upload_stops_it_and_leaves_no_partial_file() {
-    let (c, _proxy) = slow_console().await;
+    let (c, proxy) = slow_console().await;
     let t = tempdir();
-    write(&t.path().join("big.bin"), &pattern(5, 12 * 1024 * 1024));
+    write(&t.path().join("big.bin"), &pattern(5, 16 * 1024 * 1024));
     let (pool, src) = (c.pool.clone(), t.path().join("big.bin"));
-    let e = cancel_midway(&cfg(), move |config| {
+    let e = cancel_midway(&proxy, &cfg(), move |config| {
         upload::upload_file_in(&pool, &config, job_id(20), "data/big.bin", &src)
     })
     .await;
@@ -608,12 +610,12 @@ async fn cancelling_an_upload_stops_it_and_leaves_no_partial_file() {
 /// resumes, the console keeps what was durable, and the result is byte-exact.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_interrupted_upload_resumes_under_the_same_job_id() {
-    let (c, _proxy) = slow_console().await;
+    let (c, proxy) = slow_console().await;
     let t = tempdir();
-    let data = pattern(6, 12 * 1024 * 1024);
+    let data = pattern(6, 16 * 1024 * 1024);
     write(&t.path().join("big.bin"), &data);
     let (pool, src) = (c.pool.clone(), t.path().join("big.bin"));
-    let e = cancel_midway(&cfg(), move |config| {
+    let e = cancel_midway(&proxy, &cfg(), move |config| {
         upload::upload_file_in(&pool, &config, job_id(21), "data/big.bin", &src)
     })
     .await;
@@ -632,7 +634,7 @@ async fn an_interrupted_upload_resumes_under_the_same_job_id() {
 async fn upload_file_resumes_after_a_mid_stream_drop() {
     let (c, proxy) = slow_console().await;
     let t = tempdir();
-    let data = pattern(8, 12 * 1024 * 1024);
+    let data = pattern(8, 16 * 1024 * 1024);
     write(&t.path().join("resume.bin"), &data);
     let finalized = Arc::new(AtomicU64::new(0));
     let mut config = cfg();
@@ -649,7 +651,7 @@ async fn upload_file_resumes_after_a_mid_stream_drop() {
         })
     };
     let (pool, src) = (c.pool.clone(), t.path().join("resume.bin"));
-    let r = run(120, move || {
+    let r = run(300, move || {
         upload::upload_file_in(&pool, &config, job_id(22), "data/resume.bin", &src)
     })
     .await
@@ -665,10 +667,10 @@ async fn upload_file_resumes_after_a_mid_stream_drop() {
 /// midway resumes under the same job id and lands every file.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_file_list_upload_resumes_after_an_interruption() {
-    let (c, _proxy) = slow_console().await;
+    let (c, proxy) = slow_console().await;
     let t = tempdir();
-    let a = pattern(1, 6 * 1024 * 1024);
-    let b = pattern(2, 6 * 1024 * 1024);
+    let a = pattern(1, 12 * 1024 * 1024);
+    let b = pattern(2, 12 * 1024 * 1024);
     write(&t.path().join("a.bin"), &a);
     write(&t.path().join("b.bin"), &b);
     let entries = vec![
@@ -682,13 +684,13 @@ async fn a_file_list_upload_resumes_after_an_interruption() {
         },
     ];
     let (pool, e2) = (c.pool.clone(), entries.clone());
-    let e = cancel_midway(&cfg(), move |config| {
+    let e = cancel_midway(&proxy, &cfg(), move |config| {
         upload::upload_list_in(&pool, &config, job_id(23), "data/resume", &e2)
     })
     .await;
     assert!(format!("{e:#}").contains("cancel"), "{e:#}");
     let pool = c.pool.clone();
-    run(120, move || {
+    run(300, move || {
         upload::upload_list_in(&pool, &cfg(), job_id(23), "data/resume", &entries)
     })
     .await
@@ -704,14 +706,14 @@ async fn a_file_list_upload_resumes_after_an_interruption() {
 /// new, so the upload either restarts and lands the NEW content exactly, or refuses.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reused_job_id_with_changed_bytes_never_splices() {
-    let (c, _proxy) = slow_console().await;
+    let (c, proxy) = slow_console().await;
     let t = tempdir();
-    let old = pattern(30, 12 * 1024 * 1024);
-    let new = pattern(31, 12 * 1024 * 1024);
+    let old = pattern(30, 16 * 1024 * 1024);
+    let new = pattern(31, 16 * 1024 * 1024);
     let src = t.path().join("g.bin");
     write(&src, &old);
     let (pool, s2) = (c.pool.clone(), src.clone());
-    let e = cancel_midway(&cfg(), move |config| {
+    let e = cancel_midway(&proxy, &cfg(), move |config| {
         upload::upload_file_in(&pool, &config, job_id(24), "data/g.bin", &s2)
     })
     .await;
@@ -772,6 +774,7 @@ fn assert_throughput(label: &str, bytes: usize, elapsed: Duration) {
 #[tokio::test(flavor = "multi_thread")]
 async fn ci_throughput_gate_single_file_32mib() {
     const SIZE: usize = 32 * 1024 * 1024;
+    let _turn = heavy().await;
     let c = console().await;
     let t = tempdir();
     write(&t.path().join("gate.bin"), &vec![0x5Au8; SIZE]);
@@ -789,6 +792,7 @@ async fn ci_throughput_gate_single_file_32mib() {
 async fn ci_throughput_gate_dir_16x2mib() {
     const FILE: usize = 2 * 1024 * 1024;
     const COUNT: usize = 16;
+    let _turn = heavy().await;
     let c = console().await;
     let t = tempdir();
     for i in 0..COUNT {

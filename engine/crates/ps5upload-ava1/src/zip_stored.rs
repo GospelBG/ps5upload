@@ -1213,7 +1213,7 @@ mod tests {
             .collect()
     }
 
-    fn write_then_die(d: &PathBuf, m: &Manifest, upto: &[(u32, u64)]) {
+    fn write_then_die(d: &std::path::Path, m: &Manifest, upto: &[(u32, u64)]) {
         let s = StoredZipSink::new(d.join("o.zip"), "P");
         s.prepare(m).unwrap();
         s.position(&BTreeSet::new(), &BTreeMap::new()).unwrap();
