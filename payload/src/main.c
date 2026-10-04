@@ -24,6 +24,7 @@
 #include "ava1_glue.h"
 #include "takeover_flag.h"
 #include "ava1_stop.h"
+#include "ava1_gen.h"
 #include "sony_api_lock.h"
 
 #include "proc_identity.h"
@@ -731,8 +732,23 @@ int main(void) {
     state.mgmt_thread_started = 1;
     {
         if (runtime_mgmt_install(&state) != 0) fprintf(stderr, "ava1: management table not installed\n");
-        int ava1_rc = ava1_payload_start();
-        if (ava1_rc != 0) fprintf(stderr, "ava1: server did not start (%d); FTX2 continues\n", ava1_rc);
+        /* Never two helpers with AVA1 at once (the 2026-10-03 Pro outage: the prior instance was
+         * not reaped and its AVA1 server and data layer ran beside the new one; the console hung).
+         * The takeover has asked the prior instance to leave; give it a bounded time to release
+         * :9120, and if something still answers there start neither the server nor the data layer.
+         * FTX2 keeps running so the app can still replace this instance. */
+        if (takeover_wait_port_free((int)AVA1_DEFAULT_PORT, 15000, 100) != 0) {
+            fprintf(stderr,
+                    "ava1: REFUSING TO START: port %d is still answered by another process 15 s after the takeover; "
+                    "not starting the server or the data layer beside it. FTX2 continues; replace this helper "
+                    "from the app or restart the console.\n",
+                    (int)AVA1_DEFAULT_PORT);
+            ava1_payload_refused();
+            pop_notification("PS5Upload: another helper still holds the transfer port - AVA1 is off. Send the payload again or restart the PS5");
+        } else {
+            int ava1_rc = ava1_payload_start();
+            if (ava1_rc != 0) fprintf(stderr, "ava1: server did not start (%d); FTX2 continues\n", ava1_rc);
+        }
     }
     startup_trace("MGMT_THREAD_SPAWNED");
 

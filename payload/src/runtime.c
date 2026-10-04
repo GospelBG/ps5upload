@@ -2046,6 +2046,9 @@ void runtime_classify_prior_instance(runtime_state_t *state) {
  * Must be called AFTER runtime_try_takeover and BEFORE runtime_write_ownership
  * (which overwrites the prior record with our own pid).
  */
+/* How long the prior instance gets to exit by itself before it is killed. */
+#define REAP_GRACE_MS 15000
+
 void runtime_reap_prior_instance(runtime_state_t *state) {
     if (!state) return;
     int prior = runtime_read_prior_pid(state->ownership_path);
@@ -2061,54 +2064,58 @@ void runtime_reap_prior_instance(runtime_state_t *state) {
     }
     if (prior <= 0 || prior == me) return;
 
-    /* Boot-session guard (the critical safety gate). The ownership file lives
-     * on persistent /data and SURVIVES reboots. After a reboot the kernel's
-     * PID counter resets, so a stale `pid=` from a PRIOR boot is very likely
-     * now owned by UNRELATED homebrew the user autoloaded (a cheat loader,
-     * nanoDNS, ...). SIGKILLing it would take down their other tools — exactly
-     * the "my scripts died" reports. So only reap a record written during the
-     * CURRENT boot: the recorded start time must be >= this boot's wall-clock
-     * start. If either value is unknown (no sysctl, or an old-format record
-     * with no started_at), refuse to kill — the worst case is the pre-existing
-     * "restart the PS5" fallback, which is far better than killing a
-     * bystander. The name check below is kept as a second line of defense. */
-    {
-        uint64_t prior_started =
-            runtime_read_prior_started_at(state->ownership_path);
-        uint64_t boottime = runtime_system_boottime_unix();
-        if (boottime == 0 || prior_started == 0 || prior_started < boottime) {
-            fprintf(stderr,
-                    "[payload2] reap: prior record (started=%llu, boottime=%llu) "
-                    "is from a previous boot or unverifiable — pid %d may now be "
-                    "unrelated homebrew; NOT killing\n",
-                    (unsigned long long)prior_started,
-                    (unsigned long long)boottime, prior);
-            return;
-        }
-    }
-
+    /* Boot-session guard (the critical safety gate). The ownership file lives on persistent /data and
+     * SURVIVES reboots, and after a reboot the pid counter restarts, so a stale `pid=` may now be
+     * unrelated homebrew (a cheat loader, nanoDNS, ...). Two witnesses, either enough: the KERNEL's
+     * start time of that very process (ki_start, same clock as kern.boottime) is at or after this
+     * boot, or the record's started_at_unix is. The record alone used to be the only one, and a
+     * record that read started=0 left a live helper beside the new instance (the 2026-10-03 Pro
+     * outage). The name check (ours, not "payload.elf") stays the second line of defence. */
     if (kill((pid_t)prior, 0) != 0) return; /* already gone */
 
     char their_name[64] = {0};
     if (proc_name_by_pid(prior, their_name, sizeof(their_name)) != 0) {
         return; /* prior pid vanished between the checks — nothing to do */
     }
-    /* Second line of defence against pid recycling. NOT an exact compare
-     * against our own name: ours is read here, before any worker thread has
-     * started, so it is still "ps5upload.elf", while a predecessor that has
-     * been up for a while reports whichever worker the kernel picked as its
-     * representative thread — "ps5upload-wake" in issue #289's kernel log.
-     * The exact compare made this branch always take the skip path, so a
-     * wedged predecessor was never reaped and the new payload exited.
-     *
-     * The PRIMARY safety gate remains the boot-session check above; this
-     * only has to rule out a recycled pid now owned by unrelated homebrew,
-     * and no other homebrew carries the "ps5upload" prefix. */
-    if (!proc_name_is_ours(their_name)) {
+    {
+        uint64_t prior_started = runtime_read_prior_started_at(state->ownership_path);
+        uint64_t boottime = runtime_system_boottime_unix();
+        uint64_t kstart = 0;
+        int kstart_known = proc_start_by_pid(prior, &kstart) == 0;
+        ps5upload2_reap_t verdict = instance_reap_decision(proc_name_is_ours(their_name), prior_started, boottime,
+                                                           kstart, kstart_known, (uint64_t)time(NULL));
         fprintf(stderr,
-                "[payload2] reap: pid %d is '%s', not one of ours — recycled pid, skipping\n",
-                prior, their_name);
-        return;
+                "[payload2] reap: pid %d name=%s kernel_start=%llu%s record_started=%llu boottime=%llu -> %s\n",
+                prior, their_name, (unsigned long long)kstart, kstart_known ? "" : " (unreadable)",
+                (unsigned long long)prior_started, (unsigned long long)boottime,
+                verdict == PS5UPLOAD2_REAP_YES ? "ours, this boot"
+                : verdict == PS5UPLOAD2_REAP_NOT_OURS ? "not one of ours (recycled pid), skipping"
+                : "cannot show it is of this boot: NOT killing");
+        if (verdict != PS5UPLOAD2_REAP_YES) return;
+    }
+
+    /* Graceful first. The takeover request (frame or flag file) already asked it to exit, and a
+     * helper stopping cleanly finishes its Sony call and closes its journals; a SIGKILL while it is
+     * inside a Sony call is the thing that hangs a console. So wait, bounded, for it to go by itself
+     * and kill only what is still there after that. */
+    {
+        struct timespec t0, now;
+        int gone = 0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (;;) {
+            if (kill((pid_t)prior, 0) != 0) {
+                gone = 1;
+                break;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if ((now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000 >= REAP_GRACE_MS) break;
+            usleep(100000);
+        }
+        if (gone) {
+            fprintf(stderr, "[payload2] prior instance pid=%d exited by itself\n", prior);
+            return;
+        }
+        fprintf(stderr, "[payload2] prior instance pid=%d is still alive after %d ms of grace\n", prior, REAP_GRACE_MS);
     }
 
     fprintf(stderr, "[payload2] reaping crashed prior instance pid=%d (name=%s)\n",
