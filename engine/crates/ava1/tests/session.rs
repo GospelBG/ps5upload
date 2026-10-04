@@ -449,6 +449,13 @@ fn a_peer_removal_that_cannot_be_saved_changes_nothing() {
     assert_eq!(store.list().len(), 2);
     // Once the file can be written again, the removal goes through.
     std::fs::remove_file(d.join("sub")).unwrap();
+    // A write starts from the file as it is on disk (it is the truth, another process may
+    // have changed it): the wiped file lists nobody, so there is nothing to remove until
+    // the peers are back.
+    assert!(!store.remove(&[1; 32]).unwrap());
+    let mut again = PeerStore::load(&path).unwrap();
+    again.add([1; 32], "one").unwrap();
+    again.add([2; 32], "two").unwrap();
     assert!(store.remove(&[1; 32]).unwrap());
     assert!(!PeerStore::load(&path).unwrap().contains(&[1; 32]));
 }
