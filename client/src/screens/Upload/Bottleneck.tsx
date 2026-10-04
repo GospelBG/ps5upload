@@ -64,6 +64,27 @@ export function SettlingLine({ live }: { live: JobLive }) {
   );
 }
 
+/** A finished upload whose files the console has not confirmed saved (the engine's commit_ack warning):
+ *  a warning in the result, never a clean success. */
+export function UnsettledLine({ live }: { live: JobLive | undefined }) {
+  const tr = useTr();
+  if (!live?.unsettled) return null;
+  return (
+    <div
+      className="mt-1 rounded-md border border-[var(--color-warn)] bg-[var(--color-surface)] p-2 text-xs text-[var(--color-warn)]"
+      data-testid="unsettled-warning"
+      role="alert"
+    >
+      ⚠{" "}
+      {tr(
+        "upload_warn_unsettled",
+        undefined,
+        "Every byte reached the console, but it has not confirmed saving all files yet. They finish on their own; if the console loses power first, send the folder again.",
+      )}
+    </div>
+  );
+}
+
 /** Everything a running job's live notes can say, in one block. Renders nothing when the
  *  engine sent no live fields. */
 export function JobLiveNotes({ live }: { live: JobLive | undefined }) {

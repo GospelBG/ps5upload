@@ -7,6 +7,8 @@
 //                                 "source", "console drive", "console workers", "console memory"
 //                                 (Running when the engine reports it live, and always in the
 //                                 finished job's commit_ack)
+//   commit_ack.warning            a finished upload whose files the console did not confirm
+//                                 saved in place (the engine stopped waiting): shown as a warning
 //   settling                      files are still settling on the console after the job
 //                                 finished (the engine sees `unswept` > 0): "Finishing on the console"
 //
@@ -20,6 +22,8 @@ export interface JobLive {
   skipTotalBytes: number;
   bottleneck: BottleneckCause | null;
   settling: boolean;
+  /** A finished job that carries the engine's "console did not confirm saving" warning. */
+  unsettled?: boolean;
 }
 
 /** The snapshot fields this module reads (all optional). */
@@ -29,7 +33,7 @@ export interface JobLiveFields {
   skip_total_bytes?: number | null;
   bottleneck?: string | null;
   settling?: boolean | null;
-  commit_ack?: { bottleneck?: string | null } | null;
+  commit_ack?: { bottleneck?: string | null; warning?: string | null } | null;
 }
 
 /** Maps the engine's bottleneck word (`ps5upload_ava1::progress::bottleneck_name`) to a
@@ -67,6 +71,8 @@ export function jobLiveFromSnapshot(
   const skipTotalBytes = Math.max(0, Number(snap.skip_total_bytes) || 0);
   const bottleneck = bottleneckCause(snap.bottleneck ?? snap.commit_ack?.bottleneck);
   const settling = snap.settling === true;
-  if (!skipping && !bottleneck && !settling) return undefined;
-  return { skipping, skipDoneBytes, skipTotalBytes, bottleneck, settling };
+  const warning = snap.commit_ack?.warning;
+  const unsettled = typeof warning === "string" && warning.trim() !== "";
+  if (!skipping && !bottleneck && !settling && !unsettled) return undefined;
+  return { skipping, skipDoneBytes, skipTotalBytes, bottleneck, settling, ...(unsettled ? { unsettled } : {}) };
 }

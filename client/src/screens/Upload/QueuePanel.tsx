@@ -48,7 +48,7 @@ import {
 } from "../../state/uploadQueue";
 import { isRemotePath } from "../../lib/remotePath";
 import { useTransferStore } from "../../state/transfer";
-import { BottleneckLine, JobLiveNotes } from "./Bottleneck";
+import { BottleneckLine, JobLiveNotes, UnsettledLine } from "./Bottleneck";
 import { RarPasswordPrompt } from "./RarPasswordPrompt";
 import { rarPasswordProblem } from "../../lib/rarPassword";
 
@@ -1019,6 +1019,7 @@ export function QueueRow({
       {item.status === "done" && !isInstall && item.live?.bottleneck && (
         <BottleneckLine cause={item.live.bottleneck} />
       )}
+      {item.status === "done" && !isInstall && <UnsettledLine live={item.live} />}
 
       {item.status === "done" && item.installNote && (
         <div className="mt-1 text-xs text-[var(--color-muted)]">

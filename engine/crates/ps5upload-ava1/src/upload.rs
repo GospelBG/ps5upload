@@ -318,6 +318,17 @@ pub struct UploadFailure {
     pub detail: String,
 }
 
+/// The failure when a console answered BUSY to every JobOpen the bound allowed.
+pub(crate) fn busy_failure(tries: u32, message: &str) -> anyhow::Error {
+    UploadFailure {
+        reason: "ava1_busy".into(),
+        detail: format!(
+            "the console stayed busy for {tries} retries and could not take this job: {message}"
+        ),
+    }
+    .into()
+}
+
 pub(crate) fn refusal_reason(status: u16) -> String {
     match status {
         gen::ERR_NO_SPACE => "ava1_no_space".into(),
@@ -596,6 +607,7 @@ pub fn upload_with_seq_in(
         let _bridge = Bridge::start(progress.clone(), cfg);
         let mut backoff = Duration::from_millis(250);
         let mut gate = SessionGate::default();
+        let mut busy = 0u32;
         let (mut last_at, mut last_durable) = (Instant::now(), 0u64);
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -640,13 +652,14 @@ pub fn upload_with_seq_in(
                 bandwidth_cap: cfg.bandwidth_cap_bps,
                 // 7z passes its source as `seq`; RAR sets it on `opts`.
                 seq: seq.clone().or_else(|| opts.seq.clone()),
+                settle_max: None,
             };
             match send_job(&mut link, manifest.clone(), source.clone(), o).await {
                 Ok(r) if r.status == gen::STATUS_OK => {
                     let _ = std::fs::remove_dir_all(&persist);
                     let skipped_files = progress.skipped_files.load(Ordering::Relaxed);
                     let skipped_bytes = progress.skipped_bytes.load(Ordering::Relaxed);
-                    let body = serde_json::json!({
+                    let mut body = serde_json::json!({
                         "protocol": "ava1",
                         "files": r.files,
                         "bytes": r.bytes,
@@ -660,6 +673,11 @@ pub fn upload_with_seq_in(
                         "skipped_bytes": skipped_bytes,
                         "files_sent": manifest_files.saturating_sub(skipped_files),
                     });
+                    // The bytes are durable, but the console did not confirm its files settled in place
+                    // (SPEC.md §15.7): the job's snapshot says so instead of a clean success.
+                    if let Some(w) = &r.message {
+                        body["warning"] = serde_json::Value::String(w.clone());
+                    }
                     return Ok(TransferResult {
                         tx_id_hex: hex(&job_id),
                         // The field name is FTX2's; for AVA1 it is files (C19).
@@ -680,6 +698,15 @@ pub fn upload_with_seq_in(
                     let durable = progress.bytes_durable.load(Ordering::Relaxed);
                     pool.forget(console).await;
                     wait(&mut backoff, &format!("{why} ({durable} bytes durable)")).await;
+                }
+                // BUSY on the JobOpen is the console saying "not now" (it is finishing this job's files, or
+                // has no room): the same bounded backoff as a lost session, cancel honoured at the loop top.
+                Err(SendError::Refused { status, message }) if status == gen::ERR_BUSY => {
+                    busy += 1;
+                    if busy > pool.busy_tries() {
+                        return Err(busy_failure(pool.busy_tries(), &message));
+                    }
+                    wait(&mut backoff, &format!("the console is busy: {message}")).await;
                 }
                 Err(SendError::Refused { status, message }) if status == gen::ERR_EXISTS => {
                     return Err(PostCommitError::new(PostCommitKind::Exists, Some(message)).into());

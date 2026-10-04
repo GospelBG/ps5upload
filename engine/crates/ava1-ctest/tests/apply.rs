@@ -423,7 +423,7 @@ fn new_small_files_have_their_directories_synced_before_the_journal() {
             file("b/2", 1),
         ],
     };
-    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    let job = CApplyJob::begin_opts(&t.join("jobs"), &root, 0, &m, 0, 0, LogOpts::OFF);
     job.trace(true);
     job.hold_batches(true);
     for id in [1, 2, 4, 5] {
@@ -579,7 +579,7 @@ fn a_transient_journal_fsync_error_is_retried() {
     let m = Manifest {
         entries: vec![file("a", 1)],
     };
-    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    let job = CApplyJob::begin_opts(&t.join("jobs"), &root, 0, &m, 0, 0, LogOpts::OFF);
     job.trace(true);
     job.hold_batches(true);
     job.record(0, b"a", *blake3::hash(b"a").as_bytes());
@@ -608,7 +608,7 @@ fn a_retried_fsync_that_left_a_small_file_wrong_fails_instead_of_acknowledging()
     let m = Manifest {
         entries: vec![file("a", 4)],
     };
-    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    let job = CApplyJob::begin_opts(&t.join("jobs"), &root, 0, &m, 0, 0, LogOpts::OFF);
     job.hold_batches(true);
     job.record(0, b"good", *blake3::hash(b"good").as_bytes());
     job.wait_pending(1, 5000);

@@ -692,7 +692,10 @@ released only when the receiver accounts for them (its `Credit` after the apply)
 and not yet `Received`.
 
 12.6 `Durable{files, ranges}` follows the order: data synced → journal appended and
-synced → `Durable`. `JobDone` follows the last durable commit (and the staging rename).
+synced → `Durable`. What "data synced" means for a small file is the receiver's choice, but what
+the journal proves is not: a file reported durable can be reproduced by the receiver alone, either
+because its bytes and name are on stable storage in place, or (durable-by-log, §15.7) because a
+log record that holds them is, and a durable journal record names it. `JobDone` follows the last durable commit (and the staging rename).
 A failure after every byte is durable (`ERR_EXISTS`, `ERR_CROSS_DEVICE` on the final
 rename) is reported in `JobDone` and never causes a resend. A rename is durable only once its
 directory is synced: the receiver fsyncs the parent directory after every commit or staging
@@ -760,8 +763,8 @@ every partial file and resets a file on any mismatch. The verify policy re-hashe
 
 14.1 The journal: `<job dir>/journal` = magic `AVA1JNL1` (8 bytes), then records
 `u32le(len) ‖ u8 kind ‖ body ‖ u32le(crc32c(kind ‖ body))`, `len` = 1 + body length. Kinds:
-1 `JnlOpen`, 2 `JnlBatch`, 3 `JnlReset`, 4 `JnlSnapshot`, 5 `JnlDone` (bodies are the generated
-structs). Replay stops at the first record whose length runs past the file, whose CRC fails, or
+1 `JnlOpen`, 2 `JnlBatch`, 3 `JnlReset`, 4 `JnlSnapshot`, 5 `JnlDone`, 6 `JnlSweep` (bodies are the
+generated structs). Replay stops at the first record whose length runs past the file, whose CRC fails, or
 that the visitor refuses; the file is truncated there before the next append. Every append is
 followed by `fsync`. When the file passes 1 MiB it is compacted: `journal.tmp` =
 magic + `JnlOpen` + `JnlSnapshot(current state)`, `fsync`, `rename` over `journal` (same
@@ -771,7 +774,11 @@ rename).
 
 14.2 State: a `JnlBatch` marks files done (dropping their ranges), adds durable ranges and
 records roots; `JnlReset` forgets one file; `JnlSnapshot` replaces the whole state; `JnlDone`
-records the job's final status. The map answered for a resume is the replayed state (done files;
+records the job's final status. A `JnlBatch` carrying the pack extension (§15.7) also marks its
+files *unswept*; a `JnlSweep` clears that for the files it lists; a `JnlSnapshot` carries the
+unswept files (`unswept`: the `FileRun` item stream) and the pack ranges that still hold them
+(`segments`: the `PackRef` item stream, one per segment, spanning its unswept records). Replay's
+unswept set is "done, minus swept". The map answered for a resume is the replayed state (done files;
 durable ranges of the others), after the check in §13.4.
 
 14.3 Location: the console keeps job directories under `/data/ps5upload/ava/jobs/`, an engine
@@ -793,6 +800,8 @@ record whose length disagrees with the manifest is answered with `FileRetry` rea
 `RETRY_CHANGED`, and one whose BLAKE3 disagrees with the root it carries with `RETRY_VERIFY`;
 the record is not applied and the job continues.
 
+A receiver may instead take the durable-by-log path of §15.7 for these records.
+
 15.3 Large files: `pwrite` at the chunk's offset into the part file (preallocated when new),
 group CVs into the outboard. Bytes are durable after a sync batch. When every byte is durable
 and the root merged from the outboard equals the sender's `FileRoot`, the file commits: mode →
@@ -803,11 +812,32 @@ final relative path inside the staging tree, so the file's own commit renames no
 outboard that is missing at commit time is a reset (`FileRetry` `RETRY_IO`), never a new empty
 file.
 
+A receiver opens and preallocates a new part file (so that ENOSPC is found first, and so that a
+sparse file cannot collapse the drive's write rate under dirty-buffer throttling) without
+holding the job's lock, and runs a commit on a worker rather than on the thread that batches
+fsyncs. Journal appends from several commits and a batch are serialised, so their records land in
+some order; each is independent, since a commit's record names one file and only follows that
+file's rename and directory fsync. A journal compaction waits until no commit is between its
+rename and its record. Where a drive's fsync of a batch takes longer than the credit window
+holds data at the intake rate measured between batches, a receiver may fsync each chunk right
+after writing it (the batch fsync then finds little to flush); this changes no ordering.
+
 15.4 Sync batches: every 250 ms, or after `batch_max` small files (tuned 16–512, starting 256:
 halved when a batch takes over 1.5 s, doubled when under 0.5 s) or 64 MiB of large-file bytes.
-Data fsyncs run in parallel on the workers, then the new directories are fsynced, then the
-batch (`JnlBatch`) is appended and the durable ranges are reported. A stop in the middle of a
-sync journals and acknowledges nothing.
+Data fsyncs run in parallel on the workers, then the new directories are fsynced (also in
+parallel on the workers: each is an independent descriptor, and a directory is synced once per
+batch however many files it gained), then the batch (`JnlBatch`) is appended and the durable
+ranges are reported. A stop in the middle of a sync journals and acknowledges nothing.
+
+(A logged batch, §15.7, replaces the small files' data and directory syncs with one fsync of the pack
+log; the invariant below then applies to the sweep, which is where those directories are synced.)
+
+The directory-sync invariant (the journal never runs ahead of a name): a `JnlBatch` naming a
+file is appended only after every directory that gained an entry in that batch has returned from
+`fsync`, and a prepare's new directories are likewise all synced before the map is sent. The
+syncs are never deferred past the record; a crash with some of them still to do therefore leaves
+no record naming those files, and the resumed job resends them. A receiver may run the syncs in
+any order and on any threads, but not after the append.
 
 15.5 Staging and merge: a new destination is staged — the tree is written to `<root>.ava-part`,
 a sibling of the destination, while `<root>` itself is created as an empty lock folder; at the
@@ -851,6 +881,75 @@ jobs together may hold, never fewer than 4; a worker that finds the share used u
 work or waits, and the job thread syncs early so that the batch frees slots. A single job holds at
 most 512 pending small files regardless of the budget. `disk.calibrate` (§16.10) works within the same
 budget instead of opening every file at once.
+
+15.7 Durable-by-log (small files; optional for a receiver, the console and the engine implement it).
+A batch of N small files costs two fsyncs (the log, the journal) instead of N + D + 1; files are made
+durable in place later, off the transfer's critical path.
+
+Pack log. `<job dir>/pack.<n>` (n from 0, never reused within a job) = magic `AVA1PCK1` (8 bytes), then
+records `u32le(len) ‖ u8 kind ‖ body ‖ u32le(crc32c(kind ‖ body))`, `len` = 1 + body length, appended
+sequentially; kind 1 `PackFile` = a `BundleRecord` as received. A reader stops at the first record that runs
+past the extent or fails its CRC. A record never spans segments; a segment is closed when the next record would
+pass `PACK_SEGMENT` (64 MiB) and a new one starts. Segments are not preallocated (the log is fsynced every
+batch, so dirty data never piles up the way it does under a part file). A new segment's directory entry is
+synced when it is created, so a journal record may name it.
+
+Receiver steps for a small file: validate as in 15.2; append the record to the log (the offset is taken and the
+record written under one lock, so every record below a written one is written); create the file, write, mode,
+mtime, close, with no fsync and no descriptor kept. A batch then (1) fsyncs the log segments written since the last
+batch (a retried fsync is followed by reading the batch's records back and checking each CRC and root), (2) fsyncs
+large-file data as today, (3) appends one `JnlBatch` per segment its records sit in, carrying the files as runs and
+the pack extension (`pack_segment`, `pack_offset`, `pack_len`: the byte range of its records), fsynced, (4) marks the
+files done and sends `Durable`. No directory is synced here.
+
+Invariants. I1 A file reported `Durable` can be reproduced by the receiver alone: its bytes are in the file (swept)
+or in a log record named by a durable journal record. I2 `Durable` and `JobDone` are never sent before the journal
+record that proves I1 is fsynced. I3 A segment is deleted only after every file whose record it holds is swept and
+the sweep is journaled durably. I4 Large files are unchanged. I5 Recovery is idempotent: re-making a file that exists
+with the right bytes changes nothing, one with wrong bytes is rewritten.
+
+Sweep. A worker with no other work (or one that would push the log past the cap) takes up to 64 done, unswept
+files whose batch is at least `SWEEP_AGE` (3 s; every one when the job has ended) old: each is opened, re-made from its
+log record if it is missing or the wrong size, and fsynced (a retried fsync re-makes it and syncs again); then each
+distinct parent directory is fsynced; then `JnlSweep{files}` is appended and fsynced; only then does a segment whose
+files are all swept get deleted. The sweep is the only place the directories of logged small files are synced.
+
+Backpressure. The pack bytes of files not yet swept (pending ones included) are capped at `UNSWEPT_MAX` (256 MiB): a
+worker that would pass it sweeps (or runs queued sync stripes) instead of writing, so the disk holds at most one cap
+of duplicated bytes and throughput falls back to the per-file path's, never below it.
+
+Recovery. On `JobOpen` of a known job, and for every job directory at helper start, the receiver replays the journal;
+for each file done but unswept it locates the record in the pack ranges the replay kept, checks the record's root,
+and re-makes the file when it is missing or its size or BLAKE3 differs, then sweeps. A file whose record cannot be found
+or fails its CRC (a missing segment, a torn tail) is not done: a `JnlReset` forgets it and the sender resends it. A
+successful recovery leaves no segment behind. Cost is bounded by the cap.
+
+End of job and reporting. `JobDone` is sent once the final batch is journaled (I2), with ext `settling` = 1 while
+files are still unswept; `Status` ext `unswept` carries the count (absent = 0) and the job stays listed, its sweep
+running, until it reaches 0 (a session that ends does not stop it). A staged tree settles fully before its final rename
+(the sweep addresses files by path), so `JobDone` carries no flag for it; so does a console copy or move, which must
+not delete its source before what it copied is durable in place; merges and single files settle behind `JobDone`. A
+sender that sees `settling` may keep the job open, reading `Status`, until `unswept` is 0 (an engine does, for up to 30 s,
+to show "finishing on the console"); the report is true either way. A power cut inside the sweep's lag leaves the last files to be re-made by the next recovery.
+
+Failure. A sweep that fails loses nothing: its files go back to the front of the queue and are tried again after a
+backoff (100 ms doubling to 3.2 s). After five failures in a row the error is sticky: `Status` carries `code` =
+`ERR_IO` and the reason in `current` until a sweep succeeds, and a job that is still running fails with it. A sender
+that waits for `unswept` = 0 fails the upload on that `code` (the console cannot make its files durable); on its own
+timeout or a cancel it ends the wait and reports the job with a warning, never as a clean success, because the
+bytes are safe in the log. A drain (a staged tree's rename, a copy's end, a manifest change) retries a few times and
+then fails; a drain cut by a stop writes nothing (no terminal `Done`). A manifest change is refused with `ERR_IO` when
+the unswept files cannot be settled first (the sweep queue names ids, which the new manifest would renumber).
+
+Nobody holding the job. A job directory that holds a pack log is never garbage-collected. A settling job that is
+reaped (after the park age) is destroyed with its log on disk; the receiver's housekeeping takes such directories (and
+those a crash left) through the same recovery as `JobOpen`, a bounded number per pass, every few seconds and at start.
+Beside the per-job `UNSWEPT_MAX` there is a cap across jobs (512 MiB); it gates a job only past its own share (4 MiB),
+and the bytes of a job in a sticky sweep error, or of a recovery pass, do not count against the others. Recovery runs on a
+thread of its own (the reaper is never held up), takes a bounded number of directories per pass and moves on from one it
+cannot settle, so a stuck directory never starves the rest; while it holds a job id a `JobOpen` for it is answered
+`BUSY` (the sender retries with a bounded jittered backoff, honouring cancel, and then resumes; the engine does this for uploads, downloads and relays, and fails with reason `ava1_busy` once the bound, 12 tries by default, is spent). A log nobody could recover is garbage-collected a week after the normal
+age, with a log line.
 
 ## 16. Governor
 

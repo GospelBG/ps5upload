@@ -48,4 +48,14 @@ describe("job live notes", () => {
     expect(jobLiveFromSnapshot({ settling: true })?.settling).toBe(true);
     expect(jobLiveFromSnapshot({ settling: undefined })).toBeUndefined();
   });
+
+  it("carries the console's settle warning from a finished job's commit_ack, and only then", () => {
+    const warned = jobLiveFromSnapshot({
+      commit_ack: { warning: "files are still being made durable on the console" },
+    });
+    expect(warned?.unsettled).toBe(true);
+    expect(jobLiveFromSnapshot({ commit_ack: { bottleneck: "network" } })?.unsettled).toBeFalsy();
+    expect(jobLiveFromSnapshot({ commit_ack: { warning: "" } })).toBeUndefined();
+    expect(jobLiveFromSnapshot({ commit_ack: { warning: null } })).toBeUndefined();
+  });
 });

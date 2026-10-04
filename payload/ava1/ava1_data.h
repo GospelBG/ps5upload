@@ -29,7 +29,36 @@ typedef struct {
     /* Control-frame bytes queued for jobs (their inboxes and the frames behind a JobOpen
      * still opening), all jobs together; 0 = 64 MiB. Past it, the job ends with ERR_BUSY. */
     uint32_t ctl_cap;
+    /* Durable-by-log for small files (SPEC.md §15.7). 0 = the default (on), AVA1_LOG_SMALL_ON,
+     * AVA1_LOG_SMALL_OFF: the per-file-fsync path, kept for one release. */
+    uint8_t log_small;
+    uint32_t pack_segment;                /* bytes per pack segment; 0 = 64 MiB */
+    uint64_t unswept_max;                 /* pack bytes whose files are not yet durable in place; 0 = 256 MiB */
+    uint32_t sweep_age_ms;                /* a batch's files are swept after this; 0 = 3000 (tests set 1) */
+    uint64_t unswept_total;               /* the same cap across all jobs; 0 = 512 MiB */
+    uint32_t recover_every_ms;            /* housekeeping recovers parked/crashed job dirs this often; 0 = 10000 */
+    uint32_t recover_max;                 /* job directories one recovery pass takes; 0 = 4 */
 } ava1_data_cfg_t;
+#define AVA1_LOG_SMALL_ON 1
+#define AVA1_LOG_SMALL_OFF 2
+#define AVA1_PACK_SEGMENT (64u << 20)
+#define AVA1_UNSWEPT_MAX (256ull << 20)
+#define AVA1_UNSWEPT_TOTAL (512ull << 20)
+#define AVA1_SWEEP_AGE_MS 3000u
+/* 1 when small files go through the pack log (the data layer's effective setting). */
+int ava1_data_log_small(void);
+/* Crash recovery of durable-by-log (SPEC.md §15.7): one pass over the jobs directory takes up to `max`
+ * job directories that hold a pack log and nobody has open, re-makes their unswept files from the log and
+ * sweeps them. Run at start and then by housekeeping, so a job that was reaped or crashed is finished
+ * without a JobOpen. Returns how many it took. */
+uint32_t ava1_recv_recover_pass(const char *jobs_dir, uint32_t max);
+/* Pack bytes of files not yet swept, all jobs together (the cross-job cap's counter). */
+void ava1_unswept_add(int64_t delta);
+uint64_t ava1_unswept_total(void);
+/* 0 once ava1_data_stop has begun: long background work (recovery) checks it and returns. */
+int ava1_data_running(void);
+/* Housekeeping loop iterations since start (tests: a slow recovery must not stall the reaper). */
+extern unsigned ava1_house_ticks;
 
 int ava1_data_start(const ava1_data_cfg_t *cfg);  /* starts housekeeping; 0 or -errno */
 void ava1_data_stop(void);                         /* stops and frees every job */

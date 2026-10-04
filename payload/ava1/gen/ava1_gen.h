@@ -727,6 +727,12 @@ typedef struct {
     const uint8_t *roots;
     uint32_t roots_len;
     uint32_t roots_count;
+    int has_pack_segment;
+    uint32_t pack_segment;
+    int has_pack_offset;
+    uint64_t pack_offset;
+    int has_pack_len;
+    uint64_t pack_len;
 } ava1_jnl_batch_t;
 
 int ava1_jnl_batch_encode(const ava1_jnl_batch_t *m, ava1_w_t *w);
@@ -735,6 +741,34 @@ int ava1_jnl_batch_decode(const uint8_t *buf, size_t len, ava1_jnl_batch_t *m);
 int ava1_jnl_batch_append(ava1_w_t *blob, const ava1_jnl_batch_t *m);
 int ava1_jnl_batch_next(ava1_r_t *it, ava1_jnl_batch_t *out);
 int ava1_jnl_batch_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    uint32_t segment;
+    uint64_t offset;
+    uint64_t len;
+    uint32_t first_file;
+    uint32_t count;
+} ava1_pack_ref_t;
+
+int ava1_pack_ref_encode(const ava1_pack_ref_t *m, ava1_w_t *w);
+int ava1_pack_ref_decode(const uint8_t *buf, size_t len, ava1_pack_ref_t *m);
+
+int ava1_pack_ref_append(ava1_w_t *blob, const ava1_pack_ref_t *m);
+int ava1_pack_ref_next(ava1_r_t *it, ava1_pack_ref_t *out);
+int ava1_pack_ref_count(const uint8_t *p, uint32_t len, uint32_t *count);
+
+typedef struct {
+    const uint8_t *files;
+    uint32_t files_len;
+    uint32_t files_count;
+} ava1_jnl_sweep_t;
+
+int ava1_jnl_sweep_encode(const ava1_jnl_sweep_t *m, ava1_w_t *w);
+int ava1_jnl_sweep_decode(const uint8_t *buf, size_t len, ava1_jnl_sweep_t *m);
+
+int ava1_jnl_sweep_append(ava1_w_t *blob, const ava1_jnl_sweep_t *m);
+int ava1_jnl_sweep_next(ava1_r_t *it, ava1_jnl_sweep_t *out);
+int ava1_jnl_sweep_count(const uint8_t *p, uint32_t len, uint32_t *count);
 
 typedef struct {
     uint32_t file_id;
@@ -757,6 +791,12 @@ typedef struct {
     const uint8_t *roots;
     uint32_t roots_len;
     uint32_t roots_count;
+    int has_unswept;
+    const uint8_t *unswept;
+    uint32_t unswept_len;
+    int has_segments;
+    const uint8_t *segments;
+    uint32_t segments_len;
 } ava1_jnl_snapshot_t;
 
 int ava1_jnl_snapshot_encode(const ava1_jnl_snapshot_t *m, ava1_w_t *w);
@@ -1061,6 +1101,8 @@ typedef struct {
     uint32_t result_len;
     int has_code;
     uint16_t code;
+    int has_unswept;
+    uint32_t unswept;
 } ava1_status_t;
 
 int ava1_status_encode(const ava1_status_t *m, ava1_w_t *w);
@@ -1074,6 +1116,8 @@ typedef struct {
     int has_message;
     const uint8_t *message;
     uint16_t message_len;
+    int has_settling;
+    uint8_t settling;
 } ava1_job_done_t;
 
 int ava1_job_done_encode(const ava1_job_done_t *m, ava1_w_t *w);

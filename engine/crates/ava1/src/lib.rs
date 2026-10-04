@@ -14,6 +14,7 @@ pub mod keys;
 pub mod launch;
 mod link;
 pub mod manifest;
+pub mod packlog;
 pub mod peers;
 pub mod ranges;
 pub mod recv;

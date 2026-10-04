@@ -594,6 +594,7 @@ fn run(
         let (mut base_bytes, mut base_files) = (0u64, 0u64);
         let mut attempt = 0u32;
         let mut retry_restarts = 0u32;
+        let mut busy = 0u32;
         let (mut last_at, mut last_work) = (Instant::now(), 0u64);
         let mut progress = Arc::new(Progress::default());
         loop {
@@ -638,6 +639,15 @@ fn run(
                     return Ok(r.bytes);
                 }
                 Err(SendError::Disconnected(why)) => (why, true),
+                // The console answered BUSY to the JobOpen: not now. Same bounded backoff, same attempt.
+                Err(SendError::Refused { status, message }) if status == gen::ERR_BUSY => {
+                    busy += 1;
+                    if busy > pool.busy_tries() {
+                        return Err(crate::upload::busy_failure(pool.busy_tries(), &message));
+                    }
+                    wait(&mut backoff, &format!("the console is busy: {message}")).await;
+                    continue;
+                }
                 Err(SendError::Source(e))
                     if is_zip_restart(&e) && retry_restarts < MAX_RETRY_RESTARTS =>
                 {

@@ -2172,10 +2172,29 @@ int ava1_jnl_open_count(const uint8_t *p, uint32_t len, uint32_t *count) {
 }
 
 int ava1_jnl_batch_encode(const ava1_jnl_batch_t *m, ava1_w_t *w) {
+    uint16_t ext_n = 0;
     ava1_w_bytes(w, m->files, m->files_len);
     ava1_w_bytes(w, m->ranges, m->ranges_len);
     ava1_w_bytes(w, m->roots, m->roots_len);
-    ava1_w_u16(w, 0);
+    if (m->has_pack_segment) ext_n++;
+    if (m->has_pack_offset) ext_n++;
+    if (m->has_pack_len) ext_n++;
+    ava1_w_u16(w, ext_n);
+    if (m->has_pack_segment) {
+        size_t at = ava1_w_ext_begin(w, 1);
+        ava1_w_u32(w, m->pack_segment);
+        ava1_w_ext_end(w, at);
+    }
+    if (m->has_pack_offset) {
+        size_t at = ava1_w_ext_begin(w, 2);
+        ava1_w_u64(w, m->pack_offset);
+        ava1_w_ext_end(w, at);
+    }
+    if (m->has_pack_len) {
+        size_t at = ava1_w_ext_begin(w, 3);
+        ava1_w_u64(w, m->pack_len);
+        ava1_w_ext_end(w, at);
+    }
     return w->err;
 }
 
@@ -2201,10 +2220,34 @@ int ava1_jnl_batch_decode(const uint8_t *buf, size_t len, ava1_jnl_batch_t *m) {
     }
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {
-        uint32_t vlen;
-        (void)ava1_r_u16(&r);
-        vlen = ava1_r_u32(&r);
-        (void)ava1_r_take(&r, vlen);
+        uint16_t tag = ava1_r_u16(&r);
+        uint32_t vlen = ava1_r_u32(&r);
+        const uint8_t *v = ava1_r_take(&r, vlen);
+        ava1_r_t vr;
+        int rc;
+        if (r.err) break;
+        ava1_r_init(&vr, v, vlen);
+        switch (tag) {
+        case 1:
+            if (m->has_pack_segment) return AVA1_E_DUP_EXT;
+            m->has_pack_segment = 1;
+            m->pack_segment = ava1_r_u32(&vr);
+            break;
+        case 2:
+            if (m->has_pack_offset) return AVA1_E_DUP_EXT;
+            m->has_pack_offset = 1;
+            m->pack_offset = ava1_r_u64(&vr);
+            break;
+        case 3:
+            if (m->has_pack_len) return AVA1_E_DUP_EXT;
+            m->has_pack_len = 1;
+            m->pack_len = ava1_r_u64(&vr);
+            break;
+        default:
+            continue;
+        }
+        rc = ava1_r_finish(&vr);
+        if (rc != 0) return rc;
     }
     return ava1_r_finish(&r);
 }
@@ -2237,6 +2280,124 @@ int ava1_jnl_batch_count(const uint8_t *p, uint32_t len, uint32_t *count) {
     *count = 0;
     ava1_r_init(&it, p, len);
     while ((rc = ava1_jnl_batch_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_pack_ref_encode(const ava1_pack_ref_t *m, ava1_w_t *w) {
+    ava1_w_u32(w, m->segment);
+    ava1_w_u64(w, m->offset);
+    ava1_w_u64(w, m->len);
+    ava1_w_u32(w, m->first_file);
+    ava1_w_u32(w, m->count);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_pack_ref_decode(const uint8_t *buf, size_t len, ava1_pack_ref_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->segment = ava1_r_u32(&r);
+    m->offset = ava1_r_u64(&r);
+    m->len = ava1_r_u64(&r);
+    m->first_file = ava1_r_u32(&r);
+    m->count = ava1_r_u32(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_pack_ref_append(ava1_w_t *blob, const ava1_pack_ref_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_pack_ref_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_pack_ref_next(ava1_r_t *it, ava1_pack_ref_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_pack_ref_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_pack_ref_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_pack_ref_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_pack_ref_next(&it, &tmp)) == 1) (*count)++;
+    return rc;
+}
+
+int ava1_jnl_sweep_encode(const ava1_jnl_sweep_t *m, ava1_w_t *w) {
+    ava1_w_bytes(w, m->files, m->files_len);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_jnl_sweep_decode(const uint8_t *buf, size_t len, ava1_jnl_sweep_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    m->files = ava1_r_bytes(&r, &m->files_len);
+    if (!(&r)->err) {
+        int rc = ava1_file_run_count(m->files, m->files_len, &m->files_count);
+        if (rc != 0) return rc;
+    }
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_jnl_sweep_append(ava1_w_t *blob, const ava1_jnl_sweep_t *m) {
+    size_t at = ava1_w_len_begin(blob);
+    int rc = ava1_jnl_sweep_encode(m, blob);
+    if (rc != 0) return rc;
+    ava1_w_len_end(blob, at);
+    return blob->err;
+}
+
+int ava1_jnl_sweep_next(ava1_r_t *it, ava1_jnl_sweep_t *out) {
+    uint32_t n;
+    const uint8_t *p;
+    int rc;
+    if (it->err) return it->err;
+    if (it->pos == it->len) return 0;
+    n = ava1_r_u32(it);
+    p = ava1_r_take(it, n);
+    if (it->err) return it->err;
+    rc = ava1_jnl_sweep_decode(p, n, out);
+    return rc != 0 ? rc : 1;
+}
+
+int ava1_jnl_sweep_count(const uint8_t *p, uint32_t len, uint32_t *count) {
+    ava1_r_t it;
+    ava1_jnl_sweep_t tmp;
+    int rc;
+    *count = 0;
+    ava1_r_init(&it, p, len);
+    while ((rc = ava1_jnl_sweep_next(&it, &tmp)) == 1) (*count)++;
     return rc;
 }
 
@@ -2294,10 +2455,23 @@ int ava1_jnl_reset_count(const uint8_t *p, uint32_t len, uint32_t *count) {
 }
 
 int ava1_jnl_snapshot_encode(const ava1_jnl_snapshot_t *m, ava1_w_t *w) {
+    uint16_t ext_n = 0;
     ava1_w_bytes(w, m->done, m->done_len);
     ava1_w_bytes(w, m->ranges, m->ranges_len);
     ava1_w_bytes(w, m->roots, m->roots_len);
-    ava1_w_u16(w, 0);
+    if (m->has_unswept) ext_n++;
+    if (m->has_segments) ext_n++;
+    ava1_w_u16(w, ext_n);
+    if (m->has_unswept) {
+        size_t at = ava1_w_ext_begin(w, 1);
+        ava1_w_bytes(w, m->unswept, m->unswept_len);
+        ava1_w_ext_end(w, at);
+    }
+    if (m->has_segments) {
+        size_t at = ava1_w_ext_begin(w, 2);
+        ava1_w_bytes(w, m->segments, m->segments_len);
+        ava1_w_ext_end(w, at);
+    }
     return w->err;
 }
 
@@ -2323,10 +2497,29 @@ int ava1_jnl_snapshot_decode(const uint8_t *buf, size_t len, ava1_jnl_snapshot_t
     }
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {
-        uint32_t vlen;
-        (void)ava1_r_u16(&r);
-        vlen = ava1_r_u32(&r);
-        (void)ava1_r_take(&r, vlen);
+        uint16_t tag = ava1_r_u16(&r);
+        uint32_t vlen = ava1_r_u32(&r);
+        const uint8_t *v = ava1_r_take(&r, vlen);
+        ava1_r_t vr;
+        int rc;
+        if (r.err) break;
+        ava1_r_init(&vr, v, vlen);
+        switch (tag) {
+        case 1:
+            if (m->has_unswept) return AVA1_E_DUP_EXT;
+            m->has_unswept = 1;
+            m->unswept = ava1_r_bytes(&vr, &m->unswept_len);
+            break;
+        case 2:
+            if (m->has_segments) return AVA1_E_DUP_EXT;
+            m->has_segments = 1;
+            m->segments = ava1_r_bytes(&vr, &m->segments_len);
+            break;
+        default:
+            continue;
+        }
+        rc = ava1_r_finish(&vr);
+        if (rc != 0) return rc;
     }
     return ava1_r_finish(&r);
 }
@@ -3225,6 +3418,7 @@ int ava1_status_encode(const ava1_status_t *m, ava1_w_t *w) {
     if (m->has_state) ext_n++;
     if (m->has_result) ext_n++;
     if (m->has_code) ext_n++;
+    if (m->has_unswept) ext_n++;
     ava1_w_u16(w, ext_n);
     if (m->has_current) {
         size_t at = ava1_w_ext_begin(w, 1);
@@ -3244,6 +3438,11 @@ int ava1_status_encode(const ava1_status_t *m, ava1_w_t *w) {
     if (m->has_code) {
         size_t at = ava1_w_ext_begin(w, 4);
         ava1_w_u16(w, m->code);
+        ava1_w_ext_end(w, at);
+    }
+    if (m->has_unswept) {
+        size_t at = ava1_w_ext_begin(w, 5);
+        ava1_w_u32(w, m->unswept);
         ava1_w_ext_end(w, at);
     }
     return w->err;
@@ -3294,6 +3493,11 @@ int ava1_status_decode(const uint8_t *buf, size_t len, ava1_status_t *m) {
             m->has_code = 1;
             m->code = ava1_r_u16(&vr);
             break;
+        case 5:
+            if (m->has_unswept) return AVA1_E_DUP_EXT;
+            m->has_unswept = 1;
+            m->unswept = ava1_r_u32(&vr);
+            break;
         default:
             continue;
         }
@@ -3310,10 +3514,16 @@ int ava1_job_done_encode(const ava1_job_done_t *m, ava1_w_t *w) {
     ava1_w_u32(w, m->files);
     ava1_w_u64(w, m->bytes);
     if (m->has_message) ext_n++;
+    if (m->has_settling) ext_n++;
     ava1_w_u16(w, ext_n);
     if (m->has_message) {
         size_t at = ava1_w_ext_begin(w, 1);
         ava1_w_str(w, m->message, m->message_len);
+        ava1_w_ext_end(w, at);
+    }
+    if (m->has_settling) {
+        size_t at = ava1_w_ext_begin(w, 2);
+        ava1_w_u8(w, m->settling);
         ava1_w_ext_end(w, at);
     }
     return w->err;
@@ -3342,6 +3552,11 @@ int ava1_job_done_decode(const uint8_t *buf, size_t len, ava1_job_done_t *m) {
             if (m->has_message) return AVA1_E_DUP_EXT;
             m->has_message = 1;
             m->message = ava1_r_str(&vr, &m->message_len);
+            break;
+        case 2:
+            if (m->has_settling) return AVA1_E_DUP_EXT;
+            m->has_settling = 1;
+            m->settling = ava1_r_u8(&vr);
             break;
         default:
             continue;
@@ -3412,6 +3627,8 @@ const char *const ava1_message_names[] = {
     "JobListResult",
     "JnlOpen",
     "JnlBatch",
+    "PackRef",
+    "JnlSweep",
     "JnlReset",
     "JnlSnapshot",
     "JnlDone",
@@ -3446,7 +3663,7 @@ const char *const ava1_message_names[] = {
     "JobDone",
     "JobCancel",
 };
-const size_t ava1_message_count = 68;
+const size_t ava1_message_count = 70;
 
 int ava1_roundtrip(const char *name, const uint8_t *in, size_t in_len, uint8_t *out, size_t cap,
                    size_t *out_len) {
@@ -3628,6 +3845,16 @@ int ava1_roundtrip(const char *name, const uint8_t *in, size_t in_len, uint8_t *
         ava1_jnl_batch_t m;
         rc = ava1_jnl_batch_decode(in, in_len, &m);
         if (rc == 0) rc = ava1_jnl_batch_encode(&m, &w);
+    }
+    else if (strcmp(name, "PackRef") == 0) {
+        ava1_pack_ref_t m;
+        rc = ava1_pack_ref_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_pack_ref_encode(&m, &w);
+    }
+    else if (strcmp(name, "JnlSweep") == 0) {
+        ava1_jnl_sweep_t m;
+        rc = ava1_jnl_sweep_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_jnl_sweep_encode(&m, &w);
     }
     else if (strcmp(name, "JnlReset") == 0) {
         ava1_jnl_reset_t m;
