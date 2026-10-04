@@ -3403,6 +3403,8 @@ ps5src_need_dest_path: "أدخل مسار الوجهة بادئًا بـ /",
 queue_rar_password_required: "يحتاج هذا الأرشيف إلى كلمة مرور.",
 queue_rar_password_wrong: "كلمة المرور خاطئة. حاول مرة أخرى.",
 queue_rar_password_retry: "إعادة المحاولة بكلمة المرور",
+err_replace_in_progress: "يجري استبدال المساعد على هذه الوحدة بالفعل. انتظر حتى ينتهي ثم حاول مرة أخرى.",
+err_replace_cooldown: "تم استبدال المساعد على هذه الوحدة قبل لحظات. انتظر دقيقة قبل استبداله مرة أخرى.",
 };
 
 export default ar;

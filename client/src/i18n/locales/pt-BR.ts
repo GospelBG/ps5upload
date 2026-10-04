@@ -3438,6 +3438,8 @@ ps5src_need_dest_path: "Informe o caminho de destino, começando com /",
 queue_rar_password_required: "Este arquivo precisa de uma senha.",
 queue_rar_password_wrong: "Essa senha estava errada. Tente de novo.",
 queue_rar_password_retry: "Tentar de novo com a senha",
+err_replace_in_progress: "O auxiliar deste console já está sendo substituído. Aguarde terminar e tente de novo.",
+err_replace_cooldown: "O auxiliar deste console foi substituído há pouco. Aguarde um minuto antes de substituí-lo de novo.",
 };
 
 export default pt_BR;

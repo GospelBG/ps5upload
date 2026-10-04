@@ -3698,6 +3698,8 @@ ps5src_need_dest_path: "Wpisz ścieżkę docelową, zaczynając od /",
 queue_rar_password_required: "To archiwum wymaga hasła.",
 queue_rar_password_wrong: "Hasło było nieprawidłowe. Spróbuj ponownie.",
 queue_rar_password_retry: "Ponów z hasłem",
+err_replace_in_progress: "Helper na tej konsoli jest już wymieniany. Poczekaj na zakończenie i spróbuj ponownie.",
+err_replace_cooldown: "Helper na tej konsoli został wymieniony przed chwilą. Odczekaj minutę, zanim wymienisz go ponownie.",
 };
 
 export default pl;

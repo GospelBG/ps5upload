@@ -3356,6 +3356,8 @@ ps5src_need_dest_path: "请输入以 / 开头的目标路径",
 queue_rar_password_required: "此压缩包需要密码。",
 queue_rar_password_wrong: "密码错误，请重试。",
 queue_rar_password_retry: "使用密码重试",
+err_replace_in_progress: "这台主机的助手正在被替换。请等待完成后再试。",
+err_replace_cooldown: "这台主机的助手刚刚被替换过。请等待一分钟后再次替换。",
 };
 
 export default zh_CN;

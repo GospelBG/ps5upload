@@ -3405,6 +3405,8 @@ ps5src_need_dest_path: "Nhập đường dẫn đích, bắt đầu bằng /",
 queue_rar_password_required: "Tệp lưu trữ này cần mật khẩu.",
 queue_rar_password_wrong: "Mật khẩu đó sai. Hãy thử lại.",
 queue_rar_password_retry: "Thử lại với mật khẩu",
+err_replace_in_progress: "Trình trợ giúp trên máy này đang được thay thế. Hãy đợi hoàn tất rồi thử lại.",
+err_replace_cooldown: "Trình trợ giúp trên máy này vừa được thay thế. Hãy đợi một phút trước khi thay thế lại.",
 };
 
 export default vi;

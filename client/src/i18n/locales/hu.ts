@@ -3767,6 +3767,8 @@ ps5src_need_dest_path: "Add meg a cél útvonalát, / jellel kezdve",
 queue_rar_password_required: "Ehhez az archívumhoz jelszó kell.",
 queue_rar_password_wrong: "Rossz volt a jelszó. Próbáld újra.",
 queue_rar_password_retry: "Újra jelszóval",
+err_replace_in_progress: "A konzol segédprogramját már cserélik. Várd meg, amíg végez, majd próbáld újra.",
+err_replace_cooldown: "A konzol segédprogramját az imént cserélték le. Várj egy percet, mielőtt újra lecserélnéd.",
 };
 
 export default hu;

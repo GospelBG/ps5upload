@@ -86,10 +86,12 @@ describe("status_pill_has_one_probe", () => {
 });
 
 describe("which console a failure names", () => {
-  it("reads ip, addr, from, to and a nested req, stripping any port", () => {
+  it("reads ip, addr and req.addr only, stripping any port; never a from/to path", () => {
     expect(hostFromArgs({ ip: "10.0.0.2" })).toBe("10.0.0.2");
     expect(hostFromArgs({ addr: "10.0.0.3:9114", path: "/x" })).toBe("10.0.0.3");
-    expect(hostFromArgs({ req: { from: "10.0.0.4", to: "10.0.0.5" } })).toBe("10.0.0.4");
+    expect(hostFromArgs({ req: { addr: "10.0.0.4:9114", from: "/data/a" } })).toBe("10.0.0.4");
+    expect(hostFromArgs({ req: { from: "/data/a", to: "/data/b" } })).toBeUndefined();
+    expect(hostFromArgs({ from: "/data/a", to: "/mnt/usb0/b" })).toBeUndefined();
     expect(hostFromArgs({ jobId: "j" })).toBeUndefined();
     expect(hostFromArgs(undefined)).toBeUndefined();
   });

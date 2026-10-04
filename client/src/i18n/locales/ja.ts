@@ -3445,6 +3445,8 @@ ps5src_need_dest_path: "コピー先のパスを / から始めて入力して�
 queue_rar_password_required: "このアーカイブにはパスワードが必要です。",
 queue_rar_password_wrong: "パスワードが違います。もう一度お試しください。",
 queue_rar_password_retry: "パスワードで再試行",
+err_replace_in_progress: "この本体のヘルパーはすでに置き換え中です。完了を待ってから、もう一度お試しください。",
+err_replace_cooldown: "この本体のヘルパーはつい先ほど置き換えられました。再度置き換えるまで 1 分ほど待ってください。",
 };
 
 export default ja;

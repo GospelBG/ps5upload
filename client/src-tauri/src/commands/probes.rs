@@ -264,13 +264,23 @@ async fn do_payload_send(ip: &str, path: &str, target_port: u16) -> Result<u64, 
     // payload restore — which IS a ps5upload send — cleans up the ports.)
     // An OLDER helper is replaced by the engine's replace flow (the old protocol's shutdown,
     // the stamped helper, the AVA1 wait) instead of the shutdown below, which only speaks AVA1.
-    // The replace sends the bundled helper, so this send is then done.
-    if target_port == PS5_LOADER_PORT
-        && sending_ps5upload
-        && engine_helper_state(ip).await.as_deref() == Some("helper_old")
-    {
-        engine_replace_helper(ip).await?;
-        return Ok(size);
+    // The replace sends the BUNDLED helper, so it is taken only when the chosen file IS the
+    // bundled helper; any other ELF (a downgrade, a test build) is the person's deliberate
+    // choice and goes through the shutdown-then-send path, and THEIR file is what gets sent.
+    if target_port == PS5_LOADER_PORT && sending_ps5upload {
+        let state = engine_helper_state(ip).await;
+        if state.as_deref() == Some("helper_old") {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("read {path}: {e}"))?;
+            let bundled = tokio::task::spawn_blocking(move || file_is_bundled(&bytes))
+                .await
+                .unwrap_or(false);
+            if old_helper_path(state.as_deref(), bundled) == OldHelperPath::Replace {
+                engine_replace_helper(ip).await?;
+                return Ok(size);
+            }
+        }
     }
     if target_port == PS5_LOADER_PORT && sending_ps5upload {
         let mgmt_addr = format!("{ip}:9114");
@@ -480,6 +490,43 @@ async fn engine_replace_helper(ip: &str) -> Result<(), String> {
     let status = r.status();
     let body = r.text().await.unwrap_or_default();
     Err(replace_failure(status.as_u16(), &body))
+}
+
+/// How an older helper is dealt with when a ps5upload ELF is sent to the loader.
+#[derive(Debug, PartialEq, Eq)]
+enum OldHelperPath {
+    /// The engine's replace flow (it sends the bundled helper).
+    Replace,
+    /// The shutdown-then-send path: the person's own file is what gets sent.
+    ShutdownThenSend,
+}
+
+/// The replace flow only for an older helper AND the bundled helper file.
+fn old_helper_path(engine_state: Option<&str>, file_is_bundled: bool) -> OldHelperPath {
+    if engine_state == Some("helper_old") && file_is_bundled {
+        OldHelperPath::Replace
+    } else {
+        OldHelperPath::ShutdownThenSend
+    }
+}
+
+/// True when `file` is byte-for-byte the helper this app embeds.
+fn file_is_bundled(file: &[u8]) -> bool {
+    same_as_gz(file, EMBEDDED_PAYLOAD_GZ)
+}
+
+fn same_as_gz(file: &[u8], gz: &[u8]) -> bool {
+    let mut out = Vec::with_capacity(file.len());
+    let decoder = flate2::read::GzDecoder::new(gz);
+    if std::io::Read::read_to_end(
+        &mut std::io::Read::take(decoder, EMBEDDED_PAYLOAD_MAX_BYTES),
+        &mut out,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    blake3::hash(&out) == blake3::hash(file)
 }
 
 /// The error text for a refused replace: the engine's `error` (which starts with its token)
@@ -866,6 +913,42 @@ mod payload_send_tests {
     /// `&[]`, which surfaced to users as a gunzip failure on send. Since
     /// every target now `include_bytes!`s the same file, this one test
     /// covers desktop and mobile alike.
+    #[test]
+    fn only_the_bundled_helper_takes_the_replace_flow() {
+        // The older helper and the bundled file: the engine replaces it.
+        assert_eq!(
+            old_helper_path(Some("helper_old"), true),
+            OldHelperPath::Replace
+        );
+        // A custom ELF keeps the person's choice: shutdown, then send THEIR file.
+        assert_eq!(
+            old_helper_path(Some("helper_old"), false),
+            OldHelperPath::ShutdownThenSend
+        );
+        // Anything but an older helper is the plain flow, bundled or not.
+        for st in [Some("ava1"), Some("not_running"), None] {
+            assert_eq!(old_helper_path(st, true), OldHelperPath::ShutdownThenSend);
+        }
+    }
+
+    #[test]
+    fn a_file_is_the_bundled_helper_only_when_every_byte_matches() {
+        use std::io::Write;
+        let elf = b"\x7FELF the bundled helper".to_vec();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&elf).unwrap();
+        let gz = gz.finish().unwrap();
+        assert!(same_as_gz(&elf, &gz));
+        let mut other = elf.clone();
+        *other.last_mut().unwrap() ^= 1;
+        assert!(
+            !same_as_gz(&other, &gz),
+            "a one-byte difference is a custom build"
+        );
+        assert!(!same_as_gz(&elf[..4], &gz));
+        assert!(!same_as_gz(&elf, b"not gzip"));
+    }
+
     #[test]
     fn a_refused_replace_keeps_the_engines_token_first() {
         assert_eq!(

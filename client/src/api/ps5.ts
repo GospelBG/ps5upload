@@ -5,6 +5,7 @@
 // TCP send) stay in-process.
 
 import { trStatic } from "../lib/trStatic";
+import { humanizePs5Error } from "../lib/humanizeError";
 import {
   classifySession,
   reportIfNotPaired,
@@ -486,7 +487,12 @@ export async function sendPayload(
     { ip, path: elfPath, port: port ?? null },
   );
   if (resp && resp.ok === false) {
-    throw new Error(resp.error ?? resp.status ?? "payload_send failed");
+    const msg = resp.error ?? resp.status ?? "payload_send failed";
+    // The engine's replace guard tokens get their own localized text; every other
+    // failure keeps its raw message.
+    throw new Error(
+      /replace_(in_progress|cooldown)/i.test(msg) ? humanizePs5Error(msg) : msg,
+    );
   }
 }
 

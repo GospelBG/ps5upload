@@ -3412,6 +3412,8 @@ ps5src_need_dest_path: "Masukkan path tujuan, diawali /",
 queue_rar_password_required: "Arsip ini memerlukan kata sandi.",
 queue_rar_password_wrong: "Kata sandi itu salah. Coba lagi.",
 queue_rar_password_retry: "Coba lagi dengan kata sandi",
+err_replace_in_progress: "Pembantu di konsol ini sedang diganti. Tunggu sampai selesai, lalu coba lagi.",
+err_replace_cooldown: "Pembantu di konsol ini baru saja diganti. Tunggu semenit sebelum menggantinya lagi.",
 };
 
 export default id;

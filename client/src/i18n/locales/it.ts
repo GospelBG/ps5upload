@@ -3350,6 +3350,8 @@ ps5src_need_dest_path: "Inserisci il percorso di destinazione, che inizia con /"
 queue_rar_password_required: "Questo archivio richiede una password.",
 queue_rar_password_wrong: "La password era errata. Riprova.",
 queue_rar_password_retry: "Riprova con la password",
+err_replace_in_progress: "L’assistente di questa console è già in fase di sostituzione. Attendi che finisca, poi riprova.",
+err_replace_cooldown: "L’assistente di questa console è stato sostituito poco fa. Attendi un minuto prima di sostituirlo di nuovo.",
 };
 
 export default it;

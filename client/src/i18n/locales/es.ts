@@ -3350,6 +3350,8 @@ ps5src_need_dest_path: "Introduce la ruta de destino, empezando por /",
 queue_rar_password_required: "Este archivo necesita una contraseña.",
 queue_rar_password_wrong: "Esa contraseña no es correcta. Inténtalo de nuevo.",
 queue_rar_password_retry: "Reintentar con contraseña",
+err_replace_in_progress: "El asistente de esta consola ya se está reemplazando. Espera a que termine y vuelve a intentarlo.",
+err_replace_cooldown: "El asistente de esta consola se reemplazó hace un momento. Espera un minuto antes de reemplazarlo de nuevo.",
 };
 
 export default es;

@@ -3440,6 +3440,8 @@ ps5src_need_dest_path: "Saisissez le chemin de destination, commençant par /",
 queue_rar_password_required: "Cette archive nécessite un mot de passe.",
 queue_rar_password_wrong: "Ce mot de passe est incorrect. Réessayez.",
 queue_rar_password_retry: "Réessayer avec le mot de passe",
+err_replace_in_progress: "L’assistant de cette console est déjà en cours de remplacement. Attendez la fin, puis réessayez.",
+err_replace_cooldown: "L’assistant de cette console vient d’être remplacé. Attendez une minute avant de le remplacer à nouveau.",
 };
 
 export default fr;

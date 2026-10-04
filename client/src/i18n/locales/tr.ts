@@ -3410,6 +3410,8 @@ ps5src_need_dest_path: "Hedef yolunu girin, / ile başlamalı",
 queue_rar_password_required: "Bu arşiv için parola gerekiyor.",
 queue_rar_password_wrong: "Bu parola yanlıştı. Tekrar deneyin.",
 queue_rar_password_retry: "Parolayla yeniden dene",
+err_replace_in_progress: "Bu konsoldaki yardımcı zaten değiştiriliyor. Bitmesini bekleyin, sonra tekrar deneyin.",
+err_replace_cooldown: "Bu konsoldaki yardımcı az önce değiştirildi. Yeniden değiştirmeden önce bir dakika bekleyin.",
 };
 
 export default tr;

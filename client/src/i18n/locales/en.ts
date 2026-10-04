@@ -3768,6 +3768,8 @@ ps5src_need_dest_path: "Enter the destination path, starting with /",
 queue_rar_password_required: "This archive needs a password.",
 queue_rar_password_wrong: "That password was wrong. Try again.",
 queue_rar_password_retry: "Retry with password",
+err_replace_in_progress: "This console's helper is already being replaced. Wait for it to finish, then try again.",
+err_replace_cooldown: "The helper on this console was replaced a moment ago. Wait a minute before replacing it again.",
 };
 
 export default en;

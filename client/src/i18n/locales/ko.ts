@@ -3441,6 +3441,8 @@ ps5src_need_dest_path: "/로 시작하는 대상 경로를 입력하세요",
 queue_rar_password_required: "이 압축 파일에는 비밀번호가 필요합니다.",
 queue_rar_password_wrong: "비밀번호가 틀렸습니다. 다시 시도하세요.",
 queue_rar_password_retry: "비밀번호로 다시 시도",
+err_replace_in_progress: "이 본체의 도우미를 이미 교체하는 중입니다. 끝날 때까지 기다린 뒤 다시 시도하세요.",
+err_replace_cooldown: "이 본체의 도우미를 방금 교체했습니다. 다시 교체하려면 1분 정도 기다리세요.",
 };
 
 export default ko;

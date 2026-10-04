@@ -3430,6 +3430,8 @@ ps5src_need_dest_path: "ใส่พาธปลายทางที่ขึ�
 queue_rar_password_required: "ไฟล์บีบอัดนี้ต้องใช้รหัสผ่าน",
 queue_rar_password_wrong: "รหัสผ่านไม่ถูกต้อง ลองอีกครั้ง",
 queue_rar_password_retry: "ลองใหม่ด้วยรหัสผ่าน",
+err_replace_in_progress: "ตัวช่วยของเครื่องนี้กำลังถูกแทนที่อยู่แล้ว รอให้เสร็จก่อน แล้วลองใหม่",
+err_replace_cooldown: "ตัวช่วยของเครื่องนี้เพิ่งถูกแทนที่ไป รอสักหนึ่งนาทีก่อนแทนที่อีกครั้ง",
 };
 
 export default th;

@@ -3411,6 +3411,8 @@ ps5src_need_dest_path: "Gib den Zielpfad ein, beginnend mit /",
 queue_rar_password_required: "Dieses Archiv benötigt ein Passwort.",
 queue_rar_password_wrong: "Das Passwort war falsch. Versuche es erneut.",
 queue_rar_password_retry: "Mit Passwort wiederholen",
+err_replace_in_progress: "Der Helfer dieser Konsole wird bereits ersetzt. Warte, bis das abgeschlossen ist, und versuche es dann erneut.",
+err_replace_cooldown: "Der Helfer dieser Konsole wurde gerade erst ersetzt. Warte eine Minute, bevor du ihn erneut ersetzt.",
 };
 
 export default de;

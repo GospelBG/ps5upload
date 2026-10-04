@@ -3440,6 +3440,8 @@ ps5src_need_dest_path: "/ से शुरू होने वाला गं�
 queue_rar_password_required: "इस आर्काइव के लिए पासवर्ड चाहिए।",
 queue_rar_password_wrong: "वह पासवर्ड गलत था। दोबारा कोशिश करें।",
 queue_rar_password_retry: "पासवर्ड के साथ दोबारा कोशिश करें",
+err_replace_in_progress: "इस कंसोल का सहायक पहले से बदला जा रहा है। पूरा होने तक रुकें, फिर दोबारा कोशिश करें।",
+err_replace_cooldown: "इस कंसोल का सहायक अभी-अभी बदला गया है। दोबारा बदलने से पहले एक मिनट रुकें।",
 };
 
 export default hi;
