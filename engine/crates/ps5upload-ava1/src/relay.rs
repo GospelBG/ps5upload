@@ -640,6 +640,7 @@ pub fn ps5_to_ps5_between(
                 ordered: true,
                 progress: Arc::default(),
                 cancel: cancel.clone(),
+                progress_deadline: None,
             };
             let a_relay = relay.clone();
             let a_m = m.clone();

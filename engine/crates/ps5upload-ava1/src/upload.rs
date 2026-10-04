@@ -346,6 +346,7 @@ pub(crate) fn refusal_reason(status: u16) -> String {
         gen::ERR_PATH => "ava1_not_allowed".into(),
         gen::ERR_EXISTS => "ava1_exists".into(),
         gen::ERR_CROSS_DEVICE => "ava1_cross_device".into(),
+        gen::ERR_STALLED => "ava1_stalled".into(),
         _ => format!("ava1_refused_{status}"),
     }
 }
@@ -1414,7 +1415,7 @@ mod list_destination_tests {
 
 #[cfg(test)]
 mod failure_reason_tests {
-    use super::{refusal_reason, terminal_connection_reason};
+    use super::{refusal, refusal_reason, terminal_connection_reason};
     use ava1::{gen, Ava1Error};
     use std::io;
 
@@ -1443,7 +1444,11 @@ mod failure_reason_tests {
         assert_eq!(refusal_reason(gen::ERR_PATH), "ava1_not_allowed");
         assert_eq!(refusal_reason(gen::ERR_EXISTS), "ava1_exists");
         assert_eq!(refusal_reason(gen::ERR_CROSS_DEVICE), "ava1_cross_device");
+        assert_eq!(refusal_reason(gen::ERR_STALLED), "ava1_stalled");
         assert_eq!(refusal_reason(65535), "ava1_refused_65535");
+        // Every typed refusal (upload, download, relay, copy) goes through `refusal`.
+        let f = refusal(gen::ERR_STALLED, "no data".into());
+        assert_eq!(f.reason, "ava1_stalled");
     }
 }
 

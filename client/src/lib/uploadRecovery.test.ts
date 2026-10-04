@@ -116,6 +116,10 @@ describe("isAutoRecoverable", () => {
     expect(isAutoRecoverable(r, "")).toBe(true);
   });
 
+  it("recovers ava1_stalled: the receiver ended a job whose source stopped sending data (review 006)", () => {
+    expect(isAutoRecoverable("ava1_stalled", "")).toBe(true);
+  });
+
   it("recovers zip_read_error: an I/O failure reading the archive is transient", () => {
     expect(isAutoRecoverable("zip_read_error", "")).toBe(true);
   });

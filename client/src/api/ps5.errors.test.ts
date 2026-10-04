@@ -23,6 +23,12 @@ describe("humanizeJobErrorReason", () => {
     expect(humanizeJobErrorReason("totally_made_up_token")).toBeNull();
   });
 
+  it("explains ava1_stalled (the source stopped sending data)", () => {
+    expect(humanizeJobErrorReason("ava1_stalled")).toMatch(
+      /stopped making progress.*Retry.*source drive or network share/,
+    );
+  });
+
   it("recognizes ENOSPC-shaped errors", () => {
     // The two write-side ENOSPC variants: payload's writer-thread
     // I/O error mid-stream, and the upfront fs_write_failed_errno_28.

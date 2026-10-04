@@ -25,6 +25,9 @@ use crate::Ava1Error;
 
 pub const MAX_CONNS: usize = 64;
 pub const MAX_SESSIONS: usize = 16;
+/// Jobs one session may have open at once; a `JobOpen` or `Resume` past it is answered
+/// `ERR_BUSY` (review 006 #4). The console's job table is the same size.
+pub const MAX_JOBS_PER_SESSION: usize = 32;
 /// Calls in flight per session; more are answered `ERR_BUSY`.
 pub const RPC_WORKERS: usize = 8;
 pub use crate::frame::{RPC_REPLY_MAX, RPC_REQUEST_MAX};
@@ -718,6 +721,41 @@ async fn control(
                 // for no job at all.
                 if let Some(f) = entry.router.route_control(f).await {
                     let opens = f.ty == gen::JobOpen::TYPE || f.ty == gen::Resume::TYPE;
+                    // Admission: every open job holds a task and an inbox, so a paired peer
+                    // cannot open them without bound.
+                    if opens && entry.router.job_count() >= MAX_JOBS_PER_SESSION {
+                        if let Some(job) = job_of(&f) {
+                            let refused = if f.ty == gen::JobOpen::TYPE {
+                                outbox.try_send(
+                                    f.channel,
+                                    &gen::JobOpenAck {
+                                        job_id: job,
+                                        status: gen::ERR_BUSY,
+                                        credit: 0,
+                                        staged: 0,
+                                        workers: 0,
+                                        message: Some("too many jobs are open".into()),
+                                    },
+                                )
+                            } else {
+                                outbox.try_send(
+                                    f.channel,
+                                    &gen::JobMap {
+                                        job_id: job,
+                                        status: gen::ERR_BUSY,
+                                        last: 1,
+                                        done: vec![],
+                                        partial: vec![],
+                                        message: Some("too many jobs are open".into()),
+                                    },
+                                )
+                            };
+                            if refused.is_err() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                     if let (Some(host), true, Some(job), true) = (
                         &ctx.jobs,
                         opens,

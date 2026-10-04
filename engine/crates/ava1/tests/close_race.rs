@@ -96,6 +96,7 @@ async fn ordered_download(tag: &str, job: u8) {
             ordered: true,
             progress: Arc::default(),
             cancel: Arc::default(),
+            progress_deadline: None,
         },
     )
     .await
