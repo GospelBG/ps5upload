@@ -179,8 +179,8 @@ written, not when it is queued, so time spent behind other frames is not counted
 round trip. A sender may skip a Ping or Pong while other frames are queued or being
 written: they are proof of life too.
 
-Liveness counts bytes, not frames: a connection is dead after 6 s (default,
-`dead_after`) with no byte received, so a 16 MiB frame on a slow link is never
+Liveness counts bytes, not frames: a connection is dead after 12 s (default,
+`dead_after`; the ping stays at 2 s, so six pings go unanswered first) with no byte received, so a 16 MiB frame on a slow link is never
 mistaken for silence. Silence is judged by what can be read: a reader that was busy
 elsewhere (writing, waiting to write) past `dead_after` checks the socket first and
 carries on if bytes are waiting; a process that was not running (a late timer tick)
@@ -444,6 +444,11 @@ session.
 A lane carries heartbeats and, on a node with `CAP_DATA_PLANE`, the lane data frames `Chunk`
 and `Bundle` (§12) and `Error`; any other frame without the IGNORABLE flag is answered
 `Error(ERR_PROTOCOL)` and closes the lane.
+
+Lane sockets (informative): both ends ask for 4 MiB `SO_RCVBUF` and `SO_SNDBUF` on every lane, the
+client before it connects and the console on accept, before the first read, and take whatever the
+kernel grants. A lane thread that is busy opening a 15 MiB frame for 10-20 ms then does not close
+the sender's TCP window. A receiver may keep a small pool of frame buffers for chunks whose size is a class (1, 4, 8, 15 or 16 MiB; every other size is allocated exactly, so memory in use never exceeds what the credit window counted, and idle pooled memory never exceeds the admit budget) so a lane does not allocate and fault in a fresh 15 MiB block per frame; this is not visible on the wire.
 
 ## 10. Version 1 scope
 Version 1 is what this document specifies; the sections below say what that is and what it is
@@ -809,12 +814,20 @@ numbers they are fed, so both are tested against models rather than sockets.
 
 - Start: 2 lanes, a 4 MiB chunk and a 1 MiB bundle target; receiver workers start at 4.
 - Lanes: add one while the bottleneck is the network and the last addition raised throughput by
-  ≥ 10 %; otherwise revert it and hold for 30 s. A tick with a lane death or requeue drops one
+  ≥ 10 % (≥ 5 % while the rate is below 90 % of the best rate seen in the job); otherwise revert
+  it and hold for 30 s. A tick with a lane death or requeue drops one
   lane (min 1) and halves the chunk. At most 8 lanes: on a link that scales past that the count
   simply stops growing.
 - Chunk: 1–15 MiB in whole groups; halved on a stall, doubled after 10 stable ticks; never more
-  than half a second of one lane's throughput (min 1 MiB). 15 MiB, not 16: the frame cap (§2)
+  than half a second of one lane's throughput (min 1 MiB). Lanes before chunk: while the network
+  is the bottleneck, fewer than 4 lanes are open and no lane probe has failed yet, the chunk is
+  not doubled past 4 MiB (a bigger frame lengthens every decrypt stall on the receiver); once a
+  probe fails or 4 lanes are open, growth resumes. The sender can switch this policy off
+  (`PS5UPLOAD_AVA1_LANES_FIRST=0`) to A/B it; it is on by default. 15 MiB, not 16: the frame cap (§2)
   counts the header and the MAC, which a 16 MiB body would not fit under.
+- Benchmark pins (sender-local, never on the wire): `PS5UPLOAD_AVA1_LANES=n` holds the lane count
+  at n (1-8) and `PS5UPLOAD_AVA1_CHUNK=m` holds the chunk at m MiB (1-15); a pinned value ignores
+  stalls and the link. Out-of-range values are ignored. For measurement only.
 - Bundle target: a quarter second of one lane's throughput, clamped to 256 KiB–15 MiB. It moves
   with that rate; the effect is that it grows while the network is the limit and shrinks when
   the rate falls (a receiver whose workers wait shows up as a receiver-reported bottleneck, §16.9

@@ -91,6 +91,13 @@ int ava1_conn_try_send(ava1_conn_t *c, uint8_t type, uint32_t channel, const uin
 int ava1_conn_send_frame(ava1_conn_t *c, uint8_t type, uint32_t channel, uint8_t *frame, size_t body_len);
 /* The header of one frame; *body_len is its body length (the MAC is not counted).
  * Reader thread only. AVA1_E_* on failure. */
+/* Lane socket buffers (review 003 section 1): ask for AVA1_LANE_SOCKBUF on SO_RCVBUF and
+ * SO_SNDBUF so a lane thread that is busy opening a frame for 10-20 ms does not close the
+ * sender's TCP window. Call before the first read. The kernel may cap the request (it takes
+ * what it gives); the effective sizes are returned (0 when unreadable). Returns 0, or -1 when
+ * neither option could be set. */
+#define AVA1_LANE_SOCKBUF (4 * 1024 * 1024)
+int ava1_conn_tune_buffers(int fd, int *rcv, int *snd);
 int ava1_conn_recv_header(ava1_conn_t *c, ava1_header_t *h, size_t *body_len);
 /* The body of the frame whose header ava1_conn_recv_header just read (into buf;
  * keyed: opened in place). Bounded by the same liveness as a single read. Reader

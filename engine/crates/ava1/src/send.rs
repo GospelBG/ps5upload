@@ -19,7 +19,7 @@ use crate::gen::{
     self, Bundle, BundleRecord, Chunk, Credit, Durable, FileRetry, FileRoot, JobDone, JobMap,
     JobOpen, JobOpenAck, ManifestEnd, Received, Status,
 };
-use crate::governor::{self, Class, Governor, Mode, Sample};
+use crate::governor::{self, Class, Governor, GovernorOptions, JobSummary, Mode, Sample};
 use crate::manifest::Manifest;
 use crate::ranges::{from_runs, Need, RangeSet};
 use crate::router::{ConnTx, Inbound, JobLink, LaneTx};
@@ -886,7 +886,8 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
                     s.next_seq += 1;
                     let seq = s.next_seq;
                     let ty = f.ty;
-                    let body = (*f.body).clone();
+                    // Shared, not copied: the frame stays in `inflight` for a resend.
+                    let body = f.body.clone();
                     if f.class == Class::Bundle {
                         s.bundles_inflight += 1;
                     }
@@ -954,7 +955,7 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
             continue;
         };
         if let Some(bps) = cap_bps {
-            sent_bytes += body.len() as u64;
+            sent_bytes += body.len() as u64; // plaintext bytes, as before
             let due = Duration::from_secs_f64(sent_bytes as f64 / bps as f64);
             if let Some(wait) = due.checked_sub(started.elapsed()) {
                 tokio::time::sleep(wait).await;
@@ -1120,8 +1121,11 @@ pub async fn run_upload(
         bytes_budget: Arc::new(Semaphore::new(READ_AHEAD_KIB as usize)),
         stall: Mutex::new(None),
     });
-    let mut gov = Governor::new();
+    // `PS5UPLOAD_AVA1_LANES` / `_CHUNK` pin the governor (benchmarking only).
+    let mut gov = Governor::with_options(GovernorOptions::from_env());
     let first = gov.tick(&Sample::default());
+    sh.chunk.store(first.chunk, Ordering::Relaxed);
+    let mut summary = JobSummary::default();
     sh.sched.lock().unwrap().decision = Some(first);
     let small_q = Arc::new(Mutex::new(small));
     let large_q = Arc::new(Mutex::new(large));
@@ -1502,6 +1506,7 @@ pub async fn run_upload(
                     }
                 };
                 let d = gov.tick(&sample);
+                summary.observe(&sample, &d);
                 sh.chunk.store(d.chunk, Ordering::Relaxed);
                 sh.bundle.store(d.bundle, Ordering::Relaxed);
                 sh.sched.lock().unwrap().decision = Some(d);
@@ -1551,6 +1556,11 @@ pub async fn run_upload(
     }
     for h in readers {
         let _ = h.await;
+    }
+    if let Some(line) = summary.line() {
+        use std::io::Write;
+        // writeln!, not eprintln!: a dead parent's closed stderr must not panic the engine.
+        let _ = writeln!(std::io::stderr(), "{line}");
     }
     result
 }
