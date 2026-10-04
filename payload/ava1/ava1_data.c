@@ -287,6 +287,12 @@ int ava1_rpc_text(uint8_t *out, size_t cap, size_t *out_len, const char *fmt, ..
 
 int ava1_data_log_small(void) { return D.cfg.log_small != AVA1_LOG_SMALL_OFF; }
 
+int ava1_data_log_small_for_job(void) {
+    if (!ava1_data_log_small()) return 0;
+    if (getenv("PS5UPLOAD_AVA1_LOG_SMALL_OFF") != NULL || access(AVA1_LOG_SMALL_OFF_FLAG, F_OK) == 0) return 0;
+    return 1;
+}
+
 int ava1_data_start(const ava1_data_cfg_t *cfg) {
     if (D.running) return -EBUSY; /* one housekeeping thread; a second start changes nothing */
     D.cfg = *cfg;

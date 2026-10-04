@@ -93,6 +93,7 @@ struct ava1_job {
     uint8_t kind, policy;
     uint32_t flags;
     int staged;
+    int log_small;                  /* this job's small files go through the pack log (latched at creation, review 007 HW-3) */
     int dest_held;                  /* staged and <root> is our empty lock folder (Task 13) */
     char root[AVA1_MAX_PATH + 1];   /* the job root as requested */
     char base[AVA1_MAX_PATH + 16];  /* where entries land: root, or root.ava-part */

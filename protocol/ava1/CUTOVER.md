@@ -157,8 +157,11 @@ kept.
       download fix `b1be8059`), and the Phat never ran part 2. Re-run the whole table on both, on all
       three drives each (Pro: `/data`, `/mnt/usb0`, `/mnt/ext1`; Phat: `/data`, `/mnt/usb0`,
       `/mnt/ext0`).
-- [ ] **The engine's `auto` mode must not ship before that pass is green.** Until then the default
-      stays FTX2 for any release that goes to users.
+- [ ] **No release to users from this branch until every gate in this section is green.** AVA1 is the
+      only transport in this branch (`1a922f7`); there is no in-branch FTX2 fallback or kill-switch.
+      Until these gates are green, the previously shipped FTX2 release remains the version users get
+      (review 007 HW-2: this replaces the earlier "the default stays FTX2" wording, which the code no
+      longer matches).
 - [ ] **The Pro outage of 2026-10-03 is investigated.** At about 09:10 the Pro stopped answering ping and
       every port shortly after an instrumented helper (extra stderr timing lines only) was sent;
       the last keep-awake acknowledgement was 09:10:50. Cause unknown: the console may have gone to
@@ -403,7 +406,9 @@ tiny-file and game-corpus row of §4 must be re-run on the consoles.
 
 How to read a run: the console's end-of-job line (`finished in N ms ... data fsync ... dirs ...`) should show
 `dirs` near 0 during the transfer; `recovered N logged files, M lost (resent)` appears at helper start or JobOpen
-after a crash. Knobs (`ava1_data_cfg`): `log_small` (default on; `AVA1_LOG_SMALL_OFF` restores the per-file path for
+after a crash. Knobs (`ava1_data_cfg`): `log_small` (default on; `AVA1_LOG_SMALL_OFF` restores the per-file path; at runtime create
+`/data/ps5upload/debug/ava1-log-small-off` on the console (or set `PS5UPLOAD_AVA1_LOG_SMALL_OFF` on a host build),
+read once per job when it is created, review 007 HW-3, for
 this release), `pack_segment` (64 MiB), `unswept_max` (256 MiB), `sweep_age_ms` (3000).
 
 Engine (`LocalSink`, downloads): on by default except on macOS, where it measured slower on loopback (2,270 vs

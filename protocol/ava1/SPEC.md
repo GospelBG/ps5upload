@@ -278,7 +278,7 @@ normative table; the second column names the constant in the generated code.
 | 13 | `ERR_VERIFY` | a file or copy whose bytes do not match their root and that a `FileRetry` cannot fix |
 | 14 | `ERR_EXISTS` | a destination that is already there and may not be replaced: the root without `JF_OVERWRITE`, a staging root that appeared meanwhile, a file where one must go in a merge |
 | 15 | `ERR_CANCELLED` | the job was cancelled (`job.cancel`, or a `JobCancel` carrying this reason) |
-| 16 | `ERR_CROSS_DEVICE` | a staged or part-file rename whose two sides are on different devices (`st_dev`); never attempted, because a cross-device `rename` panics the console's kernel |
+| 16 | `ERR_CROSS_DEVICE` | a staged or part-file rename whose two sides are on different devices (`st_dev`); never attempted, because a cross-device `rename` panics the console's kernel; when `st_dev` of either side cannot be read the rename is refused as `ERR_IO` rather than attempted (review 007 HW-1) |
 | 17 | `ERR_CREDIT` | a lane frame larger than the credit the receiver granted (§12.4) |
 
 7.3 Management methods (the console operations FTX2 carried on :9114). Numbers are assigned by
@@ -586,12 +586,14 @@ of the same peer key whose stored manifest has that hash, else `JobMap{status = 
 never silence.
 Credit restarts after any interruption and nothing outstanding carries across a reconnect: the
 grant in a `JobOpenAck` is an absolute number that sets the sender's window (a `Credit` that
-arrives later adds to it), and a `Resume` restarts the window the same way — the receiver resets
-the job's outstanding-credit count to its current grant and re-sends that grant as `Credit`.
+arrives later adds to it). A `Resume` does **not** restart the window: the receiver answers with the
+`JobMap` only and the credit state stays the sender's, which is why `Resume` is only for senders that
+kept it. A sender that lost its credit state reopens with `JobOpen` (review 007 C-1: this is what the
+console does, `ava1_data.c`, and the engine never sends `Resume`).
 
 11.6 Staging: when the job root does not exist, the receiver writes the whole tree under
 `<root>.ava-part/` and, after the last file, renames it to `<root>` (same parent, `st_dev`
-checked). When the root exists, files are written in place; large files through
+checked; an unknown `st_dev` is refused). When the root exists, files are written in place; large files through
 `<name>.ava-part` and a same-directory rename. `JF_SINGLE_FILE` writes `<root>.ava-part`. A staging
 receiver takes `<root>` with `mkdir` before it journals the job (an existing `<root>` then
 refuses it, `ERR_EXISTS`) and records that in `JnlOpen.staged` bit 1, so on resume the empty

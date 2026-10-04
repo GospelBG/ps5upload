@@ -1187,7 +1187,7 @@ static int apply_record(ava1_job_t *j, const ava1_bundle_record_t *r) {
     for (fd = 0; !rc && (uint32_t)fd < j->pend_n; fd++) rc = j->pend_small[fd] == r->file_id;
     pthread_mutex_unlock(&j->mu);
     if (rc) return 0;
-    if (ava1_data_log_small()) return apply_record_logged(j, r, e, path, root);
+    if (j->log_small) return apply_record_logged(j, r, e, path, root);
     if (!ava1_pend_reserve(pend_gate_stopping, pend_gate_idle, j)) return 0; /* stopping */
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0 && errno == ENOENT && mkparents(path) == 0) fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
@@ -2680,9 +2680,16 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
     if (strcmp(part, fin) != 0) {
         parent_of(fin, parent, sizeof parent);
         /* Same directory by construction; checked anyway (SPEC.md §12.6, the kernel panic). */
-        if (cfg->same_device && cfg->same_device(part, parent) == 0) {
-            commit_fail(j, AVA1_ERR_CROSS_DEVICE, "the destination is on another drive", 0, 1);
-            return;
+        if (cfg->same_device) {
+            int sd = cfg->same_device(part, parent);
+            if (sd == 0) {
+                commit_fail(j, AVA1_ERR_CROSS_DEVICE, "the destination is on another drive", 0, 1);
+                return;
+            }
+            if (sd < 0) { /* unknown is refused: the one error whose cost is a kernel panic (review 007 HW-1) */
+                commit_fail(j, AVA1_ERR_IO, "could not verify the destination drive", errno, 1);
+                return;
+            }
         }
         if (rename(part, fin) != 0) {
             int e = errno;
@@ -2806,9 +2813,16 @@ static void finish(ava1_job_t *j) {
             ava1_apply_fail(j, AVA1_ERR_EXISTS, "the destination appeared during the upload; the files are in .ava-part", 0, 1);
             return;
         }
-        if (cfg->same_device && cfg->same_device(j->base, parent) == 0) {
-            ava1_apply_fail(j, AVA1_ERR_CROSS_DEVICE, "the destination is on another drive", 0, 1);
-            return;
+        if (cfg->same_device) {
+            int sd = cfg->same_device(j->base, parent);
+            if (sd == 0) {
+                ava1_apply_fail(j, AVA1_ERR_CROSS_DEVICE, "the destination is on another drive", 0, 1);
+                return;
+            }
+            if (sd < 0) { /* unknown is refused: the one error whose cost is a kernel panic (review 007 HW-1) */
+                ava1_apply_fail(j, AVA1_ERR_IO, "could not verify the destination drive", errno, 1);
+                return;
+            }
         }
         if (rename(j->base, j->root) != 0) {
             e = errno;

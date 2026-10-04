@@ -47,6 +47,15 @@ typedef struct {
 #define AVA1_SWEEP_AGE_MS 3000u
 /* 1 when small files go through the pack log (the data layer's effective setting). */
 int ava1_data_log_small(void);
+/* The runtime switch that turns durable-by-log off without a rebuild (review 007 HW-3): a file
+ * on the console, an environment variable on a host build. Read once per job when it is created
+ * (ava1_job.c), so a job is logged or per-file for its whole life; recovery of a logged job's pack
+ * ignores it (the journal decides). */
+#ifndef AVA1_LOG_SMALL_OFF_FLAG
+#define AVA1_LOG_SMALL_OFF_FLAG "/data/ps5upload/debug/ava1-log-small-off"
+#endif
+/* 1 when a job created now logs its small files: the data layer's setting unless the switch is set. */
+int ava1_data_log_small_for_job(void);
 /* Crash recovery of durable-by-log (SPEC.md §15.7): one pass over the jobs directory takes up to `max`
  * job directories that hold a pack log and nobody has open, re-makes their unswept files from the log and
  * sweeps them. Run at start and then by housekeeping, so a job that was reaped or crashed is finished

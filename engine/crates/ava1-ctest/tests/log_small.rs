@@ -400,3 +400,67 @@ fn a_compacted_journal_still_names_the_unswept_files_so_a_restart_recovers_them(
     assert_eq!(ids_done(&ev).len(), n, "{ev}");
     all_there(&t, n);
 }
+
+#[test]
+fn the_runtime_switch_turns_the_log_off_per_job_and_recovery_ignores_it() {
+    // Review 007 HW-3: `PS5UPLOAD_AVA1_LOG_SMALL_OFF` (the console's debug file) turns durable-by-log
+    // off for jobs created while it is set, and is read once at creation: a job keeps its path for
+    // its whole life. The data layer's own setting stays ON here, so the switch alone decides.
+    let n = 40;
+    // One live job at a time: the harness's C server lock is held by a job until it is dropped.
+    {
+        std::env::set_var("PS5UPLOAD_AVA1_LOG_SMALL_OFF", "1");
+        let t = tmp("switch-off");
+        let root = t.join("dest");
+        std::fs::create_dir_all(&root).unwrap();
+        let off = CApplyJob::begin_opts(
+            &t.join("jobs"),
+            &root,
+            0,
+            &small(n, true),
+            0,
+            0,
+            slow_sweep(),
+        );
+        // Switched back on before the first record: a job latched OFF at creation stays OFF.
+        std::env::remove_var("PS5UPLOAD_AVA1_LOG_SMALL_OFF");
+        for i in 0..n {
+            send(&off, i);
+        }
+        off.wait_pending(n as u32, 10_000);
+        off.wait_event("durable", 10_000);
+        assert_eq!(
+            off.unswept(),
+            0,
+            "the per-file path leaves nothing for the sweep"
+        );
+        assert_eq!(off.segments(), 0, "no pack segment was created");
+        for i in 0..n {
+            assert_eq!(std::fs::read(root.join(format!("d/{i}"))).unwrap(), body(i));
+        }
+    }
+    // A job created with the switch clear is logged as usual (sweep held off so unswept is visible).
+    let t2 = tmp("switch-on");
+    let root2 = t2.join("dest");
+    std::fs::create_dir_all(&root2).unwrap();
+    let on = CApplyJob::begin_opts(
+        &t2.join("jobs"),
+        &root2,
+        0,
+        &small(n, true),
+        0,
+        0,
+        slow_sweep(),
+    );
+    for i in 0..n {
+        send(&on, i);
+    }
+    on.wait_pending(n as u32, 10_000);
+    on.wait_event("durable", 10_000);
+    assert_eq!(
+        on.unswept() as usize,
+        n,
+        "the logged path waits for the sweep"
+    );
+    assert!(on.segments() >= 1, "a pack segment exists");
+}

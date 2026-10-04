@@ -189,6 +189,30 @@ fn c_commit_refuses_cross_device_rename() {
 }
 
 #[test]
+fn c_commit_refuses_an_unknown_device_answer_too() {
+    // Review 007 HW-1: when st_dev of either side cannot be read, same_device answers -1
+    // ("unknown"). That is refused as ERR_IO rather than attempted: a cross-device rename panics
+    // the console's kernel, so the guard fails closed on the one error it cannot judge.
+    let t = tmp("xdev-unknown");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let d = data(2 * GROUP as usize + 1, 3);
+    let m = Manifest {
+        entries: vec![file("big", d.len() as u64)],
+    };
+    c_set_same_device(-1);
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    send_large(&job, 0, &d, false);
+    assert_eq!(job.wait(10_000), ava1::gen::ERR_IO as i32);
+    c_set_same_device(1);
+    assert!(
+        root.join("big.ava-part").exists(),
+        "the part file stays for a resume"
+    );
+    assert!(!root.join("big").exists(), "no rename was attempted");
+}
+
+#[test]
 fn a_staged_tree_is_not_moved_over_a_root_that_appeared() {
     let t = tmp("exists");
     let root = t.join("dest");
