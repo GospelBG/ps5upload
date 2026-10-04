@@ -236,13 +236,21 @@ peer that started it, no session, so a reconnect does not matter), at most 8 ope
   bytes the regular files' sizes; both totals are 0 while unknown), the current step in ext `current`, and,
   once finished, `state` 1 with ext `result` (the operation's reply body, at most 128 KiB) or `state` 2 with
   ext `code` (the `ERR_*`) and the cause token in `current`. A repeat of `job.run` with the same id and the
-  same owner, op and args answers the job's status whatever state it is in (nothing runs twice); other
-  parameters are `ERR_PROTOCOL`, another owner `ERR_UNKNOWN_JOB`.
-* `job.cancel` raises the job's cancel flag and waits up to 2 s for the worker. A delete, chmod, hash,
-  crc32 or backup stops at the next directory entry or read block and the job ends `state 2`,
-  `ERR_CANCELLED`; fsck, cleanup and sdk.scan are one system call and only honour a cancel that arrives
-  before they start. Unlike a copy, a cancelled operation stays listed (finished) so a poller reads how
-  it ended; it is collected a park age after it ended, like any finished job.
+  same owner, op and args answers the job's status whatever state it is in; other parameters are
+  `ERR_PROTOCOL`, another owner `ERR_UNKNOWN_JOB`. A finished operation whose repeat gives the same outcome
+  (every op but BACKUP_SNAPSHOT and BACKUP_RESTORE) stays listed for a grace of 10 s after the first reply
+  that carried its terminal status, so a reply lost on the wire is answered from the stored job and nothing
+  runs twice inside the grace; it is then released by the reaper or by the next `job.status`/`job.run` read
+  after the grace, and a full job table releases the one delivered longest ago at once, so a loop of hashes
+  never fills the 32 slots. After the release a repeat of `job.run` runs the operation again (harmless for
+  delete, chmod, hash and crc32). A backup is kept for the park age instead, because a re-run would take a
+  second snapshot.
+* `job.cancel` raises the job's cancel flag and returns at once (it runs on a reader or RPC worker and
+  never waits for the worker). A delete, chmod, hash, crc32 or backup stops at the next directory entry or
+  read block and the poller then sees `state 2` with `ERR_CANCELLED`; fsck, cleanup and sdk.scan are one
+  system call and only honour a cancel that arrives before they start, so a cancelled fsck holds its job
+  slot (and its worker) until the system call returns. Unlike a copy, a cancelled operation stays listed
+  (finished) so a poller reads how it ended; it is collected like any finished job.
 * An operation that wraps an FTX2 handler (fsck, backup, cleanup, sdk.scan) keeps the handler's
   `{"ok":false,...}` body as its result: the operation ran and the body is the answer. Only an ERROR
   frame is a failed job. DELETE refuses a path outside the writable roots and a mount point (a path on

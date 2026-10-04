@@ -70,6 +70,7 @@ struct ava1_job {
     uint8_t id[16], owner[32], sid[16];
     int attached, refs, stopping, finished, prepared;
     uint64_t parked_at_ms;
+    int op_delivered;               /* an operation job: its terminal status was first delivered at parked_at_ms (the grace starts) */
     uint8_t kind, policy;
     uint32_t flags;
     int staged;
