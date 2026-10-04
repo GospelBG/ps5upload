@@ -31,6 +31,39 @@ fn main() {
         .include(&b3)
         .warnings(false)
         .compile("ava1b3");
+    // P3 Task 7: the shim expands the REAL rows of the "P3 Task 7" block of mgmt_table.def, with the
+    // FTX2 frame numbers from runtime.c, so the table and the tests cannot drift apart.
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    {
+        let table = std::fs::read_to_string(p.join("src/mgmt_table.def")).unwrap();
+        let mut rows = String::new();
+        let mut inside = false;
+        for line in table.lines() {
+            if line.starts_with("/* ---- P3 Task 7:") {
+                inside = true;
+            } else if line.starts_with("/* ---- end Task 7") {
+                inside = false;
+            } else if inside && (line.starts_with("MGMT_H0(") || line.starts_with("MGMT_H1(")) {
+                rows.push_str(line);
+                rows.push('\n');
+            }
+        }
+        assert!(!rows.is_empty(), "no P3 Task 7 rows in mgmt_table.def");
+        std::fs::write(out.join("t7_rows.def"), rows).unwrap();
+        let runtime = std::fs::read_to_string(p.join("src/runtime.c")).unwrap();
+        let mut frames = String::new();
+        for line in runtime.lines() {
+            if line.starts_with("#define FTX2_FRAME_") && line.contains('u') {
+                frames.push_str(line);
+                frames.push('\n');
+            }
+        }
+        std::fs::write(out.join("t7_frames.h"), frames).unwrap();
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("src/mgmt_table.def").display()
+    );
     cc::Build::new()
         .files([
             ava1.join("ava1_wire.c"),
@@ -64,12 +97,15 @@ fn main() {
             p.join("src/net_probe.c"),
             here.join("csrc/sizes.c"),
             here.join("csrc/test_shim.c"),
+            here.join("csrc/test_shim_t7.c"),
+            p.join("src/sony_api_lock.c"),
             here.join("csrc/firmware_shim.c"),
         ])
         .include(&ava1)
         .include(ava1.join("gen"))
         .include(&mono)
         .include(&b3)
+        .include(&out)
         // blake3_impl.h must see the same configuration in ava1_b3.c as in the
         // ava1b3 build, whose blake3_hash_many it calls.
         .define("BLAKE3_NO_SSE2", None)

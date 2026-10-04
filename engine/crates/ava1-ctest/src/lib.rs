@@ -396,6 +396,18 @@ pub mod ffi {
         pub fn ava1_test_copy_walk_active() -> c_int;
         pub fn ava1_test_copy_delete_active() -> c_int;
         pub fn ava1_test_retiring_blocks_reopen() -> c_int;
+        // P3 Task 7 (csrc/test_shim_t7.c)
+        pub fn ava1_test_t7_install() -> c_int;
+        pub fn ava1_test_t7_count() -> usize;
+        pub fn ava1_test_t7_entry(
+            i: usize,
+            method: *mut u32,
+            flags: *mut u32,
+            frame: *mut u32,
+            ack: *mut u32,
+        ) -> c_int;
+        pub fn ava1_test_t7_sony_peak() -> c_int;
+        pub fn ava1_test_t7_reset_peak();
         pub fn ava1_test_copy_put_decode_failure() -> c_int;
         pub fn ava1_test_copy_retry_changed_message() -> c_int;
         pub fn ava1_test_send_chunk_bytes() -> u64;
@@ -1729,5 +1741,53 @@ pub mod events {
     pub fn log(line: &str) {
         let c = CString::new(line).unwrap();
         unsafe { ffi::ava1_test_events_log(c.as_ptr()) }
+    }
+}
+
+/// P3 Task 7: the management table rows of the hardware/system/accounts/cheats/mods/notices/Remote
+/// Play group, expanded from the real `mgmt_table.def` over stub handlers (`csrc/test_shim_t7.c`).
+pub mod t7 {
+    use super::ffi;
+
+    /// One row of the real table: AVA1 method, `MGMT_*` flags, FTX2 request and ack frame numbers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Row {
+        pub method: u32,
+        pub flags: u32,
+        pub frame: u32,
+        pub ack: u32,
+    }
+
+    /// `MGMT_SONY`.
+    pub const SONY: u32 = 1;
+
+    /// Installs the Task 7 table (replacing any other). 0 on success.
+    pub fn install() -> i32 {
+        unsafe { ffi::ava1_test_t7_install() }
+    }
+    pub fn rows() -> Vec<Row> {
+        let n = unsafe { ffi::ava1_test_t7_count() };
+        (0..n)
+            .map(|i| {
+                let (mut m, mut f, mut fr, mut a) = (0, 0, 0, 0);
+                assert_eq!(
+                    unsafe { ffi::ava1_test_t7_entry(i, &mut m, &mut f, &mut fr, &mut a) },
+                    0
+                );
+                Row {
+                    method: m,
+                    flags: f,
+                    frame: fr,
+                    ack: a,
+                }
+            })
+            .collect()
+    }
+    /// The most threads that were inside a Sony-flagged stub (holding the real `sony_api_lock`) at once.
+    pub fn sony_peak() -> i32 {
+        unsafe { ffi::ava1_test_t7_sony_peak() }
+    }
+    pub fn reset_peak() {
+        unsafe { ffi::ava1_test_t7_reset_peak() }
     }
 }

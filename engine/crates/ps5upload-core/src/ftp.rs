@@ -1,10 +1,9 @@
 //! FTP Server proxy: start/stop/status an embedded FTP server on the PS5.
 
-use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m, Method};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FtpStartRequest {
@@ -44,44 +43,20 @@ pub struct FtpStatusResponse {
     pub root: String,
 }
 
-fn send_recv(
-    addr: &str,
-    req_type: FrameType,
-    ack_type: FrameType,
-    body: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    let mut c = Connection::connect(addr)?;
-    let empty: Vec<u8> = Vec::new();
-    let body = body.unwrap_or(&empty);
-    c.send_frame(req_type, body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected {:?}: {}",
-            req_type,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != ack_type {
-        bail!("expected {:?}, got {:?}", ack_type, ft);
-    }
-    Ok(resp)
+fn send_recv(addr: &str, method: Method, label: &str, body: Option<&[u8]>) -> Result<Vec<u8>> {
+    // The handler's `{"ok":false,...}` bodies carry data the callers read; call_keep gives them back
+    // as the FTX2 path did, and leaves a plain refusal an error ("payload rejected <label>: <cause>").
+    mgmt::call_keep(addr, method, label, body.unwrap_or(&[]))
 }
 
 pub fn ftp_start(addr: &str, req: &FtpStartRequest) -> Result<FtpStartResponse> {
     let body = serde_json::to_vec(req)?;
-    let resp = send_recv(
-        addr,
-        FrameType::FtpStart,
-        FrameType::FtpStartAck,
-        Some(&body),
-    )?;
+    let resp = send_recv(addr, m::FTP_START, "FtpStart", Some(&body))?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
 pub fn ftp_status(addr: &str) -> Result<FtpStatusResponse> {
-    let resp = send_recv(addr, FrameType::FtpStatus, FrameType::FtpStatusAck, None)?;
+    let resp = send_recv(addr, m::FTP_STATUS, "FtpStatus", None)?;
     Ok(serde_json::from_slice(&resp)?)
 }
 

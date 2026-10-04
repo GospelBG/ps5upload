@@ -1,10 +1,9 @@
 //! Persistent notification browser over FTX2.
 
-use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notification {
@@ -45,37 +44,18 @@ pub struct NotifClearResult {
 /// panel, which is not readable. So this really does clear everything
 /// the screen can show.
 pub fn notif_clear(addr: &str) -> Result<NotifClearResult> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::NotifClear, b"")?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected NOTIF_CLEAR: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::NotifClearAck {
-        bail!("expected NOTIF_CLEAR_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::NOTIF_CLEAR, "NOTIF_CLEAR", b"")?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
 pub fn notif_list(addr: &str, since_seq: u64) -> Result<NotificationList> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::json!({ "since_seq": since_seq });
-    c.send_frame(FrameType::NotifList, &serde_json::to_vec(&body)?)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected NOTIF_LIST: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::NotifListAck {
-        bail!("expected NOTIF_LIST_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(
+        addr,
+        m::NOTIF_LIST,
+        "NOTIF_LIST",
+        &serde_json::to_vec(&body)?,
+    )?;
     let parsed: NotificationList = serde_json::from_slice(&resp)?;
     Ok(parsed)
 }

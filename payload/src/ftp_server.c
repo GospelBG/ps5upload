@@ -194,9 +194,21 @@ static void ftp_kick_all_sessions(void) {
     pthread_mutex_unlock(&g_ftp.sessions_mu);
 }
 
+/* Resolves "." and ".." in a path. The 64 x 256 component stack (16 KiB) lives on the heap: the AVA1
+ * management workers run it next to Sony calls (mgmt_audit.py stack rejects 16 KiB+ stack arrays). On
+ * an allocation failure the answer is "/" (the FTP root), never the unresolved input. */
 static void normalize_path(const char *src, char *out, size_t cap) {
-    char stack[64][256];
+    char (*stack)[256] = malloc(64 * sizeof *stack);
     int sp = 0;
+    if (!stack) {
+        if (cap > 1) {
+            out[0] = '/';
+            out[1] = '\0';
+        } else if (cap) {
+            out[0] = '\0';
+        }
+        return;
+    }
     const char *p = src;
     while (*p) {
         while (*p == '/') p++;
@@ -228,6 +240,7 @@ static void normalize_path(const char *src, char *out, size_t cap) {
     if (pos < cap) out[pos] = '\0';
     else out[cap - 1] = '\0';
     if (pos == 1 && cap > 1) out[1] = '\0';
+    free(stack);
 }
 
 static void abs_path(struct ftp_session *s, const char *arg, char *out, size_t cap) {

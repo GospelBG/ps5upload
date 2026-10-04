@@ -9487,6 +9487,9 @@ static int handle_time_state_get(runtime_state_t *state, int client_fd,
     sce_datetime_t wall_dt;     uint32_t wall_err = 0;
     memset(&wall_dt, 0, sizeof(wall_dt));
 
+    /* sceRegMgr is not safe to call concurrently (CE-108262-9): hold sony_api_lock for the registry
+     * reads (and none of them takes it), and build/send the reply after releasing it. */
+    pthread_mutex_lock(&sony_api_lock);
     int tz_rc          = sys_registry_get_int(SCE_KEY_DATE_TIME_ZONE,
                                                 &tz_index, &tz_err);
     int date_fmt_rc    = sys_registry_get_int(SCE_KEY_DATE_DATE_FORMAT,
@@ -9510,6 +9513,7 @@ static int handle_time_state_get(runtime_state_t *state, int client_fd,
                                                 &tzdata_ver_err);
     int ntp_tick_rc    = sys_registry_get_ntp_tick_unix(&ntp_tick_unix,
                                                           &ntp_tick_err);
+    pthread_mutex_unlock(&sony_api_lock);
     int wall_rc        = sys_time_get(&wall_dt, &wall_err);
 
     /* Build response. JSON grows up to ~1.2 KB with all fields
@@ -9666,11 +9670,13 @@ static int handle_time_state_set(runtime_state_t *state, int client_fd,
     /* Issue each write. Each populates its own rc + err_code. */
     int rc_tz = 1, rc_date = 1, rc_time = 1, rc_summer = 1, rc_auto = 1;
     uint32_t ec_tz = 0, ec_date = 0, ec_time = 0, ec_summer = 0, ec_auto = 0;
+    pthread_mutex_lock(&sony_api_lock); /* sceRegMgr: one caller at a time (CE-108262-9) */
     if (has_tz)       rc_tz     = sys_registry_set_int(SCE_KEY_DATE_TIME_ZONE,    (int)tz_idx,     &ec_tz);
     if (has_date_fmt) rc_date   = sys_registry_set_int(SCE_KEY_DATE_DATE_FORMAT,  (int)date_fmt,   &ec_date);
     if (has_time_fmt) rc_time   = sys_registry_set_int(SCE_KEY_DATE_TIME_FORMAT,  (int)time_fmt,   &ec_time);
     if (has_summer)   rc_summer = sys_registry_set_int(SCE_KEY_DATE_SUMMER_TIME,  (int)summer,     &ec_summer);
     if (has_set_auto) rc_auto   = sys_registry_set_int(SCE_KEY_DATE_SET_AUTO,     (int)set_auto,   &ec_auto);
+    pthread_mutex_unlock(&sony_api_lock);
 
     /* `ok` is true only if EVERY attempted write succeeded. Skipped
      * writes don't count against ok — they leave rc_* = 1 (untouched)
@@ -10175,6 +10181,61 @@ static int parse_system_control_action(const char *body, uint64_t body_len,
     return -1;
 }
 
+/* power.control over AVA1: the handler is called with its reply captured, and the reply only leaves
+ * after the handler returns. A reboot/shutdown/standby that ran inside the handler would take the
+ * network down before the ACK was sent, so under the capture sink the destructive call is deferred to
+ * a short-lived thread that waits for the ACK to flush (the FTX2 contract: reply BEFORE the call). */
+typedef struct {
+    int action; /* system_control_action_t */
+} power_defer_t;
+
+/* Runs on the deferred power thread only, which holds no lock: take sony_api_lock so a reboot or
+ * power-off never overlaps another Sony call (the lock is held until the console goes down). */
+static void power_do_action(int action) {
+    pthread_mutex_lock(&sony_api_lock);
+    if (action == SC_ACTION_REBOOT) {
+        sceSystemServiceRequestReboot();
+    } else if (action == SC_ACTION_SHUTDOWN) {
+        void *h = dlsym(RTLD_DEFAULT, "sceSystemStateMgrTurnOff");
+        if (h) {
+            int (*turn_off)(int) = (int (*)(int))h;
+            turn_off(0);
+        } else {
+            sceSystemServiceRequestPowerOff();
+        }
+    } else if (action == SC_ACTION_STANDBY) {
+        void *h = dlsym(RTLD_DEFAULT, "sceSystemStateMgrEnterStandby");
+        if (h) {
+            int (*enter_standby)(void) = (int (*)(void))h;
+            enter_standby();
+        }
+    }
+    pthread_mutex_unlock(&sony_api_lock);
+}
+
+static void *power_defer_thread(void *arg) {
+    power_defer_t *d = (power_defer_t *)arg;
+    int action = d->action;
+    free(d);
+    usleep(400 * 1000); /* the ACK frame is written by the session thread as soon as the handler returns */
+    power_do_action(action);
+    return NULL;
+}
+
+/* 0 when the action will run (deferred); -1 when it could not be scheduled (the caller runs it inline). */
+static int power_defer(int action) {
+    power_defer_t *d = malloc(sizeof *d);
+    pthread_t t;
+    if (!d) return -1;
+    d->action = action;
+    if (create_worker_thread(&t, power_defer_thread, d) != 0) {
+        free(d);
+        return -1;
+    }
+    pthread_detach(t);
+    return 0;
+}
+
 static int handle_system_control(runtime_state_t *state, int client_fd,
                                   uint64_t trace_id, const char *body,
                                   uint64_t body_len) {
@@ -10208,6 +10269,7 @@ static int handle_system_control(runtime_state_t *state, int client_fd,
         const char *ack = "{\"ok\":true,\"action\":\"reboot\"}";
         rc = send_frame(client_fd, FTX2_FRAME_SYSTEM_CONTROL_ACK, 0,
                         trace_id, ack, strlen(ack));
+        if (mgmt_capture_active() && power_defer(SC_ACTION_REBOOT) == 0) return rc;
         sceSystemServiceRequestReboot();
         return rc;
     }
@@ -10215,6 +10277,7 @@ static int handle_system_control(runtime_state_t *state, int client_fd,
         const char *ack = "{\"ok\":true,\"action\":\"shutdown\"}";
         rc = send_frame(client_fd, FTX2_FRAME_SYSTEM_CONTROL_ACK, 0,
                         trace_id, ack, strlen(ack));
+        if (mgmt_capture_active() && power_defer(SC_ACTION_SHUTDOWN) == 0) return rc;
         /* sceSystemServiceRequestPowerOff() goes through the system's normal
          * power-button flow, which on PS5 RESPECTS the rest-mode setting — so
          * "Shutdown" commonly dropped the console into REST MODE instead of a
@@ -10250,12 +10313,15 @@ static int handle_system_control(runtime_state_t *state, int client_fd,
         const char *ack = "{\"ok\":true,\"action\":\"standby\"}";
         rc = send_frame(client_fd, FTX2_FRAME_SYSTEM_CONTROL_ACK, 0,
                         trace_id, ack, strlen(ack));
+        if (mgmt_capture_active() && power_defer(SC_ACTION_STANDBY) == 0) return rc;
         enter_standby();
         return rc;
     }
     case SC_ACTION_TICK:
         /* Tick is non-destructive; we can ACK after. */
+        pthread_mutex_lock(&sony_api_lock); /* a Sony call: one at a time with the others */
         err_code = sceSystemServicePowerTick();
+        pthread_mutex_unlock(&sony_api_lock);
         if (err_code == 0) {
             const char *ack = "{\"ok\":true,\"action\":\"tick\"}";
             return send_frame(client_fd, FTX2_FRAME_SYSTEM_CONTROL_ACK,
@@ -10386,6 +10452,10 @@ static int handle_user_list(runtime_state_t *state, int client_fd,
      * second call. We don't track a "first call done" flag because
      * the cost is negligible and statelessness avoids cross-thread
      * locking concerns. */
+    /* sceUserService is not safe to call concurrently (CE-108262-9): serialise on sony_api_lock like
+     * every other caller. AVA1 runs up to 8 management calls at once, so this handler holds the lock
+     * itself for its Sony calls and sends after it is released. */
+    pthread_mutex_lock(&sony_api_lock);
     sceUserServiceInitialize(NULL);
     int foreground = -1;
     int rc_fg = sceUserServiceGetForegroundUser(&foreground);
@@ -10418,6 +10488,7 @@ static int handle_user_list(runtime_state_t *state, int client_fd,
                       ids[i], esc,
                       ids[i] == foreground ? "true" : "false", rc_name);
     }
+    pthread_mutex_unlock(&sony_api_lock);
     if (n < (int)sizeof(body) - 2) {
         body[n++] = ']';
         body[n++] = '}';
@@ -10691,6 +10762,59 @@ static int handle_remoteplay_cancel(runtime_state_t *state, int client_fd,
     pthread_mutex_unlock(&state->state_mtx);
     return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_CANCEL_ACK, 0, trace_id,
                       resp, strlen(resp));
+}
+
+/* Remote Play readiness / enable / devices. They were inline in the FTX2 dispatcher; they are
+ * handlers now so the AVA1 management table (rp.readiness, rp.enable, rp.devices) can call them.
+ * The bodies are unchanged. The remoteplay_* entry points take sony_api_lock for the whole call
+ * (remoteplay.c "Sony-API serialization"), and the reply is sent after they return. */
+static int handle_remoteplay_readiness(runtime_state_t *state, int client_fd,
+                                       uint64_t trace_id) {
+    (void)state;
+    char body[640];
+    int n = remoteplay_readiness_json(body, sizeof(body));
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                          "readiness_overflow", 18);
+    }
+    return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_READINESS, 0,
+                      trace_id, body, (uint64_t)n);
+}
+
+static int handle_remoteplay_enable(runtime_state_t *state, int client_fd,
+                                    uint64_t trace_id, const char *request_body) {
+    (void)state;
+    char scope[16] = "";
+    extract_json_string_field(request_body, "scope", scope, sizeof(scope));
+    char body[640];
+    int n = remoteplay_enable(strcmp(scope, "user") == 0, body, sizeof(body));
+    if (n == -2) {
+        return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                          "rp_enable_unsupported_fw", 24);
+    }
+    if (n == -3) {
+        return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                          "rp_enable_no_user", 17);
+    }
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                          "rp_enable_write_failed", 22);
+    }
+    return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_ENABLE, 0,
+                      trace_id, body, (uint64_t)n);
+}
+
+static int handle_remoteplay_devices(runtime_state_t *state, int client_fd,
+                                     uint64_t trace_id) {
+    (void)state;
+    char body[2048];
+    int n = remoteplay_devices_json(body, sizeof(body));
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                          "rp_devices_overflow", 19);
+    }
+    return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_DEVICES, 0,
+                      trace_id, body, (uint64_t)n);
 }
 
 /* ── Fan curve handler ───────────────────────────────────────────────── */
@@ -12407,6 +12531,12 @@ static int handle_peripheral_control(runtime_state_t *state, int client_fd,
     }
     resolve_sce_kernel_extras();
     int rc = -1;
+    /* Peripheral ICC control is serialised with the other Sony calls: AVA1 can run several management
+     * calls at once, FTX2 rarely did. The lock covers only the control block; replies go out after. */
+    int periph_known = strcmp(action, "bd_power_off") == 0 || strcmp(action, "bd_power_on") == 0 ||
+                       strcmp(action, "eject_disc") == 0 || strcmp(action, "usb_port_off") == 0 ||
+                       strcmp(action, "usb_port_on") == 0;
+    if (periph_known) pthread_mutex_lock(&sony_api_lock);
     if (strcmp(action, "bd_power_off") == 0) {
         rc = p_sceKernelIccControlBDPowerState
                 ? p_sceKernelIccControlBDPowerState(0) : -1;
@@ -12436,6 +12566,7 @@ static int handle_peripheral_control(runtime_state_t *state, int client_fd,
         return send_frame(client_fd, FTX2_FRAME_PERIPHERAL_CONTROL_ACK,
                           0, trace_id, err, strlen(err));
     }
+    if (periph_known) pthread_mutex_unlock(&sony_api_lock);
     pthread_mutex_lock(&state->state_mtx);
     state->command_count += 1;
     pthread_mutex_unlock(&state->state_mtx);
@@ -12517,14 +12648,25 @@ static int shell_send_json_result(runtime_state_t *state, int client_fd,
      * produced JSON that ended mid-string. One measuring pass is cheaper
      * than guessing. */
     size_t esc_len = 0;
+    /* shell.exec over AVA1 answers at most 32 KiB (the plan's bound; the whole reply, JSON included):
+     * the output is cut at a character boundary and the reply says so ("truncated":true). */
+    const size_t shell_budget = 32u * 1024u - 2048u;
+    int shell_truncated = 0;
+    const int shell_capped = mgmt_capture_active();
     for (size_t i = 0; i < out_len; i++) {
         unsigned char c = (unsigned char)stdout_text[i];
-        if (c == '\\' || c == '"' || c == '\n' || c == '\r' || c == '\t')
-            esc_len += 2;
-        else if (c < 0x20)
-            esc_len += 6;
-        else
-            esc_len += 1;
+        size_t w = (c == '\\' || c == '"' || c == '\n' || c == '\r' || c == '\t') ? 2 : (c < 0x20 ? 6 : 1);
+        if (shell_capped && esc_len + w > shell_budget) {
+            /* do not end inside a UTF-8 sequence */
+            while (i > 0 && ((unsigned char)stdout_text[i] & 0xC0u) == 0x80u) {
+                i--;
+                esc_len -= 1;
+            }
+            out_len = i;
+            shell_truncated = 1;
+            break;
+        }
+        esc_len += w;
     }
     char *resp = malloc(esc_len + cwd_len * 6 + sid_len * 6 + 680);
     if (!resp) {
@@ -12568,7 +12710,7 @@ static int shell_send_json_result(runtime_state_t *state, int client_fd,
         else if (c < 0x20) { n += snprintf(resp + n, cap - (size_t)n, "\\u%04x", c); }
         else { resp[n++] = (char)c; }
     }
-    n += snprintf(resp + n, cap - (size_t)n, "\"}");
+    n += snprintf(resp + n, cap - (size_t)n, shell_truncated ? "\",\"truncated\":true}" : "\"}");
     int rc = send_frame(client_fd, FTX2_FRAME_SHELL_EXEC_ACK, 0,
                         trace_id, resp, (uint64_t)n);
     free(resp);
@@ -13514,9 +13656,12 @@ static int handle_toast_send(runtime_state_t *state, int client_fd,
      * malformed JSON or daemon offline; we surface it for the
      * renderer to log but don't treat as fatal. */
     resolve_sce_notification();
+    /* a Sony call: one at a time with the others (AVA1 runs up to 8 management calls at once) */
+    pthread_mutex_lock(&sony_api_lock);
     int rc = p_sceNotificationSend
                 ? p_sceNotificationSend(-1, 0, json)
                 : -1; /* symbol missing on this FW: toast unavailable */
+    pthread_mutex_unlock(&sony_api_lock);
     free(json);
     pthread_mutex_lock(&state->state_mtx);
     state->command_count += 1;
@@ -15629,6 +15774,125 @@ abort_done:
 
 __thread volatile unsigned int g_inflight_frame_type = 0;
 
+/* ---- P3 Task 7 table adapters ----
+ * mgmt_table.def calls handlers as (state, fd, trace, body, len). These handlers take a different
+ * shape (no length, or no state), so a one-line adapter gives them the table's. Each adapter only
+ * forwards the arguments; the body arrives NUL-terminated (mgmt_legacy_call). */
+static int mgmt_w_fan_curve_set(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_fan_curve_set(st, fd, t, b);
+}
+static int mgmt_w_user_create(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_user_create(st, fd, t, b);
+}
+static int mgmt_w_user_delete(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_user_delete(st, fd, t, b);
+}
+static int mgmt_w_backup_list(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_backup_list(st, fd, t, b);
+}
+static int mgmt_w_backup_delete(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_backup_delete(st, fd, t, b);
+}
+static int mgmt_w_remoteplay_request(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_remoteplay_request(st, fd, t, b);
+}
+static int mgmt_w_remoteplay_enable(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_remoteplay_enable(st, fd, t, b);
+}
+static int mgmt_w_activity_db_query(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_activity_db_query(st, fd, t, b);
+}
+static int mgmt_w_notif_list(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_notif_list(st, fd, t, b);
+}
+static int mgmt_w_cheats_get(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_cheats_get(st, fd, t, b);
+}
+static int mgmt_w_cheats_toggle(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_cheats_toggle(st, fd, t, b);
+}
+static int mgmt_w_cheats_delete(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_cheats_delete(st, fd, t, b);
+}
+static int mgmt_w_cheats_engine_set(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_cheats_engine_set(st, fd, t, b);
+}
+static int mgmt_w_sdk_patch(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_sdk_patch(st, fd, t, b);
+}
+static int mgmt_w_sdk_restore(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_sdk_restore(st, fd, t, b);
+}
+static int mgmt_w_tmdb_fetch(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_tmdb_fetch(st, fd, t, b);
+}
+static int mgmt_w_tmdb_store(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_tmdb_store(st, fd, t, b);
+}
+static int mgmt_w_ftp_start(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_ftp_start(st, fd, t, b);
+}
+static int mgmt_w_profile_set_username(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st;
+    (void)l;
+    return handle_profile_set_username(fd, t, b);
+}
+static int mgmt_w_profile_activate(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st;
+    (void)l;
+    return handle_profile_activate(fd, t, b);
+}
+static int mgmt_w_profile_apply_avatar(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st;
+    (void)l;
+    return handle_profile_apply_avatar(fd, t, b);
+}
+static int mgmt_w_profile_clear_slot(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st;
+    (void)l;
+    return handle_profile_clear_slot(fd, t, b);
+}
+static int mgmt_w_profile_set_local_username(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st;
+    (void)l;
+    return handle_profile_set_local_username(fd, t, b);
+}
+static int mgmt_w_profile_info(runtime_state_t *st, int fd, uint64_t t) {
+    (void)st;
+    return handle_profile_info(fd, t);
+}
+
+/* notif.send shares toast.send's 4 KiB request cap over AVA1. */
+static int mgmt_w_notif_send(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    if (l > 4096) return send_frame(fd, FTX2_FRAME_ERROR, 0, t, "body_too_large", 14);
+    return handle_notif_send(st, fd, t, b);
+}
+
+/* toast.send: the FTX2 dispatcher refused a body over 4 KiB before the handler ran (and the handler
+ * checks it again). Over AVA1 a larger body is ERR_PROTOCOL ("body_too_large"). */
+static int mgmt_w_toast_send(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    if (l > 4096) return send_frame(fd, FTX2_FRAME_ERROR, 0, t, "body_too_large", 14);
+    return handle_toast_send(st, fd, t, b, l);
+}
+
 /* The AVA1 management table (mgmt_table.def) and its thread environment. */
 #include "mgmt_install.inc"
 
@@ -16054,44 +16318,13 @@ static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
         return handle_remoteplay_request(state, client_fd, hdr.trace_id, request_body);
     }
     if (hdr.frame_type == FTX2_FRAME_REMOTEPLAY_READINESS) {
-        char body[640];
-        int n = remoteplay_readiness_json(body, sizeof(body));
-        if (n < 0 || (size_t)n >= sizeof(body)) {
-            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, hdr.trace_id,
-                              "readiness_overflow", 18);
-        }
-        return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_READINESS, 0,
-                          hdr.trace_id, body, (uint64_t)n);
+        return handle_remoteplay_readiness(state, client_fd, hdr.trace_id);
     }
     if (hdr.frame_type == FTX2_FRAME_REMOTEPLAY_ENABLE) {
-        char scope[16] = "";
-        extract_json_string_field(request_body, "scope", scope, sizeof(scope));
-        char body[640];
-        int n = remoteplay_enable(strcmp(scope, "user") == 0, body, sizeof(body));
-        if (n == -2) {
-            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, hdr.trace_id,
-                              "rp_enable_unsupported_fw", 24);
-        }
-        if (n == -3) {
-            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, hdr.trace_id,
-                              "rp_enable_no_user", 17);
-        }
-        if (n < 0 || (size_t)n >= sizeof(body)) {
-            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, hdr.trace_id,
-                              "rp_enable_write_failed", 22);
-        }
-        return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_ENABLE, 0,
-                          hdr.trace_id, body, (uint64_t)n);
+        return handle_remoteplay_enable(state, client_fd, hdr.trace_id, request_body);
     }
     if (hdr.frame_type == FTX2_FRAME_REMOTEPLAY_DEVICES) {
-        char body[2048];
-        int n = remoteplay_devices_json(body, sizeof(body));
-        if (n < 0 || (size_t)n >= sizeof(body)) {
-            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, hdr.trace_id,
-                              "rp_devices_overflow", 19);
-        }
-        return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_DEVICES, 0,
-                          hdr.trace_id, body, (uint64_t)n);
+        return handle_remoteplay_devices(state, client_fd, hdr.trace_id);
     }
     if (hdr.frame_type == FTX2_FRAME_REMOTEPLAY_STATUS) {
         return handle_remoteplay_status(state, client_fd, hdr.trace_id);

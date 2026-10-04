@@ -211,7 +211,10 @@ int mgmt_legacy_failure(const char *body, size_t len, char *token, size_t token_
  *   LC_KEEP     it is the answer (an operation's body, fsck's code, a backup's err text);
  *   LC_PROBE    it is the answer (a probe's negative result), except a malformed request
  *               ("bad_*" token), which stays an error. */
-enum { LC_KEEP = 0, LC_CONVERT = 1, LC_PROBE = 2 };
+enum { LC_KEEP = 0, LC_CONVERT = 1, LC_PROBE = 2, LC_CONVERT_KEEP = 3 };
+/*   LC_CONVERT_KEEP  an error status whose cause is the whole body up to MGMT_KEEP_MAX (the
+ *               caller needs its fields: a mount's code, a time.set err_code), else its token. */
+#define MGMT_KEEP_MAX 1024u
 static int legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_t req_len, size_t capture_cap,
                        mgmt_reply_t *rep, int mode) {
     capture_t c;
@@ -253,8 +256,18 @@ static int legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_
     if (mode != LC_KEEP && mgmt_legacy_failure((const char *)c.buf, c.len, token, sizeof token) &&
         !(mode == LC_PROBE && strstr(token, "bad_") == NULL)) {
         int st = mgmt_status_for_token(token);
-        /* the whole body (err, errno, reason, codes) when it fits a cause, else its token */
-        mgmt_reply_error(cx, st, c.len <= MGMT_CAUSE_MAX ? (const char *)c.buf : token);
+        if (mode == LC_CONVERT_KEEP) {
+            size_t n = c.len < MGMT_KEEP_MAX && c.len <= cx->cap ? c.len : 0;
+            if (n) {
+                memcpy(cx->out, c.buf, n);
+                cx->out_len = n;
+            } else {
+                mgmt_reply_error(cx, st, token);
+            }
+        } else {
+            /* the whole body (err, errno, reason, codes) when it fits a cause, else its token */
+            mgmt_reply_error(cx, st, c.len <= MGMT_CAUSE_MAX ? (const char *)c.buf : token);
+        }
         free(c.buf);
         return st;
     }
@@ -406,6 +419,21 @@ int mgmt_call_probe(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_
     int rc;
     if ((rc = text_request(cx, req, n, &b, &bl)) != AVA1_STATUS_OK) return rc;
     rc = legacy_call(cx, fn, b, bl, text_cap(cx), &rep, LC_PROBE);
+    if (rc != AVA1_STATUS_OK) return rc;
+    rc = mgmt_reply_text(cx, (const char *)rep.body, rep.len, -1);
+    mgmt_reply_free(&rep);
+    return rc;
+}
+
+/* A MgmtText method whose failure body is data the caller needs: the whole {"ok":false,...} body is
+ * the error cause (status from its "err" token), e.g. a mount's code or time.set's err_code. */
+int mgmt_call_text_keep(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn) {
+    const char *b;
+    uint32_t bl;
+    mgmt_reply_t rep;
+    int rc;
+    if ((rc = text_request(cx, req, n, &b, &bl)) != AVA1_STATUS_OK) return rc;
+    rc = legacy_call(cx, fn, b, bl, text_cap(cx), &rep, LC_CONVERT_KEEP);
     if (rc != AVA1_STATUS_OK) return rc;
     rc = mgmt_reply_text(cx, (const char *)rep.body, rep.len, -1);
     mgmt_reply_free(&rep);

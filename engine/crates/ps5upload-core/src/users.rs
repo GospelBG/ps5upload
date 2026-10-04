@@ -8,10 +8,9 @@
 //! seeing which users exist is the entry point.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserAccount {
@@ -44,19 +43,7 @@ pub struct UserList {
 }
 
 pub fn user_list(addr: &str) -> Result<UserList> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::UserList, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected USER_LIST: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::UserListAck {
-        bail!("expected USER_LIST_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::USER_LIST, "USER_LIST", &[])?;
     let parsed: UserList = serde_json::from_slice(&resp)?;
     Ok(parsed)
 }
@@ -74,20 +61,13 @@ pub struct UserCreateResult {
 }
 
 pub fn user_create(addr: &str, name: &str) -> Result<UserCreateResult> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::json!({ "name": name });
-    c.send_frame(FrameType::UserCreate, &serde_json::to_vec(&body)?)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected USER_CREATE: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::UserCreateAck {
-        bail!("expected USER_CREATE_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(
+        addr,
+        m::USER_CREATE,
+        "USER_CREATE",
+        &serde_json::to_vec(&body)?,
+    )?;
     let parsed: UserCreateResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(
@@ -111,20 +91,13 @@ pub struct UserDeleteResult {
 }
 
 pub fn user_delete(addr: &str, uid: i32, wipe_saves: bool) -> Result<()> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::json!({ "uid": uid, "wipe_saves": wipe_saves });
-    c.send_frame(FrameType::UserDelete, &serde_json::to_vec(&body)?)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected USER_DELETE: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::UserDeleteAck {
-        bail!("expected USER_DELETE_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(
+        addr,
+        m::USER_DELETE,
+        "USER_DELETE",
+        &serde_json::to_vec(&body)?,
+    )?;
     let parsed: UserDeleteResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(

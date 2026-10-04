@@ -88,6 +88,28 @@ fn is_read_only(method: u16) -> bool {
             | gen::METHOD_VIDEOS_LIST
             | gen::METHOD_INDEX_STATUS
             | gen::METHOD_INDEX_SEARCH
+            // P3 Task 7: reads of the hardware, accounts, cheats, notices and Remote Play state
+            | gen::METHOD_HW_DRIVE_SENSORS
+            | gen::METHOD_HW_FAN_CURVE_GET
+            | gen::METHOD_POWER_TELEMETRY
+            | gen::METHOD_TIME_GET
+            | gen::METHOD_TIME_STATE_GET
+            | gen::METHOD_USER_LIST
+            | gen::METHOD_PROFILE_INFO
+            | gen::METHOD_BACKUP_LIST
+            | gen::METHOD_CHEATS_LIST
+            | gen::METHOD_CHEATS_GET
+            | gen::METHOD_CHEATS_STATUS
+            | gen::METHOD_SMP_META_STATS
+            | gen::METHOD_SDK_SCAN
+            | gen::METHOD_FTP_STATUS
+            | gen::METHOD_FWSPOOF_STATUS
+            | gen::METHOD_NOTIF_LIST
+            | gen::METHOD_ACTIVITY_GET
+            | gen::METHOD_ACTIVITY_DB_QUERY
+            | gen::METHOD_RP_STATUS
+            | gen::METHOD_RP_READINESS
+            | gen::METHOD_RP_DEVICES
     )
 }
 

@@ -446,6 +446,19 @@ pub fn legacy_body(r: Result<Vec<u8>>) -> Result<Vec<u8>> {
     }
 }
 
+/// For a method whose handler answers a failure as a successful frame with a JSON body that carries
+/// data the caller reads (`{"ok":false,"err_code":N}`, `{"ok":false,"port":P,...}`): the body back, as
+/// FTX2 gave it. The same conversion as [`call_legacy_body`]; a plain-token refusal (an FTX2 `Error`
+/// frame such as `rp_enable_no_user`) stays an `Err` with the `payload rejected <LABEL>: <cause>` text.
+pub fn call_keep(addr: &str, method: Method, label: &str, body: &[u8]) -> Result<Vec<u8>> {
+    legacy_body(call_as(addr, method, label, body))
+}
+
+/// [`call_keep`]'s conversion ([`legacy_body`]), under the name the Task 7 modules use.
+pub fn keep_body(r: Result<Vec<u8>>) -> Result<Vec<u8>> {
+    legacy_body(r)
+}
+
 /// Runs one long operation and returns its result body (the legacy handler's reply: the same
 /// JSON the FTX2 frame answered). Over AVA1 it is a job the console runs while this call polls
 /// it, so a long delete or checksum no longer holds a socket for an hour; over FTX2 it is the
@@ -701,6 +714,38 @@ mod tests {
         assert!(legacy_body(refused("{\"a\":1}", 0)).is_err());
         assert!(legacy_body(Err(anyhow::anyhow!("network: reset"))).is_err());
         assert_eq!(legacy_body(Ok(b"x".to_vec())).unwrap(), b"x");
+    }
+
+    #[test]
+    fn keep_body_returns_a_json_cause_as_the_body_and_keeps_token_refusals_as_errors() {
+        let json = r#"{"ok":false,"err_code":3758104577}"#;
+        let kept: Result<Vec<u8>> = Err(MgmtError {
+            label: "TIME_SET".into(),
+            status: 255,
+            cause: json.into(),
+        }
+        .into());
+        assert_eq!(keep_body(kept).unwrap(), json.as_bytes());
+        let token: Result<Vec<u8>> = Err(MgmtError {
+            label: "REMOTE_PLAY_ENABLE".into(),
+            status: 5,
+            cause: "rp_enable_no_user".into(),
+        }
+        .into());
+        let e = keep_body(token).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "payload rejected REMOTE_PLAY_ENABLE: rp_enable_no_user"
+        );
+        // an FTX2 Error frame (status 0) whose text happens to be JSON is still an error
+        let ftx2: Result<Vec<u8>> = Err(MgmtError {
+            label: "X".into(),
+            status: 0,
+            cause: json.into(),
+        }
+        .into());
+        assert!(keep_body(ftx2).is_err());
+        assert_eq!(keep_body(Ok(b"x".to_vec())).unwrap(), b"x");
     }
 
     #[test]

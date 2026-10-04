@@ -10,6 +10,9 @@
   mgmt_audit.py lock     every MGMT_SONY entry of a "P3 Task N" block of mgmt_table.def (and app.launch) reaches a
                          `pthread_mutex_lock(&sony_api_lock)`, and no handler in runtime.c calls a p_sce* Sony
                          function without taking it (the dispatcher adds no lock of its own)
+  mgmt_audit.py sonylock every entry whose handler reaches sceUserService / sceRegMgr / sys_registry_* code
+                         also reaches a function that takes sony_api_lock (CE-108262-9: those APIs must be
+                         called one at a time; AVA1 runs up to 8 management calls at once)
   mgmt_audit.py stack    no stack array of 16 KiB or more is reachable from a table handler
                          (AVA1 workers have 512 KiB, the rule is the SPEC.md section 7.3 one)
   mgmt_audit.py report   every array of 2 KiB or more reachable from each handler in
@@ -337,12 +340,29 @@ def check_lock():
         if e["handler"] in LOCK_EXEMPT:
             continue
         r = reach(e["handler"])
-        if not any(LOCK_RE.search(strip(FUNCS[fn][0])) for fn in r):
+        # MGMT_SONY also marks handlers that only reach Sony-adjacent code (ptrace cheats, the notice
+        # ring); the lock is owed by those that call a serialised Sony API (a p_sce* pointer, or
+        # sceUserService / sceRegMgr / sys_registry_*).
+        calls_api = any(SONY_PTR_RE.search(strip(FUNCS[fn][0])) or REG_RE.search(strip(FUNCS[fn][0])) for fn in r)
+        if calls_api and not any(LOCK_RE.search(strip(FUNCS[fn][0])) for fn in r):
             bad.append("%s (%s) is MGMT_SONY but reaches no pthread_mutex_lock(&sony_api_lock)" % (e["method"], e["handler"]))
         for fn in sorted(r):
             body = strip(FUNCS[fn][0])
             if FUNCS[fn][1] == "src/runtime.c" and SONY_PTR_RE.search(body) and not LOCK_RE.search(body):
                 bad.append("%s: %s calls a p_sce* Sony function without taking sony_api_lock" % (e["method"], fn))
+    return bad
+
+
+REG_RE = re.compile(r"\b(sceUserService\w*|sceRegMgr\w*|sys_registry_\w+)\s*\(")
+
+
+def check_sonylock():
+    bad = []
+    for e in table():
+        r = reach(e["handler"])
+        touches = sorted(fn for fn in r if REG_RE.search(strip(FUNCS[fn][0])))
+        if touches and not any(LOCK_RE.search(strip(FUNCS[fn][0])) for fn in r):
+            bad.append("%s (%s) reaches %s but no function on its path takes sony_api_lock" % (e["method"], e["handler"], ", ".join(touches[:3])))
     return bad
 
 
@@ -405,8 +425,8 @@ def report():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
-    checks = dict(table=check_table, recv=check_recv, sony=check_sony, lock=check_lock, stack=check_stack, report=report, selftest=selftest)
-    todo = ["table", "recv", "sony", "lock", "stack"] if cmd == "all" else [cmd]
+    checks = dict(table=check_table, recv=check_recv, sony=check_sony, lock=check_lock, sonylock=check_sonylock, stack=check_stack, report=report, selftest=selftest)
+    todo = ["table", "recv", "sony", "lock", "sonylock", "stack"] if cmd == "all" else [cmd]
     failed = 0
     for c in todo:
         for line in checks[c]():
