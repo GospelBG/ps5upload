@@ -137,7 +137,7 @@ async fn job_done(link: &mut JobLink, limit: Duration) -> JobDone {
 async fn a_sender_that_only_pings_is_ended_with_err_stalled() {
     let (srv, d, ids) = server("stall-ping", 0);
     srv.knob("progress_ms", 800);
-    let (mut link, s) = opened(&srv, &d, ids, [0x61; 16], 2).await;
+    let (mut link, s) = opened(&srv, &d, ids.clone(), [0x61; 16], 2).await;
     let _lane = link.opener().unwrap().open().await.unwrap();
     let t0 = Instant::now();
     let done = job_done(&mut link, Duration::from_secs(15)).await;
@@ -155,7 +155,7 @@ async fn a_sender_that_only_pings_is_ended_with_err_stalled() {
 async fn a_slow_but_moving_sender_is_not_cut() {
     let (srv, d, ids) = server("stall-moving", 0);
     srv.knob("progress_ms", 800);
-    let (mut link, _s) = opened(&srv, &d, ids, [0x62; 16], 4).await;
+    let (mut link, _s) = opened(&srv, &d, ids.clone(), [0x62; 16], 4).await;
     let lane = link.opener().unwrap().open().await.unwrap();
     for i in 0..4u32 {
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -178,7 +178,7 @@ async fn a_slow_disk_is_not_a_stall() {
     // not count against the sender, which then finishes promptly.
     let (srv, d, ids) = server("stall-disk", 1_200_000);
     srv.knob("progress_ms", 800);
-    let (mut link, _s) = opened(&srv, &d, ids, [0x63; 16], 2).await;
+    let (mut link, _s) = opened(&srv, &d, ids.clone(), [0x63; 16], 2).await;
     let lane = link.opener().unwrap().open().await.unwrap();
     link.lane(lane)
         .unwrap()
@@ -201,4 +201,72 @@ async fn a_slow_disk_is_not_a_stall() {
     let done = job_done(&mut link, Duration::from_secs(30)).await;
     assert_eq!(done.status, 0, "{:?}", done.message);
     srv.knob("progress_ms", 0);
+}
+
+/// Review 006 follow-up: the long allowance belongs to a job that resumed, decided at open, not to
+/// any job that has made one durable batch. A fresh job whose source wedges after its first file is
+/// cut at the fresh limit although the resume limit is huge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_job_that_made_one_batch_still_gets_the_fresh_limit() {
+    let (srv, d, ids) = server("stall-fresh-batch", 0);
+    srv.knob("progress_ms", 800);
+    srv.knob("resume_progress_ms", 120_000);
+    let (mut link, _s) = opened(&srv, &d, ids.clone(), [0x64; 16], 3).await;
+    let lane = link.opener().unwrap().open().await.unwrap();
+    link.lane(lane)
+        .unwrap()
+        .tx
+        .send_raw(Bundle::TYPE, 0, 1, bundle([0x64; 16], 0, b"one!"))
+        .await
+        .unwrap();
+    loop {
+        if next_control(&mut link).await.ty == Durable::TYPE {
+            break;
+        }
+    }
+    let t0 = Instant::now();
+    let done = job_done(&mut link, Duration::from_secs(15)).await;
+    assert_eq!(done.status, gen::ERR_STALLED, "{:?}", done.message);
+    assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    srv.knob("progress_ms", 0);
+    srv.knob("resume_progress_ms", 0);
+}
+
+/// A resumed job (its journal holds a done file) waits for the resume limit: silent past the fresh
+/// limit it is still alive, and it is cut once the resume limit passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_job_gets_the_resume_limit() {
+    let (srv, d, ids) = server("stall-resumed", 0);
+    srv.knob("progress_ms", 800);
+    srv.knob("resume_progress_ms", 4000);
+    let job = [0x65; 16];
+    {
+        let (mut link, s) = opened(&srv, &d, ids.clone(), job, 3).await;
+        let lane = link.opener().unwrap().open().await.unwrap();
+        link.lane(lane)
+            .unwrap()
+            .tx
+            .send_raw(Bundle::TYPE, 0, 1, bundle(job, 0, b"one!"))
+            .await
+            .unwrap();
+        loop {
+            if next_control(&mut link).await.ty == Durable::TYPE {
+                break;
+            }
+        }
+        drop(link);
+        s.close().await;
+    }
+    let (mut link, _s) = opened(&srv, &d, ids.clone(), job, 3).await;
+    let _lane = link.opener().unwrap().open().await.unwrap();
+    let t0 = Instant::now();
+    let done = job_done(&mut link, Duration::from_secs(20)).await;
+    assert_eq!(done.status, gen::ERR_STALLED, "{:?}", done.message);
+    assert!(
+        t0.elapsed() >= Duration::from_millis(3500),
+        "a resumed job outlives the fresh limit: {:?}",
+        t0.elapsed()
+    );
+    srv.knob("progress_ms", 0);
+    srv.knob("resume_progress_ms", 0);
 }

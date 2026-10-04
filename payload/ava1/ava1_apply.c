@@ -2973,19 +2973,24 @@ static void maybe_sweep(ava1_job_t *j, uint64_t now) {
  * attached and owes bytes. A Ping is a byte, so the connection's liveness cannot see a sender whose data
  * pump is wedged (a source read stuck on a network share); this can. The clock only runs while we are
  * waiting on the sender alone: nothing queued, applying or waiting for a sync batch (a slow drive is
- * never a stall), and restarts on every frame, root, write or batch (the signature below). A job that
- * resumed with durable bytes gets the long limit: its sender may hash what it will not resend for a
+ * never a stall), and restarts on every frame, root, write or batch (the signature below). A resumed job (decided once, see `resumed`) gets the long limit: its sender may hash what it will not resend for a
  * long time without producing a frame. */
 static int progress_stalled(ava1_job_t *j, uint64_t now) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
-    uint64_t sig, frames;
+    uint64_t sig, frames, gen;
     int owed, ready, attached;
     pthread_mutex_lock(&j->cmu);
     frames = j->frames_in;
     ready = j->ready;
     attached = j->attached;
+    gen = j->att_gen;
     pthread_mutex_unlock(&j->cmu);
     pthread_mutex_lock(&j->mu);
+    /* Once per attach, not per re-arm: a reattached job that already holds durable work is a resume. */
+    if (gen != j->prog_gen) {
+        j->prog_gen = gen;
+        if (j->bytes_durable || j->files_done) j->resumed = 1;
+    }
     owed = j->kind == AVA1_JOB_UPLOAD && !j->role && j->prepared && !j->finished && !j->final_status &&
            !j->stopping && j->files_done + j->pend_n < j->m.files && !j->q_len && !j->busy && !j->pend_n &&
            !j->unsynced_bytes && !j->roots_new;
@@ -2997,9 +3002,10 @@ static int progress_stalled(ava1_job_t *j, uint64_t now) {
     }
     if (!j->prog_armed || sig != j->prog_sig) {
         if (!j->prog_armed) {
-            uint32_t base = cfg->progress_ms ? cfg->progress_ms : AVA1_PROGRESS_MS;
+            uint32_t fresh = cfg->progress_ms ? cfg->progress_ms : AVA1_PROGRESS_MS;
+            uint32_t resume = cfg->resume_progress_ms ? cfg->resume_progress_ms : AVA1_RESUME_PROGRESS_MS;
             pthread_mutex_lock(&j->mu);
-            j->prog_limit_ms = j->bytes_durable && !cfg->progress_ms ? AVA1_RESUME_PROGRESS_MS : base;
+            j->prog_limit_ms = j->resumed ? resume : fresh;
             pthread_mutex_unlock(&j->mu);
         }
         j->prog_armed = 1;

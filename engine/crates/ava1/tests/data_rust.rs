@@ -1342,3 +1342,77 @@ async fn a_flood_of_job_opens_is_bounded_with_err_busy() {
     }
     assert_eq!(ack.status, 0, "a freed slot admits the next open");
 }
+
+/// Review 006 follow-up: a resume whose journal holds only finished files waits the longer
+/// resume deadline (25 x), so a sender that spends several fresh deadlines hashing or skipping
+/// what is durable, sending no frame, is not cut; a fresh job with the same silence is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_done_only_resume_outlives_the_fresh_deadline() {
+    let d = common::temp_dir("rr-resume-silent");
+    let (ended, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let host = Arc::new(DeadlineHost {
+        root: d.join("share"),
+        jobs: d.join("hjobs"),
+        deadline: Duration::from_millis(400),
+        sync_delay: None,
+        ended,
+    });
+    let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(host)).await;
+    let job = [0x94u8; 16];
+    let m = small_files(3);
+    // First run: file 0 lands and is durable, then the sender goes away.
+    {
+        let s = connect(
+            &addr.to_string(),
+            id.clone(),
+            peers.clone(),
+            "c",
+            common::fast(),
+        )
+        .await
+        .unwrap();
+        let mut link = s.job(job);
+        let _ = open_and_map(&mut link, job, "in", &m).await;
+        let lane = link.opener().unwrap().open().await.unwrap();
+        link.lane(lane)
+            .unwrap()
+            .tx
+            .send_raw(Bundle::TYPE, 0, 1, bundle_body(job, 0, b"zero"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if next_control(&mut link).await.ty == Durable::TYPE {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("file 0 became durable");
+    }
+    // The receiver of the first run ends with the session.
+    let _ = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+    // Second run: done-only resume. The sender is silent for 3 s (7 fresh deadlines), then sends.
+    let s = connect(&addr.to_string(), id, peers, "c", common::fast())
+        .await
+        .unwrap();
+    let mut link = s.job(job);
+    let (_, need) = open_and_map(&mut link, job, "in", &m).await;
+    assert!(need.done.contains(&0), "the resume sees file 0 done");
+    let lane = link.opener().unwrap().open().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for i in 1..3u32 {
+        link.lane(lane)
+            .unwrap()
+            .tx
+            .send_raw(Bundle::TYPE, 0, i, bundle_body(job, i, b"data"))
+            .await
+            .unwrap();
+    }
+    let files = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .expect("the resumed job ended")
+        .expect("a result")
+        .expect("it completed, was not cut during the silence");
+    assert_eq!(files, 3);
+}

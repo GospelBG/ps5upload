@@ -1224,11 +1224,14 @@ async fn run_loop(
     let mut last_batch = Instant::now();
     // The last moment the job moved: a data frame, a root, a finished write or batch.
     let mut last_progress = Instant::now();
-    let progress_deadline = o.progress_deadline.unwrap_or(if need.partial.is_empty() {
-        PROGRESS_DEADLINE
-    } else {
-        RESUME_PROGRESS_DEADLINE
-    });
+    // A resume (the journal holds finished or partial files) may leave the sender hashing or
+    // skipping what is durable for a long while without a frame, so it waits far longer.
+    let progress_deadline = progress_limit(
+        o.progress_deadline,
+        !need.done.is_empty() || !need.partial.is_empty(),
+    );
+    // Whether the batch in flight had anything to sync (an empty one runs every SYNC_EVERY).
+    let mut batch_worked = false;
     // Out-of-order frames are bounded by the credit granted in JobOpen: the sender cannot
     // have more than one window in flight (SPEC.md §12.4). `whole` says the entry is a
     // root-checked bundle record rather than a chunk.
@@ -1288,13 +1291,7 @@ async fn run_loop(
                 tm.batch_done();
                 match b {
                     Ok(out) => {
-                        // An empty batch runs every SYNC_EVERY and moved nothing: only one
-                        // that made files or ranges durable is progress.
-                        if !(out.small.is_empty()
-                            && out.committed.is_empty()
-                            && out.reset.is_empty()
-                            && out.ranges.is_empty())
-                        {
+                        if batch_is_progress(batch_worked) {
                             last_progress = Instant::now();
                         }
                         fold_batch(&mut done, &mut large, &pg, &m, &out);
@@ -1535,6 +1532,11 @@ async fn run_loop(
         // stall), and nothing has moved for the whole deadline although the link is alive:
         // end the job. The sender sees `ERR_STALLED` and can resume; a wedged source read
         // there is its problem, not a reason to hold this job open forever.
+        // No lane up: the sender is not sending yet (or its lanes are being rebuilt), the same
+        // as the console, which arms only while a session is attached.
+        if idle && link.lanes().is_empty() {
+            last_progress = Instant::now();
+        }
         if idle
             && last_progress.elapsed() > progress_deadline
             && done.len() + pending_small.len() + inflight_small < total_files
@@ -1640,6 +1642,8 @@ async fn run_loop(
             ) {
                 last_batch = Instant::now();
                 inflight_small = pending_small.len();
+                batch_worked =
+                    !pending_small.is_empty() || large.values().any(|l| l.written.covered() > 0);
                 tm.batch_start();
                 let snap = snapshot_batch(
                     job_id,
@@ -1665,6 +1669,27 @@ async fn run_loop(
 /// network share) keeps the link alive indefinitely (review 006 #2). 3 x the SPEC default
 /// `dead_after` (12 s): generous, so a slow-but-moving link or drive is never cut.
 pub const PROGRESS_DEADLINE: Duration = Duration::from_secs(36);
+
+/// The deadline for a job: the override (tests, tuning) or the default, and a resumed job waits
+/// `RESUME_FACTOR` times as long (the default 36 s becomes the 15 minutes below).
+pub(crate) fn progress_limit(explicit: Option<Duration>, resumed: bool) -> Duration {
+    match (explicit, resumed) {
+        (Some(d), true) => d * RESUME_FACTOR,
+        (Some(d), false) => d,
+        (None, true) => RESUME_PROGRESS_DEADLINE,
+        (None, false) => PROGRESS_DEADLINE,
+    }
+}
+
+/// How much longer a resumed job may go without progress than a fresh one.
+const RESUME_FACTOR: u32 = 25;
+
+/// Whether a finished sync batch counts as progress: one that had something to sync did (even
+/// if it made nothing durable, e.g. a long sync that ends in retries); the empty batch that runs
+/// every `SYNC_EVERY` did not.
+pub(crate) fn batch_is_progress(had_work: bool) -> bool {
+    had_work
+}
 
 /// The same for a resumed job that already holds partial files: the sender may spend a long
 /// time hashing the durable groups it will not resend (no data frame is produced for them),
@@ -2817,6 +2842,24 @@ mod tests {
         }
         assert_eq!(st2, st, "a compaction loses no state");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_resumed_job_waits_longer_and_only_a_batch_with_work_is_progress() {
+        assert_eq!(progress_limit(None, false), PROGRESS_DEADLINE);
+        assert_eq!(progress_limit(None, true), RESUME_PROGRESS_DEADLINE);
+        assert_eq!(
+            progress_limit(Some(Duration::from_millis(400)), true),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            progress_limit(Some(Duration::from_millis(400)), false),
+            Duration::from_millis(400)
+        );
+        assert_eq!(PROGRESS_DEADLINE * RESUME_FACTOR, RESUME_PROGRESS_DEADLINE);
+        // A long sync that returns nothing durable still counts; the empty periodic one does not.
+        assert!(batch_is_progress(true));
+        assert!(!batch_is_progress(false));
     }
 
     #[test]

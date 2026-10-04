@@ -80,8 +80,12 @@ fn set_key_is_called_only_where_a_connection_is_keyed() {
     for e in std::fs::read_dir(&src).unwrap() {
         let p = e.unwrap().path();
         let text = std::fs::read_to_string(&p).unwrap();
-        // Production code only: everything before the file's test module.
-        let prod = text.split("#[cfg(test)]").next().unwrap();
+        // Production code only: drop the file's `#[cfg(test)] mod tests { .. }` block (a test-only
+        // accessor earlier in the file must not hide the code after it).
+        let prod = match text.find("#[cfg(test)]\nmod tests") {
+            Some(i) => &text[..i],
+            None => &text[..],
+        };
         let n = prod.matches(".set_key(").count();
         if n > 0 {
             sites.push((p.file_name().unwrap().to_string_lossy().into_owned(), n));
@@ -112,7 +116,10 @@ fn c_counters_are_only_incremented() {
             for f in ["send_ctr", "recv_ctr"] {
                 if let Some(i) = line.find(f) {
                     let rest = line[i + f.len()..].trim_start();
-                    let writes = rest.starts_with("= ") && !rest.starts_with("== ");
+                    // `=`, `+=`, `-=`, `|=` and the like; `++` (the increment) is the only write.
+                    let op = rest.trim_start_matches(['+', '-', '*', '/', '|', '&', '^']);
+                    let compound = op.len() != rest.len() && op.starts_with('=');
+                    let writes = compound || (rest.starts_with("= ") && !rest.starts_with("== "));
                     assert!(!writes, "{}:{} assigns {f}: {line}", p.display(), n + 1);
                 }
             }

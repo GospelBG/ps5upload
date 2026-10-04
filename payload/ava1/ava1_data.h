@@ -39,9 +39,10 @@ typedef struct {
     uint32_t recover_every_ms;            /* housekeeping recovers parked/crashed job dirs this often; 0 = 10000 */
     uint32_t recover_max;                 /* job directories one recovery pass takes; 0 = 4 */
     /* Review 006 #2: a receiving job that makes no progress for this long while its sender still owes
-     * bytes (it heartbeats but sends no data) is ended with AVA1_ERR_STALLED. 0 = AVA1_PROGRESS_MS, or
-     * AVA1_RESUME_PROGRESS_MS for a job that resumed with durable bytes. */
+     * bytes (it heartbeats but sends no data) is ended with AVA1_ERR_STALLED. 0 = AVA1_PROGRESS_MS. A job that
+     * resumed (its journal held done or partial files when it opened or reattached) uses resume_progress_ms. */
     uint32_t progress_ms;
+    uint32_t resume_progress_ms;          /* the same for a resumed job; 0 = AVA1_RESUME_PROGRESS_MS */
 } ava1_data_cfg_t;
 /* 3 x dead_after (12 s): generous, so a slow-but-moving link or drive is never cut. A resumed job may
  * spend a long time with the sender hashing durable groups it will not resend (no frame), so it waits

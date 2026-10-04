@@ -762,8 +762,9 @@ the progress deadline while the sender still owes bytes: a file is neither writt
 batch, the receiver has nothing of its own in flight, and the sender is attached. Progress is a
 lane data frame admitted, a `FileRoot`, a finished bundle write, or a sync batch that made
 something durable. The deadline is 3 x `dead_after` (36 s at the default 12 s); a job that resumed
-holding durable bytes gets 15 minutes, since its sender may hash the groups it will not resend for
-a long time without producing a frame. A slow drive never counts: any queued or running write, or a
+whose journal held finished or partial files when it opened (decided once, at open, or at a reattach that finds durable work) gets 15 minutes,
+since its sender may hash or skip what is durable for a long time without producing a frame. The clock runs only while the sender is attached
+(a lane is up on the engine, a session on the console), and any finished sync batch that had work counts as progress. A slow drive never counts: any queued or running write, or a
 running sync batch, holds the clock. The engine's receiver sends `JobCancel{reason: ERR_STALLED}`
 and fails the job (the engine's session retry resumes it); the console ends it with `JobDone`
 status `ERR_STALLED` and keeps the journal, as for every console-side failure. The sender
