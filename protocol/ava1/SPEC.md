@@ -877,8 +877,10 @@ successful recovery leaves no segment behind. Cost is bounded by the cap.
 End of job and reporting. `JobDone` is sent once the final batch is journaled (I2), with ext `settling` = 1 while
 files are still unswept; `Status` ext `unswept` carries the count (absent = 0) and the job stays listed, its sweep
 running, until it reaches 0 (a session that ends does not stop it). A staged tree settles fully before its final rename
-(the sweep addresses files by path), so `JobDone` carries no flag for it; merges and single files settle behind
-`JobDone`. A power cut inside the sweep's lag leaves the last files to be re-made by the next recovery.
+(the sweep addresses files by path), so `JobDone` carries no flag for it; so does a console copy or move, which must
+not delete its source before what it copied is durable in place; merges and single files settle behind `JobDone`. A
+sender that sees `settling` may keep the job open, reading `Status`, until `unswept` is 0 (an engine does, for up to 30 s,
+to show "finishing on the console"); the report is true either way. A power cut inside the sweep's lag leaves the last files to be re-made by the next recovery.
 
 ## 16. Governor
 

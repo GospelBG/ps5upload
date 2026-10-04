@@ -2659,6 +2659,12 @@ static void finish(ava1_job_t *j) {
     char parent[PATH_CAP];
     struct stat st;
     int e;
+    /* A console copy or move: a move deletes its source once the job ends (SPEC.md §15.5), and what was
+     * copied must be durable in place by then, not only in the log. */
+    if (j->kind == AVA1_JOB_COPY && (e = ava1_pack_drain(j)) != 0) {
+        ava1_apply_fail(j, AVA1_ERR_IO, "making the copied files durable failed", e, 1);
+        return;
+    }
     if (j->staged && !(j->flags & AVA1_JF_SINGLE_FILE)) {
         /* The sweep addresses files by path and the rename below moves them: settle first (the one
          * place the tail of a staged upload waits; merges and single files settle behind JobDone). */
