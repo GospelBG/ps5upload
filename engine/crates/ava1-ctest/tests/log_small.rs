@@ -526,3 +526,43 @@ fn recovery_runs_for_a_logged_job_even_when_the_flag_is_set() {
     drop(r);
     c_set_log_small_flag(None);
 }
+
+/// Review 007 #8: the sweep's first pass checks content, not only size. A file whose size is right
+/// but whose bytes are not (zero-filled blocks after a power cut, a damaged page) is re-made from
+/// its log record before it is fsynced and its record released.
+#[test]
+fn the_sweep_remakes_a_file_with_the_right_size_and_the_wrong_bytes() {
+    let t = tmp("sweep-content");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let n = 10;
+    let job = CApplyJob::begin_opts(
+        &t.join("jobs"),
+        &root,
+        0,
+        &small(n, false),
+        0,
+        0,
+        slow_sweep(), // nothing sweeps until the job ends
+    );
+    job.hold_batches(true);
+    for i in 0..n {
+        send(&job, i);
+    }
+    job.wait_pending(n as u32, 10_000);
+    job.hold_batches(false);
+    job.wait_event("durable", 10_000);
+    assert_eq!(job.unswept() as usize, n);
+    std::fs::write(root.join("d/3"), b"zzzz").unwrap(); // same size (4), wrong content
+    std::fs::remove_file(root.join("d/7")).unwrap(); // and a lost one: the live sweep re-makes it from its own record
+    std::fs::write(root.join("d/9"), b"zz").unwrap(); // and a short one
+    assert_eq!(job.wait(15_000), 0, "{}", job.events());
+    settled(&job);
+    for i in 0..n {
+        assert_eq!(
+            std::fs::read(root.join(format!("d/{i}"))).unwrap(),
+            body(i),
+            "file {i}"
+        );
+    }
+}

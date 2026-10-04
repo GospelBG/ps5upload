@@ -454,6 +454,14 @@ stops waiting (30 s, or a cancel). Housekeeping recovers parked, reaped and cras
 the console's job GC never touches one. The engine's own job GC (`journal::gc`) does not special-case pack files:
 an engine download settles everything before it ends, so a directory it left behind promised nothing to anyone.
 
+Sweep content check (review 007 #8, done): the sweep's first pass compares the file's BLAKE3 with its log record's before it
+fsyncs and releases the record, so a file with the right size and wrong bytes (zero-filled blocks after a power cut) is re-made
+from the log instead of being made durable as is. The reasoning held: the file was just written and is in the page cache, the
+record is a sequential read, files are bounded by `PACK_REC_MAX`, and the check never fails a sound file (an unreadable record
+skips it). Writing the test found a real bug the check exposed: the sync batch sorted its file ids but not their record
+locations, so the sweep queue and the per-segment journal ranges paired ids with other files' records, and a live re-make
+failed with `EIO`. Both arrays are now sorted together.
+
 Deferred:
 
 - **Pack preallocation**: segments are not preallocated (the log is fsynced every batch). If a drive shows the sparse
