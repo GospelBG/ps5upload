@@ -2686,10 +2686,30 @@ mod tests {
         let lane_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let ls = lane_seen.clone();
         tokio::spawn(async move {
-            let mut peer = FrameReader::new(cbr);
-            peer.set_max_body(crate::frame::MAX_BODY);
-            let mut lane_peer = FrameReader::new(lbr);
-            lane_peer.set_max_body(crate::frame::MAX_BODY);
+            // `FrameReader::recv` is not cancel-safe (a cancelled read loses the bytes it
+            // already took, and the next frame starts mid-body: BadMagic). The select!
+            // below cancels whichever branch loses, so each reader runs in its own task and
+            // the branches wait on a channel, which is. Capacity 1 keeps the backpressure the
+            // full-outbox test relies on while the control read is held.
+            fn pump<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+                r: R,
+            ) -> mpsc::Receiver<Result<Frame, ()>> {
+                let (tx, rx) = mpsc::channel(1);
+                tokio::spawn(async move {
+                    let mut reader = FrameReader::new(r);
+                    reader.set_max_body(crate::frame::MAX_BODY);
+                    loop {
+                        let f = reader.recv().await.map_err(|_| ());
+                        let end = f.is_err();
+                        if tx.send(f).await.is_err() || end {
+                            return;
+                        }
+                    }
+                });
+                rx
+            }
+            let mut peer = pump(cbr);
+            let mut lane_peer = pump(lbr);
             let mut peer_w = FrameWriter::new(cbw);
             let cancel_seen = rcv.cancel_seen.clone();
             // The control-read hold (the full-outbox case) and the Status flood that
@@ -2703,7 +2723,7 @@ mod tests {
                 tokio::select! {
                     f = async {
                         (&mut control_hold).await;
-                        peer.recv().await
+                        peer.recv().await.unwrap_or(Err(()))
                     } => match f {
                         Ok(f) if f.ty == JobOpen::TYPE => {
                             let open: JobOpen = f.decode().unwrap();
@@ -2774,7 +2794,7 @@ mod tests {
                         }).await;
                         flood.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(1));
                     }
-                    f = lane_peer.recv() => match f {
+                    f = async { lane_peer.recv().await.unwrap_or(Err(())) } => match f {
                         Ok(f) if is_data_type(f.ty) => {
                             let n = ls.fetch_add(1, Ordering::Relaxed);
                             let payload = f.decode::<Chunk>().map(|c| c.data.len() as u64).unwrap_or(0);
