@@ -24,6 +24,7 @@
 #include "ava1_glue.h"
 #include "takeover_flag.h"
 #include "ava1_stop.h"
+#include "ava1_data.h"
 #include "ava1_gen.h"
 #include "sony_api_lock.h"
 
@@ -716,6 +717,9 @@ int main(void) {
             pthread_attr_destroy(&mgmt_attr);
         }
     }
+    /* Probe the real descriptor ceiling before the listener threads exist: the probe opens descriptors
+     * until the kernel refuses, and a thread that opens or accepts meanwhile fails. */
+    ava1_fd_limits_probe();
     int mgmt_rc = pthread_create(&state.mgmt_thread, mgmt_attr_p,
                                  runtime_mgmt_server_loop, &state);
     if (mgmt_attr_p) pthread_attr_destroy(mgmt_attr_p);

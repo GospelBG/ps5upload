@@ -79,6 +79,10 @@ void ava1_budget_give(uint64_t n);
  * when unreadable). The apply engine's pending small-file descriptors, all jobs together,
  * stay within ava1_pend_share() (half of it); disk.calibrate holds at most that many. */
 uint32_t ava1_fd_budget(void);
+/* Reads and raises RLIMIT_NOFILE and probes the real descriptor ceiling (it opens descriptors until the
+ * kernel refuses, for a moment). Call it before any listener thread exists; the data layer's start then
+ * reuses the answer instead of starving the other threads of descriptors at boot. Idempotent. */
+void ava1_fd_limits_probe(void);
 uint32_t ava1_pend_share(void);
 /* Waits until a pending-fd slot is free, then takes it (before the open). Gives up (0) when
  * `stop` is set; `idle` runs between polls (the apply engine runs queued sync work there).

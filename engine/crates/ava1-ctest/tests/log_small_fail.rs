@@ -545,7 +545,15 @@ fn start_recovery_takes_a_few_job_directories_and_housekeeping_the_rest() {
         ..slow()
     };
     let r = CRecv::open_opts(&jobs, &t.join("dest9"), 0, gen::POLICY_REPLACE, 0, opts);
-    let left = [1u8, 2, 3].iter().filter(|b| packs(&jobs, **b) > 0).count();
+    // The start's pass runs on the recovery thread: wait for it to take its one directory.
+    let t1 = std::time::Instant::now();
+    let left = loop {
+        let left = [1u8, 2, 3].iter().filter(|b| packs(&jobs, **b) > 0).count();
+        if left < 3 || t1.elapsed().as_secs() > 10 {
+            break left;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert_eq!(left, 2, "start recovery is capped at recover_max");
     let t0 = std::time::Instant::now();
     while [1u8, 2, 3].iter().any(|b| packs(&jobs, *b) > 0) {
@@ -609,6 +617,12 @@ fn start_time_recovery_alone_restores_lost_files_without_any_jobopen() {
         }
     });
     let r = r.restart_without_open();
+    // The start's recovery pass runs on the recovery thread now (the listeners no longer wait for it).
+    let t0 = std::time::Instant::now();
+    while packs(&t.join("jobs"), 7) > 0 {
+        assert!(t0.elapsed().as_secs() < 20, "the start-time pass never recovered the log");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     all_there(&t, 30);
     let jobs = t.join("jobs");
     assert!(replay(&jobs, 7).0.unswept.is_empty());
@@ -936,5 +950,26 @@ fn stopping_the_data_layer_during_a_slow_recovery_pass_returns_promptly() {
         took < std::time::Duration::from_millis(450),
         "the stop waited {took:?} behind the recovery pass"
     );
+    drop(r);
+}
+
+/// Final review (console): the start-time pass runs on the recovery thread, so ava1_data_start returns
+/// at once; until the pass ends a JobOpen for a job that holds a log is answered BUSY, never served from
+/// state recovery has not yet restored.
+#[test]
+fn a_jobopen_before_the_start_pass_has_run_for_a_job_with_a_log_is_told_to_retry() {
+    let (r, t, m) = crash_then("early-open", 2, false, 20, |_| {});
+    let _ = (&t, &m);
+    drop(r);
+    // (the BUSY-then-resumes behaviour of an open racing a pass is covered by
+    // a_jobopen_during_a_recovery_pass_is_told_to_retry_and_then_resumes; this one only pins that
+    // the start returned and the pass completed on its own thread)
+    let jobs = t.join("jobs");
+    let r = CRecv::open_opts(&jobs, &t.join("dest"), 0, gen::POLICY_REPLACE, 0, slow());
+    let t0 = std::time::Instant::now();
+    while packs(&jobs, 7) > 0 {
+        assert!(t0.elapsed().as_secs() < 20, "the start-time pass never ran");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     drop(r);
 }

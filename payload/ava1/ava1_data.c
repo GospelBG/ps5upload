@@ -48,6 +48,7 @@ static struct {
     int fb;            /* Received waiting-sends spawned (bounded, see RECV_FB_MAX) */
     volatile int running;
     pthread_t house, recover;
+    int boot_recovered; /* the start-time recovery pass has run (recover_main) */
 } D = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
 
 const ava1_data_cfg_t *ava1_data_cfg(void) { return &D.cfg; }
@@ -134,8 +135,15 @@ static void *house_main(void *arg) {
  * never wait for the next helper start. A thread of its own, so a slow recovery (a sweep that keeps failing,
  * a large log) never delays the reaper. */
 static void *recover_main(void *arg) {
-    uint64_t last = ava1_mono_ms();
+    uint64_t last;
     (void)arg;
+    /* A helper that died (or was stopped) with files not yet durable in place finishes them now: the
+     * start's pass, here and not on the thread that starts the listeners (a large log made the main
+     * thread, and with it the legacy ports and AVA1, wait). Until it ends a JobOpen for a job that holds
+     * a log is answered BUSY (the sender retries), so no session takes one before it is recovered. */
+    if (D.cfg.jobs_dir[0]) (void)ava1_recv_recover_pass(D.cfg.jobs_dir, D.cfg.recover_max);
+    __atomic_store_n(&D.boot_recovered, 1, __ATOMIC_SEQ_CST);
+    last = ava1_mono_ms();
     while (D.running) {
         uint64_t now = ava1_mono_ms();
         if (D.cfg.jobs_dir[0] && now - last >= D.cfg.recover_every_ms) {
@@ -174,8 +182,15 @@ static uint32_t fd_probe(int *stop_errno) {
     return n;
 }
 
+static int g_fd_probed;
+
 static void fd_limit_init(void) {
     struct rlimit rl;
+    /* Once per process: the probe below opens descriptors until the kernel refuses, and any other thread
+     * opening or accepting in that window fails. ava1_fd_limits_probe() runs it early, before the listeners
+     * have threads; a later data-layer start reuses the answer. */
+    if (g_fd_probed) return;
+    g_fd_probed = 1;
     uint64_t soft = 512;
     int have = getrlimit(RLIMIT_NOFILE, &rl) == 0;
     if (have) {
@@ -213,6 +228,8 @@ static void fd_limit_init(void) {
     if (!g_fd_logged) fprintf(stderr, "[ava1] open-file budget %u\n", g_fd_budget);
     g_fd_logged = 1;
 }
+
+void ava1_fd_limits_probe(void) { fd_limit_init(); }
 
 uint32_t ava1_fd_budget(void) {
     uint32_t t = __atomic_load_n(&ava1_data_test_fd_budget, __ATOMIC_SEQ_CST);
@@ -369,6 +386,7 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     ava1_data_test_open_work_delay_ms = 0;
     ava1_data_test_ack_fail = ava1_data_test_feeder_fail = 0;
     ava1_data_test_reserve_fail = ava1_data_test_lane_alloc_fail = ava1_data_test_fb_force = 0;
+    __atomic_store_n(&D.boot_recovered, D.cfg.jobs_dir[0] ? 0 : 1, __ATOMIC_SEQ_CST);
     D.running = 1;
     if (ava1_thread_start(house_main, NULL, &D.house) != 0) {
         D.running = 0;
@@ -379,9 +397,6 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
         pthread_join(D.house, NULL);
         return -EAGAIN;
     }
-    /* A helper that died (or was stopped) with files not yet durable in place finishes them now,
-     * before any session can ask: re-materialise from the pack log and sweep. */
-    if (D.cfg.jobs_dir[0]) (void)ava1_recv_recover_pass(D.cfg.jobs_dir, D.cfg.recover_max);
     return 0;
 }
 
@@ -992,6 +1007,15 @@ static void open_now(opening_t *o, const uint8_t sid[16], const uint8_t peer[32]
         s.root = root;
         s.emit = net_emit;
         s.sid = sid;
+        if (!__atomic_load_n(&D.boot_recovered, __ATOMIC_SEQ_CST)) {
+            char jd[512];
+            ava1_job_dir(D.cfg.jobs_dir, q.job_id, jd, sizeof jd);
+            if (ava1_dir_has_pack(jd)) { /* its log is the only copy of files not yet durable: recovery goes first */
+                ack.status = AVA1_ERR_BUSY;
+                snprintf(msg, sizeof msg, "the console is still recovering this job's files; retry");
+                goto open_decided;
+            }
+        }
         pthread_mutex_lock(&g_open_mu);
         if (ava1_data_test_open_work_delay_ms) ava1_platform_sleep_ms(ava1_data_test_open_work_delay_ms);
         if (root_in_use(q.job_id, root)) {
@@ -1013,6 +1037,7 @@ static void open_now(opening_t *o, const uint8_t sid[16], const uint8_t peer[32]
             }
         }
         pthread_mutex_unlock(&g_open_mu);
+open_decided:;
     } else {
         ack.status = AVA1_ERR_PROTOCOL;
         snprintf(msg, sizeof msg, "unknown job kind");
