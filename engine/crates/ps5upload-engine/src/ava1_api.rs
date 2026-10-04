@@ -199,17 +199,7 @@ pub async fn pairing_confirm_handler(
     Json(req): Json<PairingConfirm>,
 ) -> Response {
     let addr = req.addr.unwrap_or_else(|| state.default_ps5_addr.clone());
-    let r = ps5upload_ava1::pool()
-        .confirm_pairing(&addr)
-        .await
-        .map(|()| ps5upload_ava1::Pairing::Paired);
-    let r = match r {
-        Err(ava1::Ava1Error::NotPaired) => Ok(ps5upload_ava1::Pairing::Closed),
-        Err(ava1::Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CLOSED => {
-            Ok(ps5upload_ava1::Pairing::Closed)
-        }
-        other => other,
-    };
+    let r = ps5upload_ava1::pool().confirm_or_status(&addr).await;
     let (code, body) = pairing_body(r);
     (code, Json(body)).into_response()
 }

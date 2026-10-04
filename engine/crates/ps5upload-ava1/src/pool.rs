@@ -434,6 +434,20 @@ impl Pool {
         Ok(())
     }
 
+    /// A confirm that never fails just because nothing is pending: a late or concurrent
+    /// confirm (the handshake was already confirmed, or it timed out) answers with the
+    /// console's current state (`Paired`, a fresh `Code`, or `Closed`) instead of an error.
+    pub async fn confirm_or_status(&self, console: &str) -> Result<Pairing, Ava1Error> {
+        match self.confirm_pairing(console).await {
+            Ok(()) => Ok(Pairing::Paired),
+            Err(Ava1Error::NotPaired) => self.pairing_status(console).await,
+            Err(Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CLOSED => {
+                Ok(Pairing::Closed)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// One live session for the console, connecting when there is none. C17: the lock
     /// is never held across the handshake (up to `Timing::handshake`) — one
     /// unreachable console must not stall every other console's transfer. If another

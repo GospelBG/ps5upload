@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   classifySession,
+  hostFromArgs,
   isNotPairedError,
   sessionNeedsAttention,
 } from "./consoleSession";
@@ -81,5 +82,15 @@ describe("status_pill_has_one_probe", () => {
     expect(shell).not.toContain("transferAliveRef");
     expect(shell).not.toContain("PS5_TRANSFER_PORT");
     expect(shell).not.toContain("PS5_MGMT_PORT");
+  });
+});
+
+describe("which console a failure names", () => {
+  it("reads ip, addr, from, to and a nested req, stripping any port", () => {
+    expect(hostFromArgs({ ip: "10.0.0.2" })).toBe("10.0.0.2");
+    expect(hostFromArgs({ addr: "10.0.0.3:9114", path: "/x" })).toBe("10.0.0.3");
+    expect(hostFromArgs({ req: { from: "10.0.0.4", to: "10.0.0.5" } })).toBe("10.0.0.4");
+    expect(hostFromArgs({ jobId: "j" })).toBeUndefined();
+    expect(hostFromArgs(undefined)).toBeUndefined();
   });
 });

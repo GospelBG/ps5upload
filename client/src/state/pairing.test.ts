@@ -82,4 +82,29 @@ describe("pairing store", () => {
     await usePairingStore.getState().openFor("10.0.0.2");
     expect(usePairingStore.getState().open).toBe(true);
   });
+
+  it("never opens for a failure that names no console, and opens the named one, not the active one", async () => {
+    api.pairingStatus.mockResolvedValue(CODE);
+    reportIfNotPaired("not_paired");
+    await Promise.resolve();
+    expect(usePairingStore.getState().open).toBe(false);
+    expect(api.pairingStatus).not.toHaveBeenCalled();
+    reportIfNotPaired("not_paired", "10.0.0.9");
+    await vi.waitFor(() => expect(usePairingStore.getState().open).toBe(true));
+    expect(usePairingStore.getState().host).toBe("10.0.0.9");
+    expect(api.pairingStatus).toHaveBeenCalledWith("10.0.0.9");
+  });
+
+  it("treats a state it does not know as an error the user can retry", async () => {
+    api.pairingStatus.mockResolvedValue({ state: "none" });
+    await usePairingStore.getState().openFor("10.0.0.2");
+    const s = usePairingStore.getState();
+    expect(s.open).toBe(true);
+    expect(s.view).toBeNull();
+    expect(s.error).toContain("unexpected");
+    api.pairingStatus.mockResolvedValue(CODE);
+    await s.retry();
+    expect(usePairingStore.getState().view).toEqual(CODE);
+    expect(usePairingStore.getState().error).toBeNull();
+  });
 });

@@ -19,6 +19,8 @@ import { useConnectionStore } from "./connection";
 /** After the user dismisses the dialog for a console, an automatic open for it waits this long. */
 const QUIET_MS = 60_000;
 
+const UNKNOWN_STATE = "unexpected reply from the engine";
+
 interface PairingState {
   open: boolean;
   host: string;
@@ -49,6 +51,12 @@ export const usePairingStore = create<PairingState>((set, get) => {
       // Already paired (the console trusts us after all): nothing to compare.
       if (view.state === "accepted") {
         set({ busy: false, view, open: false, paired: hostOf(host) });
+        return;
+      }
+      if (view.state === "none") {
+        // The engine said something this build does not know: an error with Retry, never a
+        // panel stuck on "Contacting the PS5…".
+        set({ busy: false, view: null, error: UNKNOWN_STATE });
         return;
       }
       set({ busy: false, view });
@@ -90,6 +98,8 @@ export const usePairingStore = create<PairingState>((set, get) => {
         const next = await pairingConfirm(host);
         if (next.state === "accepted") {
           set({ busy: false, open: false, view: next, paired: hostOf(host) });
+        } else if (next.state === "none") {
+          set({ busy: false, error: UNKNOWN_STATE });
         } else {
           // `closed`: the console's window shut before we confirmed.
           set({ busy: false, view: next });
@@ -124,7 +134,10 @@ export const usePairingStore = create<PairingState>((set, get) => {
 onNotPaired((host) => {
   const s = usePairingStore.getState();
   if (s.open) return;
-  const h = (host ?? useConnectionStore.getState().host).trim();
+  // A failure that names no console says nothing about which one to pair: never guess the
+  // active console (console B's failure must not open A's dialog).
+  const h = (host ?? "").trim();
+  if (!h) return;
   const key = hostOf(h) || "_";
   if (Date.now() < (s.quietUntil[key] ?? 0)) return;
   void s.openFor(h);

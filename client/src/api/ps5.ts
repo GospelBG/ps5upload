@@ -4272,7 +4272,12 @@ export function humanizeJobErrorReason(
   }
 }
 
-export async function jobStatus(jobId: string): Promise<JobSnapshot> {
+export async function jobStatus(
+  jobId: string,
+  /** The console the job runs against, when known: a not-paired failure opens THAT
+   *  console's pairing dialog. Without it the failure opens nothing. */
+  host?: string,
+): Promise<JobSnapshot> {
   const raw = await invoke<Record<string, unknown>>("job_status", { jobId });
   // Cheap shape validation. If the Rust side ever returns a non-snapshot
   // payload (e.g., an error envelope we forgot to map to a thrown
@@ -4290,6 +4295,7 @@ export async function jobStatus(jobId: string): Promise<JobSnapshot> {
     // A transfer that died because the console has not accepted this app opens the pairing dialog.
     reportIfNotPaired(
       (raw as { error_reason?: unknown }).error_reason ?? raw.error,
+      host,
     );
   }
   return raw as unknown as JobSnapshot;

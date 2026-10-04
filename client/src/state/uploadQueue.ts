@@ -818,7 +818,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     const samples: RateSample[] = [{ ts: startedAtMs, bytes: 0 }];
 
     while (isLive()) {
-      const snap = await jobStatus(jobId);
+      const snap = await jobStatus(jobId, item.addr);
       if (!isLive()) {
         throw new Error("queue stopped");
       }

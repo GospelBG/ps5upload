@@ -122,3 +122,23 @@ async fn a_console_that_already_trusts_us_needs_no_code() {
         Pairing::Paired
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_confirm_with_nothing_pending_re_reads_the_state() {
+    let d = dir("pool-pair-late");
+    let srv = CServer::start_with(SECRET, &d.join("srv-peers"), opts(60));
+    let pool = Pool::new(d.join("ava")).with_addr(srv.addr());
+    // Nothing pending and the window open: the confirm is answered with a fresh code, not "closed".
+    let first = pool.confirm_or_status("192.0.2.9").await.unwrap();
+    assert!(matches!(first, Pairing::Code { .. }), "{first:?}");
+    // Now it is pending: a confirm pairs.
+    assert_eq!(
+        pool.confirm_or_status("192.0.2.9").await.unwrap(),
+        Pairing::Paired
+    );
+    // A second (late or concurrent) confirm finds it paired: accepted, never closed.
+    assert_eq!(
+        pool.confirm_or_status("192.0.2.9").await.unwrap(),
+        Pairing::Paired
+    );
+}

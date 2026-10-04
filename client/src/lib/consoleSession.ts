@@ -13,6 +13,8 @@
 // Tokens come from the engine (Task 8 owns `helper_old` / `legacy_helper_wedged`,
 // `helper_not_ava1`; the pairing ones are `ava1_not_paired` / `not_paired`).
 
+import { hostOf } from "./addr";
+
 export type SessionState = "connected" | "needs_pairing" | "helper_old" | "down";
 
 const NOT_PAIRED = ["ava1_not_paired", "not_paired", "devices are not paired"];
@@ -56,6 +58,23 @@ export function classifySession(r: {
 /** States where a person has to do something (the pill gets an action). */
 export function sessionNeedsAttention(s: SessionState | null | undefined): boolean {
   return s === "needs_pairing" || s === "helper_old";
+}
+
+/** The console a command targets, from its arguments: `ip`, `addr`, `from` or `to` (the
+ *  first present string; also inside a `req` object), port stripped. Undefined when the
+ *  command names none: a failure then says nothing about WHICH console. */
+export function hostFromArgs(args: unknown): string | undefined {
+  const look = (o: unknown): string | undefined => {
+    if (!o || typeof o !== "object") return undefined;
+    const r = o as Record<string, unknown>;
+    for (const k of ["ip", "addr", "from", "to", "host"]) {
+      const v = r[k];
+      if (typeof v === "string" && v.trim()) return hostOf(v.trim()) || undefined;
+    }
+    return undefined;
+  };
+  const a = args as Record<string, unknown> | undefined;
+  return look(a) ?? look(a?.req);
 }
 
 // A tiny signal so the shared invoke wrapper can say "a call came back not_paired" without

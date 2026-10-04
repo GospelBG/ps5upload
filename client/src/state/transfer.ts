@@ -463,7 +463,7 @@ export const useTransferStore = create<TransferState>((set) => {
         if (!isLive()) return;
         let snap: JobSnapshot;
         try {
-          snap = await jobStatus(jobId);
+          snap = await jobStatus(jobId, addr);
         } catch (e) {
           if (!isLive()) return;
           const msg = e instanceof Error ? e.message : String(e);
