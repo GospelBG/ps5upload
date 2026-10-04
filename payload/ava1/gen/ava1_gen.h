@@ -251,6 +251,7 @@ typedef struct {
     uint16_t version;
     uint64_t caps;
     uint8_t session_id[16];
+    uint8_t pair_commit[32];
     int has_name;
     const uint8_t *name;
     uint16_t name_len;
@@ -264,6 +265,7 @@ int ava1_server_info_next(ava1_r_t *it, ava1_server_info_t *out);
 int ava1_server_info_count(const uint8_t *p, uint32_t len, uint32_t *count);
 
 typedef struct {
+    uint8_t nonce_c[16];
     int has_name;
     const uint8_t *name;
     uint16_t name_len;
@@ -801,6 +803,7 @@ int ava1_hs3_decode(const uint8_t *buf, size_t len, ava1_hs3_t *m);
 
 typedef struct {
     uint8_t knows_you;
+    uint8_t nonce_s[16];
     int has_launch_proof;
     uint8_t launch_proof[16];
 } ava1_welcome_t;

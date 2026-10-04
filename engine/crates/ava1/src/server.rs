@@ -547,7 +547,7 @@ async fn control(
     let req = PairRequest {
         peer_key: est.peer_key,
         peer_name: est.peer_name.clone(),
-        code: keys::pairing_code(&est.keys.hash),
+        code: est.code,
     };
     let entry = Arc::new(SessionEntry {
         keys: est.keys.clone(),

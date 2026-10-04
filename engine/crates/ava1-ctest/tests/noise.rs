@@ -138,8 +138,8 @@ fn c_derivations_and_sealing_match_rust() {
     assert_eq!(out16, keys::join_ack_tag(&dir, &sid, 5, &cn, &sn));
     let hash = [0x77u8; 64];
     assert_eq!(
-        unsafe { ffi::ava1_pairing_code(hash.as_ptr()) },
-        keys::pairing_code(&hash)
+        unsafe { ffi::ava1_pairing_code(hash.as_ptr(), cn.as_ptr(), sn.as_ptr()) },
+        keys::pairing_code(&hash, &cn, &sn)
     );
 
     for len in [0usize, 1, 15, 16, 17, 4096, 70_000] {
@@ -229,6 +229,29 @@ fn c_refuses_garbage_and_out_of_turn_messages() {
     let mut m2 = resp.write(b"").unwrap();
     m2[50] ^= 1;
     assert!(init.read(&m2).is_err(), "a tampered message 2 is refused");
+}
+
+/// S1: the pairing code and the server's commitment, from the shared vectors, in C.
+#[test]
+fn c_pairing_code_and_commit_reproduce_the_vectors() {
+    let h = |s: &str| hex::decode(s).unwrap();
+    let mut n = 0;
+    for l in include_str!("../../../../protocol/ava1/vectors/pairing.txt").lines() {
+        if l.starts_with('#') || l.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let (hash, nc, ns) = (h(f[1]), h(f[2]), h(f[3]));
+        let mut commit = [0u8; 32];
+        let code = unsafe {
+            ffi::ava1_pair_commit(ns.as_ptr(), commit.as_mut_ptr());
+            ffi::ava1_pairing_code(hash.as_ptr(), nc.as_ptr(), ns.as_ptr())
+        };
+        assert_eq!(hex::encode(&commit), f[4], "{l}");
+        assert_eq!(code.to_string(), f[5], "{l}");
+        n += 1;
+    }
+    assert!(n >= 3);
 }
 
 #[test]

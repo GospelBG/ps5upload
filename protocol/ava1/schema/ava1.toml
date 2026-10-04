@@ -87,7 +87,9 @@ fields = [{ name = "noise", ty = "bytes" }]   # payload: ClientInfo (encrypted)
 [[message]]
 name = "Welcome"
 type = 0x04
-fields = [{ name = "knows_you", ty = "u8" }]
+# nonce_s: the pairing-code reveal (SPEC.md §4.6): BLAKE2b-256(nonce_s) must equal the
+# pair_commit the server sent in ServerInfo. Required, so it cannot be stripped.
+fields = [{ name = "knows_you", ty = "u8" }, { name = "nonce_s", ty = "b16" }]
 ext = [{ tag = 1, name = "launch_proof", ty = "b16" }]
 
 [[message]]
@@ -188,11 +190,13 @@ fields = [
   { name = "version", ty = "u16" },
   { name = "caps", ty = "u64" },
   { name = "session_id", ty = "b16" },
+  { name = "pair_commit", ty = "b32" },   # BLAKE2b-256(nonce_s), revealed in Welcome (SPEC.md §4.6)
 ]
 ext = [{ tag = 1, name = "name", ty = "str" }]
 
 [[struct]]
 name = "ClientInfo"
+fields = [{ name = "nonce_c", ty = "b16" }]   # the client's pairing-code contribution (SPEC.md §4.6)
 ext = [{ tag = 1, name = "name", ty = "str" }]
 
 [[struct]]
