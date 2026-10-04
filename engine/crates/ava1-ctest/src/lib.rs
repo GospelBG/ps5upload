@@ -387,6 +387,9 @@ pub mod ffi {
             workers: u8,
         ) -> c_int;
         pub fn ava1_test_server_stop_data();
+        pub fn ava1_test_payload_stop(conn_ms: c_int, sony_ms: c_int) -> c_int;
+        pub fn ava1_test_sony_lock();
+        pub fn ava1_test_sony_unlock();
         pub fn ava1_test_data_delays(open_ms: u32, map_ms: u32);
         pub fn ava1_test_job_attached(id: *const u8) -> c_int;
         pub fn ava1_test_reap_rules(jobs_dir: *const c_char) -> c_int;
@@ -772,6 +775,23 @@ impl CServer {
     pub fn stop_data_only(&mut self) {
         self.data.as_ref().expect("stop_data_only needs start_data");
         unsafe { ffi::ava1_test_server_stop_data() };
+    }
+
+    /// The payload's real exit sequence (`ava1_payload_stop`): returns its result bits.
+    pub fn payload_stop(&mut self, conn_ms: i32, sony_ms: i32) -> i32 {
+        self.data.as_ref().expect("payload_stop needs start_data");
+        unsafe { ffi::ava1_test_payload_stop(conn_ms, sony_ms) }
+    }
+
+    /// Holds / releases the Sony API lock, as a handler in the middle of a Sony call does.
+    pub fn sony_lock(&self, held: bool) {
+        unsafe {
+            if held {
+                ffi::ava1_test_sony_lock()
+            } else {
+                ffi::ava1_test_sony_unlock()
+            }
+        }
     }
 
     pub fn start_data_again(&mut self) {

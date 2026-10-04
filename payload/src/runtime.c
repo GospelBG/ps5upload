@@ -64,6 +64,8 @@
 #include "smp_meta.h"
 #include "blake3.h"
 #include "mgmt_rpc.h"
+#include "ava1_stop.h"
+#include "ava1_glue.h"
 
 /* PS5 SDK's `<fcntl.h>` hides `posix_fadvise` and its POSIX_FADV_* constants
  * behind `__POSIX_VISIBLE >= 200112`, but defining `_POSIX_C_SOURCE` to unlock
@@ -15918,26 +15920,28 @@ static void wake_other_listener(runtime_state_t *state, int failing_port) {
 /* Asks this instance to exit: node.shutdown, the old shutdown frame, and the takeover flag file all
  * land here. Marks open transactions interrupted (so they resume), sets the flag every loop
  * checks, then nudges both accept loops: the transfer loop sits in accept() and nothing but a
- * connection wakes it. Safe to call from any thread, more than once. `delay_us` holds the nudge
- * back so a reply being written on this very connection is on the wire before the process ends. */
-static void shutdown_common(runtime_state_t *state, const char *why, unsigned delay_us) {
+ * connection wakes it. Safe to call from any thread, more than once. */
+static void shutdown_common(runtime_state_t *state, const char *why) {
     if (!state) return;
     runtime_mark_active_transactions(state, "interrupted");
     state->shutdown_requested = 1;
     (void)runtime_append_tx_event(state, why ? why : "shutdown");
-    if (delay_us) usleep(delay_us);
     wake_other_listener(state, state->mgmt_port);
     wake_other_listener(state, state->runtime_port);
 }
 
 void runtime_request_shutdown(runtime_state_t *state, const char *why) {
-    shutdown_common(state, why, 0);
+    shutdown_common(state, why);
 }
 
-/* node.shutdown (AVA1 method 5): the same exit as the old shutdown frame. */
+static void node_shutdown_fire(void *arg) { shutdown_common((runtime_state_t *)arg, "node_shutdown"); }
+
+/* node.shutdown (AVA1 method 5). The handler runs under the capture sink: its reply leaves only after
+ * it returns. So the exit is DEFERRED to a short thread (like power.control): the caller receives the
+ * acknowledgement first, then the instance stops (main.c runs ava1_payload_stop after the server loop). */
 static int handle_node_shutdown(runtime_state_t *state, int client_fd, uint64_t trace_id) {
     int rc = send_frame(client_fd, FTX2_FRAME_SHUTDOWN_ACK, 0, trace_id, "{}", 2);
-    shutdown_common(state, "node_shutdown", 200000);
+    if (ava1_shutdown_defer(300, node_shutdown_fire, state) != 0) node_shutdown_fire(state);
     return rc;
 }
 
@@ -16115,10 +16119,11 @@ static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
     /* ── HELLO ── */
     if (hdr.frame_type == FTX2_FRAME_HELLO) {
         int len = snprintf(body, sizeof(body),
-                           "{\"version\":%u,\"instance_id\":%llu,\"runtime_port\":%d}",
+                           "{\"version\":%u,\"instance_id\":%llu,\"runtime_port\":%d,"
+                           "\"ava1_port\":%d,\"ava1\":\"%s\"}",
                            FTX2_VERSION,
                            (unsigned long long)state->instance_id,
-                           state->runtime_port);
+                           state->runtime_port, (int)AVA1_DEFAULT_PORT, ava1_payload_state());
         /* snprintf returns the length that *would* have been written
          * (excluding NUL). A return > sizeof(body) means truncation;
          * clamp so we don't ask send_frame to read past the buffer. */

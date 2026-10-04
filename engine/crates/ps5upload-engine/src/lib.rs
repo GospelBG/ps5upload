@@ -44,6 +44,7 @@ mod fpkg_remote;
 mod icon_cache;
 mod inspect;
 mod install;
+mod legacy_guard;
 mod legacy_helper;
 mod local_fs;
 mod log_dedup;
@@ -3054,7 +3055,7 @@ async fn ps5_elfldr_ensure(Json(q): Json<HostQuery>) -> impl IntoResponse {
     }
 }
 
-/// GET /api/ps5/helper/state?host= — `{"state": "ava1" | "helper_old" | "not_running"}`: whether the
+/// GET /api/ps5/helper/state?host= — `{"state": "ava1" | "helper_old" | "starting" | "ava1_failed" | "not_running"}`: whether the
 /// console runs an AVA1 helper, an older helper that only speaks the old protocol (the UI offers
 /// the one-click update), or nothing (the usual send-payload flow). A TCP-level answer: pairing is
 /// a session matter.
@@ -3086,6 +3087,10 @@ async fn ps5_helper_replace(Json(q): Json<HostQuery>) -> impl IntoResponse {
                     Ok(serde_json::json!({ "state": "ava1", "replaced": false }))
                 }
                 legacy_helper::HELPER_OLD => {
+                    // One replace per console at a time, and 60 s between restarts.
+                    let _permit = legacy_guard::global()
+                        .begin(&host, std::time::Instant::now())
+                        .map_err(|t| (StatusCode::CONFLICT, legacy_guard::message(t)))?;
                     let elf = bundled_payload::image_bytes(bundled_payload::Image::Payload)
                         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
                     let stamped = ava1_api::stamped_helper(&elf);
@@ -3120,10 +3125,7 @@ async fn ps5_helper_replace(Json(q): Json<HostQuery>) -> impl IntoResponse {
                         legacy_helper::ReplaceError::Send(m) => (StatusCode::BAD_GATEWAY, m),
                     })
                 }
-                _ => Err((
-                    StatusCode::CONFLICT,
-                    "helper_not_running: nothing answers on the console".to_string(),
-                )),
+                other => Err((StatusCode::CONFLICT, legacy_guard::not_replaceable(other))),
             }
         })
         .await;

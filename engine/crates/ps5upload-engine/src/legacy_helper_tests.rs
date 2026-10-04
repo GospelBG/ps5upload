@@ -20,7 +20,14 @@ struct Fake {
     closed: Arc<AtomicBool>,
 }
 
+/// What a build from before the cutover answers to `Hello`: no AVA1 field.
+const OLD_HELLO: &str = r#"{"version":1,"instance_id":5,"runtime_port":9113}"#;
+
 fn fake_helper(exits: bool) -> Fake {
+    fake_helper_with(exits, OLD_HELLO)
+}
+
+fn fake_helper_with(exits: bool, hello_body: &'static str) -> Fake {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let ports = Ports {
         mgmt: l.local_addr().unwrap().port(),
@@ -40,7 +47,11 @@ fn fake_helper(exits: bool) -> Fake {
             let ty = u16::from_le_bytes([h[6], h[7]]);
             s2.lock().unwrap().push(h);
             let reply = if ty == SHUTDOWN { SHUTDOWN_ACK } else { 2 };
-            let _ = s.write_all(&frame(reply));
+            let mut out = frame(reply).to_vec();
+            let body = if ty == HELLO { hello_body } else { "{}" };
+            out[12..20].copy_from_slice(&(body.len() as u64).to_le_bytes());
+            out.extend_from_slice(body.as_bytes());
+            let _ = s.write_all(&out);
             if ty == SHUTDOWN && exits {
                 c2.store(true, Ordering::SeqCst);
                 return; // drops the listener: the port closes
@@ -88,6 +99,43 @@ fn probe_recognises_an_old_helper_and_nothing_else() {
         ava1: 0,
     };
     assert!(!probe("127.0.0.1", none));
+}
+
+const NEW_STARTING: &str =
+    r#"{"version":1,"instance_id":9,"runtime_port":9113,"ava1_port":9120,"ava1":"starting"}"#;
+const NEW_FAILED: &str =
+    r#"{"version":1,"instance_id":9,"runtime_port":9113,"ava1_port":9120,"ava1":"failed"}"#;
+
+/// A NEW helper still serves the old ports. It is not "old": while its AVA1 server is coming up it
+/// is `starting`, and when that server never started it is `ava1_failed`. Only a build whose Hello
+/// names no AVA1 port is `helper_old`, the one state a replace is offered for.
+#[test]
+fn a_new_build_is_never_called_helper_old() {
+    let old = fake_helper(false);
+    assert_eq!(state("127.0.0.1", old.ports), HELPER_OLD);
+    let booting = fake_helper_with(false, NEW_STARTING);
+    assert_eq!(state("127.0.0.1", booting.ports), STARTING);
+    let failed = fake_helper_with(false, NEW_FAILED);
+    assert_eq!(state("127.0.0.1", failed.ports), AVA1_FAILED);
+    // once its AVA1 port listens it is simply AVA1, whatever it still says on the old ports
+    let up = TcpListener::bind("127.0.0.1:0").unwrap();
+    let p = Ports {
+        ava1: up.local_addr().unwrap().port(),
+        ..booting.ports
+    };
+    assert_eq!(state("127.0.0.1", p), AVA1);
+}
+
+#[test]
+fn build_of_reads_the_hello_reply() {
+    assert_eq!(build_of(OLD_HELLO.as_bytes()), Build::Old);
+    assert_eq!(
+        build_of(b""),
+        Build::Old,
+        "a header-only reply is an old build"
+    );
+    assert_eq!(build_of(b"not json"), Build::Old);
+    assert_eq!(build_of(NEW_FAILED.as_bytes()), Build::New("failed".into()));
 }
 
 #[test]

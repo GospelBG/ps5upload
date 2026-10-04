@@ -138,6 +138,7 @@ typedef struct {
 
 typedef struct {
     uint64_t instance_id;
+    uint64_t takeover_nonce; /* random; names this instance in the takeover flag file (takeover_flag.h) */
     int runtime_port;           /* transfer port (9113) */
     int mgmt_port;              /* management port (9114) */
     int listener_fd;            /* transfer listener */

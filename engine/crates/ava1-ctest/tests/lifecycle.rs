@@ -22,12 +22,15 @@ extern "C" {
         attempts: c_int,
         interval_us: c_int,
     ) -> c_int;
-    fn takeover_flag_write(dir: *const c_char, id: u64) -> c_int;
-    fn takeover_flag_read(dir: *const c_char, id: *mut u64) -> c_int;
-    fn takeover_flag_newer(dir: *const c_char, my_id: u64) -> c_int;
+    fn takeover_flag_write(dir: *const c_char, nonce: u64) -> c_int;
+    fn takeover_flag_read(dir: *const c_char, nonce: *mut u64) -> c_int;
+    fn takeover_flag_unlink(dir: *const c_char);
+    fn takeover_nonce_new(nonce: *mut u64) -> c_int;
+    fn takeover_flag_identity(dir: *const c_char, out: *mut Id);
+    fn takeover_flag_asks_us_to_exit(dir: *const c_char, my: u64, stale: *const Id) -> c_int;
     fn takeover_flag_request(
         dir: *const c_char,
-        id: u64,
+        nonce: u64,
         ports: *const c_int,
         n: c_int,
         attempts: c_int,
@@ -35,10 +38,20 @@ extern "C" {
     ) -> c_int;
     fn takeover_flag_poll_start(
         dir: *const c_char,
-        id: u64,
+        nonce: u64,
         period_ms: c_int,
         cb: extern "C" fn(),
     ) -> c_int;
+}
+
+/// Mirrors takeover_flag_id_t.
+#[repr(C)]
+#[derive(Default)]
+struct Id {
+    present: c_int,
+    nonce: u64,
+    ino: u64,
+    mtime_ns: i64,
 }
 
 const NONE: c_int = 0;
@@ -160,48 +173,76 @@ fn legacy_takeover_reports_a_helper_that_does_not_exit() {
     assert_eq!(rc, STUCK);
 }
 
+fn flag_path(c: &CString) -> std::path::PathBuf {
+    std::path::Path::new(c.to_str().unwrap()).join("takeover")
+}
+
 #[test]
-fn flag_file_roundtrip_and_newer_only() {
+fn flag_file_roundtrip_and_who_it_asks_to_exit() {
     let (_d, c) = dir();
-    let mut id = 0u64;
+    let mut n = 0u64;
     assert_eq!(
-        unsafe { takeover_flag_read(c.as_ptr(), &mut id) },
+        unsafe { takeover_flag_read(c.as_ptr(), &mut n) },
         -1,
         "absent"
     );
+    assert_eq!(
+        unsafe { takeover_flag_asks_us_to_exit(c.as_ptr(), 1, std::ptr::null()) },
+        0
+    );
     assert_eq!(unsafe { takeover_flag_write(c.as_ptr(), 500) }, 0);
-    assert_eq!(unsafe { takeover_flag_read(c.as_ptr(), &mut id) }, 0);
-    assert_eq!(id, 500);
-    assert_eq!(unsafe { takeover_flag_newer(c.as_ptr(), 499) }, 1);
-    // the new instance's own flag, and a leftover from before it, never ask it to exit
-    assert_eq!(unsafe { takeover_flag_newer(c.as_ptr(), 500) }, 0);
-    assert_eq!(unsafe { takeover_flag_newer(c.as_ptr(), 501) }, 0);
+    assert_eq!(unsafe { takeover_flag_read(c.as_ptr(), &mut n) }, 0);
+    assert_eq!(n, 500);
+    // a different instance's nonce asks us to exit; our own never does
+    assert_eq!(
+        unsafe { takeover_flag_asks_us_to_exit(c.as_ptr(), 499, std::ptr::null()) },
+        1
+    );
+    assert_eq!(
+        unsafe { takeover_flag_asks_us_to_exit(c.as_ptr(), 500, std::ptr::null()) },
+        0
+    );
+    // what was already there at our start (the stale identity) does not
+    let mut id = Id::default();
+    unsafe { takeover_flag_identity(c.as_ptr(), &mut id) };
+    assert_eq!(id.present, 1);
+    assert_eq!(
+        unsafe { takeover_flag_asks_us_to_exit(c.as_ptr(), 499, &id) },
+        0
+    );
     // garbage is not a request
-    std::fs::write(
-        std::path::Path::new(c.to_str().unwrap()).join("takeover"),
-        b"zzz",
-    )
-    .unwrap();
-    assert_eq!(unsafe { takeover_flag_newer(c.as_ptr(), 1) }, 0);
-    // no temp file left behind
+    std::fs::write(flag_path(&c), b"zzz").unwrap();
+    assert_eq!(
+        unsafe { takeover_flag_asks_us_to_exit(c.as_ptr(), 1, std::ptr::null()) },
+        0
+    );
+    unsafe { takeover_flag_unlink(c.as_ptr()) };
+    assert!(!flag_path(&c).exists());
     assert!(!std::path::Path::new(c.to_str().unwrap())
         .join("takeover.tmp")
         .exists());
+}
+
+#[test]
+fn nonces_are_random_and_never_zero() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..64 {
+        let mut n = 0u64;
+        assert_eq!(unsafe { takeover_nonce_new(&mut n) }, 0);
+        assert_ne!(n, 0);
+        assert!(seen.insert(n), "a repeated nonce");
+    }
 }
 
 static OLD_EXITED: AtomicBool = AtomicBool::new(false);
 extern "C" fn old_exits() {
     OLD_EXITED.store(true, Ordering::SeqCst);
 }
-static STAYED: AtomicBool = AtomicBool::new(false);
-extern "C" fn must_not_run() {
-    STAYED.store(true, Ordering::SeqCst);
-}
 
 #[test]
 fn flag_file_takeover_exits_the_old_instance() {
     let (_d, c) = dir();
-    // The old instance (id 100) serves on `port` and polls the flag every 20 ms.
+    // The old instance (nonce 100) serves on `port` and polls the flag every 20 ms.
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port() as c_int;
     l.set_nonblocking(true).unwrap();
@@ -219,12 +260,16 @@ fn flag_file_takeover_exits_the_old_instance() {
         drop(l);
     });
     assert!(TcpStream::connect(("127.0.0.1", port as u16)).is_ok());
-    // The new instance (id 200) asks and waits for the port to free.
+    // The new instance (nonce 200) asks and waits for the port to free.
     let ports = [port];
     let rc = unsafe { takeover_flag_request(c.as_ptr(), 200, ports.as_ptr(), 1, 200, 20_000) };
     old.join().unwrap();
     assert_eq!(rc, 0, "the port freed");
     assert!(OLD_EXITED.load(Ordering::SeqCst), "the old instance exited");
+    assert!(
+        !flag_path(&c).exists(),
+        "the flag is removed after a successful takeover"
+    );
 }
 
 #[test]
@@ -235,21 +280,81 @@ fn flag_file_takeover_times_out_on_an_instance_that_stays() {
     let ports = [port];
     let rc = unsafe { takeover_flag_request(c.as_ptr(), 200, ports.as_ptr(), 1, 5, 5_000) };
     assert_eq!(rc, -1);
+    assert!(
+        flag_path(&c).exists(),
+        "the flag stays for the old instance"
+    );
     drop(l);
 }
 
+static STALE_RAN: AtomicBool = AtomicBool::new(false);
+extern "C" fn stale_cb() {
+    STALE_RAN.store(true, Ordering::SeqCst);
+}
+
 #[test]
-fn an_older_or_equal_flag_never_stops_an_instance() {
+fn a_stale_flag_at_startup_does_nothing() {
     let (_d, c) = dir();
-    unsafe { takeover_flag_write(c.as_ptr(), 100) };
+    // left behind by an instance that died or by a reboot
+    unsafe { takeover_flag_write(c.as_ptr(), 7) };
     assert_eq!(
-        unsafe { takeover_flag_poll_start(c.as_ptr(), 100, 10, must_not_run) },
+        unsafe { takeover_flag_poll_start(c.as_ptr(), 9, 10, stale_cb) },
         0
     );
-    assert_eq!(
-        unsafe { takeover_flag_poll_start(c.as_ptr(), 101, 10, must_not_run) },
-        0
+    assert!(
+        !flag_path(&c).exists(),
+        "the poll removed the stale flag at start"
     );
     std::thread::sleep(Duration::from_millis(250));
-    assert!(!STAYED.load(Ordering::SeqCst));
+    assert!(!STALE_RAN.load(Ordering::SeqCst));
+}
+
+static OWN_RAN: AtomicBool = AtomicBool::new(false);
+extern "C" fn own_cb() {
+    OWN_RAN.store(true, Ordering::SeqCst);
+}
+
+#[test]
+fn our_own_flag_never_stops_us() {
+    let (_d, c) = dir();
+    assert_eq!(
+        unsafe { takeover_flag_poll_start(c.as_ptr(), 41, 10, own_cb) },
+        0
+    );
+    unsafe { takeover_flag_write(c.as_ptr(), 41) };
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(!OWN_RAN.load(Ordering::SeqCst));
+}
+
+static CLOCK_RAN: AtomicBool = AtomicBool::new(false);
+extern "C" fn clock_cb() {
+    CLOCK_RAN.store(true, Ordering::SeqCst);
+}
+
+extern "C" {
+    fn utimes(path: *const c_char, times: *const [i64; 4]) -> c_int;
+}
+
+/// The app sets the console clock with settimeofday, so a fresh flag can carry an mtime far in the
+/// past or future. The poll never orders by time, so a fresh flag still works whatever its mtime.
+#[test]
+fn a_backward_clock_does_not_matter() {
+    let (_d, c) = dir();
+    assert_eq!(
+        unsafe { takeover_flag_poll_start(c.as_ptr(), 51, 10, clock_cb) },
+        0
+    );
+    unsafe { takeover_flag_write(c.as_ptr(), 52) };
+    // the clock "went backward": the file looks written in 1970
+    let p = CString::new(flag_path(&c).to_str().unwrap()).unwrap();
+    let t = [1i64, 0, 1, 0]; // atime/mtime = 1 s past the epoch (tv_sec, tv_usec)
+    assert_eq!(unsafe { utimes(p.as_ptr(), &t) }, 0);
+    let t0 = Instant::now();
+    while !CLOCK_RAN.load(Ordering::SeqCst) && t0.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        CLOCK_RAN.load(Ordering::SeqCst),
+        "a flag with an old mtime still asks for the exit"
+    );
 }

@@ -35,6 +35,7 @@ int runtime_try_takeover(runtime_state_t *state) {
     int rc = 0;
 
     if (!state) return -1;
+    if (state->takeover_nonce == 0) (void)takeover_nonce_new(&state->takeover_nonce);
 
     if (stat(state->ownership_path, &st) == 0) {
         printf("[payload2] previous ownership record found at %s\n", state->ownership_path);
@@ -54,11 +55,14 @@ int runtime_try_takeover(runtime_state_t *state) {
     }
     if (rc == LEGACY_TAKEOVER_FREED) state->startup_reason = PS5UPLOAD2_STARTUP_TAKEOVER;
 
+    /* A flag left from before this instance (a crash, a reboot) must not be mistaken for a request. */
+    takeover_flag_unlink(PS5UPLOAD2_RUNTIME_DIR);
+
     if (takeover_port_responding((int)AVA1_DEFAULT_PORT)) {
         /* The old instance is still serving AVA1 (an AVA1-era instance, or a transitional one
          * whose legacy ports were just freed but whose AVA1 server is still closing). */
         int ports[3] = {(int)AVA1_DEFAULT_PORT, state->mgmt_port, state->runtime_port};
-        if (takeover_flag_request(PS5UPLOAD2_RUNTIME_DIR, state->instance_id, ports, 3,
+        if (takeover_flag_request(PS5UPLOAD2_RUNTIME_DIR, state->takeover_nonce, ports, 3,
                                   TAKEOVER_PORT_RELEASE_ATTEMPTS,
                                   TAKEOVER_PORT_RELEASE_INTERVAL_US) != 0) {
             fprintf(stderr, "[payload2] takeover timed out: ava1 port %d still occupied\n",

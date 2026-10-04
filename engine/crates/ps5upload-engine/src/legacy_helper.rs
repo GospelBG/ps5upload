@@ -3,13 +3,9 @@
 //! A console that still runs a helper released before the cutover answers only the old binary
 //! protocol on :9113/:9114. The new app cannot talk to it, so before it sends the new helper it
 //! has to recognise that helper, ask it to exit and wait for its ports to close. This is the only
-//! engine code that speaks the old protocol; the constants are inlined on purpose (no
-//! `ftx2-proto`), so deleting the file deletes the last use.
+//! engine code that speaks the old protocol; the constants are inlined on purpose (no `ftx2-proto`).
 //!
-//! Engine error tokens (stable, the client matches on them; see `protocol/ava1/CUTOVER.md`):
-//! * [`HELPER_OLD`]: the console runs an older helper; the UI offers the one-click update.
-//! * [`LEGACY_HELPER_WEDGED`]: the older helper took the shutdown request and did not exit
-//!   within the window; the UI says so and offers the console restart.
+//! The state and error tokens are stable (the client matches on them): see `protocol/ava1/CUTOVER.md`.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -17,11 +13,15 @@ use std::time::{Duration, Instant};
 
 /// State token: an older helper is running (it only speaks the old protocol).
 pub const HELPER_OLD: &str = "helper_old";
-/// State token: nothing answers on the AVA1 port or the old ports (the existing send-payload flow).
+/// State token: a new helper whose AVA1 server is not listening yet. Wait; do not replace.
+pub const STARTING: &str = "starting";
+/// State token: a new helper whose AVA1 server failed to start (replacing sends the same build).
+pub const AVA1_FAILED: &str = "ava1_failed";
+/// State token: nothing answers (the existing send-payload flow).
 pub const NOT_RUNNING: &str = "not_running";
-/// State token: the AVA1 port accepts connections (pairing and versions are the session's business).
+/// State token: the AVA1 port accepts connections.
 pub const AVA1: &str = "ava1";
-/// Error token: the older helper did not exit after its shutdown request.
+/// Error token: the older helper did not exit after its shutdown.
 pub const LEGACY_HELPER_WEDGED: &str = "legacy_helper_wedged";
 
 const MAGIC: u32 = 0x3258_5446; // "FTX2", little endian on the wire
@@ -52,15 +52,14 @@ impl Default for Ports {
     }
 }
 
-/// How long the old helper gets to close both ports after its shutdown request (the payload's own
-/// takeover waits the same 10 s), and how long the new helper gets to open the AVA1 port.
+/// How long the old helper gets to close both ports (as the payload's own takeover), and the new one to open 9120.
 pub const WAIT_CLOSE: Duration = Duration::from_secs(10);
 pub const WAIT_AVA1: Duration = Duration::from_secs(20);
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(100);
 
-/// A body-less old-protocol frame (28-byte header).
+/// A body-less old-protocol frame.
 pub fn frame(frame_type: u16) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
     h[0..4].copy_from_slice(&MAGIC.to_le_bytes());
@@ -92,9 +91,9 @@ fn connect(host: &str, port: u16) -> Option<TcpStream> {
     None
 }
 
-/// Sends one body-less frame and reads the 28-byte reply header: the reply's frame type, or
+/// Sends one body-less frame and reads the reply: its frame type and (up to 1 KiB of) body, or
 /// `None` when the peer did not answer in the old protocol.
-fn ask(host: &str, port: u16, frame_type: u16) -> Option<u16> {
+fn ask(host: &str, port: u16, frame_type: u16) -> Option<(u16, Vec<u8>)> {
     let mut s = connect(host, port)?;
     s.write_all(&frame(frame_type)).ok()?;
     let mut h = [0u8; HEADER_LEN];
@@ -102,13 +101,48 @@ fn ask(host: &str, port: u16, frame_type: u16) -> Option<u16> {
     if u32::from_le_bytes(h[0..4].try_into().ok()?) != MAGIC {
         return None;
     }
-    Some(u16::from_le_bytes(h[6..8].try_into().ok()?))
+    let ty = u16::from_le_bytes(h[6..8].try_into().ok()?);
+    let len = u64::from_le_bytes(h[12..20].try_into().ok()?).min(1024) as usize;
+    let mut body = vec![0u8; len];
+    if s.read_exact(&mut body).is_err() {
+        body.clear(); // a header-only answer still proves the protocol
+    }
+    Some((ty, body))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Build {
+    /// Released before the cutover: the reply names no AVA1 port.
+    Old,
+    /// A new build; the reply's `"ava1"` field is `up`, `starting` or `failed`.
+    New(String),
+}
+
+fn build_of(body: &[u8]) -> Build {
+    let text = String::from_utf8_lossy(body);
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) if v.get("ava1_port").is_some() => Build::New(
+            v.get("ava1")
+                .and_then(|x| x.as_str())
+                .unwrap_or("starting")
+                .to_string(),
+        ),
+        _ => Build::Old,
+    }
+}
+
+/// The helper's `Hello` answer, mgmt port first (or the transfer port for a build from before the split).
+fn hello(host: &str, ports: Ports) -> Option<Build> {
+    let (_, body) = ask(host, ports.mgmt, HELLO).or_else(|| ask(host, ports.transfer, HELLO))?;
+    Some(build_of(&body))
 }
 
 /// True when the old protocol answers on the management port (or, for a helper from before the
-/// port split, the transfer port): a plain connect plus one `Hello`.
+/// port split, the transfer port): a plain connect plus one `Hello`. A new build answers too; use
+/// [`state`] to tell them apart.
+#[cfg(test)]
 pub fn probe(host: &str, ports: Ports) -> bool {
-    ask(host, ports.mgmt, HELLO).is_some() || ask(host, ports.transfer, HELLO).is_some()
+    hello(host, ports).is_some()
 }
 
 /// True when something accepts a connection on `port`.
@@ -116,22 +150,26 @@ fn listening(host: &str, port: u16) -> bool {
     connect(host, port).is_some()
 }
 
-/// What runs on the console: [`AVA1`] when the AVA1 port accepts connections, [`HELPER_OLD`] when
-/// only the old protocol answers, else [`NOT_RUNNING`].
+/// What runs on the console: [`AVA1`] when the AVA1 port accepts connections; else, when the old
+/// protocol answers, [`HELPER_OLD`] for a build from before the cutover, [`STARTING`] for a new
+/// build whose AVA1 server is still coming up and [`AVA1_FAILED`] for one whose AVA1 server did not
+/// start; else [`NOT_RUNNING`]. Only [`HELPER_OLD`] is worth replacing.
 pub fn state(host: &str, ports: Ports) -> &'static str {
     if listening(host, ports.ava1) {
-        AVA1
-    } else if probe(host, ports) {
-        HELPER_OLD
-    } else {
-        NOT_RUNNING
+        return AVA1;
+    }
+    match hello(host, ports) {
+        None => NOT_RUNNING,
+        Some(Build::Old) => HELPER_OLD,
+        Some(Build::New(a)) if a == "failed" => AVA1_FAILED,
+        Some(Build::New(_)) => STARTING,
     }
 }
 
 /// Sends the old `Shutdown` frame. `true` when the helper acknowledged it.
 pub fn shutdown(host: &str, ports: Ports) -> bool {
-    ask(host, ports.mgmt, SHUTDOWN) == Some(SHUTDOWN_ACK)
-        || ask(host, ports.transfer, SHUTDOWN) == Some(SHUTDOWN_ACK)
+    ask(host, ports.mgmt, SHUTDOWN).map(|r| r.0) == Some(SHUTDOWN_ACK)
+        || ask(host, ports.transfer, SHUTDOWN).map(|r| r.0) == Some(SHUTDOWN_ACK)
 }
 
 /// Waits until neither old port accepts a connection. `false` when one still does after `wait`.
@@ -175,16 +213,14 @@ impl std::error::Error for ReplaceError {}
 /// What a completed replacement found.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Replaced {
-    /// The new helper's AVA1 port opened within the window. `false` is not a failure of the
-    /// replacement: the helper can still be starting.
+    /// The AVA1 port opened in time (`false`: the new helper may still be starting).
     pub ava1_up: bool,
 }
 
 /// Replaces an older helper: shutdown request, wait for both old ports to close, `send` the new
 /// helper (the caller's stamped image, so its trust slot and launch token pair without a code),
 /// then wait for the AVA1 port. `send` is not called while the old helper still holds its ports.
-/// Run it from a blocking thread. One attempt only: callers must not loop it faster than the 60 s
-/// the console needs between helper restarts.
+/// Blocking; one attempt only (the route enforces the 60 s between restarts).
 pub fn replace(
     host: &str,
     ports: Ports,
@@ -192,9 +228,7 @@ pub fn replace(
     wait_ava1: Duration,
     send: impl FnOnce() -> Result<(), String>,
 ) -> Result<Replaced, ReplaceError> {
-    // An unanswered request is not fatal on its own: the helper may exit anyway, and the port
-    // check below is what decides.
-    let _acked = shutdown(host, ports);
+    let _ = shutdown(host, ports);
     if !wait_closed(host, ports, wait_close) {
         return Err(ReplaceError::Wedged);
     }

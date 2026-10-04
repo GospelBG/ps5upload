@@ -23,6 +23,7 @@
 #include "fakelib_overlay.h"
 #include "ava1_glue.h"
 #include "takeover_flag.h"
+#include "ava1_stop.h"
 
 #include "proc_identity.h"
 /* Sony "debugger" / system-process authid. Setting our process's
@@ -658,7 +659,8 @@ int main(void) {
     /* A newer instance that finds this one serving AVA1 asks it to exit through a flag file
      * (takeover.c); poll it once a second. Failure only costs the graceful takeover: the new
      * instance escalates to the reap. */
-    if (takeover_flag_poll_start(PS5UPLOAD2_RUNTIME_DIR, state.instance_id, 1000,
+    if (state.takeover_nonce == 0) (void)takeover_nonce_new(&state.takeover_nonce);
+    if (takeover_flag_poll_start(PS5UPLOAD2_RUNTIME_DIR, state.takeover_nonce, 1000,
                                  on_takeover_flag) != 0)
         fprintf(stderr, "takeover flag poll did not start\n");
     (void)fakelib_overlay_start();
@@ -744,6 +746,14 @@ int main(void) {
     fakelib_overlay_stop();
 
     runtime_arm_shutdown_watchdog(&state, rc == 0 ? 0 : 1);
+
+    /* The AVA1 half: stop accepting, let sessions and in-flight Sony calls finish (bounded, inside
+     * the 8 s exit watchdog above), then stop the data layer so journals are closed and durable
+     * jobs resume on the next start. */
+    {
+        int sr = ava1_payload_stop(2000, 3000);
+        if (sr) fprintf(stderr, "ava1: stop incomplete (0x%x); the exit watchdog ends the process\n", sr);
+    }
 
     /* Ask the mgmt thread to exit by closing its listener. accept()
      * returns with EBADF, mgmt loop sees shutdown_requested and

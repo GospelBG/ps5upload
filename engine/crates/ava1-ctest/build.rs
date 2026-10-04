@@ -100,6 +100,7 @@ fn main() {
             p.join("src/net_probe.c"),
             p.join("src/legacy_takeover.c"),
             p.join("src/takeover_flag.c"),
+            p.join("src/ava1_stop.c"),
             here.join("csrc/sizes.c"),
             here.join("csrc/test_shim.c"),
             here.join("csrc/test_shim_t7.c"),
@@ -185,7 +186,11 @@ fn main() {
         println!("cargo:rustc-link-lib=pthread");
     }
     println!("cargo:rerun-if-changed={}", ava1.display());
-    for f in ["src/legacy_takeover.c", "src/takeover_flag.c"] {
+    for f in [
+        "src/legacy_takeover.c",
+        "src/takeover_flag.c",
+        "src/ava1_stop.c",
+    ] {
         println!("cargo:rerun-if-changed={}", p.join(f).display());
     }
     println!(
