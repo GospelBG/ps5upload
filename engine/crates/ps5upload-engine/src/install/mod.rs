@@ -315,7 +315,7 @@ async fn reach_block(ip: &str, url: &str) -> Option<String> {
     let (host, port) = authority.rsplit_once(':')?;
     let port: u16 = port.parse().ok()?;
     let (mgmt, h) = (
-        crate::mgmt_addr_for(ip),
+        crate::console_addr(ip),
         host.trim_matches(|c| c == '[' || c == ']').to_string(),
     );
     let r = tokio::task::spawn_blocking(move || {

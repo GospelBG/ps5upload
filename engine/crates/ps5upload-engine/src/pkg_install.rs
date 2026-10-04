@@ -1943,7 +1943,7 @@ pub(crate) async fn install_start_handler(
         // the 600 s startup-stall deadline fired. Measured 2026-09-14 with a
         // portless addr while the exact package was already installed on the
         // console — the tracker could not see it. `req.ps5_addr` may also
-        // arrive on the transfer port (:9113), which `mgmt_addr_for` swaps.
+        // arrive on a retired port suffix, which `console_addr` drops.
         ps5_mgmt_addr: normalize_mgmt_addr(&req.ps5_addr),
         task_id: None,
         err_code: 0,
@@ -2428,34 +2428,23 @@ async fn install_cancel_handler(
     })
 }
 
-/// Normalize whatever address the caller gave into the payload's MANAGEMENT
-/// address (`ip:9114`), whatever port it arrived on.
-///
-/// Callers today pass `ip:9114`, but the engine's public surfaces accept a
-/// bare IP, and the transfer port (`:9113`) turns up in the same slots — both
-/// of which must end up on `:9114`. A wrong port here does not fail loudly:
-/// every frame (FS_LIST_DIR, the artifact hash, the Sony log read) fails
-/// instantly and every caller degrades to "nothing is there". That is how a
-/// session with a portless address sat at `phase=install` for the full 600 s
-/// stall while the exact package was already installed on the console
-/// (measured 2026-09-14).
+/// Normalize whatever address the caller gave into the console's address as the engine uses
+/// it: the host only (`console_addr`), whatever port it arrived on. A session's address is
+/// used for every observation it makes (artifact check, free-space, title-dir, Sony log), so it
+/// is normalized once, at creation, rather than by each caller.
 pub(crate) fn normalize_mgmt_addr(addr: &str) -> String {
     let host = strip_host_port(addr);
     if host.is_empty() {
         return addr.to_string();
     }
-    // A bare IPv6 literal has to go back in brackets, or `::1:9114` is a
-    // different (invalid) address than `[::1]:9114`.
-    if host.contains(':') {
-        format!("[{host}]:{PS5_MGMT_PORT}")
+    // The console's AVA1 port is the pool's concern; the engine names the host only. A bare
+    // IPv6 literal goes back in brackets.
+    crate::console_addr(&if host.contains(':') {
+        format!("[{host}]")
     } else {
-        format!("{host}:{PS5_MGMT_PORT}")
-    }
+        host
+    })
 }
-
-/// The payload's management port. Mirrors the crate-root constant of the same
-/// name (`mgmt_addr_for`) and `ps5upload_core::transfer`'s.
-const PS5_MGMT_PORT: u16 = 9114;
 
 /// Read a title's installed `APP_VER`, or `None` when it cannot be read (title
 /// absent, payload too old, console busy). `None` deliberately means "unknown"
@@ -3102,7 +3091,7 @@ async fn resolve_console_source(
 ) -> Result<ResolvedSource, String> {
     let (host, path) = console_path_url(url)
         .ok_or_else(|| format!("{url} is not a ps5://<console>/<path> location"))?;
-    let mgmt = crate::mgmt_addr_for(&host);
+    let mgmt = crate::console_addr(&host);
     let (m, p) = (mgmt.clone(), path.clone());
     let size = tokio::task::spawn_blocking(move || remote_pkg_size(&m, &p))
         .await
@@ -4153,22 +4142,15 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
     /// `install` for the full 600 s stall — while the exact package was
     /// already installed on the console.
     #[test]
-    fn a_session_address_is_always_normalized_to_the_mgmt_port() {
-        assert_eq!(normalize_mgmt_addr("192.168.86.100"), "192.168.86.100:9114");
-        assert_eq!(
-            normalize_mgmt_addr("192.168.86.100:9114"),
-            "192.168.86.100:9114"
-        );
-        // A caller may hand us the transfer port; the mgmt port is what every
-        // frame this session sends must target.
-        assert_eq!(
-            normalize_mgmt_addr("192.168.86.100:9113"),
-            "192.168.86.100:9114"
-        );
+    fn a_session_address_is_always_normalized_to_the_bare_host() {
+        assert_eq!(normalize_mgmt_addr("192.168.86.100"), "192.168.86.100");
+        assert_eq!(normalize_mgmt_addr("192.168.86.100:9114"), "192.168.86.100");
+        // An older client may hand us either retired port; the port is ignored.
+        assert_eq!(normalize_mgmt_addr("192.168.86.100:9113"), "192.168.86.100");
         // Hostnames and IPv6 literals follow the same rule.
-        assert_eq!(normalize_mgmt_addr("ps5.lan"), "ps5.lan:9114");
-        assert_eq!(normalize_mgmt_addr("[::1]"), "[::1]:9114");
-        assert_eq!(normalize_mgmt_addr("[::1]:9113"), "[::1]:9114");
+        assert_eq!(normalize_mgmt_addr("ps5.lan"), "ps5.lan");
+        assert_eq!(normalize_mgmt_addr("[::1]"), "[::1]");
+        assert_eq!(normalize_mgmt_addr("[::1]:9113"), "[::1]");
     }
 
     #[test]

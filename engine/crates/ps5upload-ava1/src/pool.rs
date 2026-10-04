@@ -24,11 +24,18 @@ pub fn ava1_addr(console: &str) -> String {
 
 /// The console string without its port (the pool's key).
 pub(crate) fn host_of(console: &str) -> String {
-    console
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(console)
-        .to_string()
+    // `[v6]` and `[v6]:port` keep their brackets; `host:port` loses the port; a bare IPv6
+    // literal (several colons, no brackets) has no port to lose.
+    if let Some(rest) = console.strip_prefix('[') {
+        if let Some(i) = rest.find(']') {
+            return format!("[{}]", &rest[..i]);
+        }
+        return console.to_string();
+    }
+    match console.split_once(':') {
+        Some((h, port)) if !port.contains(':') => h.to_string(),
+        _ => console.to_string(),
+    }
 }
 
 pub struct Pool {
@@ -590,11 +597,26 @@ pub fn pool() -> &'static Pool {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "ava1: no PS5Upload data directory (set PS5UPLOAD_DATA_DIR or HOME); using FTX2"
+                "ava1: no PS5Upload data directory (set PS5UPLOAD_DATA_DIR or HOME); AVA1 is unavailable"
             );
             Pool::unavailable()
         }
     })
+}
+
+#[cfg(test)]
+mod host_of_tests {
+    use super::host_of;
+
+    #[test]
+    fn the_pool_key_is_the_host_for_every_spelling() {
+        assert_eq!(host_of("10.0.0.2"), "10.0.0.2");
+        assert_eq!(host_of("10.0.0.2:9113"), "10.0.0.2");
+        assert_eq!(host_of("ps5.lan:9120"), "ps5.lan");
+        assert_eq!(host_of("[::1]"), "[::1]");
+        assert_eq!(host_of("[::1]:9113"), "[::1]");
+        assert_eq!(host_of("fe80::1"), "fe80::1");
+    }
 }
 
 #[cfg(test)]
