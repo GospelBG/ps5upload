@@ -6,7 +6,7 @@ mod common;
 use ava1::gen;
 use ava1::session::connect;
 use ava1::wire::Message;
-use ava1_ctest::CServer;
+use ava1_ctest::{CServer, LogOpts};
 use common::*;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -16,7 +16,17 @@ async fn two_thousand_tiny_files_never_hold_more_than_the_budget() {
     write_tree(&src, 2000, |i| 1 + i % 200);
     let peers = d.join("peers");
     let (me, mine) = paired_client(&peers);
-    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 4000, 4000, 0);
+    let srv = CServer::start_data_opts(
+        SECRET,
+        &peers,
+        &d.join("jobs"),
+        200,
+        4000,
+        4000,
+        0,
+        0,
+        LogOpts::OFF,
+    );
     srv.knob("fd_budget", 64);
     srv.knob("fd_peak_reset", 0);
     let root = d.join("dest");

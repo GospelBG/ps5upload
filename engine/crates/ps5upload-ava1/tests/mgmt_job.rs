@@ -99,6 +99,7 @@ fn status(job_id: [u8; 16], state: u8, polls: u32, current: Option<&str>) -> Sta
         state: Some(state),
         result: None,
         code: None,
+        unswept: None,
     }
 }
 

@@ -47,7 +47,7 @@ static struct {
     int bg;            /* ava1_data_spawn threads running */
     int fb;            /* Received waiting-sends spawned (bounded, see RECV_FB_MAX) */
     volatile int running;
-    pthread_t house;
+    pthread_t house, recover;
 } D = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
 
 const ava1_data_cfg_t *ava1_data_cfg(void) { return &D.cfg; }
@@ -103,11 +103,46 @@ int ava1_data_spawn(void *(*fn)(void *), void *arg) {
     return 0;
 }
 
+static uint64_t g_unswept_total;
+void ava1_unswept_add(int64_t delta) {
+    if (delta >= 0) {
+        __atomic_add_fetch(&g_unswept_total, (uint64_t)delta, __ATOMIC_RELAXED);
+    } else { /* never below zero, whatever the order the claims and releases land in */
+        uint64_t cur = __atomic_load_n(&g_unswept_total, __ATOMIC_RELAXED), sub = (uint64_t)(-delta), want;
+        do {
+            want = cur >= sub ? cur - sub : 0;
+        } while (!__atomic_compare_exchange_n(&g_unswept_total, &cur, want, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    }
+}
+uint64_t ava1_unswept_total(void) { return __atomic_load_n(&g_unswept_total, __ATOMIC_RELAXED); }
+
+int ava1_data_running(void) { return __atomic_load_n(&D.running, __ATOMIC_RELAXED); }
+
+unsigned ava1_house_ticks;
+
 static void *house_main(void *arg) {
     (void)arg;
     while (D.running) {
+        __atomic_add_fetch(&ava1_house_ticks, 1, __ATOMIC_RELAXED);
         ava1_job_reap(ava1_mono_ms());
-        ava1_platform_sleep_ms(1000);
+        ava1_platform_sleep_ms(100);
+    }
+    return NULL;
+}
+
+/* A reaped settling job, or one a crash left, has its log recovered here: the only copy of its files must
+ * never wait for the next helper start. A thread of its own, so a slow recovery (a sweep that keeps failing,
+ * a large log) never delays the reaper. */
+static void *recover_main(void *arg) {
+    uint64_t last = ava1_mono_ms();
+    (void)arg;
+    while (D.running) {
+        uint64_t now = ava1_mono_ms();
+        if (D.cfg.jobs_dir[0] && now - last >= D.cfg.recover_every_ms) {
+            (void)ava1_recv_recover_pass(D.cfg.jobs_dir, D.cfg.recover_max);
+            last = ava1_mono_ms();
+        }
+        ava1_platform_sleep_ms(50);
     }
     return NULL;
 }
@@ -250,6 +285,8 @@ int ava1_rpc_text(uint8_t *out, size_t cap, size_t *out_len, const char *fmt, ..
     return AVA1_STATUS_OK;
 }
 
+int ava1_data_log_small(void) { return D.cfg.log_small != AVA1_LOG_SMALL_OFF; }
+
 int ava1_data_start(const ava1_data_cfg_t *cfg) {
     if (D.running) return -EBUSY; /* one housekeeping thread; a second start changes nothing */
     D.cfg = *cfg;
@@ -264,11 +301,18 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     if (D.cfg.workers_start > D.cfg.workers_max) D.cfg.workers_start = D.cfg.workers_max;
     if (D.cfg.workers_start < D.cfg.workers_min) D.cfg.workers_start = D.cfg.workers_min;
     if (!D.cfg.cutoff) D.cfg.cutoff = 256u << 10;
+    if (!D.cfg.pack_segment) D.cfg.pack_segment = AVA1_PACK_SEGMENT;
+    if (!D.cfg.unswept_max) D.cfg.unswept_max = AVA1_UNSWEPT_MAX;
+    if (!D.cfg.sweep_age_ms) D.cfg.sweep_age_ms = AVA1_SWEEP_AGE_MS;
+    if (!D.cfg.unswept_total) D.cfg.unswept_total = AVA1_UNSWEPT_TOTAL;
+    if (!D.cfg.recover_every_ms) D.cfg.recover_every_ms = 10000u;
+    if (!D.cfg.recover_max) D.cfg.recover_max = 4u;
     D.budget_free = D.cfg.budget;
     fd_limit_init();
     __atomic_store_n(&g_pend_open, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&ava1_data_test_fd_budget, 0, __ATOMIC_SEQ_CST);
     D.admitted = 0;
+    __atomic_store_n(&g_unswept_total, 0, __ATOMIC_RELAXED); /* a new data layer holds no job's log bytes */
     ava1_data_test_open_delay_ms = ava1_data_test_map_delay_ms = ava1_data_test_feed_delay_ms = 0;
     ava1_data_test_open_work_delay_ms = 0;
     ava1_data_test_ack_fail = ava1_data_test_feeder_fail = 0;
@@ -278,6 +322,14 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
         D.running = 0;
         return -EAGAIN;
     }
+    if (ava1_thread_start(recover_main, NULL, &D.recover) != 0) {
+        D.running = 0;
+        pthread_join(D.house, NULL);
+        return -EAGAIN;
+    }
+    /* A helper that died (or was stopped) with files not yet durable in place finishes them now,
+     * before any session can ask: re-materialise from the pack log and sweep. */
+    if (D.cfg.jobs_dir[0]) (void)ava1_recv_recover_pass(D.cfg.jobs_dir, D.cfg.recover_max);
     return 0;
 }
 
@@ -288,6 +340,7 @@ void ava1_data_stop(void) {
     while (D.bg) pthread_cond_wait(&D.cv, &D.mu);
     pthread_mutex_unlock(&D.mu);
     pthread_join(D.house, NULL);
+    pthread_join(D.recover, NULL);
     ava1_job_free_all();
 }
 
@@ -943,6 +996,14 @@ static int encode_status(ava1_job_t *j, uint8_t *out, size_t cap, size_t *out_le
     st.bytes_durable = j->bytes_durable;
     st.bytes_total = j->have_manifest ? j->m.bytes : j->m_in.bytes;
     st.workers = j->want_workers;
+    if (j->unswept_n) {
+        st.has_unswept = 1;
+        st.unswept = j->unswept_n;
+    }
+    if (j->sweep_err) { /* the files cannot be made durable: the sender must hear it */
+        st.has_code = 1;
+        st.code = AVA1_ERR_IO;
+    }
     st.has_state = 1;
     st.state = !j->finished || (j->kind == AVA1_JOB_COPY && j->copy_move && !j->copy_delete_done)
                    ? 0 : (j->final_status == AVA1_STATUS_OK ? 1 : 2);

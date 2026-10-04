@@ -100,7 +100,7 @@ import { useUploadBatch, type BatchEntry, type BatchRow } from "../../state/uplo
 import { BatchReview } from "./BatchReview";
 import { resolveUploadDest } from "../../lib/uploadDest";
 import { QueuePanel } from "./QueuePanel";
-import { BottleneckLine, JobLiveNotes } from "./Bottleneck";
+import { BottleneckLine, JobLiveNotes, UnsettledLine } from "./Bottleneck";
 import { Ps5ToPs5Card } from "./Ps5ToPs5";
 import { humanizePs5Error } from "../../lib/humanizeError";
 import { formatBytes } from "../../lib/format";
@@ -2134,6 +2134,7 @@ function TransferStatus({ phase }: { phase: TransferPhase }) {
         <div className="mt-2">
           <BottleneckLine cause={phase.live?.bottleneck ?? null} />
         </div>
+        <UnsettledLine live={phase.live} />
         {phase.mountWarnings && phase.mountWarnings.length > 0 && (
           <ul className="mt-2 space-y-1 rounded-md border border-[var(--color-warn)] bg-[var(--color-surface)] p-2 text-xs text-[var(--color-warn)]">
             {phase.mountWarnings.map((w) => (

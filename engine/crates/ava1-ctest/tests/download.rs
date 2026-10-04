@@ -720,9 +720,11 @@ async fn two_thousand_tiny_files_download_fast() {
 /// floor guards: the per-file full-drive flush measured 56; after the batched sync, 430 debug
 /// and ~2,500-3,000 release (serial per-file writes, a 250 ms wait before the final sync);
 /// the parallel bundle writes and the immediate final sync took it to today's numbers. The
-/// floors sit at ~70% of healthy, above everything the earlier pipeline reached.
+/// floors sit at ~70% of healthy, above everything the earlier pipeline reached. Raised from 700 to 1,000
+/// (debug) with the pack log work (review 003 §3.2): 2,000 files measured 2,270-2,930 files/s on loopback, with
+/// the log on or off, while this test ran alone; the whole binary's other tests run beside it.
 const FLOOR_FILES_PER_S: f64 = if cfg!(debug_assertions) {
-    700.0
+    1000.0
 } else {
     3500.0
 };

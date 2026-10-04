@@ -348,3 +348,77 @@ Tests: `engine/crates/ava1-ctest/tests/pairing.rs` (the C server).
 **Addresses.** The client sends the bare console host (`consoleAddr`); the engine owns the port and
 ignores any port a caller sends. While the FTX2 path still exists, `resolve_connect_targets` gives a
 bare host the default FTX2 port.
+
+### 4.2 Receive/apply path changes since those runs (perf-apply, review 003; not yet measured on hardware)
+
+Host/loopback tests only (the consoles were reserved); every row of §4 above must be re-run. What
+changed and what each is expected to move:
+
+| change | where | expected effect |
+|--------|-------|-----------------|
+| preallocation outside `j->mu` (§2.1) | `lfile_open` | removes the multi-second stall of every worker and the feeder at each new large file on a slow drive; the Phat's usb0 upload should lose its two-minute preallocation freeze for the other lanes. Preallocation and ENOSPC-first are unchanged. |
+| commits on workers (§3.3) | `ava1_apply_commit_ready` | the 1,641 large files of the 223k corpus (four fsyncs each) stop blocking every batch; they overlap with the chunk work. |
+| striped directory fsyncs (§3.3, §4) | `ava1_sync_dirset` in prepare and every batch; engine `LocalSink::sync` | prepare's serial ~3 ms x thousands of parents and the per-batch serial directory fsyncs shrink by up to the worker count; this is the expected top item for the 82.5 files/s game upload. |
+| per-chunk fsync on a slow drive (§6) | `sync_batch`, `write_chunk` | should bring the Phat's usb0 large-file upload toward FTX2's 34-35 MB/s; the line `slow drive: ... fsync per chunk from now on` shows it fired. |
+| per-job stats | `ava1_apply_summary` | one line at every job's end: share of wall time in scan / data fsync / dirs / journal (job thread) and commit / preallocate (summed over workers); plus `preallocate took N ms for M MiB` and, above 1 s per GiB, `preallocation on this drive is slow`. |
+
+The periodic per-batch line (`per batch ms: scan ... data ... dirs ...`) is now opt-in like the sender's
+stage timers: `PS5UPLOAD_AVA1_TIMING=1` on a host, or create `/data/ps5upload/debug/ava1-timing` on the
+console. The end-of-job line above is always printed. To read where a slow upload spends its time:
+turn the flag on, run it, and read `/data/ps5upload/stderr.log`.
+
+Deferred (recorded here, not done):
+
+- **Directory-fsync deferral** (review 003 §3.3's second option) was not taken: striping keeps the
+  invariant "no journal record names a file whose directory is unsynced" (SPEC 15.4) and needs no
+  `lstat` of every done file on resume. Durable-by-log (`02-design-durable-by-log.md`) supersedes both.
+- **Engine side**: `LocalSink` (downloads) still does one `fsync` per file serially and opens each file
+  under its state mutex; only its directory fsyncs are parallel now. It never preallocates, so item 1
+  has no engine counterpart. A packed-sink design belongs with durable-by-log (§3.4).
+- **Compaction while commits are in flight** is skipped for that batch (it retries after the next one);
+  on a job that always has a large file committing, the journal grows past `AVA1_JNL_COMPACT_AT` until a
+  quiet batch. Not measured; if it shows, compact between a commit's journal record and the next one's
+  start instead.
+- The slow-drive switch is one-way for the life of the job and never reverts; a drive that recovers
+  (a USB hub contention that ends) keeps paying one small flush per chunk.
+
+### 4.3 Durable-by-log small files (review 003 §3.2; not yet measured on hardware)
+
+The receiver (console and engine) appends each small file to a pack log (`<job dir>/pack.<n>`), fsyncs the log
+once per batch, journals the batch with the pack range, and makes the files durable in place later (the sweep).
+A batch costs two fsyncs (log, journal) instead of N + D + 1 (SPEC 15.7). Host/loopback tests only; every
+tiny-file and game-corpus row of §4 must be re-run on the consoles.
+
+| what | expected effect |
+|------|-----------------|
+| tiny upload to `/data`, ext, usb0 | no longer bounded by the drive's per-file fsync rate (`disk.calibrate`: /data ~290 files/s); bounded by file creation. The 223k-file game should leave the per-file fsync and the per-batch directory fsyncs of §4 behind. |
+| Phat usb0 | the 27 files/s run was fsync-bound; the log turns it into sequential appends. |
+| JobDone | arrives when the log is durable; files settle for a few seconds behind it (a merge or single file). A new-folder upload settles before its rename, so its tail waits (about the last 3 s of files). |
+
+How to read a run: the console's end-of-job line (`finished in N ms ... data fsync ... dirs ...`) should show
+`dirs` near 0 during the transfer; `recovered N logged files, M lost (resent)` appears at helper start or JobOpen
+after a crash. Knobs (`ava1_data_cfg`): `log_small` (default on; `AVA1_LOG_SMALL_OFF` restores the per-file path for
+this release), `pack_segment` (64 MiB), `unswept_max` (256 MiB), `sweep_age_ms` (3000).
+
+Engine (`LocalSink`, downloads): on by default except on macOS, where it measured slower on loopback (2,270 vs
+2,870 files/s for 2,000 tiny files; a plain fsync never reaches the drive there). `PS5UPLOAD_AVA1_LOG_SMALL=1/0`
+forces it. The engine settles every logged file before it ends a job (it has no thread to settle behind JobDone),
+so its unswept cap is soft (one credit window past `unswept_max`).
+
+Failure paths (review dbl): a failed sweep is retried with a backoff and, after five failures, reported in `Status`
+(`code`/`current`); the engine fails the upload on it, or reports a warning (`warning` in the job's `commit_ack`) when it
+stops waiting (30 s, or a cancel). Housekeeping recovers parked, reaped and crashed job directories that hold a log;
+the console's job GC never touches one. The engine's own job GC (`journal::gc`) does not special-case pack files:
+an engine download settles everything before it ends, so a directory it left behind promised nothing to anyone.
+
+Deferred:
+
+- **Pack preallocation**: segments are not preallocated (the log is fsynced every batch). If a drive shows the sparse
+  collapse FTX2 hit, add `posix_fallocate` of the segment at roll time.
+- **Syscalls per file**: the console still does open, write, fchmod, utimensat by path, close for a logged file; the design's
+  `open(mode)` + `futimens` saves two syscalls and was not done.
+- **One pack writer at a time**: the append (offset + pwrite) is under one lock so a batch's range is a run of whole
+  records; a 256 KiB record is ~100 us. If a profile shows it, shard the log per worker and journal one range per shard.
+- **The sweep on a worker**: a sweep's directory syncs are serial (a worker must not wait on other workers' stripes). If
+  `dirs` shows in the end-of-job line, give the sweep its own helper thread.
+- **Engine macOS default**: revisit once an engine-side drive where fsync is expensive (a Windows or Linux host) has numbers.

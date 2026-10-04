@@ -991,6 +991,7 @@ fn job_status(job_id: [u8; 16], state: u8) -> gen::Status {
         state: Some(state),
         result: None,
         code: None,
+        unswept: None,
     }
 }
 

@@ -10,7 +10,7 @@ use ava1::gen;
 use ava1::send::Progress;
 use ava1::session::connect;
 use ava1_chaos::{ChaosConfig, ChaosProxy};
-use ava1_ctest::CServer;
+use ava1_ctest::{CServer, LogOpts};
 use common::*;
 
 fn watch(pg: Arc<Progress>) -> (Arc<Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>) {
@@ -107,7 +107,7 @@ async fn a_slow_disk_is_reported_as_the_bottleneck() {
     let src = d.join("src");
     write_tree(&src, 6000, |_| 4096);
     let (me, mine) = paired_client(&d.join("peers"));
-    let srv = CServer::start_data(
+    let srv = CServer::start_data_opts(
         SECRET,
         &d.join("peers"),
         &d.join("jobs"),
@@ -115,6 +115,8 @@ async fn a_slow_disk_is_reported_as_the_bottleneck() {
         4000,
         4000,
         20000,
+        0,
+        LogOpts::OFF,
     );
     srv.knob("budget_free", 16 << 20);
     let pg = Arc::new(Progress::default());

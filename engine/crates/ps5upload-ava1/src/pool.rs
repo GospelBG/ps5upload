@@ -31,6 +31,11 @@ pub(crate) fn host_of(console: &str) -> String {
         .to_string()
 }
 
+/// `ERR_BUSY` on a `JobOpen` is retried this many times (jittered doubling backoff, 250 ms to 5 s: about 45 s in
+/// all) before the transfer fails with a clear reason. The console says BUSY while it recovers a job's files or
+/// has no room for another job; it is never a verdict on the transfer.
+pub(crate) const DEFAULT_BUSY_TRIES: u32 = 12;
+
 pub struct Pool {
     dir: PathBuf,
     /// No identity is an error, not a panic (C4): `session()` turns the reason into an
@@ -57,6 +62,8 @@ pub struct Pool {
     /// Connections whose pairing a person has not confirmed yet, one per console: the code on
     /// screen belongs to that handshake, so it is held (not redone) until `confirm_pairing`.
     pending: tokio::sync::Mutex<HashMap<String, Session>>,
+    /// How many times a `JobOpen` answered `ERR_BUSY` is retried before the transfer gives up.
+    busy_tries: u32,
 }
 
 /// Where a console stands for the pairing dialog.
@@ -203,7 +210,19 @@ impl Pool {
             live: Mutex::default(),
             connecting: Mutex::default(),
             pending: Default::default(),
+            busy_tries: DEFAULT_BUSY_TRIES,
         }
+    }
+
+    /// Overrides how many times a BUSY `JobOpen` is retried (tests; the default suits a console that is
+    /// finishing another job's files).
+    pub fn with_busy_tries(mut self, n: u32) -> Pool {
+        self.busy_tries = n;
+        self
+    }
+
+    pub(crate) fn busy_tries(&self) -> u32 {
+        self.busy_tries
     }
 
     pub fn new(dir: PathBuf) -> Pool {
@@ -230,6 +249,7 @@ impl Pool {
             live: Mutex::default(),
             connecting: Mutex::default(),
             pending: Default::default(),
+            busy_tries: DEFAULT_BUSY_TRIES,
         }
     }
 

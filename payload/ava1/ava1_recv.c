@@ -1,5 +1,6 @@
 #include "ava1_recv.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -23,7 +24,56 @@
 typedef struct {
     ava1_job_t *j;
     int opened;
+    /* durable-by-log: done files not yet swept, and the pack ranges that hold them (SPEC.md §15.7) */
+    ava1_bits_t unswept;
+    ava1_pack_ref_t *refs;
+    uint32_t nrefs, cap_refs;
 } replay_t;
+
+static void replay_free(replay_t *r) {
+    ava1_bits_free(&r->unswept);
+    free(r->refs);
+    r->refs = NULL;
+    r->nrefs = r->cap_refs = 0;
+}
+
+static void ref_push(replay_t *r, const ava1_pack_ref_t *p) {
+    if (r->nrefs == r->cap_refs) {
+        uint32_t c = r->cap_refs ? r->cap_refs * 2 : 16;
+        ava1_pack_ref_t *q = realloc(r->refs, (size_t)c * sizeof *q);
+        if (!q) return; /* a lost ref only fails its files over to a resend */
+        r->refs = q;
+        r->cap_refs = c;
+    }
+    r->refs[r->nrefs++] = *p;
+}
+
+/* Refs with no unswept file left in their span are dropped. */
+static void refs_prune(replay_t *r) {
+    uint32_t i, k = 0;
+    for (i = 0; i < r->nrefs; i++) {
+        uint64_t f;
+        int live = 0;
+        for (f = r->refs[i].first_file; f < (uint64_t)r->refs[i].first_file + r->refs[i].count && !live; f++)
+            live = f < r->j->m.n && ava1_bits_get(&r->unswept, (uint32_t)f);
+        if (live) r->refs[k++] = r->refs[i];
+    }
+    r->nrefs = k;
+}
+
+/* Marks the files of FileRun runs unswept (set != 0) or swept. */
+static void unswept_runs(replay_t *r, const uint8_t *p, uint32_t len, int set) {
+    ava1_r_t it;
+    ava1_file_run_t run;
+    ava1_r_init(&it, p, len);
+    while (ava1_file_run_next(&it, &run) == 1) {
+        uint64_t f;
+        for (f = run.first; f < (uint64_t)run.first + run.count && f < r->j->m.n; f++) {
+            if (set) ava1_bits_set(&r->unswept, (uint32_t)f);
+            else ava1_bits_clear(&r->unswept, (uint32_t)f);
+        }
+    }
+}
 
 static void remember(ava1_job_t *j, const ava1_file_range_t *g) {
     ava1_file_range_t *a = realloc(j->last_ranges, (j->last_ranges_n + 1) * sizeof *a);
@@ -122,23 +172,70 @@ static int replay(void *ctx, uint8_t kind, const uint8_t *body, size_t len) {
         add_ranges(j, b.ranges, b.ranges_len, 1);
         add_roots(j, b.roots, b.roots_len);
         add_done(j, b.files, b.files_len);
+        if (b.has_pack_segment && b.has_pack_offset && b.has_pack_len) {
+            /* a logged batch: its files are durable through the log until a JnlSweep says otherwise */
+            ava1_pack_ref_t ref;
+            ava1_r_t it;
+            ava1_file_run_t run;
+            uint32_t lo = UINT32_MAX, hi = 0;
+            unswept_runs(r, b.files, b.files_len, 1);
+            ava1_r_init(&it, b.files, b.files_len);
+            while (ava1_file_run_next(&it, &run) == 1) {
+                if (run.first < lo) lo = run.first;
+                if (run.count && run.first + run.count - 1 > hi) hi = run.first + run.count - 1;
+            }
+            if (lo != UINT32_MAX) {
+                ref.segment = b.pack_segment;
+                ref.offset = b.pack_offset;
+                ref.len = b.pack_len;
+                ref.first_file = lo;
+                ref.count = hi - lo + 1;
+                ref_push(r, &ref);
+            }
+        }
         return 0;
     }
     case AVA1_JNL_RESET: {
         ava1_jnl_reset_t x;
         if (ava1_jnl_reset_decode(body, len, &x) != 0) return 1;
-        if (x.file_id < j->m.n) forget_file(j, x.file_id);
+        if (x.file_id < j->m.n) {
+            forget_file(j, x.file_id);
+            ava1_bits_clear(&r->unswept, x.file_id);
+        }
+        return 0;
+    }
+    case AVA1_JNL_SWEEP: {
+        ava1_jnl_sweep_t x;
+        if (ava1_jnl_sweep_decode(body, len, &x) != 0) return 1;
+        unswept_runs(r, x.files, x.files_len, 0);
         return 0;
     }
     case AVA1_JNL_SNAPSHOT: {
         ava1_jnl_snapshot_t s;
         uint32_t i;
         if (ava1_jnl_snapshot_decode(body, len, &s) != 0) return 1;
+        /* Fail closed: unswept/segments streams that do not parse in full end the replay (a torn record),
+         * never read as "everything is swept". */
+        {
+            uint32_t cnt;
+            if ((s.has_unswept && ava1_file_run_count(s.unswept, s.unswept_len, &cnt) != 0) ||
+                (s.has_segments && ava1_pack_ref_count(s.segments, s.segments_len, &cnt) != 0))
+                return 1;
+        }
         for (i = 0; i < j->m.n; i++) forget_file(j, i);
         forget_ranges(j);
         add_ranges(j, s.ranges, s.ranges_len, 2);
         add_roots(j, s.roots, s.roots_len);
         add_done(j, s.done, s.done_len);
+        for (i = 0; i < j->m.n; i++) ava1_bits_clear(&r->unswept, i);
+        r->nrefs = 0;
+        if (s.has_unswept) unswept_runs(r, s.unswept, s.unswept_len, 1);
+        if (s.has_segments) {
+            ava1_r_t it;
+            ava1_pack_ref_t ref;
+            ava1_r_init(&it, s.segments, s.segments_len);
+            while (ava1_pack_ref_next(&it, &ref) == 1) ref_push(r, &ref);
+        }
         return 0;
     }
     case AVA1_JNL_DONE: {
@@ -206,17 +303,121 @@ static int load_from_disk(ava1_job_t *j) {
     uint8_t *blob, hash[32];
     size_t len;
     int rc;
-    replay_t r = { j, 0 };
+    replay_t r;
+    memset(&r, 0, sizeof r);
+    r.j = j;
     if (ava1_manifest_file_read(j->dir, &blob, &len) != 0) return -1;
     rc = ava1_mstore_from_blob(&j->m, blob, len);
     free(blob);
-    if (rc != 0 || alloc_state(j) != 0) return -1;
-    if (ava1_jnl_open(&j->jnl, j->dir, replay, &r) != 0 || !r.opened) return -1;
+    if (rc != 0 || alloc_state(j) != 0 || ava1_bits_init(&r.unswept, j->m.n) != 0) {
+        replay_free(&r);
+        return -1;
+    }
+    if (ava1_jnl_open(&j->jnl, j->dir, replay, &r) != 0 || !r.opened) {
+        replay_free(&r);
+        return -1;
+    }
     ava1_mstore_hash(&j->m, hash);
-    if (memcmp(hash, j->manifest_hash, 32) != 0) return -1; /* a crash between the two writes */
+    if (memcmp(hash, j->manifest_hash, 32) != 0) { /* a crash between the two writes */
+        replay_free(&r);
+        return -1;
+    }
     j->have_manifest = 1;
+    /* Durable-by-log recovery (§4): the files the journal calls done but not yet swept are made again from
+     * the pack log where a crash lost them, and swept, before anything is counted or answered. */
+    refs_prune(&r);
+    snprintf(j->base, sizeof j->base, "%s%s", j->root, j->staged ? ".ava-part" : "");
+    if (ava1_pack_recover(j, &r.unswept, r.refs, r.nrefs) != 0) {
+        replay_free(&r);
+        return -1;
+    }
+    replay_free(&r);
     recount(j);
     return 0;
+}
+
+/* The owner key recovery's throwaway jobs carry: all zero, which no peer's public key is. */
+static int owner_is_recovery(const uint8_t owner[32]) {
+    static const uint8_t zero[32];
+    return memcmp(owner, zero, 32) == 0;
+}
+
+static int name_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
+
+/* One recovery pass (SPEC.md §15.7): job directories under `jobs_dir` that hold a pack log and nobody has
+ * open. Each is loaded into a throwaway job exactly as a JobOpen would load it (load_from_disk runs the
+ * recovery) and freed again; a directory whose job is listed (create refuses its id) is skipped. Bounded so
+ * a start never replays a whole disk of journals: it stops after `max` directories that settled (their log is
+ * gone) or 2*max that were tried, and the next pass starts after the last one tried, so a directory that
+ * cannot be recovered never starves the ones behind it. While a throwaway is listed a JobOpen for its id is
+ * answered BUSY. Returns how many settled. */
+uint32_t ava1_recv_recover_pass(const char *jobs_dir, uint32_t max) {
+    static pthread_mutex_t pass_mu = PTHREAD_MUTEX_INITIALIZER;
+    static uint32_t cursor;
+    enum { MAX_CAND = 512 };
+    static const uint8_t zero_owner[32];
+    char (*names)[33] = NULL;
+    uint32_t n = 0, settled = 0, tried = 0, start, k;
+    DIR *dp;
+    struct dirent *de;
+    if (pthread_mutex_trylock(&pass_mu) != 0) return 0; /* another pass is running */
+    if (!(names = malloc(MAX_CAND * sizeof *names))) {
+        pthread_mutex_unlock(&pass_mu);
+        return 0;
+    }
+    dp = opendir(jobs_dir);
+    while (dp && n < MAX_CAND && (de = readdir(dp)) != NULL) {
+        char dir[sizeof ((ava1_job_t *)0)->dir];
+        uint8_t id[16];
+        size_t i;
+        if (strlen(de->d_name) != 32) continue;
+        for (i = 0; i < 16; i++) {
+            unsigned v;
+            if (sscanf(de->d_name + 2 * i, "%2x", &v) != 1) break;
+            id[i] = (uint8_t)v;
+        }
+        if (i != 16) continue;
+        ava1_job_dir(jobs_dir, id, dir, sizeof dir);
+        if (ava1_dir_has_pack(dir)) memcpy(names[n++], de->d_name, 33);
+    }
+    if (dp) closedir(dp);
+    qsort(names, n, sizeof *names, name_cmp);
+    start = n ? cursor % n : 0;
+    for (k = 0; k < n && settled < max && tried < 2u * max && ava1_data_running(); k++) {
+        uint32_t at = (start + k) % n;
+        uint8_t id[16], buf[AVA1_MAX_PATH + 256];
+        char dir[sizeof ((ava1_job_t *)0)->dir];
+        ava1_jnl_open_t o;
+        ava1_job_t *j;
+        size_t i;
+        for (i = 0; i < 16; i++) {
+            unsigned v;
+            (void)sscanf(names[at] + 2 * i, "%2x", &v);
+            id[i] = (uint8_t)v;
+        }
+        ava1_job_dir(jobs_dir, id, dir, sizeof dir);
+        cursor = at + 1; /* the next pass starts behind this one, whatever came of it */
+        tried++;
+        if (ava1_jnl_peek_open(dir, buf, sizeof buf, &o) != 0 || o.kind != AVA1_JOB_UPLOAD || o.root_len >= AVA1_MAX_PATH) {
+            fprintf(stderr, "[ava1] recovery: %s holds a log but its journal cannot be opened; left for the GC ceiling\n", names[at]);
+            continue;
+        }
+        if (!(j = ava1_job_create(id, zero_owner))) continue; /* listed: a real session owns it */
+        j->kind = o.kind;
+        j->flags = o.flags;
+        memcpy(j->root, o.root, o.root_len);
+        j->root[o.root_len] = 0;
+        snprintf(j->dir, sizeof j->dir, "%s", dir);
+        j->ub_excluded = 1; /* a throwaway's log bytes are no other job's business (the cross-job cap) */
+        (void)load_from_disk(j); /* recovers; a job that is not ours or has nothing unswept changes nothing */
+        ava1_job_free_one(j->id);
+        ava1_job_put(j);
+        if (!ava1_dir_has_pack(dir)) settled++;
+        else fprintf(stderr, "[ava1] recovery: %s still holds its log; tried again later\n", names[at]);
+    }
+    free(names);
+    pthread_mutex_unlock(&pass_mu);
+    return settled;
 }
 
 /* ---- messages ---------------------------------------------------------------------- */
@@ -334,6 +535,12 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
         return refuse(ack, AVA1_ERR_PATH, msg, cap, "writing there is not allowed");
     if (s->entries > AVA1_MAX_ENTRIES) return refuse(ack, AVA1_ERR_PROTOCOL, msg, cap, "the manifest has too many entries");
     j = ava1_job_find(s->id);
+    if (j && owner_is_recovery(j->owner)) {
+        /* recovery's throwaway job (housekeeping, seconds at most): the sender retries on BUSY and then
+         * resumes a settled job, instead of being told the job belongs to another device */
+        ava1_job_put(j);
+        return refuse(ack, AVA1_ERR_BUSY, msg, cap, "the console is finishing this job's files; try again");
+    }
     if (j && memcmp(j->owner, s->owner, 32) != 0) {
         ava1_job_put(j);
         return refuse(ack, AVA1_ERR_UNKNOWN_JOB, msg, cap, "this job belongs to another device");
@@ -387,7 +594,7 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
         peek_staged = peeked ? o.staged : 0;
     }
     j = ava1_job_create_attached(s->id, s->owner, s->sid);
-    if (!j) return refuse(ack, AVA1_ERR_BUSY, msg, cap, "too many jobs");
+    if (!j) return refuse(ack, AVA1_ERR_BUSY, msg, cap, "too many jobs, or this job is still closing; try again");
     j->kind = s->kind;
     j->policy = s->policy;
     j->flags = s->flags;
@@ -728,7 +935,7 @@ static int journal_files(ava1_job_t *j, const ava1_bits_t *b) {
             jb.files = fb;
             jb.files_len = (uint32_t)fw.len;
             ava1_w_init(&w, body, cap + 64);
-            if (ava1_jnl_batch_encode(&jb, &w) == 0) rc = ava1_jnl_append(&j->jnl, AVA1_JNL_BATCH, body, w.len);
+            if (ava1_jnl_batch_encode(&jb, &w) == 0) rc = ava1_apply_jnl_append(j, AVA1_JNL_BATCH, body, w.len);
         }
     }
     free(fb);
@@ -876,7 +1083,7 @@ static uint16_t prepare(ava1_job_t *j, char *msg, size_t cap) {
                 status = AVA1_ERR_IO;
             }
         }
-        rc = ava1_sync_dirset(j, d, nd, 0); /* frees the strings */
+        rc = ava1_sync_dirset(j, d, nd, AVA1_HOOK_PREP_DIR_SYNCED); /* frees the strings */
         free(d);
         if (status != AVA1_STATUS_OK) return status;
         if (rc) {
@@ -1101,7 +1308,19 @@ static void recv_events(ava1_job_t *j) {
         ava1_mstore_free(&in); /* the same manifest: the replayed state stands */
     } else {
         int stopped;
-        ava1_apply_quiesce(j); /* frames of an earlier session name the old ids */
+        /* frames of an earlier session name the old ids; and files not yet durable in place must settle first,
+         * or the sweep queue would name other files once the ids move (SPEC.md §15.7) */
+        if (ava1_apply_quiesce(j) != 0) {
+            pthread_mutex_lock(&j->mu);
+            stopped = j->stopping;
+            pthread_mutex_unlock(&j->mu);
+            ava1_mstore_free(&in);
+            if (stopped) return; /* a stop or a test crash point */
+            snprintf(msg, sizeof msg, "files are still being made durable on the console; try again");
+            emit_map(j, AVA1_ERR_IO, msg);
+            ava1_apply_fail(j, AVA1_ERR_IO, msg, 0, 0);
+            return;
+        }
         st = adopt(j, &in, hash, msg, sizeof msg);
         ava1_mstore_free(&in);
         pthread_mutex_lock(&j->mu);

@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
-import { BottleneckLine, JobLiveNotes } from "./Bottleneck";
+import { BottleneckLine, JobLiveNotes, UnsettledLine } from "./Bottleneck";
 import type { BottleneckCause, JobLive } from "../../lib/jobLive";
 
 const live = (over: Partial<JobLive>): JobLive => ({
@@ -57,5 +57,17 @@ describe("finishing on the console", () => {
     expect(
       renderToStaticMarkup(<JobLiveNotes live={live({ bottleneck: "network" })} />),
     ).not.toContain("Finishing on the console");
+  });
+});
+
+describe("a finished upload the console did not confirm", () => {
+  it("is a warning in the result, not a clean success", () => {
+    const html = renderToStaticMarkup(<UnsettledLine live={live({ unsettled: true })} />);
+    expect(html).toContain('data-testid="unsettled-warning"');
+    expect(html).toContain("has not confirmed saving all files");
+  });
+  it("shows nothing for a clean finish or no notes", () => {
+    expect(renderToStaticMarkup(<UnsettledLine live={live({})} />)).toBe("");
+    expect(renderToStaticMarkup(<UnsettledLine live={undefined} />)).toBe("");
   });
 });

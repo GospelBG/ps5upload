@@ -49,7 +49,26 @@ typedef struct {        /* one large file being assembled */
     int committed;
     int dir_synced;        /* its part file's directory entry is durable (Task 13) */
     int in_list;           /* its id is in the job's lfl list (the batch scans' index) */
+    int opening;           /* a worker is opening/preallocating it with j->mu released */
+    int committing;        /* its commit is queued or running on a worker (review 003 §3.3) */
 } ava1_lfile_t;
+
+/* Durable-by-log (SPEC.md §15.7). A small file's bytes go to `pack.<n>` in the job directory and
+ * the file is made durable in place later by the sweep. */
+typedef struct { /* where a pending small file's record sits */
+    uint32_t seg, len; /* len == 0: not logged (the per-file fsync path) */
+    uint64_t off;
+} ava1_ploc_t;
+typedef struct { /* a done file waiting for the sweep */
+    uint32_t id, seg, len;
+    uint64_t off, t_ms;
+} ava1_usw_t;
+typedef struct { /* one pack segment, indexed by its number */
+    int fd;
+    uint64_t tail;
+    uint32_t nusw;          /* unswept files whose record is in it */
+    int dirty, closed, removed;
+} ava1_pseg_t;
 
 typedef struct ava1_work { /* a unit for the worker pool */
     struct ava1_work *next;
@@ -96,6 +115,22 @@ struct ava1_job {
      * follows the large files in flight, not the file count. May hold stale or duplicate
      * ids (a freed lf); lfl_snapshot sorts and filters them. Under j->mu. `lfl_all`: the
      * list could not grow, so the scans fall back to every manifest entry. */
+    /* ---- durable-by-log (all under j->mu unless noted) ---- */
+    pthread_mutex_t pack_mu;        /* one pack writer at a time: allocate the offset and pwrite */
+    ava1_pseg_t *psegs;
+    uint32_t npsegs, psegs_cap;     /* segment n is psegs[n]; the last one open is the tail */
+    ava1_ploc_t *pend_loc;          /* parallel to pend_small */
+    ava1_usw_t *usw;                /* queue of done files not yet swept, oldest first */
+    uint32_t usw_head, usw_n, usw_cap;
+    uint32_t unswept_n;             /* usw + the ones a sweep holds */
+    uint64_t unswept_bytes;         /* pack bytes of files not yet swept (pending ones included) */
+    int ub_excluded;                /* those bytes do not count against the cross-job cap (a sticky sweep error, a recovery pass) */
+    uint32_t sweeps_inflight;       /* sweeps queued or running (a compaction waits for none) */
+    int sweep_queued, settled;
+    uint32_t sweep_fail_n;          /* consecutive failed sweeps */
+    uint64_t sweep_retry_ms;        /* no sweep is queued before this (backoff) */
+    int sweep_err;                  /* sticky: the errno once failures pass SWEEP_FAIL_MAX; Status reports it */
+    char sweep_msg[96];
     uint32_t *lfl;
     uint32_t lfl_n, lfl_cap;
     int lfl_all;
@@ -103,6 +138,27 @@ struct ava1_job {
      * files, and microseconds spent in each step of the durability chain. */
     uint64_t st_batches, st_files, st_data_us, st_dirs_us, st_jnl_us, st_scan_us, st_commit_us,
         st_compact_us, st_compacts, st_log_ms;
+    /* Preallocation, all workers (atomics): microseconds, bytes and files; one "slow" line per job. */
+    uint64_t pre_us, pre_bytes;
+    /* Commits run on the workers (review 003 §3.3): `commits_inflight` (under mu) counts the
+     * queued and running ones; a journal compaction waits until there are none. `jnl_mu`
+     * serialises every journal append (the file offset and fsync order are one critical
+     * section) and compaction; lock order: jnl_mu then mu. A commit's failure is recorded like
+     * any worker's, `fail_journal` saying whether its Done must be journaled. */
+    pthread_mutex_t jnl_mu;
+    uint32_t commits_inflight;
+    /* A drive whose batch fsync outlasts the credit window (review 003 §6): once set (atomic,
+     * never cleared) workers fsync each chunk right after writing it. The rate is measured
+     * between batches: bytes_received at the end of the last one and when it ended. */
+    int perchunk;
+    uint64_t rate_bytes0, last_batch_end_ms;
+    int fail_journal;
+    uint32_t pre_files;
+    int pre_slow_logged;
+    /* Whole-job totals for the end-of-job summary (never reset by the periodic line): the job
+     * thread's scan/data/dirs/journal microseconds; commit is the sum over workers (atomic). */
+    uint64_t start_us, tot_scan_us, tot_data_us, tot_dirs_us, tot_jnl_us, tot_commit_us, tot_batches, tot_files;
+    int timing;                     /* the periodic stats line is on (opt-in, read once per job) */
     ava1_file_range_t *last_ranges; /* the last journal batch's ranges (resume check, Task 13) */
     uint32_t last_ranges_n;
     uint64_t credit, outstanding;   /* granted; lane-frame bytes held */
@@ -117,6 +173,7 @@ struct ava1_job {
     int *pend_fd;
     uint8_t (*pend_root)[32];       /* their BLAKE3 roots (re-read after a retried fsync) */
     uint32_t pend_n, pend_cap;
+    uint32_t pend_n_fd;             /* of those, the ones holding an open descriptor (and a budget slot) */
     uint32_t batch_max;             /* small files per sync batch (tuned, Task 12) */
     uint64_t last_batch_ms, unsynced_bytes;
     uint32_t roots_new;             /* FileRoots not yet journaled */

@@ -5,9 +5,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
 
-use crate::gen::{JnlBatch, JnlDone, JnlOpen, JnlReset, JnlSnapshot, ManifestEntry, RootItem};
+use crate::gen::{
+    FileRun, JnlBatch, JnlDone, JnlOpen, JnlReset, JnlSnapshot, JnlSweep, ManifestEntry, PackRef,
+    RootItem,
+};
 use crate::manifest::{Entry, Manifest};
-use crate::ranges::{from_runs, runs, Need, RangeSet};
+use crate::ranges::{from_runs, runs, runs_within_limit, Need, RangeSet};
 use crate::wire::{Message, Reader, Writer};
 
 pub const MAGIC: &[u8; 8] = b"AVA1JNL1";
@@ -16,6 +19,8 @@ pub const K_BATCH: u8 = 2;
 pub const K_RESET: u8 = 3;
 pub const K_SNAPSHOT: u8 = 4;
 pub const K_DONE: u8 = 5;
+/// Durable-by-log (SPEC.md §15.7): files now durable in place.
+pub const K_SWEEP: u8 = 6;
 /// The journal is compacted once it passes this size (SPEC.md §14).
 pub const COMPACT_AT: u64 = 1 << 20;
 
@@ -26,6 +31,7 @@ pub enum Record {
     Reset(u32),
     Snapshot(JnlSnapshot),
     Done(u16),
+    Sweep(Vec<FileRun>),
 }
 
 impl Record {
@@ -36,6 +42,7 @@ impl Record {
             Record::Reset(f) => (K_RESET, JnlReset { file_id: *f }.to_bytes()),
             Record::Snapshot(s) => (K_SNAPSHOT, s.to_bytes()),
             Record::Done(s) => (K_DONE, JnlDone { status: *s }.to_bytes()),
+            Record::Sweep(f) => (K_SWEEP, JnlSweep { files: f.clone() }.to_bytes()),
         };
         let body = b.map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Ok((k, body))
@@ -44,10 +51,39 @@ impl Record {
     fn decode(kind: u8, b: &[u8]) -> Option<Record> {
         Some(match kind {
             K_OPEN => Record::Open(JnlOpen::decode(b).ok()?),
-            K_BATCH => Record::Batch(JnlBatch::decode(b).ok()?),
+            K_BATCH => {
+                let b = JnlBatch::decode(b).ok()?;
+                if !runs_within_limit(&b.files) {
+                    return None;
+                }
+                Record::Batch(b)
+            }
             K_RESET => Record::Reset(JnlReset::decode(b).ok()?.file_id),
-            K_SNAPSHOT => Record::Snapshot(JnlSnapshot::decode(b).ok()?),
+            K_SNAPSHOT => {
+                // Fail closed: an `unswept` or `segments` stream that does not decode must stop the replay,
+                // never read as "everything is swept" (a compaction would persist that).
+                let s = JnlSnapshot::decode(b).ok()?;
+                if !runs_within_limit(&s.done) {
+                    return None;
+                }
+                if let Some(u) = &s.unswept {
+                    if !runs_within_limit(&item_stream::<FileRun>(u)?) {
+                        return None;
+                    }
+                }
+                if let Some(g) = &s.segments {
+                    item_stream::<PackRef>(g)?;
+                }
+                Record::Snapshot(s)
+            }
             K_DONE => Record::Done(JnlDone::decode(b).ok()?.status),
+            K_SWEEP => {
+                let f = JnlSweep::decode(b).ok()?.files;
+                if !runs_within_limit(&f) {
+                    return None;
+                }
+                Record::Sweep(f)
+            }
             _ => return None,
         })
     }
@@ -208,6 +244,23 @@ impl Journal {
     }
 }
 
+/// A `records` item stream without its total-length prefix, as a snapshot extension carries it.
+fn item_bytes<M: Message>(items: &[M]) -> Option<Vec<u8>> {
+    let mut w = Writer::new();
+    w.records(items).ok()?;
+    Some(w.buf[4..].to_vec())
+}
+
+/// The inverse of `item_bytes`; `None` for a stream that does not decode in full.
+fn item_stream<M: Message>(b: &[u8]) -> Option<Vec<M>> {
+    let mut framed = (b.len() as u32).to_le_bytes().to_vec();
+    framed.extend_from_slice(b);
+    let mut r = Reader::new(&framed);
+    let v = r.records().ok()?;
+    r.finish().ok()?;
+    Some(v)
+}
+
 /// What a replay knows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct State {
@@ -216,6 +269,11 @@ pub struct State {
     pub ranges: BTreeMap<u32, RangeSet>,
     pub roots: BTreeMap<u32, [u8; 32]>,
     pub finished: Option<u16>,
+    /// Done files whose bytes are only in the pack log so far (SPEC.md §15.7).
+    pub unswept: BTreeSet<u32>,
+    /// The pack ranges whose files are not all swept (a ref is live while an unswept id lies in
+    /// `first_file..first_file + count`).
+    pub packs: Vec<PackRef>,
 }
 
 impl State {
@@ -237,9 +295,32 @@ impl State {
                 for f in from_runs(&b.files) {
                     self.ranges.remove(&f);
                 }
+                if let (Some(segment), Some(offset), Some(len)) =
+                    (b.pack_segment, b.pack_offset, b.pack_len)
+                {
+                    let files = from_runs(&b.files);
+                    if let (Some(&lo), Some(&hi)) = (files.first(), files.last()) {
+                        self.unswept.extend(files.iter().copied());
+                        self.packs.push(PackRef {
+                            segment,
+                            offset,
+                            len,
+                            first_file: lo,
+                            count: hi - lo + 1,
+                        });
+                    }
+                }
+            }
+            Record::Sweep(f) => {
+                for id in from_runs(f) {
+                    self.unswept.remove(&id);
+                }
+                self.prune_packs();
             }
             Record::Reset(f) => {
                 self.done.remove(f);
+                self.unswept.remove(f);
+                self.prune_packs();
                 self.ranges.remove(f);
                 self.roots.remove(f);
             }
@@ -253,13 +334,41 @@ impl State {
                         .insert(x.offset, x.offset + x.len);
                 }
                 self.roots = s.roots.iter().map(|x| (x.file_id, x.root)).collect();
+                // (Record::decode already refused a snapshot whose streams do not decode.)
+                self.unswept = s
+                    .unswept
+                    .as_deref()
+                    .and_then(item_stream::<FileRun>)
+                    .map(|v| from_runs(&v))
+                    .unwrap_or_default();
+                self.packs = s
+                    .segments
+                    .as_deref()
+                    .and_then(item_stream::<PackRef>)
+                    .unwrap_or_default();
             }
             Record::Done(s) => self.finished = Some(*s),
         }
     }
 
+    fn prune_packs(&mut self) {
+        let unswept = &self.unswept;
+        self.packs.retain(|p| {
+            unswept
+                .range(p.first_file..p.first_file.saturating_add(p.count))
+                .next()
+                .is_some()
+        });
+    }
+
     pub fn snapshot(&self) -> JnlSnapshot {
         JnlSnapshot {
+            unswept: (!self.unswept.is_empty())
+                .then(|| item_bytes(&runs(&self.unswept)))
+                .flatten(),
+            segments: (!self.packs.is_empty())
+                .then(|| item_bytes(&self.packs))
+                .flatten(),
             done: runs(&self.done),
             ranges: self
                 .ranges
@@ -420,6 +529,109 @@ mod tests {
         d
     }
 
+    #[test]
+    fn a_snapshot_with_undecodable_unswept_bytes_is_refused_not_read_as_all_swept() {
+        // Failing open: an unswept list that does not decode must stop the replay (a torn record), never
+        // become "nothing is unswept", which a compaction would then persist.
+        let d = tmp("badsnap");
+        let mut j = Journal::create(&d, &open_rec()).unwrap();
+        let mut st = State::default();
+        st.done.insert(3);
+        st.unswept.insert(3);
+        let mut snap = st.snapshot();
+        assert!(snap.unswept.is_some());
+        snap.unswept = Some(vec![9, 9, 9]); // not an item stream
+        j.append(&Record::Snapshot(snap)).unwrap();
+        drop(j);
+        let (_, recs) = Journal::open(&d).unwrap();
+        assert_eq!(recs.len(), 1, "only the Open survived: {recs:?}");
+        // and the segments list the same
+        let mut j = Journal::create(&d, &open_rec()).unwrap();
+        let mut snap = st.snapshot();
+        snap.segments = Some(vec![1, 0, 0, 0, 7]);
+        j.append(&Record::Snapshot(snap)).unwrap();
+        drop(j);
+        assert_eq!(Journal::open(&d).unwrap().1.len(), 1);
+    }
+
+    #[test]
+    fn a_hostile_run_length_is_refused_by_replay_and_bounded_everywhere() {
+        let huge = vec![FileRun {
+            first: 0,
+            count: u32::MAX,
+        }];
+        let t = std::time::Instant::now();
+        let set = crate::ranges::from_runs(&huge);
+        assert!(set.len() as u64 <= crate::ranges::MAX_RUN_IDS);
+        assert!(
+            t.elapsed().as_secs() < 20,
+            "from_runs spun on a hostile run"
+        );
+        let d = tmp("hugerun");
+        let mut j = Journal::create(&d, &open_rec()).unwrap();
+        j.append(&Record::Sweep(huge)).unwrap();
+        drop(j);
+        assert_eq!(
+            Journal::open(&d).unwrap().1.len(),
+            1,
+            "the record is refused"
+        );
+    }
+
+    fn pack_batch(files: Vec<FileRun>, segment: u32, offset: u64, len: u64) -> Record {
+        Record::Batch(JnlBatch {
+            files,
+            ranges: vec![],
+            roots: vec![],
+            pack_segment: Some(segment),
+            pack_offset: Some(offset),
+            pack_len: Some(len),
+        })
+    }
+
+    #[test]
+    fn a_pack_batch_leaves_files_unswept_until_a_sweep_and_snapshots_keep_them() {
+        // Durable-by-log (SPEC.md §15.7): replay = done, minus swept, plus the pack ranges that
+        // still hold unswept files.
+        let mut st = State::default();
+        st.apply(&pack_batch(vec![FileRun { first: 1, count: 3 }], 0, 8, 400));
+        st.apply(&pack_batch(vec![FileRun { first: 7, count: 1 }], 1, 8, 90));
+        assert_eq!(st.unswept.iter().copied().collect::<Vec<_>>(), [1, 2, 3, 7]);
+        assert_eq!(st.packs.len(), 2);
+        assert!(st.done.contains(&2) && st.done.contains(&7));
+        // a snapshot round trips both lists
+        let snap = st.snapshot();
+        let mut again = State::default();
+        again.apply(&Record::Snapshot(snap));
+        assert_eq!(again.unswept, st.unswept);
+        assert_eq!(again.packs, st.packs);
+        // a sweep of some files keeps the range that still has one; of all, drops it
+        st.apply(&Record::Sweep(vec![FileRun { first: 1, count: 2 }]));
+        assert_eq!(st.unswept.iter().copied().collect::<Vec<_>>(), [3, 7]);
+        assert_eq!(st.packs.len(), 2);
+        st.apply(&Record::Sweep(vec![FileRun { first: 3, count: 1 }]));
+        assert_eq!(st.packs.len(), 1);
+        assert_eq!(st.packs[0].segment, 1);
+        // a reset takes a file out of both
+        st.apply(&Record::Reset(7));
+        assert!(st.unswept.is_empty() && st.packs.is_empty());
+        assert!(!st.done.contains(&7));
+    }
+
+    #[test]
+    fn the_sweep_record_and_the_pack_extension_survive_the_file() {
+        let d = tmp("sweep");
+        let mut j = Journal::create(&d, &open_rec()).unwrap();
+        let b = pack_batch(vec![FileRun { first: 0, count: 2 }], 3, 8, 77);
+        j.append(&b).unwrap();
+        j.append(&Record::Sweep(vec![FileRun { first: 0, count: 2 }]))
+            .unwrap();
+        drop(j);
+        let (_, recs) = Journal::open(&d).unwrap();
+        assert_eq!(recs[1], b);
+        assert_eq!(recs[2], Record::Sweep(vec![FileRun { first: 0, count: 2 }]));
+    }
+
     fn open_rec() -> JnlOpen {
         JnlOpen {
             job_id: [1; 16],
@@ -443,6 +655,9 @@ mod tests {
                 file_id: 9,
                 root: [off as u8; 32],
             }],
+            pack_len: None,
+            pack_offset: None,
+            pack_segment: None,
         })
     }
 

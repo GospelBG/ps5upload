@@ -219,6 +219,7 @@ fn status_with_result() -> Status {
         state: Some(2),
         result: Some(b"cause".to_vec()),
         code: Some(ERR_IO),
+        unswept: None,
     }
 }
 
