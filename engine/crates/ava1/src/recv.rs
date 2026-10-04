@@ -518,6 +518,7 @@ pub async fn receive_job(
                     files: 0,
                     bytes: 0,
                     message: Some(e.to_string()),
+                    settling: None,
                 })
                 .await;
             return Err(e);
@@ -1203,6 +1204,7 @@ async fn run_loop(
                             files: m.files(),
                             bytes: m.bytes(),
                             message: Some(e.to_string()),
+                            settling: None,
                         })
                         .await
                         .map_err(|e| SendError::Disconnected(e.to_string()))?;
@@ -1221,6 +1223,7 @@ async fn run_loop(
                         files: m.files(),
                         bytes: m.bytes(),
                         message: None,
+                        settling: None,
                     })
                     .await
                     .map_err(|e| SendError::Disconnected(e.to_string()))?;
@@ -1564,6 +1567,9 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
         files: runs(&small),
         ranges: ranges.clone(),
         roots,
+        pack_len: None,
+        pack_offset: None,
+        pack_segment: None,
     });
     let (j, rec, r) = tokio::task::spawn_blocking(move || {
         let r = jnl.append(&rec);
@@ -1677,6 +1683,9 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
             files: runs(&set),
             ranges: Vec::new(),
             roots: Vec::new(),
+            pack_len: None,
+            pack_offset: None,
+            pack_segment: None,
         });
         let (j, rec, r) = tokio::task::spawn_blocking(move || {
             let r = jnl.append(&rec);
@@ -1923,6 +1932,9 @@ mod tests {
                     .collect(),
                 ranges: Vec::new(),
                 roots: Vec::new(),
+                pack_len: None,
+                pack_offset: None,
+                pack_segment: None,
             });
             st.apply(&rec);
             jnl.append(&rec).unwrap();

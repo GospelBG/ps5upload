@@ -1291,6 +1291,7 @@ pub struct Status {
     pub state: Option<u8>,
     pub result: Option<Vec<u8>>,
     pub code: Option<u16>,
+    pub unswept: Option<u32>,
 }
 
 impl Message for Status {
@@ -1312,11 +1313,13 @@ impl Message for Status {
         if self.state.is_some() { ext_n += 1; }
         if self.result.is_some() { ext_n += 1; }
         if self.code.is_some() { ext_n += 1; }
+        if self.unswept.is_some() { ext_n += 1; }
         w.u16(ext_n);
         if let Some(v) = &self.current { w.ext(1, |w| { w.str(v) })?; }
         if let Some(v) = &self.state { w.ext(2, |w| { w.u8(*v); Ok(()) })?; }
         if let Some(v) = &self.result { w.ext(3, |w| { w.bytes(v) })?; }
         if let Some(v) = &self.code { w.ext(4, |w| { w.u16(*v); Ok(()) })?; }
+        if let Some(v) = &self.unswept { w.ext(5, |w| { w.u32(*v); Ok(()) })?; }
         Ok(())
     }
 
@@ -1363,6 +1366,12 @@ impl Message for Status {
                     m.code = Some(vr.u16()?);
                     vr.finish()?;
                 }
+                5 => {
+                    if m.unswept.is_some() { return Err(DecodeError::DupExt(5)); }
+                    let mut vr = Reader::new(v);
+                    m.unswept = Some(vr.u32()?);
+                    vr.finish()?;
+                }
                 _ => {}
             }
         }
@@ -1382,6 +1391,7 @@ pub struct JobDone {
     pub files: u32,
     pub bytes: u64,
     pub message: Option<String>,
+    pub settling: Option<u8>,
 }
 
 impl Message for JobDone {
@@ -1394,8 +1404,10 @@ impl Message for JobDone {
         w.u64(self.bytes);
         let mut ext_n: u16 = 0;
         if self.message.is_some() { ext_n += 1; }
+        if self.settling.is_some() { ext_n += 1; }
         w.u16(ext_n);
         if let Some(v) = &self.message { w.ext(1, |w| { w.str(v) })?; }
+        if let Some(v) = &self.settling { w.ext(2, |w| { w.u8(*v); Ok(()) })?; }
         Ok(())
     }
 
@@ -1416,6 +1428,12 @@ impl Message for JobDone {
                     if m.message.is_some() { return Err(DecodeError::DupExt(1)); }
                     let mut vr = Reader::new(v);
                     m.message = Some(vr.str()?);
+                    vr.finish()?;
+                }
+                2 => {
+                    if m.settling.is_some() { return Err(DecodeError::DupExt(2)); }
+                    let mut vr = Reader::new(v);
+                    m.settling = Some(vr.u8()?);
                     vr.finish()?;
                 }
                 _ => {}
@@ -2831,6 +2849,9 @@ pub struct JnlBatch {
     pub files: Vec<FileRun>,
     pub ranges: Vec<FileRange>,
     pub roots: Vec<RootItem>,
+    pub pack_segment: Option<u32>,
+    pub pack_offset: Option<u64>,
+    pub pack_len: Option<u64>,
 }
 
 impl Message for JnlBatch {
@@ -2840,7 +2861,14 @@ impl Message for JnlBatch {
         w.records(&self.files)?;
         w.records(&self.ranges)?;
         w.records(&self.roots)?;
-        w.u16(0);
+        let mut ext_n: u16 = 0;
+        if self.pack_segment.is_some() { ext_n += 1; }
+        if self.pack_offset.is_some() { ext_n += 1; }
+        if self.pack_len.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.pack_segment { w.ext(1, |w| { w.u32(*v); Ok(()) })?; }
+        if let Some(v) = &self.pack_offset { w.ext(2, |w| { w.u64(*v); Ok(()) })?; }
+        if let Some(v) = &self.pack_len { w.ext(3, |w| { w.u64(*v); Ok(()) })?; }
         Ok(())
     }
 
@@ -2850,6 +2878,98 @@ impl Message for JnlBatch {
         m.files = r.records::<FileRun>()?;
         m.ranges = r.records::<FileRange>()?;
         m.roots = r.records::<RootItem>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            match tag {
+                1 => {
+                    if m.pack_segment.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.pack_segment = Some(vr.u32()?);
+                    vr.finish()?;
+                }
+                2 => {
+                    if m.pack_offset.is_some() { return Err(DecodeError::DupExt(2)); }
+                    let mut vr = Reader::new(v);
+                    m.pack_offset = Some(vr.u64()?);
+                    vr.finish()?;
+                }
+                3 => {
+                    if m.pack_len.is_some() { return Err(DecodeError::DupExt(3)); }
+                    let mut vr = Reader::new(v);
+                    m.pack_len = Some(vr.u64()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PackRef {
+    pub segment: u32,
+    pub offset: u64,
+    pub len: u64,
+    pub first_file: u32,
+    pub count: u32,
+}
+
+impl Message for PackRef {
+    const NAME: &'static str = "PackRef";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.segment);
+        w.u64(self.offset);
+        w.u64(self.len);
+        w.u32(self.first_file);
+        w.u32(self.count);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.segment = r.u32()?;
+        m.offset = r.u64()?;
+        m.len = r.u64()?;
+        m.first_file = r.u32()?;
+        m.count = r.u32()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JnlSweep {
+    pub files: Vec<FileRun>,
+}
+
+impl Message for JnlSweep {
+    const NAME: &'static str = "JnlSweep";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.records(&self.files)?;
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.files = r.records::<FileRun>()?;
         let ext_n = r.u16()?;
         for _ in 0..ext_n {
             let tag = r.u16()?;
@@ -2897,6 +3017,8 @@ pub struct JnlSnapshot {
     pub done: Vec<FileRun>,
     pub ranges: Vec<FileRange>,
     pub roots: Vec<RootItem>,
+    pub unswept: Option<Vec<u8>>,
+    pub segments: Option<Vec<u8>>,
 }
 
 impl Message for JnlSnapshot {
@@ -2906,7 +3028,12 @@ impl Message for JnlSnapshot {
         w.records(&self.done)?;
         w.records(&self.ranges)?;
         w.records(&self.roots)?;
-        w.u16(0);
+        let mut ext_n: u16 = 0;
+        if self.unswept.is_some() { ext_n += 1; }
+        if self.segments.is_some() { ext_n += 1; }
+        w.u16(ext_n);
+        if let Some(v) = &self.unswept { w.ext(1, |w| { w.bytes(v) })?; }
+        if let Some(v) = &self.segments { w.ext(2, |w| { w.bytes(v) })?; }
         Ok(())
     }
 
@@ -2921,7 +3048,21 @@ impl Message for JnlSnapshot {
             let tag = r.u16()?;
             let len = r.u32()? as usize;
             let v = r.take(len)?;
-            let _ = (tag, v);
+            match tag {
+                1 => {
+                    if m.unswept.is_some() { return Err(DecodeError::DupExt(1)); }
+                    let mut vr = Reader::new(v);
+                    m.unswept = Some(vr.bytes()?);
+                    vr.finish()?;
+                }
+                2 => {
+                    if m.segments.is_some() { return Err(DecodeError::DupExt(2)); }
+                    let mut vr = Reader::new(v);
+                    m.segments = Some(vr.bytes()?);
+                    vr.finish()?;
+                }
+                _ => {}
+            }
         }
         r.finish()?;
         Ok(m)
@@ -2959,7 +3100,7 @@ impl Message for JnlDone {
 }
 
 /// Every message and struct, by name (conformance tests).
-pub const ALL: &[&str] = &["Hs1", "Hs2", "Hs3", "Welcome", "PairConfirm", "PairResult", "Join", "JoinAck", "Ping", "Pong", "Error", "Bye", "RpcRequest", "RpcResponse", "JobOpen", "JobOpenAck", "ManifestPage", "ManifestEnd", "JobMap", "Resume", "Chunk", "Bundle", "Received", "Credit", "Durable", "FileRoot", "FileRetry", "Status", "JobDone", "JobCancel", "NodeInfo", "HelloInfo", "ServerInfo", "ClientInfo", "PairingOpen", "CryptoBench", "CryptoBenchResult", "ManifestEntry", "FileRun", "FileRange", "BundleRecord", "RootItem", "JobCopy", "JobRef", "DiskCalibrate", "CalPoint", "DiskCalibrateResult", "MgmtText", "NodeStatus", "FsList", "FsEntry", "FsListResult", "FsPath", "FsStat", "FsMkdir", "FsRename", "FsChmod", "FsRead", "FsReadResult", "FsWrite", "JobRun", "JobEntry", "JobListResult", "JnlOpen", "JnlBatch", "JnlReset", "JnlSnapshot", "JnlDone", ];
+pub const ALL: &[&str] = &["Hs1", "Hs2", "Hs3", "Welcome", "PairConfirm", "PairResult", "Join", "JoinAck", "Ping", "Pong", "Error", "Bye", "RpcRequest", "RpcResponse", "JobOpen", "JobOpenAck", "ManifestPage", "ManifestEnd", "JobMap", "Resume", "Chunk", "Bundle", "Received", "Credit", "Durable", "FileRoot", "FileRetry", "Status", "JobDone", "JobCancel", "NodeInfo", "HelloInfo", "ServerInfo", "ClientInfo", "PairingOpen", "CryptoBench", "CryptoBenchResult", "ManifestEntry", "FileRun", "FileRange", "BundleRecord", "RootItem", "JobCopy", "JobRef", "DiskCalibrate", "CalPoint", "DiskCalibrateResult", "MgmtText", "NodeStatus", "FsList", "FsEntry", "FsListResult", "FsPath", "FsStat", "FsMkdir", "FsRename", "FsChmod", "FsRead", "FsReadResult", "FsWrite", "JobRun", "JobEntry", "JobListResult", "JnlOpen", "JnlBatch", "PackRef", "JnlSweep", "JnlReset", "JnlSnapshot", "JnlDone", ];
 
 #[doc(hidden)]
 pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
@@ -2991,8 +3132,8 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "Durable" => Durable { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, files: vec![FileRun::default(); rng.below(3) as usize], ranges: vec![FileRange::default(); rng.below(3) as usize], }.to_bytes().ok(),
         "FileRoot" => FileRoot { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, file_id: rng.next_u64() as u32, root: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, }.to_bytes().ok(),
         "FileRetry" => FileRetry { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, file_id: rng.next_u64() as u32, reason: rng.next_u64() as u16, }.to_bytes().ok(),
-        "Status" => Status { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, files_done: rng.next_u64() as u32, files_total: rng.next_u64() as u32, bytes_received: rng.next_u64(), bytes_durable: rng.next_u64(), bytes_total: rng.next_u64(), bottleneck: rng.next_u64() as u8, workers: rng.next_u64() as u8, lanes: rng.next_u64() as u8, sequential: rng.next_u64() as u8, current: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, state: if rng.below(2) == 1 { Some(rng.next_u64() as u8) } else { None }, result: if rng.below(2) == 1 { Some({ let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }) } else { None }, code: if rng.below(2) == 1 { Some(rng.next_u64() as u16) } else { None }, }.to_bytes().ok(),
-        "JobDone" => JobDone { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, status: rng.next_u64() as u16, files: rng.next_u64() as u32, bytes: rng.next_u64(), message: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
+        "Status" => Status { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, files_done: rng.next_u64() as u32, files_total: rng.next_u64() as u32, bytes_received: rng.next_u64(), bytes_durable: rng.next_u64(), bytes_total: rng.next_u64(), bottleneck: rng.next_u64() as u8, workers: rng.next_u64() as u8, lanes: rng.next_u64() as u8, sequential: rng.next_u64() as u8, current: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, state: if rng.below(2) == 1 { Some(rng.next_u64() as u8) } else { None }, result: if rng.below(2) == 1 { Some({ let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }) } else { None }, code: if rng.below(2) == 1 { Some(rng.next_u64() as u16) } else { None }, unswept: if rng.below(2) == 1 { Some(rng.next_u64() as u32) } else { None }, }.to_bytes().ok(),
+        "JobDone" => JobDone { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, status: rng.next_u64() as u16, files: rng.next_u64() as u32, bytes: rng.next_u64(), message: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, settling: if rng.below(2) == 1 { Some(rng.next_u64() as u8) } else { None }, }.to_bytes().ok(),
         "JobCancel" => JobCancel { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, reason: rng.next_u64() as u16, }.to_bytes().ok(),
         "NodeInfo" => NodeInfo { version: rng.ascii(20), platform: rng.ascii(20), name: rng.ascii(20), firmware: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
         "HelloInfo" => HelloInfo { version_min: rng.next_u64() as u16, version_max: rng.next_u64() as u16, caps: rng.next_u64(), }.to_bytes().ok(),
@@ -3028,9 +3169,11 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "JobEntry" => JobEntry { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, kind: rng.next_u64() as u8, state: rng.next_u64() as u8, files_done: rng.next_u64() as u32, files_total: rng.next_u64() as u32, bytes_done: rng.next_u64(), bytes_total: rng.next_u64(), }.to_bytes().ok(),
         "JobListResult" => JobListResult { jobs: vec![JobEntry::default(); rng.below(3) as usize], }.to_bytes().ok(),
         "JnlOpen" => JnlOpen { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, manifest_hash: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, kind: rng.next_u64() as u8, flags: rng.next_u64() as u32, staged: rng.next_u64() as u8, root: rng.ascii(20), }.to_bytes().ok(),
-        "JnlBatch" => JnlBatch { files: vec![FileRun::default(); rng.below(3) as usize], ranges: vec![FileRange::default(); rng.below(3) as usize], roots: vec![RootItem::default(); rng.below(3) as usize], }.to_bytes().ok(),
+        "JnlBatch" => JnlBatch { files: vec![FileRun::default(); rng.below(3) as usize], ranges: vec![FileRange::default(); rng.below(3) as usize], roots: vec![RootItem::default(); rng.below(3) as usize], pack_segment: if rng.below(2) == 1 { Some(rng.next_u64() as u32) } else { None }, pack_offset: if rng.below(2) == 1 { Some(rng.next_u64()) } else { None }, pack_len: if rng.below(2) == 1 { Some(rng.next_u64()) } else { None }, }.to_bytes().ok(),
+        "PackRef" => PackRef { segment: rng.next_u64() as u32, offset: rng.next_u64(), len: rng.next_u64(), first_file: rng.next_u64() as u32, count: rng.next_u64() as u32, }.to_bytes().ok(),
+        "JnlSweep" => JnlSweep { files: vec![FileRun::default(); rng.below(3) as usize], }.to_bytes().ok(),
         "JnlReset" => JnlReset { file_id: rng.next_u64() as u32, }.to_bytes().ok(),
-        "JnlSnapshot" => JnlSnapshot { done: vec![FileRun::default(); rng.below(3) as usize], ranges: vec![FileRange::default(); rng.below(3) as usize], roots: vec![RootItem::default(); rng.below(3) as usize], }.to_bytes().ok(),
+        "JnlSnapshot" => JnlSnapshot { done: vec![FileRun::default(); rng.below(3) as usize], ranges: vec![FileRange::default(); rng.below(3) as usize], roots: vec![RootItem::default(); rng.below(3) as usize], unswept: if rng.below(2) == 1 { Some({ let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }) } else { None }, segments: if rng.below(2) == 1 { Some({ let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }) } else { None }, }.to_bytes().ok(),
         "JnlDone" => JnlDone { status: rng.next_u64() as u16, }.to_bytes().ok(),
         _ => None,
     }
@@ -3107,6 +3250,8 @@ pub fn roundtrip(name: &str, bytes: &[u8]) -> Option<Result<Vec<u8>, String>> {
         "JobListResult" => rt::<JobListResult>(bytes),
         "JnlOpen" => rt::<JnlOpen>(bytes),
         "JnlBatch" => rt::<JnlBatch>(bytes),
+        "PackRef" => rt::<PackRef>(bytes),
+        "JnlSweep" => rt::<JnlSweep>(bytes),
         "JnlReset" => rt::<JnlReset>(bytes),
         "JnlSnapshot" => rt::<JnlSnapshot>(bytes),
         "JnlDone" => rt::<JnlDone>(bytes),

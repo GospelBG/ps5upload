@@ -2783,8 +2783,7 @@ mod tests {
                                     status: 0,
                                     files: manifest_files,
                                     bytes: manifest_bytes,
-                                    message: None,
-                                }).await;
+                                    message: None, settling: None,}).await;
                             }
                         }
                         Ok(_) => {}
@@ -3307,8 +3306,7 @@ mod tests {
                                     status: 0,
                                     files: manifest_files,
                                     bytes: manifest_bytes,
-                                    message: None,
-                                }).await;
+                                    message: None, settling: None,}).await;
                             }
                         }
                         None => return,

@@ -534,6 +534,7 @@ ext = [
   { tag = 2, name = "state", ty = "u8" },
   { tag = 3, name = "result", ty = "bytes" },   # job.run: the finished job's output (a handler's text body)
   { tag = 4, name = "code", ty = "u16" },       # a failed job's ERR_* code
+  { tag = 5, name = "unswept", ty = "u32" },    # durable-by-log (SPEC.md §15.7): done files not yet durable in place; absent = 0
 ]
 
 [[message]]
@@ -545,7 +546,10 @@ fields = [
   { name = "files", ty = "u32" },
   { name = "bytes", ty = "u64" },
 ]
-ext = [{ tag = 1, name = "message", ty = "str" }]
+ext = [
+  { tag = 1, name = "message", ty = "str" },
+  { tag = 2, name = "settling", ty = "u8" },    # 1: the log is durable but files are still being made durable in place (SPEC.md §15.7)
+]
 
 [[message]]
 name = "JobCancel"
@@ -1203,6 +1207,27 @@ fields = [
   { name = "ranges", ty = "records", of = "FileRange" },
   { name = "roots", ty = "records", of = "RootItem" },
 ]
+# Durable-by-log (SPEC.md §15.7): present when the batch wrote small files to the pack log; the byte
+# range of this batch's PackFile records inside segment `pack.<segment>`.
+ext = [
+  { tag = 1, name = "pack_segment", ty = "u32" },
+  { tag = 2, name = "pack_offset", ty = "u64" },
+  { tag = 3, name = "pack_len", ty = "u64" },
+]
+
+[[struct]]
+name = "PackRef"            # where a batch's PackFile records live (journal snapshots only)
+fields = [
+  { name = "segment", ty = "u32" },
+  { name = "offset", ty = "u64" },
+  { name = "len", ty = "u64" },
+  { name = "first_file", ty = "u32" },
+  { name = "count", ty = "u32" },
+]
+
+[[struct]]
+name = "JnlSweep"           # journal kind 6: these files are now durable in place
+fields = [{ name = "files", ty = "records", of = "FileRun" }]
 
 [[struct]]
 name = "JnlReset"
@@ -1214,6 +1239,12 @@ fields = [
   { name = "done", ty = "records", of = "FileRun" },
   { name = "ranges", ty = "records", of = "FileRange" },
   { name = "roots", ty = "records", of = "RootItem" },
+]
+# Records cannot be extensions, so these carry the records' item streams as bytes: `unswept` the
+# FileRuns of done files not yet swept, `segments` the PackRefs whose files are not all swept.
+ext = [
+  { tag = 1, name = "unswept", ty = "bytes" },
+  { tag = 2, name = "segments", ty = "bytes" },
 ]
 
 [[struct]]
