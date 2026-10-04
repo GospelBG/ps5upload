@@ -81,9 +81,9 @@ use ps5upload_core::{
     focus::{focus_probe, FocusProbe},
     fs_ops::{
         app_launch, app_list_registered, app_register, app_unregister, backup_content_databases,
-        fs_copy_robust, fs_delete_with_op_id, fs_mkdir, fs_mount, fs_move_with_timeout,
-        fs_op_cancel, fs_op_status, fs_read, fs_read_with_timeout, fs_unmount, list_dir, reconcile,
-        DirListing, ListDirOptions, MountResult, ReconcileMode, RegisterResult,
+        fs_delete_with_op_id, fs_mkdir, fs_mount, fs_move_with_timeout, fs_op_cancel, fs_op_status,
+        fs_read, fs_read_with_timeout, fs_unmount, list_dir, reconcile, DirListing, ListDirOptions,
+        MountResult, ReconcileMode, RegisterResult,
     },
     game_meta::{parse_param_json_bytes, parse_param_sfo_bytes},
     hw::{
@@ -1484,6 +1484,14 @@ fn fail_job_if_capacity_insufficient(
     true
 }
 
+/// The synchronous form of [`fail_job_unless_console_ready`] for the routes that answer with
+/// an error text instead of a job: the same token and message, `helper_not_ava1: <message>` or
+/// `not_paired: <message>`, which the client matches on. Blocking.
+fn require_console_ready(addr: &str) -> anyhow::Result<()> {
+    ps5upload_ava1::console::require_ava1(addr)
+        .map_err(|f| anyhow::anyhow!("{}: {}", f.reason, f.detail))
+}
+
 /// Fails the job when the console cannot be used over AVA1: nothing listening or an older
 /// helper (`helper_not_ava1`), or not paired yet (`not_paired`). There is no other transport to
 /// fall back to, so this runs first, before any preflight. Blocking. `true` = the job was failed.
@@ -2116,10 +2124,9 @@ async fn ps5_fs_move(
     // 1-hour deadline: an intra-volume fs_move returns in milliseconds
     // (rename(2) is metadata-only). A CROSS-volume move can't rename (the
     // payload refuses it — a cross-device rename panics this kernel) and
-    // returns `fs_move_cross_mount`; the CLIENT then completes it as
+    // returns `fs_move_cross_mount`; the engine then completes it as a console-side
     // copy-then-delete, which can run for minutes on a multi-GiB file. Keep the
-    // generous bound so the default 30 s socket timeout can't fire mid-op and
-    // surface as the cryptic "read frame header" 502.
+    // generous bound so a socket timeout can't fire mid-op.
     let io_timeout = std::time::Duration::from_secs(60 * 60);
     let overwrite = req.overwrite;
     let op_id = if req.op_id != 0 {
@@ -2127,20 +2134,19 @@ async fn ps5_fs_move(
     } else {
         next_fs_op_id()
     };
-    // One blocking closure for the whole decision (the AVA1 probe is a blocking
-    // session attempt): the rename is still tried first — a same-drive move is
-    // metadata-only — and only a cross-mount refusal on an AVA1 console becomes a
-    // console-side move (copy, then delete the source after a verified finish), which
-    // replaces the client's copy-then-delete fallback for those consoles. `overwrite`
-    // travels with it, so a move that was not allowed to clobber still refuses.
+    // One blocking closure for the whole decision: the rename is still tried first (a
+    // same-drive move is metadata-only) and only a cross-mount refusal becomes a console-side
+    // move (copy, then delete the source after a verified finish). `overwrite` travels with
+    // it, so a move that was not allowed to clobber still refuses.
     match tokio::task::spawn_blocking(move || {
         match fs_move_with_timeout(&addr, &from, &to, Some(io_timeout)) {
             Err(e)
                 if {
                     let msg = format!("{e:#}");
                     msg.contains("cross_mount") || msg.contains("EXDEV")
-                } && ps5upload_ava1::route::use_ava1(&addr) =>
+                } =>
             {
+                require_console_ready(&addr)?;
                 ps5upload_ava1::copy::console_copy(&addr, &from, &to, op_id, true, overwrite)
             }
             other => other,
@@ -2194,29 +2200,18 @@ async fn ps5_fs_copy(
     crate::log_info!("fs_copy: addr={addr} from={from} to={to}");
     let from_for_log = from.clone();
     let to_for_log = to.clone();
-    // Robust, drop-tolerant copy: a 25 GB USB→internal copy over flaky Wi-Fi
-    // used to die "read frame header" minutes in, because the bare copy holds
-    // ONE connection for the whole operation while the console keeps copying
-    // fine. fs_copy_robust fires the copy with an op_id and tracks completion by
-    // polling fs_op_status on fresh connections, so a connection blip no longer
-    // aborts a healthy copy. A non-zero op_id is required for tracking; generate
+    // The copy runs on the console as a job (`job.copy`): the engine polls it, so a connection
+    // blip does not abort a healthy copy. A non-zero op_id is required for tracking; generate
     // one when the caller didn't supply theirs (they just won't get a % bar).
     let op_id = if req.op_id != 0 {
         req.op_id
     } else {
         next_fs_op_id()
     };
-    // 3 min with zero bytes written ⇒ genuinely stuck (a live USB copy advances
-    // steadily; this only trips on a wedged console / pulled drive).
-    let stall = std::time::Duration::from_secs(180);
     let overwrite = req.overwrite;
     match tokio::task::spawn_blocking(move || {
-        // AVA1 (Task 25): the probe is blocking, so it runs here, not on the reactor.
-        if ps5upload_ava1::route::use_ava1(&addr) {
-            ps5upload_ava1::copy::console_copy(&addr, &from, &to, op_id, false, overwrite)
-        } else {
-            fs_copy_robust(&addr, &from, &to, op_id, stall, overwrite)
-        }
+        require_console_ready(&addr)?;
+        ps5upload_ava1::copy::console_copy(&addr, &from, &to, op_id, false, overwrite)
     })
     .await
     .map_err(anyhow::Error::from)

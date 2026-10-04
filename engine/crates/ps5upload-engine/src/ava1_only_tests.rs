@@ -271,6 +271,26 @@ async fn transfer_download_zip_with_no_ava1_listener_is_helper_not_ava1() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn fs_copy_with_no_ava1_listener_is_helper_not_ava1() {
+    let req = FsMoveReq {
+        addr: Some("127.0.0.1:9113".to_string()),
+        from: "/data/a".to_string(),
+        to: "/data/b".to_string(),
+        op_id: 0,
+        overwrite: false,
+    };
+    let resp = ps5_fs_copy(State(state_for(&Default::default())), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("helper_not_ava1"), "{text}");
+}
+
 /// A console that has not accepted this app fails with `not_paired` (the pairing dialog's
 /// trigger), as a job failure and as a management refusal.
 #[test]
