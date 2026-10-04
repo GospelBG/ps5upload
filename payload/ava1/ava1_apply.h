@@ -67,6 +67,7 @@ void ava1_apply_finish_landed(ava1_job_t *j);
 #define AVA1_HOOK_BATCH_SYNCED 6    /* the batch's file data fsynced */
 #define AVA1_HOOK_BATCH_DIR_SYNCED 7 /* one directory that gained an entry, fsynced */
 #define AVA1_HOOK_BATCH_JOURNALED 8 /* the batch appended to the journal */
+#define AVA1_HOOK_PREALLOC 9        /* a part file is about to be preallocated (job mutex NOT held) */
 extern void (*ava1_apply_hook)(ava1_job_t *j, int point, uint32_t id);
 /* Tests only (NULL in the payload): an errno to inject at a point instead of doing the work.
  * Consulted at AVA1_HOOK_DIR_SYNCED of the staged tree's rename. */

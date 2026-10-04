@@ -377,6 +377,10 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
     pthread_mutex_unlock(&j->mu);
     if (!first) return;
     ava1_log_job_event(status == AVA1_STATUS_OK ? "done" : "fail", j, status);
+    if (__atomic_load_n(&j->pre_files, __ATOMIC_RELAXED))
+        fprintf(stderr, "[ava1] job %02x%02x%02x%02x: preallocate took %llu ms for %llu MiB\n", j->id[0], j->id[1],
+                j->id[2], j->id[3], (unsigned long long)(__atomic_load_n(&j->pre_us, __ATOMIC_RELAXED) / 1000u),
+                (unsigned long long)(__atomic_load_n(&j->pre_bytes, __ATOMIC_RELAXED) >> 20));
     if (credit) ava1_budget_give(credit);
     if (journal_done) {
         ava1_jnl_done_t d;
@@ -598,54 +602,91 @@ int ava1_apply_parallel(ava1_job_t *j, void (*fn)(ava1_job_t *, void *, uint32_t
 
 /* ---- applying ---------------------------------------------------------------------- */
 
-/* The large file's state with open descriptors; caller holds j->mu. NULL + *err on failure. */
-/* create == 0 (the commit's reopen): a missing part file or outboard is ENOENT, never a new
- * empty file — an empty part would hash to nothing and be renamed over the real file. */
-static ava1_lfile_t *lfile_open(ava1_job_t *j, uint32_t id, int *err, int create) {
-    ava1_lfile_t *lf = ava1_lfile_get(j, id);
+/* Opens a large file's part file and outboard, preallocating a new part file (review 003
+ * §2.1: this used to run under j->mu, so a minutes-long preallocation on a slow drive stalled
+ * every other worker and the feeder). It touches no job lock; the caller publishes the
+ * descriptors under j->mu. create == 0 (the commit's reopen): a missing part file or outboard
+ * is ENOENT, never a new empty file — an empty part would hash to nothing and be renamed over
+ * the real file. 0, or an errno with both descriptors closed. */
+static int lfile_open_fds(ava1_job_t *j, uint32_t id, int create, int *fdp, int *obp) {
     const ava1_ment_t *e = &j->m.e[id];
     char path[PATH_CAP];
     struct stat st;
+    int fd, ob = -1, err;
+    *fdp = *obp = -1;
+    ava1_apply_path(j, id, 1, path, sizeof path);
+    if (!path[0]) return ENAMETOOLONG;
+    fd = open(path, O_RDWR | (create ? O_CREAT : 0) | O_NOFOLLOW, 0600);
+    if (fd < 0 && create && errno == ENOENT && mkparents(path) == 0) fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+    if (fd < 0) return errno;
+    if (fstat(fd, &st) == 0 && st.st_size == 0 && e->size > 0) {
+        /* FTX2 preallocates for the same reason (runtime.c, "a sparse file on PS5 UFS collapses
+         * from 60 to 2-3 MiB/s under dirty-buffer throttling"): keep it, and keep ENOSPC first. */
+        uint64_t t0, dt;
+        int rc;
+        HOOK(j, AVA1_HOOK_PREALLOC, id);
+        t0 = mono_us();
+        rc = ava1_platform_preallocate(fd, e->size);
+        dt = mono_us() - t0;
+        __atomic_add_fetch(&j->pre_us, dt, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&j->pre_bytes, e->size, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&j->pre_files, 1, __ATOMIC_RELAXED);
+        /* more than a second per GiB: say so once per job, so CUTOVER can record it per drive */
+        if (dt * (1ull << 30) > 1000000ull * e->size && !__atomic_exchange_n(&j->pre_slow_logged, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "[ava1] job %02x%02x%02x%02x: preallocation on this drive is slow (%llu ms for %llu MiB)\n",
+                    j->id[0], j->id[1], j->id[2], j->id[3], (unsigned long long)(dt / 1000u),
+                    (unsigned long long)(e->size >> 20));
+        if (rc == ENOSPC) {
+            close(fd);
+            return ENOSPC;
+        }
+    }
+    if (groups_of(e->size) >= 2) {
+        ob_path(j, id, path, sizeof path);
+        ob = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
+        if (ob < 0) { /* never leave a data fd open without its outboard: CVs would go unwritten */
+            err = errno;
+            close(fd);
+            return err;
+        }
+        if (fstat(ob, &st) == 0 && (uint64_t)st.st_size < groups_of(e->size) * 32u)
+            (void)ftruncate(ob, (off_t)(groups_of(e->size) * 32u));
+    }
+    *fdp = fd;
+    *obp = ob;
+    return 0;
+}
+
+/* The large file's state with open descriptors. Caller holds j->mu, which is released while
+ * the files are opened and preallocated (another worker wanting the same file waits on
+ * `opening`) and held again on return. NULL + *err on failure. */
+static ava1_lfile_t *lfile_open(ava1_job_t *j, uint32_t id, int *err, int create) {
+    ava1_lfile_t *lf = ava1_lfile_get(j, id);
+    int fd, ob, rc;
     *err = 0;
     if (!lf) {
         *err = ENOMEM;
         return NULL;
     }
+    while (lf->opening && !j->stopping) pthread_cond_wait(&j->cv, &j->mu);
     if (lf->fd >= 0) return lf;
-    ava1_apply_path(j, id, 1, path, sizeof path);
-    if (!path[0]) {
-        *err = ENAMETOOLONG;
+    if (lf->opening) { /* stopping while another thread still opens it */
+        *err = EINTR;
         return NULL;
     }
-    lf->fd = open(path, O_RDWR | (create ? O_CREAT : 0) | O_NOFOLLOW, 0600);
-    if (lf->fd < 0 && create && errno == ENOENT && mkparents(path) == 0)
-        lf->fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
-    if (lf->fd < 0) {
-        *err = errno;
+    lf->opening = 1;
+    pthread_mutex_unlock(&j->mu);
+    rc = lfile_open_fds(j, id, create, &fd, &ob);
+    pthread_mutex_lock(&j->mu);
+    lf->opening = 0;
+    pthread_cond_broadcast(&j->cv);
+    if (rc) {
+        *err = rc;
         return NULL;
     }
-    if (fstat(lf->fd, &st) == 0 && st.st_size == 0 && e->size > 0) {
-        int rc = ava1_platform_preallocate(lf->fd, e->size);
-        if (rc == ENOSPC) {
-            *err = ENOSPC;
-            goto fail;
-        }
-    }
-    if (groups_of(e->size) >= 2) {
-        ob_path(j, id, path, sizeof path);
-        lf->ob_fd = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
-        if (lf->ob_fd < 0) {
-            *err = errno;
-            goto fail;
-        }
-        if (fstat(lf->ob_fd, &st) == 0 && (uint64_t)st.st_size < groups_of(e->size) * 32u)
-            (void)ftruncate(lf->ob_fd, (off_t)(groups_of(e->size) * 32u));
-    }
+    lf->fd = fd;
+    lf->ob_fd = ob;
     return lf;
-fail: /* never leave a data fd open without its outboard: CVs would go unwritten */
-    close(lf->fd);
-    lf->fd = -1;
-    return NULL;
 }
 
 static int write_chunk(ava1_job_t *j, uint32_t id, uint64_t off, const uint8_t *d, size_t len) {
@@ -658,6 +699,10 @@ static int write_chunk(ava1_job_t *j, uint32_t id, uint64_t off, const uint8_t *
         return 0; /* a late duplicate */
     }
     lf = lfile_open(j, id, &err, 1);
+    if (lf && (lf->committed || ava1_bits_get(&j->done, id))) { /* committed while we opened it */
+        pthread_mutex_unlock(&j->mu);
+        return 0;
+    }
     /* Our own descriptors: the job thread may close lf's at commit while we write, and a
      * reused descriptor number would then take these bytes into some other file. */
     fd = lf ? dup(lf->fd) : -1;

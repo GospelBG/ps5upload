@@ -1260,7 +1260,15 @@ static uint64_t g_dup_off;
 static void ev_add(const char *s, int done);
 
 static int g_arm_point = -1, g_arm_n, g_arm_errno;
+/* Probe counters (perf-apply): what the hooks saw, read by ava1_test_apply_probe. */
+static unsigned g_pre_calls, g_pre_held;
 static void t_hook(ava1_job_t *j, int point, uint32_t id) {
+    if (point == AVA1_HOOK_PREALLOC) {
+        /* Called right before the preallocation: the job mutex must NOT be held here. */
+        __atomic_add_fetch(&g_pre_calls, 1, __ATOMIC_SEQ_CST);
+        if (pthread_mutex_trylock(&j->mu) != 0) __atomic_add_fetch(&g_pre_held, 1, __ATOMIC_SEQ_CST);
+        else pthread_mutex_unlock(&j->mu);
+    }
     if (point == __atomic_load_n(&g_arm_point, __ATOMIC_SEQ_CST)) { /* fsync fault, armed for this point */
         ava1_fsync_test_errno = g_arm_errno;
         __atomic_store_n(&ava1_fsync_test_fail_n, g_arm_n, __ATOMIC_SEQ_CST);
@@ -1305,6 +1313,13 @@ void ava1_test_fsync_fault(int point, int n, int err) {
 }
 unsigned ava1_test_fsync_retries(void) { return __atomic_load_n(&ava1_fsync_retries_total, __ATOMIC_RELAXED); }
 int ava1_test_fsync_pending_faults(void) { return __atomic_load_n(&ava1_fsync_test_fail_n, __ATOMIC_SEQ_CST); }
+
+/* out[0] = preallocations seen, out[1] = of those, how many ran with the job mutex held. */
+void ava1_test_apply_probe(uint64_t out[8]) {
+    memset(out, 0, 8 * sizeof out[0]);
+    out[0] = __atomic_load_n(&g_pre_calls, __ATOMIC_SEQ_CST);
+    out[1] = __atomic_load_n(&g_pre_held, __ATOMIC_SEQ_CST);
+}
 
 void ava1_test_apply_trace(int on) { __atomic_store_n(&g_trace, on, __ATOMIC_SEQ_CST); }
 
@@ -1443,6 +1458,7 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
     ava1_test_set_same_device(1); /* a test that died mid-way must not leak its override */
     __atomic_store_n(&ava1_fsync_test_fail_n, 0, __ATOMIC_SEQ_CST); /* ... or its fsync fault */
     __atomic_store_n(&g_arm_point, -1, __ATOMIC_SEQ_CST);
+    g_pre_calls = g_pre_held = 0;
     memset(&cfg, 0, sizeof cfg);
     snprintf(cfg.jobs_dir, sizeof cfg.jobs_dir, "%s", jobs_dir);
     cfg.may_write = t_allow;

@@ -347,6 +347,7 @@ pub mod ffi {
         pub fn ava1_test_apply_end();
         pub fn ava1_test_apply_bundle_raw(d: *const u8, len: usize, count: u32) -> c_int;
         pub fn ava1_test_apply_trace(on: c_int);
+        pub fn ava1_test_apply_probe(out: *mut u64);
         pub fn ava1_test_apply_dup_on_commit(id: u32, off: u64, d: *const u8, len: usize) -> c_int;
         pub fn ava1_test_apply_fail_dir_sync(id: u32);
         pub fn ava1_test_apply_hold(on: c_int);
@@ -1319,6 +1320,15 @@ impl Drop for CSendWindow {
     }
 }
 
+/// Counters the C test hooks keep while an apply job runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Probe {
+    /// Part files preallocated.
+    pub prealloc_calls: u64,
+    /// ... of which with the job mutex held (the slow part under the lock this guards against).
+    pub prealloc_with_job_mutex_held: u64,
+}
+
 /// The payload's apply engine on a hand-built job (one at a time: it shares the C
 /// server lock, since both use the data layer's globals).
 pub struct CApplyJob {
@@ -1437,6 +1447,16 @@ impl CApplyJob {
     /// ava1_apply_bundle's answer for raw record bytes claiming `count` records.
     pub fn raw_bundle(&self, records: &[u8], count: u32) -> i32 {
         unsafe { ffi::ava1_test_apply_bundle_raw(records.as_ptr(), records.len(), count) }
+    }
+
+    /// What the hooks have seen since this job began (see `Probe`).
+    pub fn probe(&self) -> Probe {
+        let mut o = [0u64; 8];
+        unsafe { ffi::ava1_test_apply_probe(o.as_mut_ptr()) };
+        Probe {
+            prealloc_calls: o[0],
+            prealloc_with_job_mutex_held: o[1],
+        }
     }
 
     /// Record the apply engine's test hooks as "hook <point> <file id>" event lines.

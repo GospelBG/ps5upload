@@ -48,6 +48,7 @@ typedef struct {        /* one large file being assembled */
     int committed;
     int dir_synced;        /* its part file's directory entry is durable (Task 13) */
     int in_list;           /* its id is in the job's lfl list (the batch scans' index) */
+    int opening;           /* a worker is opening/preallocating it with j->mu released */
 } ava1_lfile_t;
 
 typedef struct ava1_work { /* a unit for the worker pool */
@@ -100,6 +101,10 @@ struct ava1_job {
      * files, and microseconds spent in each step of the durability chain. */
     uint64_t st_batches, st_files, st_data_us, st_dirs_us, st_jnl_us, st_scan_us, st_commit_us,
         st_compact_us, st_compacts, st_log_ms;
+    /* Preallocation, all workers (atomics): microseconds, bytes and files; one "slow" line per job. */
+    uint64_t pre_us, pre_bytes;
+    uint32_t pre_files;
+    int pre_slow_logged;
     ava1_file_range_t *last_ranges; /* the last journal batch's ranges (resume check, Task 13) */
     uint32_t last_ranges_n;
     uint64_t credit, outstanding;   /* granted; lane-frame bytes held */
