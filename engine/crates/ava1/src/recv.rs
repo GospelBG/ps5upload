@@ -929,6 +929,9 @@ struct Large {
     written: RangeSet,
     durable: RangeSet,
     root: Option<[u8; 32]>,
+    /// A relay's root of a one-group file, hashed from the chunk as it passed through (nothing
+    /// is kept to read back).
+    single: Option<[u8; 32]>,
 }
 
 fn new_large(dir: &std::path::Path, m: &Manifest, id: u32) -> Large {
@@ -944,7 +947,76 @@ fn new_large(dir: &std::path::Path, m: &Manifest, id: u32) -> Large {
         written: RangeSet::new(),
         durable: RangeSet::new(),
         root: None,
+        single: None,
     }
+}
+
+/// A chunk of `len` bytes at `off` of a file of `size` must be group-aligned, inside the
+/// file, and whole groups unless it ends the file.
+fn check_chunk_range(size: u64, off: u64, len: u64) -> Result<(), SendError> {
+    if !off.is_multiple_of(GROUP)
+        || off > size
+        || len > size - off
+        || (!len.is_multiple_of(GROUP) && off + len != size)
+    {
+        return Err(SendError::Protocol("a chunk outside its file".into()));
+    }
+    Ok(())
+}
+
+/// What the ordered receiver does with a data frame about to enter its reorder buffer.
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    Keep,
+    /// Behind the cursor or already buffered: the bytes are of no use (credit still returns).
+    Drop,
+}
+
+/// The most the ordered reorder buffer may hold, in credit windows. The sender writes in order,
+/// so what waits here is what arrived ahead of a slower lane's frame; a peer that keeps sending
+/// ahead of a frame it never sends would otherwise grow it without end (the credit is returned
+/// on receipt).
+const REORDER_WINDOWS: u64 = 4;
+
+/// Validates the key of a data frame before it is buffered (final review: engine #4): the file
+/// must be a file of the manifest, the range inside it, the key at or past the cursor and not
+/// already held, and the buffer within `REORDER_WINDOWS` of credit.
+#[allow(clippy::too_many_arguments)]
+fn admit_ordered(
+    m: &Manifest,
+    cursor: (u32, u64),
+    held: &BTreeMap<(u32, u64), (bool, Vec<u8>)>,
+    held_bytes: u64,
+    credit: u64,
+    file_id: u32,
+    off: u64,
+    len: u64,
+    whole: bool,
+) -> Result<Admit, SendError> {
+    let e = m
+        .entry(file_id)
+        .filter(|e| e.kind == gen::ENTRY_FILE)
+        .ok_or_else(|| {
+            SendError::Protocol(format!("a frame names {file_id}, which is not a file here"))
+        })?;
+    if whole {
+        if off != 0 || len != e.size {
+            return Err(SendError::Protocol(
+                "a bundled file of the wrong size".into(),
+            ));
+        }
+    } else {
+        check_chunk_range(e.size, off, len)?;
+    }
+    if (file_id, off) < cursor || held.contains_key(&(file_id, off)) {
+        return Ok(Admit::Drop);
+    }
+    if held_bytes.saturating_add(len) > credit.saturating_mul(REORDER_WINDOWS) {
+        return Err(SendError::Protocol(
+            "the ordered sender ran too far ahead of a frame it has not sent".into(),
+        ));
+    }
+    Ok(Admit::Keep)
 }
 
 /// A chunk (SPEC.md §12.2, the C receiver's ava1_apply_chunk): inside the file, group
@@ -971,13 +1043,7 @@ async fn apply_chunk(
     }
     let size = e.size;
     let len = data.len() as u64;
-    if !off.is_multiple_of(GROUP)
-        || off > size
-        || len > size - off
-        || (!len.is_multiple_of(GROUP) && off + len != size)
-    {
-        return Err(SendError::Protocol("a chunk outside its file".into()));
-    }
+    check_chunk_range(size, off, len)?;
     let l = large.entry(id).or_insert_with(|| new_large(dir, m, id));
     let s2 = sink.clone();
     let data = Arc::new(data);
@@ -998,8 +1064,29 @@ async fn apply_chunk(
             ob.put(gi, &cv)?;
         }
     }
+    if sink.transient_relay() && verify::groups(size) < 2 && off == 0 && len == size {
+        l.single = Some(*blake3::hash(&data).as_bytes());
+    }
     l.written.insert(off, off + len);
     Ok(())
+}
+
+/// What a relay holds as the root of a finished file, to compare with the root the source
+/// announced: the root of the chunks that passed through it (the CVs of a file of several
+/// groups, the hash of a one-group file) or, when part of the file never passed through here
+/// (the destination already had it), the announced root itself, which the destination checks
+/// over the complete file.
+fn relay_root(
+    groups: u64,
+    cvs: Option<Vec<[u8; 32]>>,
+    single: Option<[u8; 32]>,
+    announced: [u8; 32],
+) -> [u8; 32] {
+    if groups >= 2 {
+        cvs.map_or(announced, |c| verify::root_from_cvs(&c))
+    } else {
+        single.unwrap_or(announced)
+    }
 }
 
 /// From here on both sides are identical: journal, map, apply, sync, commit, finish
@@ -1187,6 +1274,7 @@ async fn run_loop(
                 written: RangeSet::new(),
                 durable: good,
                 root: st.roots.get(&id).copied(),
+                single: None,
             },
         );
     }
@@ -1313,11 +1401,13 @@ async fn run_loop(
     );
     // Whether the batch in flight had anything to sync (an empty one runs every SYNC_EVERY).
     let mut batch_worked = false;
-    // Out-of-order frames are bounded by the credit granted in JobOpen: the sender cannot
-    // have more than one window in flight (SPEC.md §12.4). `whole` says the entry is a
+    // Out-of-order frames wait here. The credit returns on receipt, so the window does not bound
+    // them: `admit_ordered` refuses keys outside the manifest and the cursor, and caps the buffer
+    // at `REORDER_WINDOWS` windows of the granted credit. `whole` says the entry is a
     // root-checked bundle record rather than a chunk.
     let mut reorder: BTreeMap<(u32, u64), (bool, Vec<u8>)> = BTreeMap::new();
     let mut cursor: (u32, u64) = (0, 0);
+    let mut reorder_bytes = 0u64;
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The journal and the applied state move into each sync batch and come back with it;
@@ -1433,7 +1523,21 @@ async fn run_loop(
                             continue;
                         }
                         if o.ordered {
-                            reorder.insert((c.file_id, c.offset), (false, c.data));
+                            if admit_ordered(
+                                &m,
+                                cursor,
+                                &reorder,
+                                reorder_bytes,
+                                granted,
+                                c.file_id,
+                                c.offset,
+                                c.data.len() as u64,
+                                false,
+                            )? == Admit::Keep
+                            {
+                                reorder_bytes += c.data.len() as u64;
+                                reorder.insert((c.file_id, c.offset), (false, c.data));
+                            }
                         } else {
                             apply_chunk(&sink, &m, &dir, &mut large, c.file_id, c.offset, c.data)
                                 .await?;
@@ -1485,7 +1589,21 @@ async fn run_loop(
                                         .map_err(|e| SendError::Disconnected(e.to_string()))?;
                                     continue;
                                 }
-                                reorder.insert((r.file_id, 0), (true, r.data));
+                                if admit_ordered(
+                                    &m,
+                                    cursor,
+                                    &reorder,
+                                    reorder_bytes,
+                                    granted,
+                                    r.file_id,
+                                    0,
+                                    r.data.len() as u64,
+                                    true,
+                                )? == Admit::Keep
+                                {
+                                    reorder_bytes += r.data.len() as u64;
+                                    reorder.insert((r.file_id, 0), (true, r.data));
+                                }
                             } else {
                                 jobs.push((r.file_id, r.root, r.data));
                             }
@@ -1550,6 +1668,7 @@ async fn run_loop(
                         let Some((whole, data)) = reorder.remove(&cursor) else {
                             break;
                         };
+                        reorder_bytes -= data.len() as u64;
                         let (fid, off, n) = (cursor.0, cursor.1, data.len() as u64);
                         if whole {
                             // A bundle record: its root was checked when it arrived, so the
@@ -1571,6 +1690,16 @@ async fn run_loop(
                         } else {
                             (fid, off + n)
                         };
+                    }
+                    // What the cursor has passed without feeding (a skipped partial range) is no
+                    // longer wanted: it must not sit in the buffer for the rest of the job.
+                    while let Some((&k, _)) = reorder.first_key_value() {
+                        if k >= cursor {
+                            break;
+                        }
+                        if let Some((_, (_, d))) = reorder.pop_first() {
+                            reorder_bytes -= d.len() as u64;
+                        }
                     }
                 }
             }
@@ -1938,6 +2067,7 @@ struct BatchLarge {
     prior_durable: RangeSet,
     root: Option<[u8; 32]>,
     ob: Option<Arc<Mutex<Outboard>>>,
+    single: Option<[u8; 32]>,
 }
 
 /// What the batch hands back to the loop, which folds it into the live state.
@@ -2011,6 +2141,7 @@ fn snapshot_batch(
             prior_durable: l.durable.clone(),
             root: l.root,
             ob: l.hasher_cvs.clone(),
+            single: l.single,
         });
     }
     Ok(BatchJob {
@@ -2173,8 +2304,13 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
         }
         let actual = if sink.transient_relay() {
             // B owns durability and checks the complete root. A's skipped bytes
-            // exist only on B, so its transient sink cannot reread them here.
-            Some(root)
+            // exist only on B, so its transient sink cannot reread them here. What did pass
+            // through here is checked against the root the source announced (engine #5).
+            let cvs: Option<Vec<[u8; 32]>> = l.ob.as_ref().and_then(|ob| {
+                let ob = ob.lock().unwrap();
+                (0..verify::groups(l.size)).map(|g| ob.get(g)).collect()
+            });
+            Some(relay_root(verify::groups(l.size), cvs, l.single, root))
         } else if verify::groups(l.size) >= 2 {
             let ob = l
                 .ob
@@ -2465,6 +2601,76 @@ mod tests {
             }));
         }
         (sink, groups, st)
+    }
+
+    #[test]
+    fn the_ordered_reorder_buffer_refuses_keys_outside_the_range_and_is_bounded() {
+        let file = |size| Entry {
+            kind: gen::ENTRY_FILE,
+            mode: 0o644,
+            size,
+            mtime: 0,
+            path: String::new(),
+            root: None,
+        };
+        let mut a = file(3 * GROUP);
+        a.path = "a".into();
+        let mut b = file(10);
+        b.path = "b".into();
+        let m = Manifest {
+            entries: vec![a, b],
+        };
+        let held: BTreeMap<(u32, u64), (bool, Vec<u8>)> =
+            BTreeMap::from([((0, GROUP), (false, vec![]))]);
+        let g = |cursor, held_bytes, credit, id, off, len, whole| {
+            admit_ordered(&m, cursor, &held, held_bytes, credit, id, off, len, whole)
+        };
+        assert_eq!(
+            g((0, 0), 0, GROUP, 0, 0, GROUP, false).unwrap(),
+            Admit::Keep
+        );
+        // Outside the manifest, past the file, misaligned, overrunning: protocol errors.
+        assert!(g((0, 0), 0, GROUP, 7, 0, 1, false).is_err());
+        assert!(g((0, 0), 0, GROUP, 0, 4 * GROUP, GROUP, false).is_err());
+        assert!(g((0, 0), 0, GROUP, 0, 5, GROUP, false).is_err());
+        assert!(g((0, 0), 0, GROUP, 0, 2 * GROUP, 2 * GROUP, false).is_err());
+        assert!(g((0, 0), 0, GROUP, 1, 0, 11, true).is_err());
+        // Behind the cursor, or already held: dropped, not an error.
+        assert_eq!(
+            g((1, 0), 0, GROUP, 0, 0, GROUP, false).unwrap(),
+            Admit::Drop
+        );
+        assert_eq!(
+            g((0, 0), 0, GROUP, 0, GROUP, GROUP, false).unwrap(),
+            Admit::Drop
+        );
+        // The buffer is capped at REORDER_WINDOWS windows of credit.
+        let cap = GROUP * REORDER_WINDOWS;
+        assert!(g((0, 0), cap - GROUP, GROUP, 0, 2 * GROUP, GROUP, false).is_ok());
+        assert!(g((0, 0), cap - GROUP + 1, GROUP, 0, 2 * GROUP, GROUP, false).is_err());
+    }
+
+    #[test]
+    fn a_relay_compares_the_announced_root_with_the_relayed_bytes() {
+        let data: Vec<u8> = (0..(3 * GROUP as usize)).map(|i| (i * 13) as u8).collect();
+        let cvs: Vec<[u8; 32]> = data
+            .chunks(GROUP as usize)
+            .enumerate()
+            .map(|(i, g)| verify::group_cv(g, i as u64))
+            .collect();
+        let real = *blake3::hash(&data).as_bytes();
+        assert_eq!(real, verify::root_from_cvs(&cvs));
+        let lie = [9u8; 32];
+        // Everything passed through: the computed root decides, so a lying announcement differs.
+        assert_eq!(relay_root(3, Some(cvs.clone()), None, real), real);
+        assert_ne!(relay_root(3, Some(cvs), None, lie), lie);
+        // A part never passed through (the destination had it): the announcement stands.
+        assert_eq!(relay_root(3, None, None, lie), lie);
+        // One group: the hash of the chunk that passed through.
+        let one = b"one group of bytes";
+        let h = *blake3::hash(one).as_bytes();
+        assert_eq!(relay_root(1, None, Some(h), lie), h);
+        assert_eq!(relay_root(1, None, None, lie), lie);
     }
 
     #[test]
