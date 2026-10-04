@@ -105,8 +105,7 @@ use ps5upload_core::{
     },
     transfer::{
         inspect_7z, inspect_zip, sevenz_plan_preview, transfer_file_list_multistream,
-        transfer_file_list_resumable, zip_plan_preview, FileListEntry, TransferConfig,
-        DEFAULT_RESUME_RETRIES, TX_FLAG_RESUME,
+        zip_plan_preview, FileListEntry, TransferConfig, DEFAULT_RESUME_RETRIES, TX_FLAG_RESUME,
     },
     users::{user_list, UserList},
     volumes::{list_volumes, VolumeList},
@@ -7963,11 +7962,6 @@ async fn transfer_file_list_handler(
         Ok(id) => id,
         Err(e) => return json_err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    let initial_flags = if caller_supplied_tx_id {
-        TX_FLAG_RESUME
-    } else {
-        0
-    };
 
     let job_id = Uuid::new_v4();
     let started_at_ms = now_ms();
@@ -8102,6 +8096,10 @@ async fn transfer_file_list_handler(
         let _stop_guard = TickerStopGuard::new(stop_ticker);
         let mut fail_guard =
             JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
+        if fail_job_unless_console_ready(&jobs, &events_tx, job_id, started_at_ms, &addr) {
+            fail_guard.mark_succeeded();
+            return;
+        }
         if fail_job_if_capacity_insufficient(
             &jobs,
             &events_tx,
@@ -8125,31 +8123,22 @@ async fn transfer_file_list_handler(
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
         cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
-        // All transfer endpoints share the same 3-attempt resume policy
-        // (1 fresh + 2 resumes). See `transfer_dir_handler` for rationale.
-        // AVA1 (Task 22) or FTX2 for this job. The probe may take up to
-        // ~3 s on the first AUTO job per console; it runs here, on the
-        // blocking thread, and its session is reused by the transfer.
-        let use_ava1 = ps5upload_ava1::route::use_ava1(&addr)
-            && ps5upload_ava1::upload::upload_list_supported(&req.dest_root, &entries);
-        crate::log_info!(
-            "transfer_file_list: job={job_id} protocol={}",
-            if use_ava1 { "ava1" } else { "ftx2" }
-        );
-        let result = if use_ava1 {
-            // Resume is by job_id (the sender reopens with JobOpen); retries
-            // live in the adapter's loop, so no flags/retry count here (C3).
-            ps5upload_ava1::upload::upload_list(&cfg, tx_id, &req.dest_root, &entries)
-        } else {
-            transfer_file_list_resumable(
-                &cfg,
-                tx_id,
-                &req.dest_root,
-                &entries,
-                DEFAULT_RESUME_RETRIES,
-                initial_flags,
-            )
-        };
+        crate::log_info!("transfer_file_list: job={job_id} protocol=ava1");
+        // One job is one manifest under one root, so a destination outside the root cannot
+        // ride along: say which one instead of sending the rest.
+        let result =
+            match ps5upload_ava1::upload::upload_list_first_unsupported(&req.dest_root, &entries) {
+                Some(dest) => Err(anyhow::Error::from(ps5upload_ava1::upload::UploadFailure {
+                    reason: "ava1_list_outside_root".into(),
+                    detail: format!(
+                        "{dest} is outside the upload folder {}; send it as its own upload",
+                        req.dest_root
+                    ),
+                })),
+                // Resume is by job_id (the sender reopens with JobOpen); retries live in the
+                // adapter's loop.
+                None => ps5upload_ava1::upload::upload_list(&cfg, tx_id, &req.dest_root, &entries),
+            };
         let skipped_files_count: u64 = 0;
         let skipped_bytes_count: u64 = 0;
         match result {

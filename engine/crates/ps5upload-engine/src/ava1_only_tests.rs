@@ -181,6 +181,30 @@ async fn transfer_rar_with_no_ava1_listener_is_helper_not_ava1() {
     assert_helper_not_ava1(&jobs).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn transfer_file_list_with_no_ava1_listener_is_helper_not_ava1() {
+    let dir = std::env::temp_dir().join(format!("p5-ava1only-fl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.bin"), b"hello").unwrap();
+    let jobs: Arc<Mutex<HashMap<Uuid, JobState>>> = Arc::new(Mutex::new(HashMap::new()));
+    let req = TransferFileListReq {
+        addr: Some("127.0.0.1:9113".to_string()),
+        tx_id: None,
+        dest_root: "/data/x".to_string(),
+        files: vec![FileListEntryReq {
+            src: dir.join("a.bin").to_string_lossy().into_owned(),
+            dest: "a.bin".to_string(),
+        }],
+        bandwidth_cap_mbps: None,
+    };
+    let resp = transfer_file_list_handler(State(state_for(&jobs)), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_helper_not_ava1(&jobs).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A console that has not accepted this app fails with `not_paired` (the pairing dialog's
 /// trigger), as a job failure and as a management refusal.
 #[test]

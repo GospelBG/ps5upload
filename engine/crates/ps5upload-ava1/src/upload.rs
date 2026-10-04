@@ -825,12 +825,18 @@ fn relative_list_path(dest_root: &str, dest: &str) -> Result<String> {
     Ok(rel.to_owned())
 }
 
-/// A mixed file list may contain absolute paths outside the AVA1 job root.
-/// The engine routes that entire job through FTX2, which supports them.
-pub fn upload_list_supported(dest_root: &str, entries: &[FileListEntry]) -> bool {
+/// A file list may contain absolute destinations outside the job's root, which one job (one
+/// manifest under one root) cannot carry. The first such destination, for the error message.
+pub fn upload_list_first_unsupported(dest_root: &str, entries: &[FileListEntry]) -> Option<String> {
     entries
         .iter()
-        .all(|e| relative_list_path(dest_root, &e.dest).is_ok())
+        .find(|e| relative_list_path(dest_root, &e.dest).is_err())
+        .map(|e| e.dest.clone())
+}
+
+/// Whether every destination fits under the job root.
+pub fn upload_list_supported(dest_root: &str, entries: &[FileListEntry]) -> bool {
+    upload_list_first_unsupported(dest_root, entries).is_none()
 }
 
 pub fn upload_list_in(
@@ -931,7 +937,7 @@ pub fn upload_list(
 
 #[cfg(test)]
 mod list_destination_tests {
-    use super::{relative_list_path, upload_list_supported};
+    use super::{relative_list_path, upload_list_first_unsupported};
     use ps5upload_core::transfer::FileListEntry;
 
     #[test]
@@ -958,7 +964,7 @@ mod list_destination_tests {
     }
 
     #[test]
-    fn a_mixed_list_with_one_outside_path_uses_the_ftx2_route() {
+    fn a_mixed_list_with_one_outside_path_names_it() {
         let entries = [
             FileListEntry {
                 src: "a".into(),
@@ -969,7 +975,14 @@ mod list_destination_tests {
                 dest: "/data/other/b".into(),
             },
         ];
-        assert!(!upload_list_supported("/data/games", &entries));
+        assert_eq!(
+            upload_list_first_unsupported("/data/games", &entries).as_deref(),
+            Some("/data/other/b")
+        );
+        assert_eq!(
+            upload_list_first_unsupported("/data/games", &entries[..1]),
+            None
+        );
     }
 }
 
