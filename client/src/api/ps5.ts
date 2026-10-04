@@ -4268,6 +4268,34 @@ export function humanizeJobErrorReason(
         "joberr.fs_read_path_not_allowed",
         'This file is in a read-only system partition that\'s normally blocked. Enable Settings → "Allow downloading system files" to download from /system, /system_data, and other protected paths.',
       );
+    // An archive the uploader cannot stream (the same decoding crates the retired transport
+    // used, so nothing a fallback once handled is lost). Reasons: the engine's own
+    // `zip_unsupported` / `7z_unsupported` / `rar_unsupported`, and the source-level
+    // `ava1_7z_unsupported`, `ava1_7z_unsupported_layout`, `ava1_rar_unsupported`.
+    case "zip_unsupported":
+    case "ava1_zip_unsupported":
+      return trStatic(
+        "joberr.zip_unsupported",
+        "This .zip uses something the uploader can't stream (encryption, a compression method other than Deflate or Stored, or an unsafe or duplicate file path). Extract it on your computer and upload the folder instead.",
+      );
+    case "7z_unsupported":
+    case "ava1_7z_unsupported":
+      return trStatic(
+        "joberr.sevenz_unsupported",
+        "This .7z uses a compression method or feature the uploader can't stream. Extract it on your computer and upload the folder instead.",
+      );
+    case "7z_unsupported_layout":
+    case "ava1_7z_unsupported_layout":
+      return trStatic(
+        "joberr.sevenz_unsupported_layout",
+        "This .7z keeps directories or empty files between its files inside one solid block, a layout the uploader can't stream. Re-pack it with 7-Zip, or extract it and upload the folder.",
+      );
+    case "rar_unsupported":
+    case "ava1_rar_unsupported":
+      return trStatic(
+        "joberr.rar_unsupported",
+        "This .rar has duplicate or unsafe file paths, or a feature the uploader can't stream. Extract it on your computer and upload the folder instead.",
+      );
     case "tx_table_full":
       return trStatic(
         "joberr.tx_table_full",

@@ -96,6 +96,17 @@ kept.
       is not reachable (FTX2 sent up to 1 MiB).
 - [x] A failed multi-chunk `fs.write` (`ps5upload-ava1/src/mgmt.rs`, `write_chunks`) removes its `<path>.ps5upload.tmp` best-effort with a
   `job.run` DELETE (only after a chunk was accepted); if that fails too, the next write of the path truncates it (offset 0).
+- [x] Archives AVA1 cannot stream (P3 Task 17 follow-up): a zip, 7z or RAR the AVA1 sources refuse used to be
+      handed to the FTX2 pipeline. That fallback lost nothing: the FTX2 path decoded with the same crates
+      (`zip`, `sevenz-rust2`, `unrar`) and refused the same inputs (encryption, unsupported methods, unsafe or
+      duplicate paths, a 7z solid block with directories between its files). The engine now fails the job with
+      `zip_unsupported`, `7z_unsupported`, `ava1_7z_unsupported_layout` or `rar_unsupported`; the client maps
+      each to a message that says to extract the archive and upload the folder (`humanizeJobErrorReason`, all 20
+      locales), and auto-recovery treats them as terminal.
+- [x] File lists with destinations outside the upload root (P3 Task 17 follow-up): one AVA1 job has one root
+      (SPEC.md section 11.2), so the list is split into the root's job plus one job per other destination
+      directory, run in sequence under one call (`upload_list_in`): progress aggregates, a cancel stops the
+      rest, a failure names the first failing path.
 - [ ] `ps5_fs_move`'s same-drive rename moves to an AVA1 RPC with the `st_dev` guard (never an
       unguarded `rename()` across mounts: that panics the console's kernel).
 - [x] NAS sources: `SourceFs` now has an `mtime` (SMB, FTP and SFTP report one; a backend that does

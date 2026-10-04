@@ -75,6 +75,21 @@ describe("isAutoRecoverable", () => {
   });
 
   it.each([
+    "zip_unsupported",
+    "7z_unsupported",
+    "7z_unsupported_layout",
+    "ava1_7z_unsupported",
+    "ava1_7z_unsupported_layout",
+    "ava1_7z_corrupt",
+    "ava1_7z_encrypted",
+    "ava1_zip_corrupt",
+    "rar_unsupported",
+    "ava1_rar_unsupported",
+  ])("does NOT recover the unreadable-archive failure %s (the same archive fails the same way)", (r) => {
+    expect(isAutoRecoverable(r, "")).toBe(false);
+  });
+
+  it.each([
     "ava1_rar_password_required",
     "ava1_rar_password_wrong",
     "ava1_rar_corrupt",
