@@ -25,6 +25,8 @@ pub enum Ava1Error {
     NotPaired,
     #[error("a different device answered at this address (its key is not the expected one)")]
     WrongPeer,
+    #[error("the pairing commitment does not match the reveal: the handshake is not with the device it appears to be")]
+    PairingCommitMismatch,
     #[error("the other device sent no usable key")]
     WeakKey,
     #[error("timed out")]

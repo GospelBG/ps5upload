@@ -24,11 +24,13 @@ fn payload_ava1_uses_only_monotonic_clocks() {
     for p in &files {
         let src = std::fs::read_to_string(p).unwrap();
         for bad in ["gettimeofday", "CLOCK_REALTIME", "clock_settime", "ftime("] {
-            assert!(
-                !src.contains(bad),
-                "{} uses {bad}; use CLOCK_MONOTONIC",
-                p.display()
-            );
+            // Whole identifiers only: strftime( formats a display timestamp (the event log), not timing.
+            let hit = src.match_indices(bad).any(|(i, _)| {
+                i == 0
+                    || !src.as_bytes()[i - 1].is_ascii_alphanumeric()
+                        && src.as_bytes()[i - 1] != b'_'
+            });
+            assert!(!hit, "{} uses {bad}; use CLOCK_MONOTONIC", p.display());
         }
     }
     let count = |ext: &str, under: &str| {

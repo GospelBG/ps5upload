@@ -43,6 +43,7 @@
 #include "hw_info.h"
 #include "drive_sensors.h"
 #include "backup.h"
+#include "fs_jobs.h"
 #include "remoteplay.h"
 #include "fan_curve.h"
 #include "notif.h"
@@ -56,6 +57,7 @@
 #include "sys_registry.h"
 #include "profile.h"
 #include "sony_api_lock.h"
+#include "net_probe.h"
 #include "focus_probe.h"
 #include "proc_list.h"
 #include "proc_identity.h"
@@ -6548,121 +6550,14 @@ static void fs_op_progress(int idx, uint64_t delta);
  * existing engine + UI plumbing renders delete progress without
  * changes (total_bytes from recursive_size, bytes_copied from this
  * accumulator). */
-/* Force-flush the parent directory's metadata after a delete.
- * exFAT (used for USB external storage on PS5) caches directory
- * entries and the FAT allocation bitmap in kernel buffers. After
- * unlink(), the freed clusters may not be reflected in statfs()
- * free-space until the volume is lazily flushed — which can take
- * minutes or require a remount. On large files (multi-GiB game
- * images) this surfaces as "file is gone but space is still used,"
- * confusing users into thinking the delete failed.
- *
- * fsync() on a directory fd is the POSIX-recommended way to force
- * the metadata flush. On UFS2 (internal SSD) this is a cheap no-op
- * beyond the normal journal commit; on exFAT it forces the bitmap
- * update so free space is immediately reclaimable.
- *
- * Best-effort: failure is non-fatal because the delete itself
- * already succeeded — the space WILL be reclaimed eventually
- * regardless. */
-static void fsync_parent_dir(const char *path) {
-    char parent[1024];
-    const char *slash = strrchr(path, '/');
-    if (!slash) return;
-    size_t plen;
-    if (slash == path) {
-        plen = 1;
-    } else {
-        plen = (size_t)(slash - path);
-    }
-    if (plen >= sizeof(parent)) plen = sizeof(parent) - 1;
-    memcpy(parent, path, plen);
-    parent[plen] = '\0';
-    int dfd = open(parent, O_RDONLY);
-    if (dfd >= 0) {
-        (void)fsync(dfd);
-        close(dfd);
-    }
-}
+/* The recursive remove, chmod and size walks live in fs_jobs.c (shared with the job.run
+ * operations); these adapt the in-flight op table (progress + cancel by slot) to its hooks. */
+static int fsop_cancelled_cb(void *arg) { return fs_op_cancel_pending((int)(intptr_t)arg); }
+static void fsop_file_cb(void *arg, uint64_t bytes) { fs_op_progress((int)(intptr_t)arg, bytes); }
 
 static int rm_rf_op(const char *path, int depth, int op_idx) {
-    struct stat st;
-    DIR *d;
-    struct dirent *e;
-    char sub[1024];
-    int rc = 0;
-
-    if (depth > 64) return -1;
-    if (op_idx >= 0 && fs_op_cancel_pending(op_idx)) return -2;
-    if (lstat(path, &st) != 0) {
-        /* Already gone (ENOENT) is SUCCESS, not failure. A concurrent boot
-         * sweep, or the caller's own earlier delete, may have removed it —
-         * surfacing that as fs_delete_failed turned a benign race (e.g. the
-         * staged-pkg auto-delete after an install) into a scary user error. */
-        if (errno == ENOENT) return 0;
-        return -1;
-    }
-    if (!S_ISDIR(st.st_mode)) {
-        /* Regular file / symlink / device. unlink() works for all. */
-        if (unlink(path) != 0) {
-            if (errno == ENOENT) return 0; /* already gone → ok */
-            /* EBUSY: Sony's async installer can still hold a just-installed
-             * .pkg open when auto-delete-after-install fires. Retry briefly
-             * (≤1s) before declaring failure rather than failing the click. */
-            if (errno == EBUSY) {
-                int freed = 0;
-                for (int i = 0; i < 10; i++) {
-                    usleep(100000); /* 100 ms */
-                    if (unlink(path) == 0 || errno == ENOENT) {
-                        freed = 1;
-                        break;
-                    }
-                    if (errno != EBUSY) break;
-                }
-                if (!freed) return -1;
-            } else {
-                return -1;
-            }
-        }
-        if (op_idx >= 0 && S_ISREG(st.st_mode)) {
-            fs_op_progress(op_idx, (uint64_t)st.st_size);
-        }
-        /* Flush the parent directory so exFAT reclaims the freed
-         * clusters immediately rather than lazily. Without this, a
-         * multi-GiB delete (e.g. moving a 116 GB game image off USB)
-         * leaves the space marked "used" until the volume is remounted
-         * or the kernel's lazy flush runs — confusing the user into
-         * thinking the delete failed. See fsync_parent_dir for details. */
-        if (st.st_size >= (off_t)(100 * 1024 * 1024)) {
-            fsync_parent_dir(path);
-        }
-        return 0;
-    }
-    d = opendir(path);
-    if (!d) return -1;
-    while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        if (op_idx >= 0 && fs_op_cancel_pending(op_idx)) { rc = -2; break; }
-        int n = snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name);
-        if (n < 0 || (size_t)n >= sizeof(sub)) { rc = -1; break; }
-        int sub_rc = rm_rf_op(sub, depth + 1, op_idx);
-        if (sub_rc == -2) { rc = -2; break; }   /* propagate cancel */
-        if (sub_rc != 0) { rc = -1; /* keep going; best effort */ }
-    }
-    closedir(d);
-    /* Only rmdir if we weren't cancelled — leaving the dir avoids the
-     * surprising case where a user hits Stop and the top-level dir
-     * vanishes anyway because rmdir succeeded on the now-empty subtree
-     * we already cleared. The fs_copy_cancelled cleanup pattern in
-     * handle_fs_delete also relies on this: a partial tree is
-     * acceptable, but the entry the user clicked Stop on stays so
-     * they can see what's left. */
-    /* ENOENT here too means the directory is already gone — treat as success. */
-    if (rc != -2 && rmdir(path) != 0 && errno != ENOENT) rc = -1;
-    /* Flush the parent dir after rmdir for the same exFAT reason as
-     * the file-unlink path above. */
-    if (rc == 0) fsync_parent_dir(path);
-    return rc;
+    fsj_hooks_t h = { fsop_cancelled_cb, fsop_file_cb, (void *)(intptr_t)op_idx, NULL };
+    return fsj_rm_rf(path, depth, op_idx >= 0 ? &h : NULL);
 }
 
 static int rm_rf(const char *path, int depth) {
@@ -6671,30 +6566,7 @@ static int rm_rf(const char *path, int depth) {
 
 /* Recursive chmod on `path`. Descends dirs. Same depth cap as rm_rf. */
 static int chmod_rf(const char *path, mode_t mode, int depth) {
-    struct stat st;
-    DIR *d;
-    struct dirent *e;
-    char sub[1024];
-    int rc = 0;
-
-    if (depth > 64) return -1;
-    if (lstat(path, &st) != 0) return -1;
-    /* A link that leads into the trust store is not chmod'ed (chmod follows it). */
-    if (S_ISLNK(st.st_mode) && path_in_protected(path)) return 0;
-    /* chmod first, then descend — so even if recursion fails partially
-     * we've at least updated the top. */
-    if (chmod(path, mode) != 0) rc = -1;
-    if (!S_ISDIR(st.st_mode)) return rc;
-    d = opendir(path);
-    if (!d) return -1;
-    while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        int n = snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name);
-        if (n < 0 || (size_t)n >= sizeof(sub)) { rc = -1; break; }
-        if (chmod_rf(sub, mode, depth + 1) != 0) rc = -1;
-    }
-    closedir(d);
-    return rc;
+    return fsj_chmod_rf(path, (unsigned)mode, depth, NULL);
 }
 
 /* Recursive copy from `src` to `dst`. Descends dirs, copies regular
@@ -6922,57 +6794,10 @@ static int fs_op_set_cancel(uint64_t op_id) {
  * the much longer cp_rf phase to finish first. Returns -2 on cancel
  * (matches cp_rf_op's convention). */
 #define RECURSIVE_SIZE_MAX_DEPTH 64
-static int recursive_size_inner(const char *path, uint64_t *out,
-                                 int depth, int op_idx) {
-    struct stat st;
-    DIR *d;
-    struct dirent *e;
-    if (depth > RECURSIVE_SIZE_MAX_DEPTH) {
-        fprintf(stderr,
-                "[payload2] recursive_size: depth cap %d hit at %s\n",
-                RECURSIVE_SIZE_MAX_DEPTH, path);
-        return -1;
-    }
-    /* Cancel check at directory boundaries — same cadence as
-     * rm_rf_op / cp_rf_op. Per-file granularity isn't worth it for
-     * stat walks (each stat is sub-microsecond on warm cache). */
-    if (op_idx >= 0 && fs_op_cancel_pending(op_idx)) return -2;
-    if (lstat(path, &st) != 0) return -1;
-    if (S_ISREG(st.st_mode)) {
-        *out += (uint64_t)st.st_size;
-        return 0;
-    }
-    if (!S_ISDIR(st.st_mode)) {
-        /* symlinks/specials don't contribute bytes. */
-        return 0;
-    }
-    d = opendir(path);
-    if (!d) return -1;
-    int rc = 0;
-    while ((e = readdir(d)) != NULL) {
-        char sub[1024];
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        if (snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name) >= (int)sizeof(sub)) {
-            /* A truncated child path means the copy will hit the same
-             * limit and bail; reporting success here would lie about
-             * total_bytes and make the progress bar drift past 100%.
-             * Surface the failure now so the caller fails fast with
-             * fs_copy_walk_failed rather than mid-copy. */
-            rc = -1;
-            break;
-        }
-        int sub_rc = recursive_size_inner(sub, out, depth + 1, op_idx);
-        if (sub_rc != 0) {
-            rc = sub_rc; /* propagate -1 (error) or -2 (cancel) */
-            break;
-        }
-    }
-    closedir(d);
-    return rc;
-}
 
 static int recursive_size_op(const char *path, uint64_t *out, int op_idx) {
-    return recursive_size_inner(path, out, 0, op_idx);
+    fsj_hooks_t h = { fsop_cancelled_cb, NULL, (void *)(intptr_t)op_idx, NULL };
+    return fsj_tree_size(path, out, NULL, 0, op_idx >= 0 ? &h : NULL);
 }
 
 /* ── Async-write file copier (parallel read + write) ──────────────────────────
@@ -9626,6 +9451,9 @@ static int handle_time_state_get(runtime_state_t *state, int client_fd,
     sce_datetime_t wall_dt;     uint32_t wall_err = 0;
     memset(&wall_dt, 0, sizeof(wall_dt));
 
+    /* sceRegMgr is not safe to call concurrently (CE-108262-9): hold sony_api_lock for the registry
+     * reads (and none of them takes it), and build/send the reply after releasing it. */
+    pthread_mutex_lock(&sony_api_lock);
     int tz_rc          = sys_registry_get_int(SCE_KEY_DATE_TIME_ZONE,
                                                 &tz_index, &tz_err);
     int date_fmt_rc    = sys_registry_get_int(SCE_KEY_DATE_DATE_FORMAT,
@@ -9649,6 +9477,7 @@ static int handle_time_state_get(runtime_state_t *state, int client_fd,
                                                 &tzdata_ver_err);
     int ntp_tick_rc    = sys_registry_get_ntp_tick_unix(&ntp_tick_unix,
                                                           &ntp_tick_err);
+    pthread_mutex_unlock(&sony_api_lock);
     int wall_rc        = sys_time_get(&wall_dt, &wall_err);
 
     /* Build response. JSON grows up to ~1.2 KB with all fields
@@ -9805,11 +9634,13 @@ static int handle_time_state_set(runtime_state_t *state, int client_fd,
     /* Issue each write. Each populates its own rc + err_code. */
     int rc_tz = 1, rc_date = 1, rc_time = 1, rc_summer = 1, rc_auto = 1;
     uint32_t ec_tz = 0, ec_date = 0, ec_time = 0, ec_summer = 0, ec_auto = 0;
+    pthread_mutex_lock(&sony_api_lock); /* sceRegMgr: one caller at a time (CE-108262-9) */
     if (has_tz)       rc_tz     = sys_registry_set_int(SCE_KEY_DATE_TIME_ZONE,    (int)tz_idx,     &ec_tz);
     if (has_date_fmt) rc_date   = sys_registry_set_int(SCE_KEY_DATE_DATE_FORMAT,  (int)date_fmt,   &ec_date);
     if (has_time_fmt) rc_time   = sys_registry_set_int(SCE_KEY_DATE_TIME_FORMAT,  (int)time_fmt,   &ec_time);
     if (has_summer)   rc_summer = sys_registry_set_int(SCE_KEY_DATE_SUMMER_TIME,  (int)summer,     &ec_summer);
     if (has_set_auto) rc_auto   = sys_registry_set_int(SCE_KEY_DATE_SET_AUTO,     (int)set_auto,   &ec_auto);
+    pthread_mutex_unlock(&sony_api_lock);
 
     /* `ok` is true only if EVERY attempted write succeeded. Skipped
      * writes don't count against ok — they leave rc_* = 1 (untouched)
@@ -10314,6 +10145,61 @@ static int parse_system_control_action(const char *body, uint64_t body_len,
     return -1;
 }
 
+/* power.control over AVA1: the handler is called with its reply captured, and the reply only leaves
+ * after the handler returns. A reboot/shutdown/standby that ran inside the handler would take the
+ * network down before the ACK was sent, so under the capture sink the destructive call is deferred to
+ * a short-lived thread that waits for the ACK to flush (the FTX2 contract: reply BEFORE the call). */
+typedef struct {
+    int action; /* system_control_action_t */
+} power_defer_t;
+
+/* Runs on the deferred power thread only, which holds no lock: take sony_api_lock so a reboot or
+ * power-off never overlaps another Sony call (the lock is held until the console goes down). */
+static void power_do_action(int action) {
+    pthread_mutex_lock(&sony_api_lock);
+    if (action == SC_ACTION_REBOOT) {
+        sceSystemServiceRequestReboot();
+    } else if (action == SC_ACTION_SHUTDOWN) {
+        void *h = dlsym(RTLD_DEFAULT, "sceSystemStateMgrTurnOff");
+        if (h) {
+            int (*turn_off)(int) = (int (*)(int))h;
+            turn_off(0);
+        } else {
+            sceSystemServiceRequestPowerOff();
+        }
+    } else if (action == SC_ACTION_STANDBY) {
+        void *h = dlsym(RTLD_DEFAULT, "sceSystemStateMgrEnterStandby");
+        if (h) {
+            int (*enter_standby)(void) = (int (*)(void))h;
+            enter_standby();
+        }
+    }
+    pthread_mutex_unlock(&sony_api_lock);
+}
+
+static void *power_defer_thread(void *arg) {
+    power_defer_t *d = (power_defer_t *)arg;
+    int action = d->action;
+    free(d);
+    usleep(400 * 1000); /* the ACK frame is written by the session thread as soon as the handler returns */
+    power_do_action(action);
+    return NULL;
+}
+
+/* 0 when the action will run (deferred); -1 when it could not be scheduled (the caller runs it inline). */
+static int power_defer(int action) {
+    power_defer_t *d = malloc(sizeof *d);
+    pthread_t t;
+    if (!d) return -1;
+    d->action = action;
+    if (create_worker_thread(&t, power_defer_thread, d) != 0) {
+        free(d);
+        return -1;
+    }
+    pthread_detach(t);
+    return 0;
+}
+
 static int handle_system_control(runtime_state_t *state, int client_fd,
                                   uint64_t trace_id, const char *body,
                                   uint64_t body_len) {
@@ -10347,6 +10233,7 @@ static int handle_system_control(runtime_state_t *state, int client_fd,
         const char *ack = "{\"ok\":true,\"action\":\"reboot\"}";
         rc = send_frame(client_fd, FTX2_FRAME_SYSTEM_CONTROL_ACK, 0,
                         trace_id, ack, strlen(ack));
+        if (mgmt_capture_active() && power_defer(SC_ACTION_REBOOT) == 0) return rc;
         sceSystemServiceRequestReboot();
         return rc;
     }
@@ -10354,6 +10241,7 @@ static int handle_system_control(runtime_state_t *state, int client_fd,
         const char *ack = "{\"ok\":true,\"action\":\"shutdown\"}";
         rc = send_frame(client_fd, FTX2_FRAME_SYSTEM_CONTROL_ACK, 0,
                         trace_id, ack, strlen(ack));
+        if (mgmt_capture_active() && power_defer(SC_ACTION_SHUTDOWN) == 0) return rc;
         /* sceSystemServiceRequestPowerOff() goes through the system's normal
          * power-button flow, which on PS5 RESPECTS the rest-mode setting — so
          * "Shutdown" commonly dropped the console into REST MODE instead of a
@@ -10389,12 +10277,15 @@ static int handle_system_control(runtime_state_t *state, int client_fd,
         const char *ack = "{\"ok\":true,\"action\":\"standby\"}";
         rc = send_frame(client_fd, FTX2_FRAME_SYSTEM_CONTROL_ACK, 0,
                         trace_id, ack, strlen(ack));
+        if (mgmt_capture_active() && power_defer(SC_ACTION_STANDBY) == 0) return rc;
         enter_standby();
         return rc;
     }
     case SC_ACTION_TICK:
         /* Tick is non-destructive; we can ACK after. */
+        pthread_mutex_lock(&sony_api_lock); /* a Sony call: one at a time with the others */
         err_code = sceSystemServicePowerTick();
+        pthread_mutex_unlock(&sony_api_lock);
         if (err_code == 0) {
             const char *ack = "{\"ok\":true,\"action\":\"tick\"}";
             return send_frame(client_fd, FTX2_FRAME_SYSTEM_CONTROL_ACK,
@@ -10525,6 +10416,10 @@ static int handle_user_list(runtime_state_t *state, int client_fd,
      * second call. We don't track a "first call done" flag because
      * the cost is negligible and statelessness avoids cross-thread
      * locking concerns. */
+    /* sceUserService is not safe to call concurrently (CE-108262-9): serialise on sony_api_lock like
+     * every other caller. AVA1 runs up to 8 management calls at once, so this handler holds the lock
+     * itself for its Sony calls and sends after it is released. */
+    pthread_mutex_lock(&sony_api_lock);
     sceUserServiceInitialize(NULL);
     int foreground = -1;
     int rc_fg = sceUserServiceGetForegroundUser(&foreground);
@@ -10557,6 +10452,7 @@ static int handle_user_list(runtime_state_t *state, int client_fd,
                       ids[i], esc,
                       ids[i] == foreground ? "true" : "false", rc_name);
     }
+    pthread_mutex_unlock(&sony_api_lock);
     if (n < (int)sizeof(body) - 2) {
         body[n++] = ']';
         body[n++] = '}';
@@ -10678,6 +10574,8 @@ static int handle_backup_snapshot(runtime_state_t *state, int client_fd,
     int rc = -1;
     if (tag[0] && path[0]) {
         rc = backup_snapshot(tag, path, &ts, &files, &bytes);
+        if (rc == BACKUP_CANCELLED)
+            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id, "backup_cancelled", 16);
         if (rc != 0) err = "snapshot failed (source not found or empty)";
     } else {
         err = "missing tag or path";
@@ -10728,6 +10626,8 @@ static int handle_backup_restore(runtime_state_t *state, int client_fd,
     int rc = -1;
     if (tag[0] && ts > 0) {
         rc = backup_restore(tag, ts, &restored);
+        if (rc == BACKUP_CANCELLED)
+            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id, "backup_cancelled", 16);
         if (rc != 0) err = "snapshot not found or restore failed";
     } else {
         err = "missing tag or timestamp";
@@ -10826,6 +10726,59 @@ static int handle_remoteplay_cancel(runtime_state_t *state, int client_fd,
     pthread_mutex_unlock(&state->state_mtx);
     return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_CANCEL_ACK, 0, trace_id,
                       resp, strlen(resp));
+}
+
+/* Remote Play readiness / enable / devices. They were inline in the FTX2 dispatcher; they are
+ * handlers now so the AVA1 management table (rp.readiness, rp.enable, rp.devices) can call them.
+ * The bodies are unchanged. The remoteplay_* entry points take sony_api_lock for the whole call
+ * (remoteplay.c "Sony-API serialization"), and the reply is sent after they return. */
+static int handle_remoteplay_readiness(runtime_state_t *state, int client_fd,
+                                       uint64_t trace_id) {
+    (void)state;
+    char body[640];
+    int n = remoteplay_readiness_json(body, sizeof(body));
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                          "readiness_overflow", 18);
+    }
+    return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_READINESS, 0,
+                      trace_id, body, (uint64_t)n);
+}
+
+static int handle_remoteplay_enable(runtime_state_t *state, int client_fd,
+                                    uint64_t trace_id, const char *request_body) {
+    (void)state;
+    char scope[16] = "";
+    extract_json_string_field(request_body, "scope", scope, sizeof(scope));
+    char body[640];
+    int n = remoteplay_enable(strcmp(scope, "user") == 0, body, sizeof(body));
+    if (n == -2) {
+        return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                          "rp_enable_unsupported_fw", 24);
+    }
+    if (n == -3) {
+        return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                          "rp_enable_no_user", 17);
+    }
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                          "rp_enable_write_failed", 22);
+    }
+    return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_ENABLE, 0,
+                      trace_id, body, (uint64_t)n);
+}
+
+static int handle_remoteplay_devices(runtime_state_t *state, int client_fd,
+                                     uint64_t trace_id) {
+    (void)state;
+    char body[2048];
+    int n = remoteplay_devices_json(body, sizeof(body));
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                          "rp_devices_overflow", 19);
+    }
+    return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_DEVICES, 0,
+                      trace_id, body, (uint64_t)n);
 }
 
 /* ── Fan curve handler ───────────────────────────────────────────────── */
@@ -11386,6 +11339,27 @@ static int handle_fan_curve_get(runtime_state_t *state, int client_fd,
                       trace_id, buf, strlen(buf));
 }
 
+/* The save / screenshot / video lists are built in one heap buffer of LIST_JSON_CAP bytes and
+ * cut at an entry when it fills (the walkers stop at cap-2300/-2800). Over AVA1 the dispatcher
+ * pages the array (`more`), so the buffer only bounds one walk. A walk that reached the limit
+ * says so, with `"truncated":true`, instead of looking complete: 512 KiB is ~3,000 entries. */
+#define LIST_JSON_CAP (512 * 1024)
+#define LIST_JSON_TRUNC_MARGIN 2900
+
+static int list_json_close(char *resp, int n, int cap) {
+    if (n >= cap - LIST_JSON_TRUNC_MARGIN) {
+        static const char t[] = "],\"truncated\":true}";
+        if (n + (int)sizeof t <= cap) {
+            memcpy(resp + n, t, sizeof t - 1);
+            n += (int)sizeof t - 1;
+        }
+    } else if (n < cap - 2) {
+        resp[n++] = ']';
+        resp[n++] = '}';
+    }
+    return n;
+}
+
 /* ── Save-data listing ───────────────────────────────────────────────── */
 
 /* Walk a savedata root for one user, appending JSON entries to `body`.
@@ -11491,13 +11465,13 @@ static int handle_list_saves(runtime_state_t *state, int client_fd,
     /* Response body is large — saves can number in the hundreds. 64 KB
      * is comfortable; the ~100-byte-per-entry budget gives room for
      * ~600 entries before truncation. */
-    char *resp = malloc(64 * 1024);
+    char *resp = malloc(LIST_JSON_CAP);
     if (!resp) {
         const char *err = "{\"err\":\"oom\"}";
         return send_frame(client_fd, FTX2_FRAME_LIST_SAVES_ACK, 0,
                           trace_id, err, strlen(err));
     }
-    int cap = 64 * 1024;
+    int cap = LIST_JSON_CAP;
     int n = 0;
     n += snprintf(resp + n, cap - n, "{\"saves\":[");
     int wrote_one = 0;
@@ -11538,10 +11512,7 @@ static int handle_list_saves(runtime_state_t *state, int client_fd,
         }
         closedir(home);
     }
-    if (n < cap - 2) {
-        resp[n++] = ']';
-        resp[n++] = '}';
-    }
+    n = list_json_close(resp, n, cap);
     int rc = send_frame(client_fd, FTX2_FRAME_LIST_SAVES_ACK, 0, trace_id,
                         resp, (uint64_t)n);
     free(resp);
@@ -12036,6 +12007,7 @@ static int handle_search_index(runtime_state_t *state, int client_fd,
     n += snprintf(resp + n, cap - n, "{\"results\":[");
     int wrote_one = 0;
     int matched = 0;
+    int cut = 0;
     pthread_mutex_lock(&g_index_lock);
     for (size_t i = 0; i < g_index_count && matched < limit; i++) {
         const char *path = g_index_entries[i].path;
@@ -12048,7 +12020,10 @@ static int handle_search_index(runtime_state_t *state, int client_fd,
         if (size_max > 0 && sz > size_max) continue;
         char esc_path[2048];
         json_escape_into(path, esc_path, sizeof(esc_path));
-        if (n >= cap - 2300) break;
+        if (n >= cap - 2300) {
+            cut = 1; /* the reply buffer is full: say so below, never look complete */
+            break;
+        }
         if (wrote_one) resp[n++] = ',';
         wrote_one = 1;
         n += snprintf(resp + n, cap - n,
@@ -12057,7 +12032,9 @@ static int handle_search_index(runtime_state_t *state, int client_fd,
         matched++;
     }
     pthread_mutex_unlock(&g_index_lock);
-    if (n < cap - 2) {
+    if (cut) {
+        n += snprintf(resp + n, cap - n, "],\"truncated\":true}");
+    } else if (n < cap - 2) {
         resp[n++] = ']';
         resp[n++] = '}';
     }
@@ -12133,9 +12110,15 @@ static int handle_app_lifecycle(runtime_state_t *state, int client_fd,
         }
         int count = 0;
         int rc = -1;
+        /* sceApplication* is Sony code: serialised like every other Sony call
+         * (P3 Task 6: AVA1 runs up to eight management calls at once, FTX2 ran one
+         * thread per connection, and an unserialised Sony call can take the host
+         * process down, CE-108262-9). */
+        pthread_mutex_lock(&sony_api_lock);
         if (resolve_sce_syscore() == 0 && p_sceApplicationGetProcs) {
             rc = p_sceApplicationGetProcs(buf, APP_PROCS_MAX_COUNT, &count);
         }
+        pthread_mutex_unlock(&sony_api_lock);
         if (rc != 0 || count < 0) count = 0;
         if (count > APP_PROCS_MAX_COUNT) count = APP_PROCS_MAX_COUNT;
         int n = 0;
@@ -12168,7 +12151,12 @@ static int handle_app_lifecycle(runtime_state_t *state, int client_fd,
         return send_frame(client_fd, FTX2_FRAME_APP_LIFECYCLE_ACK, 0,
                           trace_id, err, strlen(err));
     }
+    /* The suspend / resume / kill calls below are Sony APIs: hold sony_api_lock across
+     * the whole action (the kill ladder is up to four calls, run back to back as before)
+     * and release it on every exit. */
+    pthread_mutex_lock(&sony_api_lock);
     if (resolve_sce_syscore() != 0) {
+        pthread_mutex_unlock(&sony_api_lock);
         const char *err = "{\"ok\":false,\"err\":\"libSceSysCore_unavailable\"}";
         return send_frame(client_fd, FTX2_FRAME_APP_LIFECYCLE_ACK, 0,
                           trace_id, err, strlen(err));
@@ -12212,10 +12200,12 @@ static int handle_app_lifecycle(runtime_state_t *state, int client_fd,
             rc = rc4;
         }
     } else {
+        pthread_mutex_unlock(&sony_api_lock);
         const char *err = "{\"ok\":false,\"err\":\"unknown_action\"}";
         return send_frame(client_fd, FTX2_FRAME_APP_LIFECYCLE_ACK, 0,
                           trace_id, err, strlen(err));
     }
+    pthread_mutex_unlock(&sony_api_lock);
     pthread_mutex_lock(&state->state_mtx);
     state->command_count += 1;
     pthread_mutex_unlock(&state->state_mtx);
@@ -12505,6 +12495,12 @@ static int handle_peripheral_control(runtime_state_t *state, int client_fd,
     }
     resolve_sce_kernel_extras();
     int rc = -1;
+    /* Peripheral ICC control is serialised with the other Sony calls: AVA1 can run several management
+     * calls at once, FTX2 rarely did. The lock covers only the control block; replies go out after. */
+    int periph_known = strcmp(action, "bd_power_off") == 0 || strcmp(action, "bd_power_on") == 0 ||
+                       strcmp(action, "eject_disc") == 0 || strcmp(action, "usb_port_off") == 0 ||
+                       strcmp(action, "usb_port_on") == 0;
+    if (periph_known) pthread_mutex_lock(&sony_api_lock);
     if (strcmp(action, "bd_power_off") == 0) {
         rc = p_sceKernelIccControlBDPowerState
                 ? p_sceKernelIccControlBDPowerState(0) : -1;
@@ -12534,6 +12530,7 @@ static int handle_peripheral_control(runtime_state_t *state, int client_fd,
         return send_frame(client_fd, FTX2_FRAME_PERIPHERAL_CONTROL_ACK,
                           0, trace_id, err, strlen(err));
     }
+    if (periph_known) pthread_mutex_unlock(&sony_api_lock);
     pthread_mutex_lock(&state->state_mtx);
     state->command_count += 1;
     pthread_mutex_unlock(&state->state_mtx);
@@ -12615,14 +12612,25 @@ static int shell_send_json_result(runtime_state_t *state, int client_fd,
      * produced JSON that ended mid-string. One measuring pass is cheaper
      * than guessing. */
     size_t esc_len = 0;
+    /* shell.exec over AVA1 answers at most 32 KiB (the plan's bound; the whole reply, JSON included):
+     * the output is cut at a character boundary and the reply says so ("truncated":true). */
+    const size_t shell_budget = 32u * 1024u - 2048u;
+    int shell_truncated = 0;
+    const int shell_capped = mgmt_capture_active();
     for (size_t i = 0; i < out_len; i++) {
         unsigned char c = (unsigned char)stdout_text[i];
-        if (c == '\\' || c == '"' || c == '\n' || c == '\r' || c == '\t')
-            esc_len += 2;
-        else if (c < 0x20)
-            esc_len += 6;
-        else
-            esc_len += 1;
+        size_t w = (c == '\\' || c == '"' || c == '\n' || c == '\r' || c == '\t') ? 2 : (c < 0x20 ? 6 : 1);
+        if (shell_capped && esc_len + w > shell_budget) {
+            /* do not end inside a UTF-8 sequence */
+            while (i > 0 && ((unsigned char)stdout_text[i] & 0xC0u) == 0x80u) {
+                i--;
+                esc_len -= 1;
+            }
+            out_len = i;
+            shell_truncated = 1;
+            break;
+        }
+        esc_len += w;
     }
     char *resp = malloc(esc_len + cwd_len * 6 + sid_len * 6 + 680);
     if (!resp) {
@@ -12666,7 +12674,7 @@ static int shell_send_json_result(runtime_state_t *state, int client_fd,
         else if (c < 0x20) { n += snprintf(resp + n, cap - (size_t)n, "\\u%04x", c); }
         else { resp[n++] = (char)c; }
     }
-    n += snprintf(resp + n, cap - (size_t)n, "\"}");
+    n += snprintf(resp + n, cap - (size_t)n, shell_truncated ? "\",\"truncated\":true}" : "\"}");
     int rc = send_frame(client_fd, FTX2_FRAME_SHELL_EXEC_ACK, 0,
                         trace_id, resp, (uint64_t)n);
     free(resp);
@@ -12853,9 +12861,16 @@ static int handle_crc32_file(runtime_state_t *state, int client_fd,
     build_crc32_table();
     uint32_t crc = 0xffffffffu;
     uint64_t total = 0;
-    char buf[64 * 1024];
+    /* Heap, not stack: 64 KiB on a management thread's stack is what mgmt_audit.py refuses. */
+    char *buf = (char *)malloc(64 * 1024);
+    if (!buf) {
+        close(fd);
+        const char *err = "{\"err\":\"oom\"}";
+        return send_frame(client_fd, FTX2_FRAME_CRC32_FILE_ACK, 0,
+                          trace_id, err, strlen(err));
+    }
     while (1) {
-        ssize_t n = read(fd, buf, sizeof(buf));
+        ssize_t n = read(fd, buf, 64 * 1024);
         if (n <= 0) break;
         for (ssize_t i = 0; i < n; i++) {
             crc = g_crc32_table[(crc ^ (unsigned char)buf[i]) & 0xff]
@@ -12863,6 +12878,7 @@ static int handle_crc32_file(runtime_state_t *state, int client_fd,
         }
         total += (uint64_t)n;
     }
+    free(buf);
     close(fd);
     crc ^= 0xffffffffu;
     char resp[160];
@@ -13481,70 +13497,12 @@ static int handle_net_reach(runtime_state_t *state, int client_fd,
                             uint64_t trace_id, const char *body,
                             uint64_t body_len) {
     if (!state) return -1;
-    char host[64] = {0}, port_s[16] = {0}, timeout_s[16] = {0};
-    if (parse_json_string_field_local(body, body_len, "host", host, sizeof(host)) != 0 ||
-        parse_json_string_field_local(body, body_len, "port", port_s, sizeof(port_s)) != 0) {
-        const char *err = "{\"ok\":false,\"err\":\"bad_request\"}";
-        return send_frame(client_fd, FTX2_FRAME_NET_REACH_ACK, 0, trace_id, err, strlen(err));
-    }
-    (void)parse_json_string_field_local(body, body_len, "timeout_ms", timeout_s, sizeof(timeout_s));
-    long port = strtol(port_s, NULL, 10);
-    long timeout_ms = timeout_s[0] ? strtol(timeout_s, NULL, 10) : 3000;
-    if (timeout_ms < 100) timeout_ms = 100;
-    if (timeout_ms > 15000) timeout_ms = 15000;
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t)port);
-    if (port <= 0 || port > 65535 || inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
-        const char *err = "{\"ok\":false,\"err\":\"bad_address\"}";
-        return send_frame(client_fd, FTX2_FRAME_NET_REACH_ACK, 0, trace_id, err, strlen(err));
-    }
+    char resp[320];
     pthread_mutex_lock(&state->state_mtx);
     state->command_count += 1;
     pthread_mutex_unlock(&state->state_mtx);
-
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    int err_no = 0, timed_out = 0;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        err_no = errno;
-    } else {
-        int fl = fcntl(fd, F_GETFL, 0);
-        (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-        if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-            if (errno == EINPROGRESS) {
-                struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
-                int pr = poll(&pfd, 1, (int)timeout_ms);
-                if (pr == 0) {
-                    timed_out = 1;
-                } else if (pr < 0) {
-                    err_no = errno;
-                } else {
-                    int soerr = 0;
-                    socklen_t sl = sizeof(soerr);
-                    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0) soerr = errno;
-                    err_no = soerr;
-                }
-            } else {
-                err_no = errno;
-            }
-        }
-        close(fd);
-    }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    long ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
-    char resp[256];
-    int n;
-    if (!timed_out && err_no == 0) {
-        n = snprintf(resp, sizeof(resp), "{\"ok\":true,\"ms\":%ld}", ms);
-    } else {
-        n = snprintf(resp, sizeof(resp),
-                     "{\"ok\":false,\"timed_out\":%s,\"errno\":%d,\"err\":\"%s\",\"ms\":%ld}",
-                     timed_out ? "true" : "false", err_no,
-                     timed_out ? "timed out" : strerror(err_no), ms);
-    }
+    /* The probe itself lives in net_probe.c so the host tests run the real code. */
+    size_t n = net_probe_reach(body, (size_t)body_len, resp, sizeof(resp));
     return send_frame(client_fd, FTX2_FRAME_NET_REACH_ACK, 0, trace_id, resp, (uint64_t)n);
 }
 
@@ -13662,9 +13620,12 @@ static int handle_toast_send(runtime_state_t *state, int client_fd,
      * malformed JSON or daemon offline; we surface it for the
      * renderer to log but don't treat as fatal. */
     resolve_sce_notification();
+    /* a Sony call: one at a time with the others (AVA1 runs up to 8 management calls at once) */
+    pthread_mutex_lock(&sony_api_lock);
     int rc = p_sceNotificationSend
                 ? p_sceNotificationSend(-1, 0, json)
                 : -1; /* symbol missing on this FW: toast unavailable */
+    pthread_mutex_unlock(&sony_api_lock);
     free(json);
     pthread_mutex_lock(&state->state_mtx);
     state->command_count += 1;
@@ -13690,13 +13651,13 @@ static int handle_index_cancel(runtime_state_t *state, int client_fd,
 static int handle_list_screenshots(runtime_state_t *state, int client_fd,
                                     uint64_t trace_id) {
     if (!state) return -1;
-    char *resp = malloc(64 * 1024);
+    char *resp = malloc(LIST_JSON_CAP);
     if (!resp) {
         const char *err = "{\"err\":\"oom\"}";
         return send_frame(client_fd, FTX2_FRAME_LIST_SCREENSHOTS_ACK, 0,
                           trace_id, err, strlen(err));
     }
-    int cap = 64 * 1024;
+    int cap = LIST_JSON_CAP;
     int n = 0;
     n += snprintf(resp + n, cap - n, "{\"items\":[");
     int wrote_one = 0;
@@ -13714,10 +13675,7 @@ static int handle_list_screenshots(runtime_state_t *state, int client_fd,
     walk_screenshots("/user/av_contents/thumbnails/photo", 5,
                      resp, &n, cap, &wrote_one, &seen, 1);
     free(seen.names);
-    if (n < cap - 2) {
-        resp[n++] = ']';
-        resp[n++] = '}';
-    }
+    n = list_json_close(resp, n, cap);
     int rc = send_frame(client_fd, FTX2_FRAME_LIST_SCREENSHOTS_ACK, 0,
                         trace_id, resp, (uint64_t)n);
     free(resp);
@@ -13732,21 +13690,18 @@ static int handle_list_screenshots(runtime_state_t *state, int client_fd,
 static int handle_list_videos(runtime_state_t *state, int client_fd,
                               uint64_t trace_id) {
     if (!state) return -1;
-    char *resp = malloc(64 * 1024);
+    char *resp = malloc(LIST_JSON_CAP);
     if (!resp) {
         const char *err = "{\"err\":\"oom\"}";
         return send_frame(client_fd, FTX2_FRAME_LIST_VIDEOS_ACK, 0,
                           trace_id, err, strlen(err));
     }
-    int cap = 64 * 1024;
+    int cap = LIST_JSON_CAP;
     int n = 0;
     n += snprintf(resp + n, cap - n, "{\"items\":[");
     int wrote_one = 0;
     walk_videos("/user/av_contents/video", 5, resp, &n, cap, &wrote_one);
-    if (n < cap - 2) {
-        resp[n++] = ']';
-        resp[n++] = '}';
-    }
+    n = list_json_close(resp, n, cap);
     int rc = send_frame(client_fd, FTX2_FRAME_LIST_VIDEOS_ACK, 0,
                         trace_id, resp, (uint64_t)n);
     free(resp);
@@ -13951,7 +13906,9 @@ static int handle_focus_probe(runtime_state_t *state, int client_fd,
  * guards self/kernel/init; the UI is responsible for warning before a
  * "system" kill. Ack {"ok":bool,"pid":N[,"err":"..."]}. */
 static int handle_process_kill(runtime_state_t *state, int client_fd,
-                               uint64_t trace_id, const char *body) {
+                               uint64_t trace_id, const char *body,
+                               uint64_t body_len) {
+    (void)body_len;
     int pid = (int)extract_json_uint64_field(body ? body : "", "pid");
     int rc = proc_kill(pid);
     int err_no = errno; /* capture immediately — proc_kill set it on failure */
@@ -15807,6 +15764,125 @@ static void mgmt_fs_count(void) {
     pthread_mutex_unlock(&st->state_mtx);
 }
 
+/* ---- P3 Task 7 table adapters ----
+ * mgmt_table.def calls handlers as (state, fd, trace, body, len). These handlers take a different
+ * shape (no length, or no state), so a one-line adapter gives them the table's. Each adapter only
+ * forwards the arguments; the body arrives NUL-terminated (mgmt_legacy_call). */
+static int mgmt_w_fan_curve_set(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_fan_curve_set(st, fd, t, b);
+}
+static int mgmt_w_user_create(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_user_create(st, fd, t, b);
+}
+static int mgmt_w_user_delete(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_user_delete(st, fd, t, b);
+}
+static int mgmt_w_backup_list(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_backup_list(st, fd, t, b);
+}
+static int mgmt_w_backup_delete(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_backup_delete(st, fd, t, b);
+}
+static int mgmt_w_remoteplay_request(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_remoteplay_request(st, fd, t, b);
+}
+static int mgmt_w_remoteplay_enable(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_remoteplay_enable(st, fd, t, b);
+}
+static int mgmt_w_activity_db_query(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_activity_db_query(st, fd, t, b);
+}
+static int mgmt_w_notif_list(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_notif_list(st, fd, t, b);
+}
+static int mgmt_w_cheats_get(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_cheats_get(st, fd, t, b);
+}
+static int mgmt_w_cheats_toggle(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_cheats_toggle(st, fd, t, b);
+}
+static int mgmt_w_cheats_delete(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_cheats_delete(st, fd, t, b);
+}
+static int mgmt_w_cheats_engine_set(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_cheats_engine_set(st, fd, t, b);
+}
+static int mgmt_w_sdk_patch(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_sdk_patch(st, fd, t, b);
+}
+static int mgmt_w_sdk_restore(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_sdk_restore(st, fd, t, b);
+}
+static int mgmt_w_tmdb_fetch(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_tmdb_fetch(st, fd, t, b);
+}
+static int mgmt_w_tmdb_store(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_tmdb_store(st, fd, t, b);
+}
+static int mgmt_w_ftp_start(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)l;
+    return handle_ftp_start(st, fd, t, b);
+}
+static int mgmt_w_profile_set_username(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st;
+    (void)l;
+    return handle_profile_set_username(fd, t, b);
+}
+static int mgmt_w_profile_activate(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st;
+    (void)l;
+    return handle_profile_activate(fd, t, b);
+}
+static int mgmt_w_profile_apply_avatar(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st;
+    (void)l;
+    return handle_profile_apply_avatar(fd, t, b);
+}
+static int mgmt_w_profile_clear_slot(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st;
+    (void)l;
+    return handle_profile_clear_slot(fd, t, b);
+}
+static int mgmt_w_profile_set_local_username(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st;
+    (void)l;
+    return handle_profile_set_local_username(fd, t, b);
+}
+static int mgmt_w_profile_info(runtime_state_t *st, int fd, uint64_t t) {
+    (void)st;
+    return handle_profile_info(fd, t);
+}
+
+/* notif.send shares toast.send's 4 KiB request cap over AVA1. */
+static int mgmt_w_notif_send(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    if (l > 4096) return send_frame(fd, FTX2_FRAME_ERROR, 0, t, "body_too_large", 14);
+    return handle_notif_send(st, fd, t, b);
+}
+
+/* toast.send: the FTX2 dispatcher refused a body over 4 KiB before the handler ran (and the handler
+ * checks it again). Over AVA1 a larger body is ERR_PROTOCOL ("body_too_large"). */
+static int mgmt_w_toast_send(runtime_state_t *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    if (l > 4096) return send_frame(fd, FTX2_FRAME_ERROR, 0, t, "body_too_large", 14);
+    return handle_toast_send(st, fd, t, b, l);
+}
+
 /* The AVA1 management table (mgmt_table.def) and its thread environment. */
 #include "mgmt_install.inc"
 
@@ -16164,7 +16240,7 @@ static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
     }
     if (hdr.frame_type == FTX2_FRAME_PROCESS_KILL) {
         return handle_process_kill(state, client_fd, hdr.trace_id,
-                                   request_body);
+                                   request_body, hdr.body_len);
     }
     if (hdr.frame_type == FTX2_FRAME_SYSLOG_TAIL) {
         return handle_syslog_tail(state, client_fd, hdr.trace_id);
@@ -16229,44 +16305,13 @@ static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
         return handle_remoteplay_request(state, client_fd, hdr.trace_id, request_body);
     }
     if (hdr.frame_type == FTX2_FRAME_REMOTEPLAY_READINESS) {
-        char body[640];
-        int n = remoteplay_readiness_json(body, sizeof(body));
-        if (n < 0 || (size_t)n >= sizeof(body)) {
-            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, hdr.trace_id,
-                              "readiness_overflow", 18);
-        }
-        return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_READINESS, 0,
-                          hdr.trace_id, body, (uint64_t)n);
+        return handle_remoteplay_readiness(state, client_fd, hdr.trace_id);
     }
     if (hdr.frame_type == FTX2_FRAME_REMOTEPLAY_ENABLE) {
-        char scope[16] = "";
-        extract_json_string_field(request_body, "scope", scope, sizeof(scope));
-        char body[640];
-        int n = remoteplay_enable(strcmp(scope, "user") == 0, body, sizeof(body));
-        if (n == -2) {
-            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, hdr.trace_id,
-                              "rp_enable_unsupported_fw", 24);
-        }
-        if (n == -3) {
-            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, hdr.trace_id,
-                              "rp_enable_no_user", 17);
-        }
-        if (n < 0 || (size_t)n >= sizeof(body)) {
-            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, hdr.trace_id,
-                              "rp_enable_write_failed", 22);
-        }
-        return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_ENABLE, 0,
-                          hdr.trace_id, body, (uint64_t)n);
+        return handle_remoteplay_enable(state, client_fd, hdr.trace_id, request_body);
     }
     if (hdr.frame_type == FTX2_FRAME_REMOTEPLAY_DEVICES) {
-        char body[2048];
-        int n = remoteplay_devices_json(body, sizeof(body));
-        if (n < 0 || (size_t)n >= sizeof(body)) {
-            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, hdr.trace_id,
-                              "rp_devices_overflow", 19);
-        }
-        return send_frame(client_fd, FTX2_FRAME_REMOTEPLAY_DEVICES, 0,
-                          hdr.trace_id, body, (uint64_t)n);
+        return handle_remoteplay_devices(state, client_fd, hdr.trace_id);
     }
     if (hdr.frame_type == FTX2_FRAME_REMOTEPLAY_STATUS) {
         return handle_remoteplay_status(state, client_fd, hdr.trace_id);

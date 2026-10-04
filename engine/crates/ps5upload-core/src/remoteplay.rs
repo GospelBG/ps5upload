@@ -1,10 +1,9 @@
 //! Remote Play PIN generation over FTX2.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemotePlayStatus {
@@ -25,17 +24,13 @@ pub struct RemotePlayStatus {
 }
 
 pub fn remoteplay_request(addr: &str, manual_account_id: Option<&str>) -> Result<PinSnapshot> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::json!({ "manual_account_id": manual_account_id.unwrap_or("") });
-    c.send_frame(FrameType::RemotePlayRequest, &serde_json::to_vec(&body)?)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected REMOTEPLAY_REQUEST: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
+    let resp = mgmt::call_keep(
+        addr,
+        m::RP_REQUEST,
+        "REMOTEPLAY_REQUEST",
+        &serde_json::to_vec(&body)?,
+    )?;
     // The payload acks with frame type RemotePlayStatus (189) and body
     // {"ok":true|false}. A non-Error frame was previously treated as success
     // without inspecting the body — so a genuine on-console failure
@@ -72,34 +67,13 @@ pub struct PinSnapshot {
 }
 
 pub fn remoteplay_status(addr: &str) -> Result<RemotePlayStatus> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::RemotePlayStatus, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected REMOTEPLAY_STATUS: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::RemotePlayStatus {
-        bail!("expected REMOTEPLAY_STATUS response, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::RP_STATUS, "REMOTEPLAY_STATUS", &[])?;
     let parsed: RemotePlayStatus = serde_json::from_slice(&resp)?;
     Ok(parsed)
 }
 
 pub fn remoteplay_cancel(addr: &str) -> Result<()> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::RemotePlayCancel, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected REMOTEPLAY_CANCEL: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
+    mgmt::call_keep(addr, m::RP_CANCEL, "REMOTEPLAY_CANCEL", &[])?;
     Ok(())
 }
 
@@ -214,19 +188,7 @@ pub struct RemotePlayDevices {
 
 /// Read the readiness snapshot. Performs no writes on the console.
 pub fn remoteplay_readiness(addr: &str) -> Result<RemotePlayReadiness> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::RemotePlayReadiness, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected RemotePlayReadiness: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::RemotePlayReadiness {
-        bail!("unexpected reply to RemotePlayReadiness: {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::RP_READINESS, "RemotePlayReadiness", &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -235,38 +197,19 @@ pub fn remoteplay_readiness(addr: &str) -> Result<RemotePlayReadiness> {
 /// Returns the re-read readiness snapshot, so the caller never has to
 /// assume the write took effect.
 pub fn remoteplay_enable(addr: &str, scope: &str) -> Result<RemotePlayReadiness> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::json!({ "scope": scope });
-    c.send_frame(FrameType::RemotePlayEnable, &serde_json::to_vec(&body)?)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected RemotePlayEnable: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::RemotePlayEnable {
-        bail!("unexpected reply to RemotePlayEnable: {ft:?}");
-    }
+    let resp = mgmt::call_keep(
+        addr,
+        m::RP_ENABLE,
+        "RemotePlayEnable",
+        &serde_json::to_vec(&body)?,
+    )?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
 /// Devices this console has been paired with.
 pub fn remoteplay_devices(addr: &str) -> Result<RemotePlayDevices> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::RemotePlayDevices, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected RemotePlayDevices: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::RemotePlayDevices {
-        bail!("unexpected reply to RemotePlayDevices: {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::RP_DEVICES, "RemotePlayDevices", &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 

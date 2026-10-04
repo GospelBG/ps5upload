@@ -73,15 +73,26 @@ closes the connection.
 the Join tag uses dir = c2s and m = "join" ‖ session_id ‖ u16le(lane) ‖ cn; the
 JoinAck tag uses dir = s2c and m = "join-ack" ‖ session_id ‖ u16le(lane) ‖ cn ‖ sn.
 
-4.6 Pairing code: u32le(BLAKE2b-256("AVA1 pairing" ‖ h)[0..4]) mod 10⁶, shown as
-six digits. A man in the middle yields different h, so different codes.
+4.6 Pairing code: u32le(BLAKE2b-256("AVA1 pairing" ‖ h ‖ nonce_c ‖ nonce_s)[0..4])
+mod 10⁶, shown as six digits. nonce_c and nonce_s are 16 random bytes from the client
+and the server; the server commits to its own, `pair_commit = BLAKE2b-256(nonce_s)`,
+in ServerInfo (message 2) before it has seen nonce_c (in ClientInfo, message 3), and
+reveals nonce_s in the sealed Welcome. A man in the middle yields different h, but h
+alone is not enough: the last thing mixed into h is message 3's payload, which the
+initiator chooses, so an attacker running two handshakes could search payloads until
+both codes agree. With the commit-then-reveal round, facing the client the attacker
+commits before it sees nonce_c, and facing the console it must send its own nonce
+before the console reveals nonce_s, so each active attempt is a single 1-in-10⁶ guess
+(and costs a visible pairing notification). `vectors/pairing.txt` pins the commitment
+and the code. The three fields are required (a node that omits one is refused, since
+an optional field could be stripped); a trusted reconnect carries them too.
 
 ## 5. Handshake and pairing
 1. Client → `Hs1{noise}` (unsealed): Noise message 1, payload `HelloInfo`
    (version range, caps 0).
 2. Server: no common version → `Error(ERR_UNSUPPORTED_VERSION)` unsealed, close.
    Else → `Hs2{noise}`: message 2, payload `ServerInfo` (version, caps, random
-   session_id, name). `caps` bit 0 is `CAP_DATA_PLANE` (1): the node hosts the jobs
+   session_id, pair_commit (§4.6), name). `caps` bit 0 is `CAP_DATA_PLANE` (1): the node hosts the jobs
    of §11–§16. A client sends no data-plane frame and no method 16–19 request to a
    node that did not advertise it.
    Bit 1 is `CAP_MGMT` (2): the node serves the management methods of §7.3 (numbers 4 and
@@ -89,14 +100,18 @@ six digits. A man in the middle yields different h, so different codes.
    for `ERR_UNKNOWN_METHOD`; a node that does not advertise it answers
    `ERR_UNKNOWN_METHOD` to them. The payload advertises it when its management table is
    installed (`mgmt_rpc_installed()`); the Rust `Session::has_mgmt()` reads it.
-3. Client → `Hs3{noise}`: message 3, payload `ClientInfo` (name). Both sides
+3. Client → `Hs3{noise}`: message 3, payload `ClientInfo` (nonce_c (§4.6), name). Both sides
    now key lane 0 (§4.3) and every further frame is sealed. A client that expects
    a particular device (it knows the key it paired with at this address) compares
    the server's static key from message 2 and, if it differs, closes without
    sending `Hs3` — the wrong device never learns the client's key or name.
 4. The server learned the client's key in message 3. Unknown key and pairing
-   closed → sealed `Error(ERR_PAIRING_CLOSED)`, close. Else → sealed
-   `Welcome{knows_you}`.
+   closed → sealed `Error(ERR_PAIRING_CLOSED)`, close. A ClientInfo without
+   nonce_c → sealed `Error(ERR_PROTOCOL)`, close. Else → sealed
+   `Welcome{knows_you, nonce_s}`. The client checks BLAKE2b-256(nonce_s) against the
+   pair_commit of message 2 before it shows any code or trusts anything else in the
+   Welcome; a mismatch, or a ServerInfo or Welcome without its field, closes the
+   connection (after a best-effort `Error(ERR_PROTOCOL)`).
 5. Pairing: while either side does not know the other, both show the pairing
    code (§4.6). After the user confirms, a client whose server sent knows_you = 0
    sends `PairConfirm` (channel = request id); the server answers
@@ -206,9 +221,34 @@ delays liveness.
 | 4–141 | management methods | see §7.3 and `MGMT_METHODS.md` | see §7.3 |
 
 `Status.state` is 0 while the job runs, 1 when it finished OK and 2 when it failed (the cause is
-in ext `current`). Methods 16–19 are the version 1 data-plane RPCs and exist only on a node that
+in ext `current`, the `ERR_*` code in ext `code`; a finished `job.run` job's output is in ext `result`). Methods 16–19 are the version 1 data-plane RPCs and exist only on a node that
 advertises `CAP_DATA_PLANE`; the management methods are §7.3 and exist on a node that advertises `CAP_MGMT`. The behaviour of 16–18 is §15.5; of
 19, §16.10.
+
+7.1.1 `job.run` and `job.list` (long management operations). `job.run{job_id, op, args}` starts operation
+`op` (`JOB_OP_*`: DELETE 1, CHMOD_R 2, HASH 3, CRC32 4, FSCK 5, BACKUP_SNAPSHOT 6, BACKUP_RESTORE 7,
+CLEANUP 8, SDK_SCAN 9) on its own worker thread (the 512 KiB management stack) and answers at once with a
+`Status` (state 0). `args` is the operation's request body, the same legacy JSON the FTX2 frame carried
+(at most 60 KiB). The job is an entry of the job table (counted against the 32-job limit, owned by the
+peer that started it, no session, so a reconnect does not matter), at most 8 operations run at once
+(`ERR_BUSY` for a ninth) and an unknown `op` is `ERR_PROTOCOL` (`unknown_op`).
+* `job.status` returns the progress (`files_done/total`, `bytes_durable/total`: files are non-directories,
+  bytes the regular files' sizes; both totals are 0 while unknown), the current step in ext `current`, and,
+  once finished, `state` 1 with ext `result` (the operation's reply body, at most 128 KiB) or `state` 2 with
+  ext `code` (the `ERR_*`) and the cause token in `current`. A repeat of `job.run` with the same id and the
+  same owner, op and args answers the job's status whatever state it is in (nothing runs twice); other
+  parameters are `ERR_PROTOCOL`, another owner `ERR_UNKNOWN_JOB`.
+* `job.cancel` raises the job's cancel flag and waits up to 2 s for the worker. A delete, chmod, hash,
+  crc32 or backup stops at the next directory entry or read block and the job ends `state 2`,
+  `ERR_CANCELLED`; fsck, cleanup and sdk.scan are one system call and only honour a cancel that arrives
+  before they start. Unlike a copy, a cancelled operation stays listed (finished) so a poller reads how
+  it ended; it is collected a park age after it ended, like any finished job.
+* An operation that wraps an FTX2 handler (fsck, backup, cleanup, sdk.scan) keeps the handler's
+  `{"ok":false,...}` body as its result: the operation ran and the body is the answer. Only an ERROR
+  frame is a failed job. DELETE refuses a path outside the writable roots and a mount point (a path on
+  another device than its parent): `ERR_PATH`, `fs_delete_path_not_allowed` / `fs_delete_path_is_mount_point`.
+* `job.list` returns the peer's jobs of every kind as `JobListResult` (`JobEntry.kind` 1 upload, 2
+  download, 3 copy, 4 operation).
 
 7.2 Error codes. The numbers below are generated from `schema/ava1.toml`, whose constants are the
 normative table; the second column names the constant in the generated code.
@@ -253,6 +293,15 @@ A `MgmtText` body is the payload handler's existing request or reply (UTF-8 text
 JSON), carried unchanged in `MgmtText.body`; `more = 1` on a reply means the method is paged and
 the caller asks again with the next `offset`. Typing the text methods is deferred (§10): the text
 bodies are stable and tested, and the cutover does not need them typed.
+
+`log.klog` and `log.syslog` are clamped tails, not paged reads: when the console's text is longer than
+`RPC_TEXT_MAX` the reply is its newest `RPC_TEXT_MAX` bytes, starting at a line boundary (else a
+UTF-8 boundary), with `more = 1` meaning "older text was left out"; a text that fits is returned whole
+with `more` absent or 0. `net.reach` is a probe: its negative answer (`{"ok":false,"timed_out":..,
+"errno":..,"ms":..}`) is the measurement and travels as an ordinary OK reply; only a malformed request
+(`bad_request`, `bad_address`) is `ERR_PROTOCOL`. A console writes a human-readable job event log at
+`/data/ps5upload/ava/events.log` (one line per job open, resume, done and fail with status, bytes,
+files and lanes; 1 MiB, rolled to `events.log.old`), read with `fs.read` like the other log files.
 
 Encoding overhead. A `MgmtText` is `u32 length + text + u16 ext count` (6 bytes), plus 7 bytes when
 `more` is present (tag u16, length u32, value u8). It is the `RpcResponse` body, so the largest text
@@ -843,4 +892,18 @@ than the manifest fails the job (the archive changed between listing and sending
 protocol or receiver failure) and must poll it at least every 1 MiB of input, including while
 skipping, and every `EntrySink` call fails
 once the job is ending; `SeqSource::close` is called at teardown before the decode thread is
-joined. The bottleneck is `BN_SOURCE` while the decode thread is what the lanes wait on.
+joined. The sender attributes the bottleneck itself: it is `BN_SOURCE` when lanes find nothing queued, except
+in a tick in which the decode thread parked on its read-ahead budget (the budget is held by frames in flight,
+so the lanes, not the source, are the limit then).
+
+17.5 Entry metadata. The manifest carries each entry's own last-modified time as `mtime` (it is content, not
+container metadata) where the format exposes it: 7z (the entry's FILETIME), zip (its DOS time, read as UTC) and
+RAR (UnRAR's DOS time in the host's zone and 2 s resolution; a stamp in the future is read as absent, and
+non-Unix hosts carry none). 0 means the archive has none. Directory mtimes are 0, and modes stay `0644` for files
+and `0755` for directories: archives' Unix permission bits are not carried (zip's `unix_mode` excepted).
+
+17.6 Refusals. A duplicate name, a path that is both a file and a directory (and, for RAR, two names that differ
+only in case) fail the job terminally (`ava1_7z_unsupported`, `ava1_rar_unsupported`); only an unsupported 7z
+coder method falls back to FTX2, since FTX2 has the same problem with the others (it writes both duplicates, or
+hits the same decoder memory limit). A RAR's listing order is compared with its extraction order only when a
+non-solid resume skips entries by position; any other pass binds entries by path.

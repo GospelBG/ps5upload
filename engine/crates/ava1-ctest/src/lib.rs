@@ -86,7 +86,8 @@ pub mod ffi {
         /// Feeds `frame` to the C reader of a connection keyed with `key` (counter 0).
         /// 0 = opened; AVA1_E_* otherwise.
         pub fn ava1_test_conn_open_frame(key: *const u8, frame: *const u8, len: usize) -> c_int;
-        pub fn ava1_pairing_code(hash: *const u8) -> u32;
+        pub fn ava1_pairing_code(hash: *const u8, nonce_c: *const u8, nonce_s: *const u8) -> u32;
+        pub fn ava1_pair_commit(nonce_s: *const u8, out: *mut u8);
         pub fn ava1_noise_init(
             ns: *mut CNoise,
             initiator: c_int,
@@ -298,6 +299,14 @@ pub mod ffi {
         pub fn ava1_test_page_next(out: *mut i64);
         pub fn ava1_test_data_clamp(start: u8, min: u8, max: u8, out: *mut c_int);
         pub fn ava1_test_set_same_device(v: c_int);
+        pub fn ava1_test_fsj_delay_us(us: u32);
+        pub fn ava1_test_fsj_cross_name(name: *const c_char);
+        pub fn ava1_test_copy_atomic(
+            src: *const c_char,
+            dst: *const c_char,
+            blocks: c_int,
+        ) -> c_int;
+        pub fn ava1_test_reap_far();
         pub fn ava1_test_mgmt_install() -> c_int;
         pub fn ava1_test_mgmt_install_duplicate() -> c_int;
         pub fn ava1_test_mgmt_uninstall();
@@ -310,6 +319,17 @@ pub mod ffi {
             sony_peak: *mut c_int,
         );
         pub fn ava1_test_mgmt_last_path(out: *mut u8, cap: usize) -> usize;
+        pub fn ava1_test_mgmt_install_diag() -> c_int;
+        pub fn ava1_test_mgmt_diag_peak() -> c_int;
+        pub fn ava1_test_mgmt_set_syslog(len: u32, mode: c_int);
+        pub fn ava1_test_tail_window(
+            text: *const u8,
+            len: usize,
+            cap: usize,
+            start: *mut usize,
+        ) -> c_int;
+        pub fn ava1_test_events_set(path: *const c_char, limit: u32);
+        pub fn ava1_test_events_log(line: *const c_char);
         pub fn ava1_test_set_allow_read(v: c_int);
         pub fn ava1_test_apply_begin(
             jobs: *const c_char,
@@ -378,9 +398,22 @@ pub mod ffi {
         pub fn ava1_test_copy_walk_active() -> c_int;
         pub fn ava1_test_copy_delete_active() -> c_int;
         pub fn ava1_test_retiring_blocks_reopen() -> c_int;
+        // P3 Task 7 (csrc/test_shim_t7.c)
+        pub fn ava1_test_t7_install() -> c_int;
+        pub fn ava1_test_t7_count() -> usize;
+        pub fn ava1_test_t7_entry(
+            i: usize,
+            method: *mut u32,
+            flags: *mut u32,
+            frame: *mut u32,
+            ack: *mut u32,
+        ) -> c_int;
+        pub fn ava1_test_t7_sony_peak() -> c_int;
+        pub fn ava1_test_t7_reset_peak();
         pub fn ava1_test_copy_put_decode_failure() -> c_int;
         pub fn ava1_test_copy_retry_changed_message() -> c_int;
         pub fn ava1_test_send_chunk_bytes() -> u64;
+        pub fn ava1_send_timing_enabled() -> c_int;
         pub fn ava1_send_test_begin(credit: u64);
         pub fn ava1_send_test_end();
         pub fn ava1_send_test_put(len: u64) -> c_int;
@@ -1176,6 +1209,32 @@ thread_local! {
     static SAME_DEVICE: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
 }
 
+/// A folder or file with this base name reports another device than its parent (a mount point)
+/// to the walkers' device guard; "" turns it off (every data start does).
+pub fn c_set_cross_name(name: &str) {
+    let c = std::ffi::CString::new(name).unwrap();
+    unsafe { ffi::ava1_test_fsj_cross_name(c.as_ptr()) }
+}
+
+/// `fsj_copy_atomic(src, dst)` with a cancel after `blocks` 64 KiB blocks (negative: never):
+/// 0, -1 or -2 (cancelled).
+pub fn c_copy_atomic(src: &std::path::Path, dst: &std::path::Path, blocks: i32) -> i32 {
+    let s = std::ffi::CString::new(src.to_str().unwrap()).unwrap();
+    let d = std::ffi::CString::new(dst.to_str().unwrap()).unwrap();
+    unsafe { ffi::ava1_test_copy_atomic(s.as_ptr(), d.as_ptr(), blocks) }
+}
+
+/// Runs the payload's reaper as if an hour had passed: finished jobs are collected, running
+/// ones stay.
+pub fn c_reap_far() {
+    unsafe { ffi::ava1_test_reap_far() }
+}
+
+/// Every file a job.run operation visits waits this long (0 = off; reset at each data start).
+pub fn c_set_fsj_delay_us(us: u32) {
+    unsafe { ffi::ava1_test_fsj_delay_us(us) }
+}
+
 /// What the data layer's same_device hook answers for the next apply job begun on this
 /// thread (1 same, 0 crosses, -1 unknown). It is installed under the C server lock by
 /// `CApplyJob::begin` and cleared when that job ends, so it cannot reach a job another
@@ -1663,10 +1722,98 @@ pub mod mgmt {
         unsafe { ffi::ava1_test_mgmt_stats(&mut e, &mut l, &mut f, &mut p) };
         (e, l, f, p)
     }
+    /// Installs the Task 9 diagnostics table (klog, syslog, net.*, proc.modules) instead of the
+    /// general stub table. 0 on success.
+    pub fn install_diag() -> i32 {
+        unsafe { ffi::ava1_test_mgmt_install_diag() }
+    }
+    /// The most diagnostics calls the console ran at once since `install_diag`.
+    pub fn diag_peak() -> i32 {
+        unsafe { ffi::ava1_test_mgmt_diag_peak() }
+    }
+    /// The stub `log.syslog` handler: `len` bytes of numbered lines (mode 0), the sysctl error
+    /// frame (1), an empty buffer (2) or text after a 60 ms hold (3).
+    pub fn set_syslog(len: u32, mode: i32) {
+        unsafe { ffi::ava1_test_mgmt_set_syslog(len, mode) }
+    }
+    /// `mgmt_tail_window`: (clipped, start of the window).
+    pub fn tail_window(text: &[u8], cap: usize) -> (bool, usize) {
+        let mut start = 0usize;
+        let c = unsafe { ffi::ava1_test_tail_window(text.as_ptr(), text.len(), cap, &mut start) };
+        (c != 0, start)
+    }
     /// The path the stub `fs.mkdir` handler last received.
     pub fn last_path() -> String {
         let mut b = [0u8; 256];
         let n = unsafe { ffi::ava1_test_mgmt_last_path(b.as_mut_ptr(), b.len()) };
         String::from_utf8_lossy(&b[..n]).into_owned()
+    }
+}
+
+/// The AVA1 event log (payload/ava1/ava1_events.c, P3 Task 9).
+pub mod events {
+    use super::ffi;
+    use std::ffi::CString;
+    use std::path::Path;
+
+    /// Points the log at `path` (None = off) with a roll size of `limit` bytes (0 = 1 MiB).
+    pub fn set(path: Option<&Path>, limit: u32) {
+        let c = path.map(|p| CString::new(p.to_str().unwrap()).unwrap());
+        unsafe {
+            ffi::ava1_test_events_set(c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()), limit)
+        }
+    }
+    /// `ava1_log_event`.
+    pub fn log(line: &str) {
+        let c = CString::new(line).unwrap();
+        unsafe { ffi::ava1_test_events_log(c.as_ptr()) }
+    }
+}
+
+/// P3 Task 7: the management table rows of the hardware/system/accounts/cheats/mods/notices/Remote
+/// Play group, expanded from the real `mgmt_table.def` over stub handlers (`csrc/test_shim_t7.c`).
+pub mod t7 {
+    use super::ffi;
+
+    /// One row of the real table: AVA1 method, `MGMT_*` flags, FTX2 request and ack frame numbers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Row {
+        pub method: u32,
+        pub flags: u32,
+        pub frame: u32,
+        pub ack: u32,
+    }
+
+    /// `MGMT_SONY`.
+    pub const SONY: u32 = 1;
+
+    /// Installs the Task 7 table (replacing any other). 0 on success.
+    pub fn install() -> i32 {
+        unsafe { ffi::ava1_test_t7_install() }
+    }
+    pub fn rows() -> Vec<Row> {
+        let n = unsafe { ffi::ava1_test_t7_count() };
+        (0..n)
+            .map(|i| {
+                let (mut m, mut f, mut fr, mut a) = (0, 0, 0, 0);
+                assert_eq!(
+                    unsafe { ffi::ava1_test_t7_entry(i, &mut m, &mut f, &mut fr, &mut a) },
+                    0
+                );
+                Row {
+                    method: m,
+                    flags: f,
+                    frame: fr,
+                    ack: a,
+                }
+            })
+            .collect()
+    }
+    /// The most threads that were inside a Sony-flagged stub (holding the real `sony_api_lock`) at once.
+    pub fn sony_peak() -> i32 {
+        unsafe { ffi::ava1_test_t7_sony_peak() }
+    }
+    pub fn reset_peak() {
+        unsafe { ffi::ava1_test_t7_reset_peak() }
     }
 }

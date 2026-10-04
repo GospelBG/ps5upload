@@ -329,24 +329,37 @@ async fn mkdir_chmod_and_stat_send_typed_bodies() {
     );
 }
 
+/// A recursive chmod is a `job.run` CHMOD_R op (progress, cancel, no socket held for minutes);
+/// the legacy body is the op's arguments, and the caller gets the empty reply it always did.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_recursive_chmod_is_left_to_ftx2_until_it_runs_as_a_job() {
+async fn a_recursive_chmod_runs_as_a_job() {
+    let seen = Arc::new(Mutex::new(Vec::<(u16, Vec<u8>)>::new()));
+    let s2 = seen.clone();
     let (t, _p, c) = console(
         "rchmod",
-        Box::new(|_, _| err(gen::ERR_INTERNAL, "must not be called")),
+        Box::new(move |method, body| {
+            s2.lock().unwrap().push((method, body.to_vec()));
+            let id = match method {
+                gen::METHOD_JOB_RUN => gen::JobRun::decode(body).unwrap().job_id,
+                gen::METHOD_JOB_STATUS => gen::JobRef::decode(body).unwrap().job_id,
+                _ => return err(gen::ERR_INTERNAL, "unexpected"),
+            };
+            ok(job_status(id, 1).to_bytes().unwrap())
+        }),
     )
     .await;
-    let r = call(
-        &t,
-        &c,
-        m::FS_CHMOD,
-        "FS_CHMOD",
-        br#"{"path":"/a","mode":"0777","recursive":1}"#,
-        T,
-    )
-    .await
-    .unwrap();
-    assert!(r.is_none());
+    let body = br#"{"path":"/a","mode":"0777","recursive":1}"#;
+    let r = call(&t, &c, m::FS_CHMOD, "FS_CHMOD", body, T)
+        .await
+        .unwrap();
+    assert_eq!(r, Some(Vec::new()));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].0, gen::METHOD_JOB_RUN);
+    let run = gen::JobRun::decode(&seen[0].1).unwrap();
+    assert_eq!(
+        (run.op, run.args.as_slice()),
+        (gen::JOB_OP_CHMOD_R, &body[..])
+    );
 }
 
 fn file_bytes(n: usize) -> Vec<u8> {
@@ -876,18 +889,26 @@ async fn concurrent_first_calls_open_one_session() {
     assert_eq!(p.attempts(), 1);
 }
 
-/// A mid-sequence failure leaves `<path>.ps5upload.tmp` on the console: no removal method exists
-/// before Task 5's `job.run` DELETE (`TODO(Task 5)`, CUTOVER.md). This documents today's behaviour:
-/// the second chunk is refused, the write stops, and no cleanup call is made.
+/// A failure after an accepted chunk leaves `<path>.ps5upload.tmp` on the console; the writer
+/// removes it best-effort with a `job.run` DELETE and still reports the write's own error.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_failed_multi_chunk_write_makes_no_cleanup_call_and_leaves_the_tmp_to_the_next_write() {
+async fn a_failed_multi_chunk_write_removes_its_tmp_and_reports_the_write_error() {
     let n = Arc::new(AtomicUsize::new(0));
-    let methods = Arc::new(Mutex::new(Vec::<u16>::new()));
-    let (n2, m2) = (n.clone(), methods.clone());
+    let seen = Arc::new(Mutex::new(Vec::<(u16, Vec<u8>)>::new()));
+    let (n2, s2) = (n.clone(), seen.clone());
     let (t, _p, c) = console(
         "wtmp",
-        Box::new(move |method, _| {
-            m2.lock().unwrap().push(method);
+        Box::new(move |method, body| {
+            s2.lock().unwrap().push((method, body.to_vec()));
+            if method == gen::METHOD_JOB_RUN {
+                // The cleanup job: one status poll later it is done.
+                let r = gen::JobRun::decode(body).unwrap();
+                return ok(job_status(r.job_id, 1).to_bytes().unwrap());
+            }
+            if method == gen::METHOD_JOB_STATUS {
+                let r = gen::JobRef::decode(body).unwrap();
+                return ok(job_status(r.job_id, 1).to_bytes().unwrap());
+            }
             if n2.fetch_add(1, Ordering::SeqCst) == 1 {
                 err(gen::ERR_NO_SPACE, "no_space")
             } else {
@@ -908,23 +929,69 @@ async fn a_failed_multi_chunk_write_makes_no_cleanup_call_and_leaves_the_tmp_to_
     .await
     .unwrap_err();
     assert_eq!(e.to_string(), "payload rejected FS_WRITE_BYTES: no_space");
+    let seen = seen.lock().unwrap();
+    let methods: Vec<u16> = seen.iter().map(|s| s.0).collect();
     assert_eq!(
-        *methods.lock().unwrap(),
-        vec![gen::METHOD_FS_WRITE, gen::METHOD_FS_WRITE],
-        "stopped at the failed chunk; nothing tried to remove the tmp"
+        methods[..3],
+        [
+            gen::METHOD_FS_WRITE,
+            gen::METHOD_FS_WRITE,
+            gen::METHOD_JOB_RUN
+        ],
+        "stopped at the failed chunk, then removed the tmp"
     );
-    // The retry starts at offset 0, which the payload treats as "truncate the abandoned tmp".
-    n.store(100, Ordering::SeqCst);
-    call(
+    let run = gen::JobRun::decode(&seen[2].1).unwrap();
+    assert_eq!(run.op, gen::JOB_OP_DELETE);
+    let args: serde_json::Value = serde_json::from_slice(&run.args).unwrap();
+    assert_eq!(args["path"], "/data/p.ps5upload.tmp");
+}
+
+/// A refusal of the FIRST chunk names a tmp file this write did not create: nothing is removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_first_chunk_removes_nothing() {
+    let methods = Arc::new(Mutex::new(Vec::<u16>::new()));
+    let m2 = methods.clone();
+    let (t, _p, c) = console(
+        "wtmp0",
+        Box::new(move |method, _| {
+            m2.lock().unwrap().push(method);
+            err(gen::ERR_EXISTS, "exists")
+        }),
+    )
+    .await;
+    let size = 3 * gen::FSW_CHUNK_MAX as usize;
+    let e = call(
         &t,
         &c,
         m::FS_WRITE,
         "FS_WRITE_BYTES",
-        &write_body("/data/p", size, "overwrite"),
+        &write_body("/data/p", size, "create"),
         T,
     )
     .await
-    .unwrap();
+    .unwrap_err();
+    assert!(e.to_string().contains("exists"), "{e}");
+    assert_eq!(*methods.lock().unwrap(), vec![gen::METHOD_FS_WRITE]);
+}
+
+/// A finished job's Status, as the console answers `job.run` / `job.status`.
+fn job_status(job_id: [u8; 16], state: u8) -> gen::Status {
+    gen::Status {
+        job_id,
+        files_done: 0,
+        files_total: 0,
+        bytes_received: 0,
+        bytes_durable: 0,
+        bytes_total: 0,
+        bottleneck: 0,
+        workers: 0,
+        lanes: 0,
+        sequential: 0,
+        current: None,
+        state: Some(state),
+        result: None,
+        code: None,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -965,4 +1032,43 @@ fn call_from_a_current_thread_runtime_does_not_panic() {
     let r = cur.block_on(async { t.call(&c, m::HW_INFO, "HW_INFO", b"", T) });
     assert_eq!(r.unwrap().unwrap(), b"fine");
     drop(rt);
+}
+
+// ---- P3 Task 9: the log tails ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clamped_log_tail_is_led_by_a_note_and_a_whole_one_is_not() {
+    let (t, _p, c) = console(
+        "tails",
+        Box::new(|method, body| {
+            let n: usize = text_of(body).parse().unwrap_or(0);
+            let more = match method {
+                gen::METHOD_LOG_SYSLOG => Some(1),
+                gen::METHOD_LOG_KLOG => Some(0),
+                _ => None,
+            };
+            ok(MgmtText {
+                body: vec![b'x'; n],
+                more,
+            }
+            .to_bytes()
+            .unwrap())
+        }),
+    )
+    .await;
+    // the console clamped it (`more` = 1): the text says so, then the newest part follows
+    let r = call(&t, &c, m::LOG_SYSLOG, "SYSLOG_TAIL", b"5", T)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        r,
+        [ps5upload_ava1::mgmt::TAIL_CLIPPED.as_bytes(), b"xxxxx"].concat()
+    );
+    // not clamped (`more` = 0): the bytes untouched
+    let r = call(&t, &c, m::LOG_KLOG, "KLOG_READ", b"5", T)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r, b"xxxxx");
 }

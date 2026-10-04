@@ -33,24 +33,27 @@ fn dir(tag: &str) -> PathBuf {
 }
 
 /// A started C server with the stub table installed and a paired client.
-async fn rig(tag: &str) -> (CServer, Session) {
+/// The stub table, its counters and the C server are process-wide: tests of this file run one at a
+/// time (the lock is held for the rig's life; the server drops first).
+struct Rig {
+    _srv: CServer,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+fn rig_lock() -> std::sync::MutexGuard<'static, ()> {
+    // one serialisation scheme for every shim-global test: the shared guard (src/lib.rs)
+    CServer::lock_for_shim_tests()
+}
+
+async fn rig(tag: &str) -> (Rig, Session) {
     rig_with(tag, true).await
 }
 
 /// `install = false`: the server starts with no management table (no CAP_MGMT).
-async fn rig_with(tag: &str, install: bool) -> (CServer, Session) {
-    // The stub table and counters are process-wide: hold the shared shim guard for the whole test
-    // (the test's thread owns it until the thread ends), so the suite passes in parallel mode.
-    thread_local! {
-        static SHIM: std::cell::RefCell<Option<std::sync::MutexGuard<'static, ()>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    SHIM.with(|g| {
-        let mut g = g.borrow_mut();
-        if g.is_none() {
-            *g = Some(CServer::lock_for_shim_tests());
-        }
-    });
+// The guard serialises whole tests, each on its own runtime; no other task of the test waits on it.
+#[allow(clippy::await_holding_lock)]
+async fn rig_with(tag: &str, install: bool) -> (Rig, Session) {
+    let lock = rig_lock();
     if install {
         assert_eq!(mgmt::install(), 0);
     } else {
@@ -75,7 +78,13 @@ async fn rig_with(tag: &str, install: bool) -> (CServer, Session) {
     )
     .await
     .unwrap();
-    (srv, s)
+    (
+        Rig {
+            _srv: srv,
+            _lock: lock,
+        },
+        s,
+    )
 }
 
 fn text(s: &str) -> Vec<u8> {
@@ -237,7 +246,10 @@ async fn c_mgmt_error_frame_becomes_status_and_cause() {
         .unwrap();
     assert_eq!(
         (r.status, r.body.as_slice()),
-        (gen::ERR_INTERNAL, &b"launch_failed"[..])
+        (
+            gen::ERR_INTERNAL,
+            &br#"{"ok":false,"err":"launch_failed"}"#[..]
+        )
     );
     // a missing argument is the peer's
     let r = s.rpc(LAUNCH, &text("{}")).await.unwrap();
@@ -542,7 +554,14 @@ fn legacy_tokens_map_to_the_closest_status() {
         ("eperm", gen::ERR_IO),
         ("fs_write_failed_errno_28", gen::ERR_IO),
         ("disk_full", gen::ERR_NO_SPACE),
+        // Ambiguous pairs (review L5): the first matching rule wins, so a substring that
+        // two rules share resolves by order. "already_running" is BUSY, bare "already"
+        // is EXISTS; "invalid_path" is PATH (the path rule precedes "invalid" -> PROTOCOL).
         ("already_running", gen::ERR_BUSY),
+        ("already", gen::ERR_EXISTS),
+        ("already_exists", gen::ERR_EXISTS),
+        ("invalid_path", gen::ERR_PATH),
+        ("invalid_title_id", gen::ERR_PROTOCOL),
         ("launch_title_id_missing", gen::ERR_PROTOCOL),
         ("something_else", gen::ERR_INTERNAL),
     ];

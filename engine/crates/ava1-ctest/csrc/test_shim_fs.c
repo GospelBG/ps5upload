@@ -163,10 +163,10 @@ static int h_pkg(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
     static int run_##name(const uint8_t *q, uint32_t n, mgmt_ctx_t *cx) { return helper(q, n, cx, name); }
 RUN(h_shutdown, mgmt_call_empty)
 RUN(h_cleanup, mgmt_call_text)
-RUN(h_klog, mgmt_call_klog)
-RUN(h_syslog, mgmt_call_syslog)
+RUN(h_klog, mgmt_call_tail)
+RUN(h_syslog, mgmt_call_tail)
 RUN(h_ifaces, mgmt_call_text)
-RUN(h_reach, mgmt_call_text_keep)
+RUN(h_reach, mgmt_call_probe)
 RUN(h_speed, mgmt_call_text)
 RUN(h_pkg, mgmt_call_text_keep)
 

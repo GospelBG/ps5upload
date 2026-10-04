@@ -202,26 +202,21 @@ pub fn fs_hash_with_timeout(
     path: &str,
     io_timeout: Option<std::time::Duration>,
 ) -> Result<HashResult> {
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .context("applying fs_hash I/O timeout")?;
-    }
     let body = serde_json::to_vec(&serde_json::json!({ "path": path }))
         .context("serialize fs_hash body")?;
-    c.send_frame(FrameType::FsHash, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_HASH({}): {}",
-            path,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::FsHashAck {
-        bail!("expected FS_HASH_ACK, got {:?}", ft);
-    }
+    // A job over AVA1 (the hash of a multi-GiB file outlives any request deadline); the
+    // caller's timeout is now the whole wait.
+    let resp = mgmt::run_op(
+        addr,
+        mgmt::ops::HASH,
+        &format!("FS_HASH({path})"),
+        &body,
+        &mgmt::JobCall {
+            op_id: 0,
+            subject: path,
+            deadline: io_timeout.unwrap_or(mgmt::DEFAULT_TIMEOUT),
+        },
+    )?;
     let parsed: HashResult =
         serde_json::from_slice(&resp).context("decode FS_HASH_ACK body as JSON")?;
     Ok(parsed)
@@ -280,39 +275,6 @@ pub fn fs_read_with_timeout(
 
 // ─── Destructive ops (delete / move / chmod / mkdir) ────────────────────────
 
-/// Send a management-port frame that expects an empty ACK body (or an
-/// error frame), with a caller-supplied per-socket I/O timeout. Used for the
-/// ops that have no data to return on success (delete, copy) and that can run
-/// long (fs_copy of multi-GiB files) where the default 30 s read timeout would
-/// fire long before the payload finishes the internal disk-to-disk copy.
-fn send_empty_ack_op_with_timeout(
-    addr: &str,
-    frame: FrameType,
-    body: &[u8],
-    expected: FrameType,
-    what: &str,
-    io_timeout: Option<std::time::Duration>,
-) -> Result<()> {
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .with_context(|| format!("applying {what} I/O timeout"))?;
-    }
-    c.send_frame(frame, body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected {what}: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != expected {
-        bail!("expected {expected:?}, got {ft:?}");
-    }
-    Ok(())
-}
-
 /// Delete a file or directory recursively on the PS5. Path must be under
 /// the payload's writable-root allowlist (/data, /user, /mnt/ext*, /mnt/usb*).
 ///
@@ -358,28 +320,30 @@ pub fn fs_delete_with_op_id(
 ) -> Result<()> {
     let body =
         serde_json::to_vec(&serde_json::json!({ "path": path })).context("serialize fs_delete")?;
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .context("applying FS_DELETE I/O timeout")?;
+    match mgmt::run_op(
+        addr,
+        mgmt::ops::DELETE,
+        "FS_DELETE",
+        &body,
+        &mgmt::JobCall {
+            op_id,
+            subject: path,
+            deadline: io_timeout.unwrap_or(mgmt::DEFAULT_TIMEOUT),
+        },
+    ) {
+        Ok(_) => Ok(()),
+        // Cancellation is a non-error outcome from the user's POV (they hit Stop): surface
+        // it distinctly so the engine HTTP layer can return 409 instead of 502, mirroring
+        // fs_copy.
+        Err(e) if is_cancel(&e, "fs_delete_cancelled") => bail!("cancelled"),
+        Err(e) => Err(e),
     }
-    c.send_frame_with_trace(FrameType::FsDelete, &body, op_id)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        let msg = String::from_utf8_lossy(&resp).to_string();
-        // Cancellation is a non-error outcome from the user's POV
-        // (they hit Stop) — surface it distinctly so the engine HTTP
-        // layer can return 409 instead of 502, mirroring fs_copy.
-        if msg == "fs_delete_cancelled" {
-            bail!("cancelled");
-        }
-        bail!("payload rejected FS_DELETE: {msg}");
-    }
-    if ft != FrameType::FsDeleteAck {
-        bail!("expected FS_DELETE_ACK, got {:?}", ft);
-    }
-    Ok(())
+}
+
+/// True when `e` is the payload's own cancel outcome `token`.
+fn is_cancel(e: &anyhow::Error, token: &str) -> bool {
+    e.downcast_ref::<mgmt::MgmtError>()
+        .is_some_and(|m| m.cause == token)
 }
 
 /// Copy a file or directory recursively on the PS5. Both `from` and `to`
@@ -500,6 +464,31 @@ pub struct FsOpSnapshot {
 /// second mgmt-port connection so the two requests don't serialize
 /// behind each other on the payload's worker pool.
 pub fn fs_op_status(addr: &str, op_id: u64) -> Result<FsOpSnapshot> {
+    // An operation the AVA1 transport runs as a job (delete, ...): its progress is the job's.
+    if let Some(found) = mgmt::op_progress(addr, op_id)? {
+        return Ok(match found {
+            Some(p) => FsOpSnapshot {
+                found: true,
+                op_id,
+                kind: p.kind,
+                from: p.subject,
+                to: String::new(),
+                total_bytes: p.bytes_total,
+                bytes_copied: p.bytes_done,
+                cancel_requested: p.cancel_requested,
+            },
+            None => FsOpSnapshot {
+                found: false,
+                op_id: 0,
+                kind: String::new(),
+                from: String::new(),
+                to: String::new(),
+                total_bytes: 0,
+                bytes_copied: 0,
+                cancel_requested: false,
+            },
+        });
+    }
     let mut c = Connection::connect(addr)?;
     // Short timeout — status calls should return in milliseconds. A
     // hung payload here would otherwise stall the poller every
@@ -530,6 +519,9 @@ pub fn fs_op_status(addr: &str, op_id: u64) -> Result<FsOpSnapshot> {
 /// found and the cancel flag was set; false if the op_id wasn't
 /// recognized (already finished or never registered).
 pub fn fs_op_cancel(addr: &str, op_id: u64) -> Result<bool> {
+    if let Some(found) = mgmt::op_cancel(addr, op_id)? {
+        return Ok(found);
+    }
     let mut c = Connection::connect(addr)?;
     c.set_io_timeout(std::time::Duration::from_secs(5))
         .context("applying FS_OP_CANCEL I/O timeout")?;
@@ -913,8 +905,21 @@ pub fn fs_chmod_with_timeout(
         "recursive": if recursive { 1 } else { 0 },
     }))
     .context("serialize fs_chmod")?;
-    // A recursive chmod has no AVA1 method of its own (a job.run op, Task 5): the transport hands
-    // it back and `mgmt::call_with` runs it over FTX2 until then.
+    if recursive {
+        // The walk of a big tree is a job (progress, cancel, no socket held for minutes).
+        mgmt::run_op(
+            addr,
+            mgmt::ops::CHMOD_R,
+            "FS_CHMOD",
+            &body,
+            &mgmt::JobCall {
+                op_id: 0,
+                subject: path,
+                deadline: io_timeout.unwrap_or(mgmt::DEFAULT_TIMEOUT),
+            },
+        )?;
+        return Ok(());
+    }
     mgmt::call_with(addr, m::FS_CHMOD, "FS_CHMOD", &body, io_timeout)?;
     Ok(())
 }
@@ -958,29 +963,27 @@ pub struct RegisterResult {
 /// `"PSN"` or `"disc"` and the launcher rejects it. Invasive:
 /// modifies the user's source file in place, so it's opt-in.
 pub fn app_register(addr: &str, src_path: &str, patch_drm_type: bool) -> Result<RegisterResult> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::to_vec(&serde_json::json!({
         "src_path": src_path,
         "patch_drm_type": if patch_drm_type { 1 } else { 0 },
     }))
     .context("serialize app_register body")?;
-    c.send_frame(FrameType::AppRegister, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APP_REGISTER({}): {}",
-            src_path,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppRegisterAck {
-        bail!("expected APP_REGISTER_ACK, got {:?}", ft);
-    }
+    // A register can run 10 s or more (copy of the metadata, the nullfs mount, Sony's installer
+    // under its lock), so it gets the 60 s deadline a launch has.
+    let resp = mgmt::call_with(
+        addr,
+        m::APP_REGISTER,
+        &format!("APP_REGISTER({src_path})"),
+        &body,
+        Some(SONY_CALL_TIMEOUT),
+    )?;
     let parsed: RegisterResult =
         serde_json::from_slice(&resp).context("decode APP_REGISTER_ACK body as JSON")?;
     Ok(parsed)
 }
+
+/// The deadline of the Sony-lock calls that can queue behind one another or run long.
+const SONY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Reverse of `app_register`. Unmounts the nullfs at
 /// `/system_ex/app/<title_id>/`, removes tracking link files, and
@@ -1017,19 +1020,14 @@ impl UnregisterOutcome {
 pub fn app_unregister(addr: &str, title_id: &str) -> Result<UnregisterOutcome> {
     let body = serde_json::to_vec(&serde_json::json!({ "title_id": title_id }))
         .context("serialize app_unregister body")?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppUnregister, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APP_UNREGISTER: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppUnregisterAck {
-        bail!("expected APP_UNREGISTER_ACK, got {ft:?}");
-    }
+    // On FW 13.60 the unregister repeats for two records and can run 10 s or more: 60 s deadline.
+    let resp = mgmt::call_with(
+        addr,
+        m::APP_UNREGISTER,
+        "APP_UNREGISTER",
+        &body,
+        Some(SONY_CALL_TIMEOUT),
+    )?;
     // Older payloads answer with an empty body — treat that as "Sony's
     // result unknown", i.e. 0, rather than failing the call.
     let rc = serde_json::from_slice::<serde_json::Value>(&resp)
@@ -1053,14 +1051,14 @@ pub fn app_unregister(addr: &str, title_id: &str) -> Result<UnregisterOutcome> {
 pub fn app_launch(addr: &str, title_id: &str) -> Result<()> {
     let body = serde_json::to_vec(&serde_json::json!({ "title_id": title_id }))
         .context("serialize app_launch body")?;
-    send_empty_ack_op_with_timeout(
+    mgmt::call_with(
         addr,
-        FrameType::AppLaunch,
-        &body,
-        FrameType::AppLaunchAck,
+        m::APP_LAUNCH,
         "APP_LAUNCH",
-        Some(std::time::Duration::from_secs(60)),
-    )
+        &body,
+        Some(SONY_CALL_TIMEOUT),
+    )?;
+    Ok(())
 }
 
 /// One entry returned by `app_list_registered`.
@@ -1093,19 +1091,8 @@ pub struct RegisteredApps {
 /// old `list_sqlite_unavailable` failure is no longer reachable — callers
 /// that still map it are harmless, and older payloads can still send it.
 pub fn app_list_registered(addr: &str) -> Result<RegisteredApps> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppListRegistered, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APP_LIST_REGISTERED: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppListRegisteredAck {
-        bail!("expected APP_LIST_REGISTERED_ACK, got {:?}", ft);
-    }
+    // Over AVA1 the transport pages the list (a reply holds ~1,700 entries) and returns one document.
+    let resp = mgmt::call(addr, m::APP_LIST, &[])?;
     let parsed: RegisteredApps =
         serde_json::from_slice(&resp).context("decode APP_LIST_REGISTERED_ACK body as JSON")?;
     Ok(parsed)
@@ -1583,11 +1570,7 @@ pub fn reconcile(
                     // 30 s socket timeout would multiply N files × 30 s
                     // on a crashed payload — at hundreds of files the
                     // user would think the app is dead.
-                    match fs_hash_with_timeout(
-                        addr,
-                        &remote_path,
-                        Some(std::time::Duration::from_secs(10)),
-                    ) {
+                    match hash_remote_waiting_out_busy(addr, &remote_path)? {
                         Ok(r) => local_hash != r.hash,
                         Err(e) => {
                             crate::core_log!(
@@ -1622,6 +1605,31 @@ pub fn reconcile(
         already_present,
         bytes_already_present,
     })
+}
+
+/// `ERR_BUSY` (AVA1 status 8): the console has no free job slot or operation worker right now.
+const STATUS_BUSY: u16 = 8;
+
+/// Hashes one remote file for the reconcile. A busy console is not an answer about the file:
+/// waiting it out (up to ~15 s) is right, and giving up is an error of the whole reconcile, never a
+/// silent "unverified, must re-send" (which would re-upload everything while the console is merely
+/// working). Any other failure is the inner `Err`, which the caller treats as unverified.
+fn hash_remote_waiting_out_busy(addr: &str, remote_path: &str) -> Result<Result<HashResult>> {
+    for attempt in 0..60 {
+        match fs_hash_with_timeout(addr, remote_path, Some(std::time::Duration::from_secs(10))) {
+            Err(e)
+                if e.downcast_ref::<mgmt::MgmtError>()
+                    .is_some_and(|m| m.status == STATUS_BUSY) =>
+            {
+                if attempt == 59 {
+                    return Err(e.context("reconcile: the console stayed busy"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            r => return Ok(r),
+        }
+    }
+    unreachable!("the loop returns on its last attempt")
 }
 
 /// Stream a local file through BLAKE3 in 64 KiB chunks. Mirrors the
@@ -2011,5 +2019,58 @@ mod tests {
         assert!(!inv.contains_key(".git/HEAD"));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A console that answers `ERR_BUSY` to the first `busy` hash jobs, then hashes.
+    struct BusyThenOk {
+        busy: std::sync::atomic::AtomicUsize,
+    }
+
+    impl mgmt::MgmtTransport for BusyThenOk {
+        fn call(
+            &self,
+            _: &str,
+            _: mgmt::Method,
+            _: &str,
+            _: &[u8],
+            _: std::time::Duration,
+        ) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn run_job(
+            &self,
+            _: &str,
+            _: mgmt::JobOp,
+            label: &str,
+            _: &[u8],
+            _: &mgmt::JobCall<'_>,
+        ) -> Result<Option<Vec<u8>>> {
+            use std::sync::atomic::Ordering;
+            if self
+                .busy
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(mgmt::MgmtError {
+                    label: label.into(),
+                    status: STATUS_BUSY,
+                    cause: "the job table is full".into(),
+                }
+                .into());
+            }
+            Ok(Some(br#"{"path":"/p","size":1,"hash":"ab"}"#.to_vec()))
+        }
+    }
+
+    #[test]
+    fn a_busy_console_is_waited_out_never_read_as_must_resend() {
+        let _g = mgmt::scoped_transport(std::sync::Arc::new(BusyThenOk { busy: 3.into() }));
+        let r = hash_remote_waiting_out_busy("c:1", "/p").unwrap().unwrap();
+        assert_eq!(r.hash, "ab");
+        // Busy for good is an error of the whole reconcile, not an `Ok(Err(..))` the caller would
+        // turn into "unverified".
+        let _g = mgmt::scoped_transport(std::sync::Arc::new(BusyThenOk { busy: 1000.into() }));
+        assert!(hash_remote_waiting_out_busy("c:1", "/p").is_err());
     }
 }

@@ -3,10 +3,8 @@
 //! affect the payload's transfer/install pipelines.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
 use crate::mgmt::{self, m};
 
 /// Read up to `max_bytes` of currently-buffered kernel log. Empty
@@ -21,6 +19,7 @@ use crate::mgmt::{self, m};
 pub fn klog_read(addr: &str, max_bytes: u32) -> Result<String> {
     let body = serde_json::json!({ "max_bytes": max_bytes });
     let body = serde_json::to_vec(&body)?;
+    // One reply carries at most the newest ~56 KiB; a console that had more says so in the text.
     let resp = mgmt::call(addr, m::LOG_KLOG, &body)?;
     Ok(String::from_utf8_lossy(&resp).into_owned())
 }
@@ -73,6 +72,9 @@ pub struct PeripheralAck {
     pub err: Option<String>,
 }
 
+/// The longest a `shell.exec` call may take (AVA1 plan: bounded to 10 s).
+pub const SHELL_MAX_SECS: u64 = 10;
+
 /// Send a peripheral-control action. `port` only matters for
 /// `UsbPortOff` / `UsbPortOn`; ignored otherwise.
 pub fn peripheral_control(
@@ -91,19 +93,7 @@ pub fn peripheral_control(
         "port": port,
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::PeripheralControl, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected PERIPHERAL_CONTROL: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::PeripheralControlAck {
-        bail!("expected PERIPHERAL_CONTROL_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::PERIPH_CONTROL, "PERIPHERAL_CONTROL", &body)?;
     let parsed: PeripheralAck = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(
@@ -166,19 +156,16 @@ pub fn shell_run(
         "timeout_secs": timeout_secs,
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::ShellExec, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected SHELL_RUN: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::ShellExecAck {
-        bail!("expected SHELL_RUN ack, got {ft:?}");
-    }
+    // Bounded: the call's deadline is the shell's own timeout, never more than 10 s (the payload runs
+    // an allowlisted built-in only and answers at most 32 KiB, with "truncated":true past that).
+    let deadline = std::time::Duration::from_secs(u64::from(timeout_secs).clamp(1, SHELL_MAX_SECS));
+    let resp = mgmt::keep_body(mgmt::call_with(
+        addr,
+        m::SHELL_EXEC,
+        "SHELL_RUN",
+        &body,
+        Some(deadline),
+    ))?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -197,21 +184,35 @@ pub struct Crc32FileResult {
 pub fn crc32_file(addr: &str, path: &str) -> Result<Crc32FileResult> {
     let body = serde_json::json!({ "path": path });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::Crc32File, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected CRC32_FILE: {}",
-            String::from_utf8_lossy(&resp)
-        );
+    // A job over AVA1: checksumming a large file takes longer than a request deadline.
+    // The deadline is the old read timeout times ten (a 64 GiB image at ~100 MB/s).
+    match mgmt::run_op(
+        addr,
+        mgmt::ops::CRC32,
+        "CRC32_FILE",
+        &body,
+        &mgmt::JobCall {
+            op_id: 0,
+            subject: path,
+            deadline: CRC32_DEADLINE,
+        },
+    ) {
+        Ok(resp) => Ok(serde_json::from_slice(&resp)?),
+        // The FTX2 handler answered a failure as a normal ack carrying `err`; keep that shape
+        // for a job the console ran and could not finish (a missing file, a refused path).
+        Err(e) => match e.downcast_ref::<mgmt::MgmtError>() {
+            Some(m) if m.status != 0 => Ok(Crc32FileResult {
+                crc32: None,
+                size: None,
+                err: Some(m.cause.clone()),
+            }),
+            _ => Err(e),
+        },
     }
-    if ft != FrameType::Crc32FileAck {
-        bail!("expected CRC32_FILE_ACK, got {ft:?}");
-    }
-    Ok(serde_json::from_slice(&resp)?)
 }
+
+/// How long [`crc32_file`] waits for the console to finish.
+const CRC32_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppDbEntry {
@@ -238,19 +239,7 @@ pub struct AppDbList {
 
 /// Query app.db for the title_id ↔ app_id ↔ name mapping.
 pub fn appdb_query(addr: &str) -> Result<AppDbList> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppDbQuery, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APPDB_QUERY: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppDbQueryAck {
-        bail!("expected APPDB_QUERY_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::APP_DB_QUERY, &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -285,19 +274,13 @@ pub fn appinfo_query(addr: &str, title_id: &str, keys: Option<&str>) -> Result<A
         "title_id": title_id,
         "keys": keys.unwrap_or(""),
     });
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppInfoQuery, body.to_string().as_bytes())?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APPINFO_QUERY: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppInfoQueryAck {
-        bail!("expected APPINFO_QUERY_ACK, got {ft:?}");
-    }
+    // `{"ok":false,"error":..}` is a reply the caller decodes (AppInfoRows.error): see call_legacy_body.
+    let resp = mgmt::call_legacy_body(
+        addr,
+        m::APP_INFO_QUERY,
+        "APPINFO_QUERY",
+        body.to_string().as_bytes(),
+    )?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -321,19 +304,13 @@ pub fn appinfo_set(addr: &str, title_id: &str, key: &str, val: &str) -> Result<A
         "key": key,
         "val": val,
     });
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppInfoSet, body.to_string().as_bytes())?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APPINFO_SET: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppInfoSetAck {
-        bail!("expected APPINFO_SET_ACK, got {ft:?}");
-    }
+    // A refused edit is `{"ok":false,"err":..}`, a result the caller reports (AppInfoSetResult.err).
+    let resp = mgmt::call_legacy_body(
+        addr,
+        m::APP_INFO_SET,
+        "APPINFO_SET",
+        body.to_string().as_bytes(),
+    )?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -490,19 +467,18 @@ pub fn ufs_fsck(addr: &str, device: &str, repair: bool) -> Result<UfsFsckResult>
         "repair": repair,
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::UfsFsck, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected UFS_FSCK: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::UfsFsckAck {
-        bail!("expected UFS_FSCK_ACK, got {ft:?}");
-    }
+    // fsck of a big volume runs for minutes: a job, polled (its reply is the same JSON).
+    let resp = mgmt::run_op(
+        addr,
+        mgmt::ops::FSCK,
+        "UFS_FSCK",
+        &body,
+        &mgmt::JobCall {
+            op_id: 0,
+            subject: device,
+            deadline: FSCK_DEADLINE,
+        },
+    )?;
     let parsed: UfsFsckResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(
@@ -512,6 +488,9 @@ pub fn ufs_fsck(addr: &str, device: &str, repair: bool) -> Result<UfsFsckResult>
     }
     Ok(parsed)
 }
+
+/// How long [`ufs_fsck`] waits for the console to finish.
+const FSCK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Measure round-trip latency to the payload by issuing N empty
 /// NetSpeedTest frames and timing each ACK.
@@ -565,28 +544,23 @@ pub fn net_reach(addr: &str, host: &str, port: u16, timeout_ms: u32) -> Result<N
         "timeout_ms": timeout_ms.to_string(),
     })
     .to_string();
-    // The payload answers an unreachable host with `ok:false` plus errno/timed_out/ms; over AVA1
-    // that is an error status carrying the body, which `call_legacy_ok` hands back as the reply.
-    let resp = mgmt::call_legacy_ok(addr, m::NET_REACH, "NET_REACH", body.as_bytes())?;
+    // The probe may wait `timeout_ms` for the connect; the call's own deadline is longer.
+    let deadline =
+        std::time::Duration::from_millis(u64::from(timeout_ms.clamp(100, 15_000)) + 5_000);
+    let resp = mgmt::call_with(
+        addr,
+        m::NET_REACH,
+        m::NET_REACH.label,
+        body.as_bytes(),
+        Some(deadline),
+    )?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
 pub fn proc_modules(addr: &str, pid: i32) -> Result<ModuleList> {
     let body = serde_json::json!({ "pid": pid });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::ProcModules, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected PROC_MODULES: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::ProcModulesAck {
-        bail!("expected PROC_MODULES_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::PROC_MODULES, &body)?;
     Ok(serde_json::from_slice(&resp)?)
 }
 

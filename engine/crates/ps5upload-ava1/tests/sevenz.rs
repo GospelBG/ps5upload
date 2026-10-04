@@ -940,3 +940,62 @@ fn sevenz_rss_stays_bounded_at_one_thread() {
         "RSS grew {growth_mib} MiB decoding 400 MiB"
     );
 }
+
+#[test]
+fn a_duplicate_name_is_terminal_not_an_ftx2_fallback() {
+    let d = temp_dir("dup");
+    let spec = Spec {
+        folders: vec![
+            vec![("a".into(), vec![1; 10])],
+            vec![("a".into(), vec![2; 10])],
+        ],
+        dirs: vec![],
+        empties: vec![],
+        copy: false,
+    };
+    build(&d.join("dup.7z"), &spec);
+    let p = Pool::new(d.join("ava")).with_addr("127.0.0.1:1");
+    let e = upload::upload_7z_in(&p, &cfg(), [9; 16], "out", &d.join("dup.7z")).unwrap_err();
+    assert!(e.downcast_ref::<upload::SevenzUnsupported>().is_none());
+    let f = failure(&e);
+    assert_eq!(f.reason, "ava1_7z_unsupported");
+    assert!(f.detail.contains("appears twice"), "{}", f.detail);
+    assert_eq!(p.attempts(), 0);
+}
+
+#[test]
+fn a_file_and_directory_conflict_is_terminal() {
+    let d = temp_dir("filedir");
+    let spec = Spec {
+        folders: vec![vec![("x".into(), vec![1; 10]), ("x/y".into(), vec![2; 10])]],
+        dirs: vec![],
+        empties: vec![],
+        copy: false,
+    };
+    build(&d.join("fd.7z"), &spec);
+    let p = Pool::new(d.join("ava")).with_addr("127.0.0.1:1");
+    let e = upload::upload_7z_in(&p, &cfg(), [9; 16], "out", &d.join("fd.7z")).unwrap_err();
+    assert!(e.downcast_ref::<upload::SevenzUnsupported>().is_none());
+    let f = failure(&e);
+    assert_eq!(f.reason, "ava1_7z_unsupported");
+    assert!(f.detail.contains("file and a directory"), "{}", f.detail);
+}
+
+#[test]
+fn an_entrys_own_mtime_is_carried_into_the_manifest() {
+    use sevenz_rust2::NtTime;
+    let d = temp_dir("mtime");
+    let mut w = ArchiveWriter::create(d.join("t.7z")).unwrap();
+    let mut en = ArchiveEntry::new_file("dated");
+    // 2024-02-29 12:30:40 UTC.
+    en.last_modified_date = NtTime::from((1_709_209_840u64 + 11_644_473_600) * 10_000_000);
+    en.has_last_modified_date = true;
+    w.push_archive_entry(en, Some(&b"hello"[..])).unwrap();
+    w.push_archive_entry(ArchiveEntry::new_file("undated"), Some(&b"x"[..]))
+        .unwrap();
+    w.finish().unwrap();
+    let (m, _src) = SevenzSource::open(&d.join("t.7z"), &[]).unwrap();
+    let t = |n: &str| m.entries.iter().find(|e| e.path == n).unwrap().mtime;
+    assert_eq!(t("dated"), 1_709_209_840);
+    assert_eq!(t("undated"), 0);
+}

@@ -285,6 +285,7 @@ impl FrameMessage for Hs3 {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Welcome {
     pub knows_you: u8,
+    pub nonce_s: [u8; 16],
     pub launch_proof: Option<[u8; 16]>,
 }
 
@@ -293,6 +294,7 @@ impl Message for Welcome {
 
     fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.u8(self.knows_you);
+        w.fixed(&self.nonce_s);
         let mut ext_n: u16 = 0;
         if self.launch_proof.is_some() { ext_n += 1; }
         w.u16(ext_n);
@@ -304,6 +306,7 @@ impl Message for Welcome {
         let mut r = Reader::new(b);
         let mut m = Self::default();
         m.knows_you = r.u8()?;
+        m.nonce_s = r.fixed::<16>()?;
         let ext_n = r.u16()?;
         for _ in 0..ext_n {
             let tag = r.u16()?;
@@ -1553,6 +1556,7 @@ pub struct ServerInfo {
     pub version: u16,
     pub caps: u64,
     pub session_id: [u8; 16],
+    pub pair_commit: [u8; 32],
     pub name: Option<String>,
 }
 
@@ -1563,6 +1567,7 @@ impl Message for ServerInfo {
         w.u16(self.version);
         w.u64(self.caps);
         w.fixed(&self.session_id);
+        w.fixed(&self.pair_commit);
         let mut ext_n: u16 = 0;
         if self.name.is_some() { ext_n += 1; }
         w.u16(ext_n);
@@ -1576,6 +1581,7 @@ impl Message for ServerInfo {
         m.version = r.u16()?;
         m.caps = r.u64()?;
         m.session_id = r.fixed::<16>()?;
+        m.pair_commit = r.fixed::<32>()?;
         let ext_n = r.u16()?;
         for _ in 0..ext_n {
             let tag = r.u16()?;
@@ -1598,6 +1604,7 @@ impl Message for ServerInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClientInfo {
+    pub nonce_c: [u8; 16],
     pub name: Option<String>,
 }
 
@@ -1605,6 +1612,7 @@ impl Message for ClientInfo {
     const NAME: &'static str = "ClientInfo";
 
     fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.nonce_c);
         let mut ext_n: u16 = 0;
         if self.name.is_some() { ext_n += 1; }
         w.u16(ext_n);
@@ -1615,6 +1623,7 @@ impl Message for ClientInfo {
     fn decode(b: &[u8]) -> Result<Self, DecodeError> {
         let mut r = Reader::new(b);
         let mut m = Self::default();
+        m.nonce_c = r.fixed::<16>()?;
         let ext_n = r.u16()?;
         for _ in 0..ext_n {
             let tag = r.u16()?;
@@ -2958,7 +2967,7 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "Hs1" => Hs1 { noise: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
         "Hs2" => Hs2 { noise: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
         "Hs3" => Hs3 { noise: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
-        "Welcome" => Welcome { knows_you: rng.next_u64() as u8, launch_proof: if rng.below(2) == 1 { Some({ let mut a = [0u8; 16]; rng.fill(&mut a); a }) } else { None }, }.to_bytes().ok(),
+        "Welcome" => Welcome { knows_you: rng.next_u64() as u8, nonce_s: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, launch_proof: if rng.below(2) == 1 { Some({ let mut a = [0u8; 16]; rng.fill(&mut a); a }) } else { None }, }.to_bytes().ok(),
         "PairConfirm" => PairConfirm { }.to_bytes().ok(),
         "PairResult" => PairResult { accepted: rng.next_u64() as u8, }.to_bytes().ok(),
         "Join" => Join { session_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, lane_id: rng.next_u64() as u16, client_nonce: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, tag: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, }.to_bytes().ok(),
@@ -2987,8 +2996,8 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "JobCancel" => JobCancel { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, reason: rng.next_u64() as u16, }.to_bytes().ok(),
         "NodeInfo" => NodeInfo { version: rng.ascii(20), platform: rng.ascii(20), name: rng.ascii(20), firmware: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
         "HelloInfo" => HelloInfo { version_min: rng.next_u64() as u16, version_max: rng.next_u64() as u16, caps: rng.next_u64(), }.to_bytes().ok(),
-        "ServerInfo" => ServerInfo { version: rng.next_u64() as u16, caps: rng.next_u64(), session_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, name: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
-        "ClientInfo" => ClientInfo { name: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
+        "ServerInfo" => ServerInfo { version: rng.next_u64() as u16, caps: rng.next_u64(), session_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, pair_commit: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, name: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
+        "ClientInfo" => ClientInfo { nonce_c: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, name: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),
         "PairingOpen" => PairingOpen { seconds: rng.next_u64() as u16, }.to_bytes().ok(),
         "CryptoBench" => CryptoBench { mib: rng.next_u64() as u16, }.to_bytes().ok(),
         "CryptoBenchResult" => CryptoBenchResult { bytes: rng.next_u64(), micros: rng.next_u64(), open_micros: if rng.below(2) == 1 { Some(rng.next_u64()) } else { None }, backend: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, }.to_bytes().ok(),

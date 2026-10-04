@@ -21,10 +21,9 @@
 //! live on the payload; this module just drives the frames.
 
 use anyhow::{bail, Context, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m, Method};
 
 /// The four texture sizes the PS5 profile cache expects, in pixels. Each is
 /// written as both `avatar<N>.dds` and `picture<N>.dds`.
@@ -426,27 +425,9 @@ fn encode_png(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
 
 // ─── Frame round-trips ───────────────────────────────────────────────────────
 
-fn round_trip_body(
-    addr: &str,
-    req: FrameType,
-    body: &[u8],
-    ack: FrameType,
-    label: &str,
-) -> Result<Vec<u8>> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(req, body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected {label}: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != ack {
-        bail!("expected {ack:?}, got {ft:?}");
-    }
-    Ok(resp)
+fn round_trip_body(addr: &str, method: Method, body: &[u8], label: &str) -> Result<Vec<u8>> {
+    // A handler's `{"ok":false,...}` body is returned as it was sent (the callers read `ok`/`err_code`).
+    mgmt::call_keep(addr, method, label, body)
 }
 
 /// One offline-account name slot.
@@ -501,13 +482,7 @@ pub struct ProfileInfo {
 
 /// Read the foreground user + the offline-account name slots.
 pub fn profile_info(addr: &str) -> Result<ProfileInfo> {
-    let resp = round_trip_body(
-        addr,
-        FrameType::ProfileInfo,
-        &[],
-        FrameType::ProfileInfoAck,
-        "PROFILE_INFO",
-    )?;
+    let resp = round_trip_body(addr, m::PROFILE_INFO, &[], "PROFILE_INFO")?;
     let info: ProfileInfo = serde_json::from_slice(&resp).context("parse PROFILE_INFO ack")?;
     Ok(info)
 }
@@ -523,13 +498,7 @@ struct OkResult {
 /// Rename an offline-account name slot (1-based).
 pub fn profile_set_username(addr: &str, slot: i32, name: &str) -> Result<()> {
     let body = serde_json::to_vec(&serde_json::json!({ "slot": slot, "name": name }))?;
-    let resp = round_trip_body(
-        addr,
-        FrameType::ProfileSetUsername,
-        &body,
-        FrameType::ProfileSetUsernameAck,
-        "PROFILE_SET_USERNAME",
-    )?;
+    let resp = round_trip_body(addr, m::PROFILE_SET_USERNAME, &body, "PROFILE_SET_USERNAME")?;
     let r: OkResult = serde_json::from_slice(&resp)?;
     if !r.ok {
         bail!(
@@ -557,9 +526,8 @@ pub fn profile_set_local_username(addr: &str, uid: u32, name: &str) -> Result<()
     let body = serde_json::to_vec(&serde_json::json!({ "uid": uid, "name": name }))?;
     let resp = round_trip_body(
         addr,
-        FrameType::ProfileSetLocalUsername,
+        m::PROFILE_SET_LOCAL_USERNAME,
         &body,
-        FrameType::ProfileSetLocalUsernameAck,
         "PROFILE_SET_LOCAL_USERNAME",
     )?;
     let r: OkResult = serde_json::from_slice(&resp)?;
@@ -581,13 +549,7 @@ pub fn profile_activate(addr: &str, slot: i32, id: Option<u64>) -> Result<String
         req["id"] = serde_json::Value::String(format!("0x{id:016x}"));
     }
     let body = serde_json::to_vec(&req)?;
-    let resp = round_trip_body(
-        addr,
-        FrameType::ProfileActivate,
-        &body,
-        FrameType::ProfileActivateAck,
-        "PROFILE_ACTIVATE",
-    )?;
+    let resp = round_trip_body(addr, m::PROFILE_ACTIVATE, &body, "PROFILE_ACTIVATE")?;
     let r: ActivateResult = serde_json::from_slice(&resp)?;
     if !r.ok {
         bail!("slot activation rejected by the console");
@@ -598,13 +560,7 @@ pub fn profile_activate(addr: &str, slot: i32, id: Option<u64>) -> Result<String
 /// Clear a slot's id + flags (de-activate, keep name + type).
 pub fn profile_clear_slot(addr: &str, slot: i32) -> Result<()> {
     let body = serde_json::to_vec(&serde_json::json!({ "slot": slot }))?;
-    let resp = round_trip_body(
-        addr,
-        FrameType::ProfileClearSlot,
-        &body,
-        FrameType::ProfileClearSlotAck,
-        "PROFILE_CLEAR_SLOT",
-    )?;
+    let resp = round_trip_body(addr, m::PROFILE_CLEAR_SLOT, &body, "PROFILE_CLEAR_SLOT")?;
     let r: OkResult = serde_json::from_slice(&resp)?;
     if !r.ok {
         bail!("slot clear rejected by the console");
@@ -666,13 +622,7 @@ pub fn profile_apply_avatar(
     }
 
     let body = serde_json::to_vec(&serde_json::json!({ "uid": uid }))?;
-    let resp = round_trip_body(
-        addr,
-        FrameType::ProfileApplyAvatar,
-        &body,
-        FrameType::ProfileApplyAvatarAck,
-        "PROFILE_APPLY_AVATAR",
-    )?;
+    let resp = round_trip_body(addr, m::PROFILE_APPLY_AVATAR, &body, "PROFILE_APPLY_AVATAR")?;
     let r: ApplyAvatarResult = serde_json::from_slice(&resp)?;
     if !r.ok {
         bail!(

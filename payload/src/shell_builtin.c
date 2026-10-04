@@ -27,6 +27,9 @@
 #include "proc_list.h"
 #include "runtime.h"
 
+/* The cp/mv copy buffer: heap-allocated (mgmt_audit.py stack rejects 16 KiB+ stack arrays). */
+#define SHELL_COPY_BUF (64u * 1024u)
+
 /* Set in main.c; the `id` builtin reports whether elevation worked. */
 extern volatile int g_ucred_elevation_rc;
 
@@ -1376,17 +1379,23 @@ int handle_shell_builtin(const char *cmd_in, char **out_text,
                 any_err = 1;
                 continue;
             }
-            char buf[64 * 1024];
-            ssize_t r;
+            /* 64 KiB on the heap, not the stack: this runs on a worker that also holds Sony calls. */
+            char *buf = malloc(SHELL_COPY_BUF);
+            ssize_t r = -1;
             int copy_err = 0;
-            while ((r = read(sfd, buf, sizeof(buf))) > 0) {
-                ssize_t off = 0;
-                while (off < r) {
-                    ssize_t w = write(dfd, buf + off, (size_t)(r - off));
-                    if (w <= 0) { copy_err = 1; break; }
-                    off += w;
+            if (!buf) {
+                copy_err = 1;
+            } else {
+                while ((r = read(sfd, buf, SHELL_COPY_BUF)) > 0) {
+                    ssize_t off = 0;
+                    while (off < r) {
+                        ssize_t w = write(dfd, buf + off, (size_t)(r - off));
+                        if (w <= 0) { copy_err = 1; break; }
+                        off += w;
+                    }
+                    if (copy_err) break;
                 }
-                if (copy_err) break;
+                free(buf);
             }
             close(sfd);
             close(dfd);
@@ -1529,17 +1538,22 @@ int handle_shell_builtin(const char *cmd_in, char **out_text,
                     any_err = 1;
                     continue;
                 }
-                char buf[64 * 1024];
-                ssize_t r;
+                char *buf = malloc(SHELL_COPY_BUF);
+                ssize_t r = -1;
                 int copy_err = 0;
-                while ((r = read(sfd, buf, sizeof(buf))) > 0) {
-                    ssize_t off = 0;
-                    while (off < r) {
-                        ssize_t w = write(dfd, buf + off, (size_t)(r - off));
-                        if (w <= 0) { copy_err = 1; break; }
-                        off += w;
+                if (!buf) {
+                    copy_err = 1;
+                } else {
+                    while ((r = read(sfd, buf, SHELL_COPY_BUF)) > 0) {
+                        ssize_t off = 0;
+                        while (off < r) {
+                            ssize_t w = write(dfd, buf + off, (size_t)(r - off));
+                            if (w <= 0) { copy_err = 1; break; }
+                            off += w;
+                        }
+                        if (copy_err) break;
                     }
-                    if (copy_err) break;
+                    free(buf);
                 }
                 close(sfd);
                 close(dfd);
@@ -1617,15 +1631,18 @@ int handle_shell_builtin(const char *cmd_in, char **out_text,
                     any_err = 1;
                     continue;
                 }
-                char buf[64 * 1024];
-                ssize_t rd;
-                while ((rd = read(sfd, buf, sizeof(buf))) > 0) {
-                    ssize_t off = 0;
-                    while (off < rd) {
-                        ssize_t w = write(dfd, buf + off, (size_t)(rd - off));
-                        if (w <= 0) { rd = -1; break; }
-                        off += w;
+                char *buf = malloc(SHELL_COPY_BUF);
+                ssize_t rd = -1;
+                if (buf) {
+                    while ((rd = read(sfd, buf, SHELL_COPY_BUF)) > 0) {
+                        ssize_t off = 0;
+                        while (off < rd) {
+                            ssize_t w = write(dfd, buf + off, (size_t)(rd - off));
+                            if (w <= 0) { rd = -1; break; }
+                            off += w;
+                        }
                     }
+                    free(buf);
                 }
                 close(sfd);
                 close(dfd);

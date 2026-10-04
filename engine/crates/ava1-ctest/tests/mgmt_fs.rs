@@ -691,91 +691,14 @@ async fn fs_write_validates_flags_and_paths() {
 // ---- node, log, net ----
 
 #[tokio::test(flavor = "multi_thread")]
-async fn klog_read_marks_more() {
-    let r = rig("klog").await;
-    let ask = |n: Option<u32>| match n {
-        Some(n) => text(&format!("{{\"max_bytes\":{n}}}")),
-        None => text("{}"),
-    };
-    // buffer holds 100 000 bytes: the default ask (16 KiB) is full, so more is set
-    mgmt_fs::set(false, 100_000, 0);
-    let (st, b) = r.raw(gen::METHOD_LOG_KLOG, &ask(None)).await;
-    assert_eq!(st, OK);
-    let t = MgmtText::decode(&b).unwrap();
-    assert_eq!((t.body.len(), t.more), (16 * 1024, Some(1)));
-    // an ask bigger than the cap is held to 64 KiB
-    let (_, b) = r.raw(gen::METHOD_LOG_KLOG, &ask(Some(1_000_000))).await;
-    let t = MgmtText::decode(&b).unwrap();
-    assert_eq!((t.body.len(), t.more), (64 * 1024, Some(1)));
-    // the buffer is smaller than the ask: everything, no more
-    mgmt_fs::set(false, 500, 0);
-    let (_, b) = r.raw(gen::METHOD_LOG_KLOG, &ask(Some(4096))).await;
-    let t = MgmtText::decode(&b).unwrap();
-    assert_eq!((t.body.len(), t.more), (500, Some(0)));
-    // an empty buffer is an empty OK
-    mgmt_fs::set(false, 0, 0);
-    let (st, b) = r.raw(gen::METHOD_LOG_KLOG, &ask(None)).await;
-    assert_eq!(st, OK);
-    assert_eq!(MgmtText::decode(&b).unwrap().body.len(), 0);
-    // an open failure is an error with its token
-    mgmt_fs::set(false, u32::MAX, 0);
-    let (st, b) = r.raw(gen::METHOD_LOG_KLOG, &ask(None)).await;
-    assert_eq!(
-        (st, cause(&b).as_str()),
-        (gen::ERR_INTERNAL, "open_klog_failed")
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn syslog_returns_the_tail_and_says_older_text_was_cut() {
-    let r = rig("syslog").await;
-    let expect =
-        |from: usize, to: usize| -> Vec<u8> { (from..to).map(|i| b'a' + (i % 26) as u8).collect() };
-    // 1 MiB (the handler's cap) does not fit a reply: the LAST RPC_TEXT_MAX bytes are returned
-    let total = 1024 * 1024;
-    mgmt_fs::set(false, 0, total as u32);
-    let (st, b) = r.raw(gen::METHOD_LOG_SYSLOG, &text("")).await;
-    assert_eq!(st, OK);
-    let t = MgmtText::decode(&b).unwrap();
-    let keep = gen::RPC_TEXT_MAX as usize;
-    assert_eq!((t.body.len(), t.more), (keep, Some(1)));
-    assert_eq!(
-        t.body,
-        expect(total - keep, total),
-        "the newest text, not the oldest"
-    );
-    // a smaller buffer comes whole
-    mgmt_fs::set(false, 0, 5000);
-    let (_, b) = r.raw(gen::METHOD_LOG_SYSLOG, &text("")).await;
-    let t = MgmtText::decode(&b).unwrap();
-    assert_eq!((t.body, t.more), (expect(0, 5000), Some(0)));
-    // max_bytes asks for less: still the tail
-    let (_, b) = r
-        .raw(gen::METHOD_LOG_SYSLOG, &text("{\"max_bytes\":100}"))
-        .await;
-    let t = MgmtText::decode(&b).unwrap();
-    assert_eq!((t.body, t.more), (expect(4900, 5000), Some(1)));
-    // empty and failing
-    mgmt_fs::set(false, 0, 0);
-    let (st, b) = r.raw(gen::METHOD_LOG_SYSLOG, &text("")).await;
-    assert_eq!((st, MgmtText::decode(&b).unwrap().body.len()), (OK, 0));
-    mgmt_fs::set(false, 0, u32::MAX);
-    let (st, b) = r.raw(gen::METHOD_LOG_SYSLOG, &text("")).await;
-    assert_eq!(
-        (st, cause(&b).as_str()),
-        (gen::ERR_IO, "syslog_tail_sysctl_errno_5")
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn failures_that_carry_data_keep_it_in_the_cause() {
     let r = rig("keep").await;
-    // net.reach: the caller reads timed_out/errno/ms from the failure
+    // net.reach is a probe (Task 9's mgmt_call_probe): an unreachable host is an ANSWER carrying timed_out/errno/ms
     let (st, b) = r
         .raw(gen::METHOD_NET_REACH, &text(r#"{"host":"unreachable"}"#))
         .await;
-    assert_eq!(st, gen::ERR_INTERNAL);
-    let v: serde_json::Value = serde_json::from_slice(&b).expect("the cause is the failure body");
+    assert_eq!(st, OK);
+    let v: serde_json::Value = serde_json::from_slice(&MgmtText::decode(&b).unwrap().body).unwrap();
     assert_eq!(
         (
             v["ok"].as_bool(),
@@ -789,10 +712,10 @@ async fn failures_that_carry_data_keep_it_in_the_cause() {
         .await;
     assert_eq!(st, OK);
     assert_eq!(MgmtText::decode(&b).unwrap().body, br#"{"ok":true,"ms":4}"#);
-    // a failure with only a token keeps the token
+    // a malformed request is an error status with its token
     let (st, b) = r.raw(gen::METHOD_NET_REACH, &text("{}")).await;
     assert_eq!(st, gen::ERR_PROTOCOL);
-    assert_eq!(cause(&b), r#"{"ok":false,"err":"bad_request"}"#);
+    assert_eq!(cause(&b), "bad_request");
     // a mount's code and mount point
     let (st, b) = r.raw(gen::METHOD_FS_MOUNT_PKG, &text("{}")).await;
     assert_ne!(st, OK);

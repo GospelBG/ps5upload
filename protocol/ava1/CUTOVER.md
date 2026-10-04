@@ -89,8 +89,13 @@ kept.
       FTX2 (`ZipTooLarge`); they need a streaming entry reader.
 - [ ] Management RPCs: every :9114 FTX2 frame the engine core sends (list above) needs an AVA1
       method. `SPEC.md` §7.1 defines only 1–3 and 16–19. This is project 3's main work.
-- [ ] A failed multi-chunk `fs.write` (`ps5upload-ava1/src/mgmt.rs`, `write_chunks`) leaves `<path>.ps5upload.tmp` behind until the next
-  write of that path (offset 0 truncates it). Needs `job.run` DELETE (Task 5) for a best-effort cleanup; `TODO(Task 5)` marks the spot.
+- [ ] Task 9 leftovers: `net.speedtest` now measures round trips on the shared AVA1 session (gate and
+      pool included), so its numbers are not comparable with the FTX2 one-connection figures; the AVA1
+      event log has no line for a `job.copy` ending (only upload/download receivers and peer-ended
+      senders log); a clamped `log.syslog` tail is a note plus the newest 256 KiB, the older kernel text
+      is not reachable (FTX2 sent up to 1 MiB).
+- [x] A failed multi-chunk `fs.write` (`ps5upload-ava1/src/mgmt.rs`, `write_chunks`) removes its `<path>.ps5upload.tmp` best-effort with a
+  `job.run` DELETE (only after a chunk was accepted); if that fails too, the next write of the path truncates it (offset 0).
 - [ ] `ps5_fs_move`'s same-drive rename moves to an AVA1 RPC with the `st_dev` guard (never an
       unguarded `rename()` across mounts: that panics the console's kernel).
 - [x] NAS sources: `SourceFs` now has an `mtime` (SMB, FTP and SFTP report one; a backend that does
@@ -127,6 +132,13 @@ kept.
 - [ ] Engine tests that stub or assert FTX2 (list in section 1) are replaced by their AVA1
       equivalents, and `git grep -n -i ftx2` over engine, client and payload is empty except for the
       CHANGELOG.
+- [ ] Review 002 L1, deferred: a RAR entry's mtime comes from a DOS local time read through the
+      host's time zone with a "more than a day in the future is none" rule, and the mtime is part of the
+      manifest hash. A resume after a host time-zone change, or after such a stamp comes within a day of
+      now, no longer matches its journal and restarts that upload. Rare and only costs a restart; fix
+      by recording the plan-time mtimes in the job, or by dropping RAR mtimes from the hash.
+- [ ] Review 002 L3: the sender's tick reads the decode thread's budget-wait counter every tick (fixed
+      after review); the call site has no test of its own, only the tracker and the decoder park do.
 
 ## 3. Release gates
 

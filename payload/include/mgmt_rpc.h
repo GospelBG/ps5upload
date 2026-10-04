@@ -19,6 +19,7 @@
 #include <stdint.h>
 
 #include "ava1_gen.h" /* AVA1_METHOD_* for the table */
+#include "ava1_op.h"  /* job.run operations (AVA1_JOB_OP_*) */
 
 /* Entry flags. */
 #define MGMT_SONY (1u << 0) /* the handler reaches Sony code (register/profile/registry/remoteplay/notif or a Sony API) and takes the serialisation lock itself; the dispatcher adds no lock and no Sony call */
@@ -29,6 +30,8 @@
 
 /* The cause a handler returns when its answer did not fit (SPEC.md §7.3). */
 #define MGMT_ERR_TRUNCATED "reply truncated"
+/* The longest error cause (a kept failure body longer than this travels as its token only). */
+#define MGMT_CAUSE_MAX 200u
 
 struct mgmt_ctx;
 
@@ -82,6 +85,31 @@ int mgmt_rpc_handles(uint16_t method);
 int mgmt_rpc_dispatch(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *out, size_t cap,
                       size_t *out_len);
 
+/* ---- job.run operations wrapped around an FTX2 handler (P3 Task 5) ----
+ *
+ * An operation entry (the MGMT_OP* lines of mgmt_table.def) runs on an op job's worker: the
+ * environment hook, the handler behind the capture sink, then the reply becomes the job's
+ * result. Unlike a plain method, an `{"ok":false,...}` body is NOT turned into an error: the
+ * operation ran and the body is its answer (fsck's non-zero code, a backup's err text), kept
+ * verbatim for the caller that parses it. Only an ERROR frame fails the job (status from the
+ * token, cause = the token). */
+typedef struct {
+    uint8_t op;            /* AVA1_JOB_OP_* */
+    uint16_t legacy_frame; /* the FTX2 frame number (g_inflight_frame_type, the crash breadcrumb) */
+    uint16_t ack_frame;
+    uint32_t flags;        /* MGMT_* */
+    mgmt_legacy_fn fn;
+} mgmt_op_entry_t;
+
+/* Registers the operations with ava1_op.c (after mgmt_rpc_install). 0, or -1. */
+int mgmt_rpc_install_ops(const mgmt_op_entry_t *table, size_t n);
+
+/* For a legacy handler running as an operation (no-ops anywhere else, e.g. on the FTX2 path):
+ * has job.cancel arrived, and progress / totals for job.status. */
+int mgmt_op_cancelled(void);
+void mgmt_op_progress(uint64_t files, uint64_t bytes);
+void mgmt_op_total(uint64_t files, uint64_t bytes);
+
 /* ---- the capture sink (called from runtime.c's send_frame) ---- */
 int mgmt_capture_active(void);
 /* Records a frame instead of sending it. 0, or -1 when the body did not fit (the call
@@ -106,20 +134,25 @@ int mgmt_reply_error(mgmt_ctx_t *cx, int status, const char *cause);
  * ERR_EXISTS, ERR_CROSS_DEVICE, ERR_BUSY, ERR_IO, ERR_UNKNOWN_JOB, ERR_CANCELLED,
  * ERR_PROTOCOL for malformed requests, else ERR_INTERNAL. */
 int mgmt_status_for_token(const char *token);
-/* 1 when `body` is a legacy failure ({"ok":false,...}); *token receives its "err" value. */
+/* 1 when `body` is a legacy failure: a JSON object whose TOP-LEVEL "ok" is false, wherever that key sits (an
+ * "ok" inside a nested object or a string does not count). *token receives its top-level err/error/reason. */
 int mgmt_legacy_failure(const char *body, size_t len, char *token, size_t token_cap);
 
 /* Runner helpers the table (mgmt_table.def) names: (request, length, ctx, legacy handler). */
 int mgmt_call_text(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);   /* MgmtText in and out */
 int mgmt_call_paged(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);  /* MgmtText, offset/limit/more */
+int mgmt_call_tail(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);   /* MgmtText, clamped tail (log.klog, log.syslog) */
+int mgmt_call_probe(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);  /* MgmtText; {"ok":false,...} is an answer (net.reach) */
 int mgmt_call_fs_mkdir(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn); /* FsMkdir -> empty */
 
 int mgmt_call_text_keep(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn); /* a failure body is the cause */
-int mgmt_call_empty(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);     /* -> empty */
-int mgmt_call_klog(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);      /* log.klog: max_bytes, more */
-int mgmt_call_syslog(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);    /* log.syslog: a tail, more */
 
+int mgmt_call_empty(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);     /* -> empty (node.shutdown) */
 int mgmt_call_node_status(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn); /* -> NodeStatus */
+
+/* Where a clamped tail of `len` bytes starts so that at most `cap` bytes remain: 0 and *start = 0
+ * when it all fits; else 1 with *start on a line boundary (or a UTF-8 boundary). */
+int mgmt_tail_window(const char *text, size_t len, size_t cap, size_t *start);
 
 /* JSON string escaping for building a legacy request. Returns the length written (without
  * the NUL), or -1 when it does not fit. */
