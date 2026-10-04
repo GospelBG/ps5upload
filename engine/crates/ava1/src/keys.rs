@@ -46,7 +46,26 @@ impl Identity {
 
     /// Reads a 32-byte secret, creating it (mode 0600) when the file is missing. A file of
     /// the wrong size is an error: replacing it would silently unpair every device.
+    /// Creation holds an advisory lock on `<path>.lock` and re-reads under it, so two
+    /// processes starting together end up with the one identity the first of them made.
     pub fn load_or_create(path: &Path) -> io::Result<Self> {
+        if let Some(id) = Self::read(path)? {
+            return Ok(id);
+        }
+        let _lock = crate::fslock::lock(path)?;
+        if let Some(id) = Self::read(path)? {
+            return Ok(id);
+        }
+        let bytes = zeroize::Zeroizing::new(random_bytes::<32>()?);
+        let tmp = crate::fslock::TmpGuard::new(crate::fslock::unique_tmp(path));
+        write_private(tmp.path(), &bytes[..])?;
+        std::fs::rename(tmp.path(), path)?;
+        tmp.disarm();
+        Ok(Self::from_secret(*bytes))
+    }
+
+    /// The identity in `path`; None when the file does not exist.
+    fn read(path: &Path) -> io::Result<Option<Self>> {
         match std::fs::read(path) {
             Ok(b) => {
                 let b = zeroize::Zeroizing::new(b);
@@ -56,26 +75,20 @@ impl Identity {
                         format!("{} holds {} bytes, expected 32", path.display(), b.len()),
                     )
                 })?;
-                return Ok(Self::from_secret(a));
+                Ok(Some(Self::from_secret(a)))
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         }
-        let bytes = zeroize::Zeroizing::new(random_bytes::<32>()?);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("tmp");
-        write_private(&tmp, &bytes[..])?;
-        std::fs::rename(&tmp, path)?;
-        Ok(Self::from_secret(*bytes))
     }
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true);
+    // `create_new`: the name is unique to this call, and an existing file is never
+    // truncated or adopted.
+    o.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

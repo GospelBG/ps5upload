@@ -98,6 +98,9 @@ impl PeerStore {
     /// changes unless the save succeeds.
     pub fn add(&mut self, key: [u8; 32], name: &str) -> io::Result<()> {
         self.refuse_if_unreadable()?;
+        // Under the file's lock, from what is on disk now: another process may have paired a
+        // device since this store was loaded, and saving the stale copy would unpair it.
+        let _lock = self.lock_and_reload()?;
         let before = self.peers.clone();
         self.peers.retain(|p| p.key != key);
         if self.peers.len() >= MAX_PEERS {
@@ -119,6 +122,7 @@ impl PeerStore {
     /// succeeds.
     pub fn remove(&mut self, key: &[u8; 32]) -> io::Result<bool> {
         self.refuse_if_unreadable()?;
+        let _lock = self.lock_and_reload()?;
         let before = self.peers.clone();
         self.peers.retain(|p| &p.key != key);
         if self.peers.len() == before.len() {
@@ -128,6 +132,18 @@ impl PeerStore {
         Ok(true)
     }
 
+    /// Takes the file's advisory lock (none for an in-memory store) and re-reads the peers
+    /// from disk, so a read-modify-write starts from what every process has written.
+    fn lock_and_reload(&mut self) -> io::Result<Option<crate::fslock::FileLock>> {
+        let Some(path) = self.path.clone() else {
+            return Ok(None);
+        };
+        let lock = crate::fslock::lock(&path)?;
+        self.peers = Self::load(&path)?.peers;
+        Ok(Some(lock))
+    }
+
+    /// Writes the file; the caller holds the lock.
     fn save(&self) -> io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -147,14 +163,19 @@ impl PeerStore {
                 )
             })
             .collect();
-        let tmp = path.with_extension("tmp");
+        let tmp = crate::fslock::TmpGuard::new(crate::fslock::unique_tmp(path));
         {
             use std::io::Write;
-            let mut f = std::fs::File::create(&tmp)?;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(tmp.path())?;
             f.write_all(text.as_bytes())?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(tmp.path(), path)?;
+        tmp.disarm();
+        Ok(())
     }
 }
 

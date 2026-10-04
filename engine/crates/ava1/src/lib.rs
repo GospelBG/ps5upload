@@ -3,6 +3,7 @@ pub mod conn;
 pub mod crc32c;
 mod error;
 pub mod frame;
+pub mod fslock;
 #[rustfmt::skip]
 pub mod gen;
 pub mod governor;

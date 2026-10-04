@@ -473,38 +473,41 @@ impl Pool {
     /// `connect_expecting`, and this only runs after that passed). Written through a
     /// temp file + rename, the same shape the peer store uses.
     fn pin(&self, host: &str, key: [u8; 32]) {
+        self.rewrite_pins(|lines| {
+            lines.retain(|l| l.split_once(' ').map(|(h, _)| h) != Some(host));
+            lines.push(format!("{host} {}", ava1::hex::encode(&key)));
+        });
+    }
+
+    /// Read-modify-write of the pins file under its advisory lock, through a temp file no
+    /// other writer shares: the engine and the desktop app may both pin.
+    fn rewrite_pins(&self, change: impl FnOnce(&mut Vec<String>)) {
         let p = self.dir.join("consoles");
+        let Ok(_lock) = ava1::fslock::lock(&p) else {
+            return;
+        };
         let mut lines: Vec<String> = std::fs::read_to_string(&p)
             .unwrap_or_default()
             .lines()
-            .filter(|l| l.split_once(' ').map(|(h, _)| h) != Some(host))
             .map(String::from)
             .collect();
-        lines.push(format!("{host} {}", ava1::hex::encode(&key)));
-        let tmp = self.dir.join("consoles.tmp");
-        if std::fs::write(&tmp, lines.join("\n") + "\n").is_ok() {
-            let _ = std::fs::rename(tmp, p);
-        }
-    }
-
-    /// Removes the pin for `host` (see `forget_console_key`).
-    fn unpin(&self, host: &str) {
-        let p = self.dir.join("consoles");
-        let lines: Vec<String> = std::fs::read_to_string(&p)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| l.split_once(' ').map(|(h, _)| h) != Some(host))
-            .map(String::from)
-            .collect();
-        let tmp = self.dir.join("consoles.tmp");
+        change(&mut lines);
         let body = if lines.is_empty() {
             String::new()
         } else {
             lines.join("\n") + "\n"
         };
-        if std::fs::write(&tmp, body).is_ok() {
-            let _ = std::fs::rename(tmp, p);
+        let tmp = ava1::fslock::TmpGuard::new(ava1::fslock::unique_tmp(&p));
+        if std::fs::write(tmp.path(), body).is_ok() && std::fs::rename(tmp.path(), &p).is_ok() {
+            tmp.disarm();
         }
+    }
+
+    /// Removes the pin for `host` (see `forget_console_key`).
+    fn unpin(&self, host: &str) {
+        self.rewrite_pins(|lines| {
+            lines.retain(|l| l.split_once(' ').map(|(h, _)| h) != Some(host));
+        });
     }
 
     /// One handshake with the console, pairing not yet settled; and the key it was pinned to.

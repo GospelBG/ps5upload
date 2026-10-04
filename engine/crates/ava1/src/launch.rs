@@ -113,6 +113,11 @@ impl LaunchTokens {
         Self::default()
     }
 
+    /// The advisory lock on the token file (none when there is no file).
+    fn file_lock(&self) -> io::Result<Option<crate::fslock::FileLock>> {
+        self.path.as_deref().map(crate::fslock::lock).transpose()
+    }
+
     fn load(&self, mem: &[Issued]) -> io::Result<Vec<Issued>> {
         let Some(path) = &self.path else {
             return Ok(mem.to_vec());
@@ -139,17 +144,17 @@ impl LaunchTokens {
             .iter()
             .map(|i| format!("{} {}\n", crate::hex::encode(&i.token), i.unix))
             .collect();
-        let tmp = path.with_extension("tmp");
+        let tmp = crate::fslock::TmpGuard::new(crate::fslock::unique_tmp(path));
         {
             use std::io::Write;
             let mut o = std::fs::OpenOptions::new();
-            o.write(true).create(true).truncate(true);
+            o.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 o.mode(0o600);
             }
-            let mut f = o.open(&tmp)?;
+            let mut f = o.open(tmp.path())?;
             // A file left by an older build may have looser bits: `mode` only applies
             // to a file it creates.
             #[cfg(unix)]
@@ -160,7 +165,9 @@ impl LaunchTokens {
             f.write_all(text.as_bytes())?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(tmp.path(), path)?;
+        tmp.disarm();
+        Ok(())
     }
 
     /// A fresh random token, recorded before it is returned: a token that could not be
@@ -175,6 +182,7 @@ impl LaunchTokens {
     /// the oldest.
     pub fn record(&self, token: [u8; TOKEN_LEN], unix: u64) -> io::Result<()> {
         let mut mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
+        let _file_lock = self.file_lock()?;
         let now = now_unix();
         let mut all: Vec<Issued> = self
             .load(&mem)?
@@ -205,6 +213,10 @@ impl LaunchTokens {
     /// An unreadable file recognises nothing: the session pairs the usual way.
     pub fn recognises(&self, h: &[u8; 64], proof_: &[u8; 16]) -> bool {
         let mut mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
+        // Across processes too: two readers of one file must not both spend a token.
+        let Ok(_file_lock) = self.file_lock() else {
+            return false;
+        };
         let now = now_unix();
         let Ok(all) = self.load(&mem) else {
             return false;

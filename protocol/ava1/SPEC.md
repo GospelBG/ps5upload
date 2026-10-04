@@ -160,7 +160,9 @@ from pairing, so the console itself checks the typed code (§5.5).
    place of Welcome. A node shows at most one pairing request per 10 s, and only
    for a client it has sent Welcome to: a client gone before its Welcome uses none.
 7. Peer stores: `<64 hex key> <unix seconds> <name>` per line, ≤ 32 peers (oldest
-   dropped), written atomically (temp file + rename in the same directory). A
+   dropped), written atomically (a temp file no other writer shares + rename in the same
+   directory). The reference side shares the file, the identity and the launch tokens between processes:
+   each read-modify-write holds an advisory lock on `<file>.lock` and starts from the file as it is then. A
    missing file is an empty store. A file that exists but cannot be read is not:
    the node runs, knows no peers, logs the failure, never opens its automatic
    window, accepts no pairing, and never writes the file.
