@@ -214,6 +214,14 @@ static int replay(void *ctx, uint8_t kind, const uint8_t *body, size_t len) {
         ava1_jnl_snapshot_t s;
         uint32_t i;
         if (ava1_jnl_snapshot_decode(body, len, &s) != 0) return 1;
+        /* Fail closed: unswept/segments streams that do not parse in full end the replay (a torn record),
+         * never read as "everything is swept". */
+        {
+            uint32_t cnt;
+            if ((s.has_unswept && ava1_file_run_count(s.unswept, s.unswept_len, &cnt) != 0) ||
+                (s.has_segments && ava1_pack_ref_count(s.segments, s.segments_len, &cnt) != 0))
+                return 1;
+        }
         for (i = 0; i < j->m.n; i++) forget_file(j, i);
         forget_ranges(j);
         add_ranges(j, s.ranges, s.ranges_len, 2);

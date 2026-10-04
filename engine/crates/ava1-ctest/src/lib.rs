@@ -2106,6 +2106,12 @@ pub fn sony_hold(ms: u64) -> std::thread::JoinHandle<()> {
     h
 }
 
+/// The next `n` file syncs of any console sweep fail with EIO (-1: until set to 0): the wire tests' lever for a
+/// receiver that cannot make its files durable.
+pub fn sweep_failures(n: i32) {
+    unsafe { ffi::ava1_test_sweep_fail(n) }
+}
+
 /// `ava1_jobs_gc` over `jobs` as if `age_s` seconds had passed and the limit were `max_age_s`: how
 /// many job directories it removed.
 pub fn jobs_gc(jobs: &Path, age_s: i64, max_age_s: i64) -> i32 {

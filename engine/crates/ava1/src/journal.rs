@@ -10,7 +10,7 @@ use crate::gen::{
     RootItem,
 };
 use crate::manifest::{Entry, Manifest};
-use crate::ranges::{from_runs, runs, Need, RangeSet};
+use crate::ranges::{from_runs, runs, runs_within_limit, Need, RangeSet};
 use crate::wire::{Message, Reader, Writer};
 
 pub const MAGIC: &[u8; 8] = b"AVA1JNL1";
@@ -51,11 +51,39 @@ impl Record {
     fn decode(kind: u8, b: &[u8]) -> Option<Record> {
         Some(match kind {
             K_OPEN => Record::Open(JnlOpen::decode(b).ok()?),
-            K_BATCH => Record::Batch(JnlBatch::decode(b).ok()?),
+            K_BATCH => {
+                let b = JnlBatch::decode(b).ok()?;
+                if !runs_within_limit(&b.files) {
+                    return None;
+                }
+                Record::Batch(b)
+            }
             K_RESET => Record::Reset(JnlReset::decode(b).ok()?.file_id),
-            K_SNAPSHOT => Record::Snapshot(JnlSnapshot::decode(b).ok()?),
+            K_SNAPSHOT => {
+                // Fail closed: an `unswept` or `segments` stream that does not decode must stop the replay,
+                // never read as "everything is swept" (a compaction would persist that).
+                let s = JnlSnapshot::decode(b).ok()?;
+                if !runs_within_limit(&s.done) {
+                    return None;
+                }
+                if let Some(u) = &s.unswept {
+                    if !runs_within_limit(&item_stream::<FileRun>(u)?) {
+                        return None;
+                    }
+                }
+                if let Some(g) = &s.segments {
+                    item_stream::<PackRef>(g)?;
+                }
+                Record::Snapshot(s)
+            }
             K_DONE => Record::Done(JnlDone::decode(b).ok()?.status),
-            K_SWEEP => Record::Sweep(JnlSweep::decode(b).ok()?.files),
+            K_SWEEP => {
+                let f = JnlSweep::decode(b).ok()?.files;
+                if !runs_within_limit(&f) {
+                    return None;
+                }
+                Record::Sweep(f)
+            }
             _ => return None,
         })
     }
@@ -223,11 +251,14 @@ fn item_bytes<M: Message>(items: &[M]) -> Option<Vec<u8>> {
     Some(w.buf[4..].to_vec())
 }
 
-/// The inverse of `item_bytes`; a malformed stream yields what decoded before the fault.
-fn item_stream<M: Message>(b: &[u8]) -> Vec<M> {
+/// The inverse of `item_bytes`; `None` for a stream that does not decode in full.
+fn item_stream<M: Message>(b: &[u8]) -> Option<Vec<M>> {
     let mut framed = (b.len() as u32).to_le_bytes().to_vec();
     framed.extend_from_slice(b);
-    Reader::new(&framed).records().unwrap_or_default()
+    let mut r = Reader::new(&framed);
+    let v = r.records().ok()?;
+    r.finish().ok()?;
+    Some(v)
 }
 
 /// What a replay knows.
@@ -303,16 +334,17 @@ impl State {
                         .insert(x.offset, x.offset + x.len);
                 }
                 self.roots = s.roots.iter().map(|x| (x.file_id, x.root)).collect();
+                // (Record::decode already refused a snapshot whose streams do not decode.)
                 self.unswept = s
                     .unswept
                     .as_deref()
-                    .map(item_stream::<FileRun>)
+                    .and_then(item_stream::<FileRun>)
                     .map(|v| from_runs(&v))
                     .unwrap_or_default();
                 self.packs = s
                     .segments
                     .as_deref()
-                    .map(item_stream::<PackRef>)
+                    .and_then(item_stream::<PackRef>)
                     .unwrap_or_default();
             }
             Record::Done(s) => self.finished = Some(*s),
@@ -495,6 +527,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn a_snapshot_with_undecodable_unswept_bytes_is_refused_not_read_as_all_swept() {
+        // Failing open: an unswept list that does not decode must stop the replay (a torn record), never
+        // become "nothing is unswept", which a compaction would then persist.
+        let d = tmp("badsnap");
+        let mut j = Journal::create(&d, &open_rec()).unwrap();
+        let mut st = State::default();
+        st.done.insert(3);
+        st.unswept.insert(3);
+        let mut snap = st.snapshot();
+        assert!(snap.unswept.is_some());
+        snap.unswept = Some(vec![9, 9, 9]); // not an item stream
+        j.append(&Record::Snapshot(snap)).unwrap();
+        drop(j);
+        let (_, recs) = Journal::open(&d).unwrap();
+        assert_eq!(recs.len(), 1, "only the Open survived: {recs:?}");
+        // and the segments list the same
+        let mut j = Journal::create(&d, &open_rec()).unwrap();
+        let mut snap = st.snapshot();
+        snap.segments = Some(vec![1, 0, 0, 0, 7]);
+        j.append(&Record::Snapshot(snap)).unwrap();
+        drop(j);
+        assert_eq!(Journal::open(&d).unwrap().1.len(), 1);
+    }
+
+    #[test]
+    fn a_hostile_run_length_is_refused_by_replay_and_bounded_everywhere() {
+        let huge = vec![FileRun {
+            first: 0,
+            count: u32::MAX,
+        }];
+        let t = std::time::Instant::now();
+        let set = crate::ranges::from_runs(&huge);
+        assert!(set.len() as u64 <= crate::ranges::MAX_RUN_IDS);
+        assert!(
+            t.elapsed().as_secs() < 20,
+            "from_runs spun on a hostile run"
+        );
+        let d = tmp("hugerun");
+        let mut j = Journal::create(&d, &open_rec()).unwrap();
+        j.append(&Record::Sweep(huge)).unwrap();
+        drop(j);
+        assert_eq!(
+            Journal::open(&d).unwrap().1.len(),
+            1,
+            "the record is refused"
+        );
     }
 
     fn pack_batch(files: Vec<FileRun>, segment: u32, offset: u64, len: u64) -> Record {

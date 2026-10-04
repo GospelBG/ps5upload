@@ -48,6 +48,9 @@ pub struct SendOptions {
     /// replaces the random-access readers and `run_upload`'s `Source` is used only for
     /// its `close()`.
     pub seq: Option<Arc<dyn crate::seq::SeqSource>>,
+    /// How long to wait for a receiver's files to settle after its JobDone (SPEC.md §15.7); `None` =
+    /// `SETTLE_MAX`. Tests shorten it.
+    pub settle_max: Option<Duration>,
 }
 
 impl SendOptions {
@@ -64,6 +67,7 @@ impl SendOptions {
             cancel: Arc::default(),
             bandwidth_cap: None,
             seq: None,
+            settle_max: None,
         }
     }
 }
@@ -1544,8 +1548,32 @@ pub async fn run_upload(
             }
         }
     };
+    let mut result = result;
     if settle_after && result.is_ok() {
-        settle_wait(link, &pg).await;
+        let max = opts.settle_max.unwrap_or(SETTLE_MAX);
+        let why = settle_wait(link, &pg, &opts.cancel, max).await;
+        match (&why, result.as_mut()) {
+            (Settled::Failed(code, msg), Ok(_)) => {
+                eprintln!("[ava1] upload: the console cannot make its files durable: {msg}");
+                result = Err(SendError::Refused {
+                    status: *code,
+                    message: if msg.is_empty() {
+                        "the console cannot make its files durable".into()
+                    } else {
+                        msg.clone()
+                    },
+                });
+            }
+            (_, Ok(rep)) => {
+                if let Some(w) = settle_warning(&why) {
+                    rep.message = Some(match rep.message.take() {
+                        Some(m) => format!("{m}; {w}"),
+                        None => w,
+                    });
+                }
+            }
+            _ => {}
+        }
     }
     // Every exit: stop the readers' flag, wake the sleepers, cancel and join every
     // lane task still held (correction 5; a dead lane's task was detached at its
@@ -1587,29 +1615,79 @@ pub async fn run_upload(
 /// reports anyway: the report is true either way (every byte is durable through the receiver's log).
 pub const SETTLE_MAX: Duration = Duration::from_secs(30);
 
-/// The receiver said files are still settling: keep the job alive while its `Status` reports
-/// `unswept`, so the engine can show "finishing on the console". Ends when it reaches 0, the session
-/// closes, or after `SETTLE_MAX`.
-async fn settle_wait(link: &mut JobLink, pg: &Progress) {
+/// How a settle wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Settled {
+    /// The receiver reported `unswept` = 0.
+    Done,
+    /// `settle_max` passed with files still unswept.
+    TimedOut,
+    /// The job was cancelled while waiting.
+    Cancelled,
+    /// The session closed first.
+    Closed,
+    /// The receiver reported it cannot make the files durable (Status `code`).
+    Failed(u16, String),
+}
+
+/// The receiver said files are still settling: keep the job alive while its `Status` reports `unswept`, so
+/// the engine can show "finishing on the console". Ends when it reaches 0, the receiver reports a failure
+/// (Status `code`, the sweep's sticky error), the job is cancelled, the session closes, or after `max`.
+/// Polls `cancel` every 100 ms.
+async fn settle_wait(
+    link: &mut JobLink,
+    pg: &Progress,
+    cancel: &AtomicBool,
+    max: Duration,
+) -> Settled {
     pg.settling.store(true, Ordering::Relaxed);
     let t0 = Instant::now();
-    while let Some(left) = SETTLE_MAX.checked_sub(t0.elapsed()) {
-        match tokio::time::timeout(left, link.rx.recv()).await {
+    let out = loop {
+        if cancel.load(Ordering::Relaxed) {
+            break Settled::Cancelled;
+        }
+        let Some(left) = max.checked_sub(t0.elapsed()) else {
+            break Settled::TimedOut;
+        };
+        match tokio::time::timeout(left.min(Duration::from_millis(100)), link.rx.recv()).await {
             Ok(Some(Inbound::Control(f))) if f.ty == Status::TYPE => {
-                if let Ok(st) = f.decode::<Status>() {
-                    let n = st.unswept.unwrap_or(0);
-                    pg.unswept.store(n, Ordering::Relaxed);
-                    if n == 0 {
-                        break;
-                    }
+                let Ok(st) = f.decode::<Status>() else {
+                    continue;
+                };
+                if let Some(code) = st.code.filter(|c| *c != 0) {
+                    break Settled::Failed(code, st.current.unwrap_or_default());
+                }
+                let n = st.unswept.unwrap_or(0);
+                pg.unswept.store(n, Ordering::Relaxed);
+                if n == 0 {
+                    break Settled::Done;
                 }
             }
-            Ok(Some(Inbound::Closed(_))) | Ok(None) | Err(_) => break,
-            Ok(Some(_)) => {}
+            Ok(Some(Inbound::Closed(_))) | Ok(None) => break Settled::Closed,
+            Ok(Some(_)) | Err(_) => {}
         }
-    }
+    };
     pg.unswept.store(0, Ordering::Relaxed);
     pg.settling.store(false, Ordering::Relaxed);
+    out
+}
+
+/// The warning a report carries when the receiver's files were not confirmed durable in place: the bytes
+/// are safe in its log (an upload is never resent for this), but the job did not end clean.
+fn settle_warning(why: &Settled) -> Option<String> {
+    let w = match why {
+        Settled::Done => return None,
+        Settled::TimedOut => "files are still being made durable on the console",
+        Settled::Cancelled => {
+            "cancelled while files were still being made durable on the console (they are safe in its log)"
+        }
+        Settled::Closed => {
+            "the console closed the session while files were still being made durable (they are safe in its log)"
+        }
+        Settled::Failed(..) => return None,
+    };
+    eprintln!("[ava1] upload: {w}");
+    Some(w.to_string())
 }
 
 /// One upload from open to report: `open_upload` then `run_upload`.

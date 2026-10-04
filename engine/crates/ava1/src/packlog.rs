@@ -88,7 +88,7 @@ pub struct PackLog {
     /// Done files waiting for the sweep, oldest first.
     usw: VecDeque<Usw>,
     /// Taken by a sweep that has not been journaled yet.
-    sweeping: HashMap<u32, Loc>,
+    sweeping: HashMap<u32, Vec<Loc>>,
     unswept_bytes: u64,
 }
 
@@ -145,7 +145,7 @@ impl PackLog {
 
     /// Files done but not yet swept (the sweep in flight included).
     pub fn unswept(&self) -> usize {
-        self.usw.len() + self.sweeping.len()
+        self.usw.len() + self.sweeping.values().map(Vec::len).sum::<usize>()
     }
 
     /// Pack bytes of files not yet swept, pending ones included.
@@ -293,7 +293,7 @@ impl PackLog {
             match self.usw.front() {
                 Some(u) if force || u.at.elapsed() >= self.opts.age => {
                     let u = self.usw.pop_front().unwrap();
-                    self.sweeping.insert(u.loc.id, u.loc);
+                    self.sweeping.entry(u.loc.id).or_default().push(u.loc);
                     out.push(u.loc);
                 }
                 _ => break,
@@ -305,11 +305,18 @@ impl PackLog {
     /// A sweep failed before it was journaled: its files go back to the front of the queue.
     pub fn due_failed(&mut self, locs: &[Loc]) {
         for l in locs.iter().rev() {
-            if self.sweeping.remove(&l.id).is_some() {
+            let Some(v) = self.sweeping.get_mut(&l.id) else {
+                continue;
+            };
+            if let Some(at) = v.iter().position(|x| x == l) {
+                v.remove(at);
                 self.usw.push_front(Usw {
                     loc: *l,
                     at: Instant::now() - self.opts.age,
                 });
+            }
+            if v.is_empty() {
+                self.sweeping.remove(&l.id);
             }
         }
     }
@@ -328,7 +335,8 @@ impl PackLog {
     /// nobody holds goes).
     pub fn swept(&mut self, ids: &[u32]) {
         for id in ids {
-            if let Some(l) = self.sweeping.remove(id) {
+            // every record of the file (a file sent again before its first record was swept has two)
+            for l in self.sweeping.remove(id).unwrap_or_default() {
                 self.unref(l);
             }
         }
@@ -491,6 +499,40 @@ mod tests {
         // closed, fully swept segments are gone; the open tail stays until cleanup
         let left: Vec<_> = std::fs::read_dir(&d).unwrap().flatten().collect();
         assert!(left.len() <= 1, "{left:?}");
+        p.cleanup();
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_file_logged_twice_releases_both_records_once_swept() {
+        // a file reset and sent again before its first record was swept: two records, one id
+        let d = tmp("dup");
+        let mut p = PackLog::new(
+            &d,
+            PackOpts {
+                segment: 4096,
+                max_unswept: 1 << 20,
+                age: Duration::ZERO,
+            },
+        );
+        p.append(&rec(5, b"first")).unwrap();
+        p.append(&rec(5, b"second")).unwrap();
+        let (_, groups) = p.take_batch(&[5]).unwrap();
+        assert_eq!(
+            groups.iter().map(|g| g.files.len()).sum::<usize>(),
+            2,
+            "{groups:?}"
+        );
+        p.journaled(&groups);
+        let due = p.due(true, 10);
+        assert_eq!(due.len(), 2);
+        p.swept(&[5]);
+        assert_eq!(p.unswept(), 0, "an in-flight sweep entry was lost");
+        assert_eq!(
+            p.unswept_bytes(),
+            0,
+            "bytes stayed counted for a swept file"
+        );
         p.cleanup();
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
     }

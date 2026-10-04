@@ -405,6 +405,12 @@ Engine (`LocalSink`, downloads): on by default except on macOS, where it measure
 forces it. The engine settles every logged file before it ends a job (it has no thread to settle behind JobDone),
 so its unswept cap is soft (one credit window past `unswept_max`).
 
+Failure paths (review dbl): a failed sweep is retried with a backoff and, after five failures, reported in `Status`
+(`code`/`current`); the engine fails the upload on it, or reports a warning (`warning` in the job's `commit_ack`) when it
+stops waiting (30 s, or a cancel). Housekeeping recovers parked, reaped and crashed job directories that hold a log;
+the console's job GC never touches one. The engine's own job GC (`journal::gc`) does not special-case pack files:
+an engine download settles everything before it ends, so a directory it left behind promised nothing to anyone.
+
 Deferred:
 
 - **Pack preallocation**: segments are not preallocated (the log is fsynced every batch). If a drive shows the sparse

@@ -932,6 +932,20 @@ not delete its source before what it copied is durable in place; merges and sing
 sender that sees `settling` may keep the job open, reading `Status`, until `unswept` is 0 (an engine does, for up to 30 s,
 to show "finishing on the console"); the report is true either way. A power cut inside the sweep's lag leaves the last files to be re-made by the next recovery.
 
+Failure. A sweep that fails loses nothing: its files go back to the front of the queue and are tried again after a
+backoff (100 ms doubling to 3.2 s). After five failures in a row the error is sticky: `Status` carries `code` =
+`ERR_IO` and the reason in `current` until a sweep succeeds, and a job that is still running fails with it. A sender
+that waits for `unswept` = 0 fails the upload on that `code` (the console cannot make its files durable); on its own
+timeout or a cancel it ends the wait and reports the job with a warning, never as a clean success, because the
+bytes are safe in the log. A drain (a staged tree's rename, a copy's end, a manifest change) retries a few times and
+then fails; a drain cut by a stop writes nothing (no terminal `Done`). A manifest change is refused with `ERR_IO` when
+the unswept files cannot be settled first (the sweep queue names ids, which the new manifest would renumber).
+
+Nobody holding the job. A job directory that holds a pack log is never garbage-collected. A settling job that is
+reaped (after the park age) is destroyed with its log on disk; the receiver's housekeeping takes such directories (and
+those a crash left) through the same recovery as `JobOpen`, a bounded number per pass, every few seconds and at start.
+Beside the per-job `UNSWEPT_MAX` there is a cap across jobs (512 MiB).
+
 ## 16. Governor
 
 The sender and the receiver each keep one small control loop; both are pure functions of the

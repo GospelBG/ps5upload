@@ -625,13 +625,14 @@ pub fn upload_with_seq_in(
                 bandwidth_cap: cfg.bandwidth_cap_bps,
                 // 7z passes its source as `seq`; RAR sets it on `opts`.
                 seq: seq.clone().or_else(|| opts.seq.clone()),
+                settle_max: None,
             };
             match send_job(&mut link, manifest.clone(), source.clone(), o).await {
                 Ok(r) if r.status == gen::STATUS_OK => {
                     let _ = std::fs::remove_dir_all(&persist);
                     let skipped_files = progress.skipped_files.load(Ordering::Relaxed);
                     let skipped_bytes = progress.skipped_bytes.load(Ordering::Relaxed);
-                    let body = serde_json::json!({
+                    let mut body = serde_json::json!({
                         "protocol": "ava1",
                         "files": r.files,
                         "bytes": r.bytes,
@@ -645,6 +646,11 @@ pub fn upload_with_seq_in(
                         "skipped_bytes": skipped_bytes,
                         "files_sent": manifest_files.saturating_sub(skipped_files),
                     });
+                    // The bytes are durable, but the console did not confirm its files settled in place
+                    // (SPEC.md §15.7): the job's snapshot says so instead of a clean success.
+                    if let Some(w) = &r.message {
+                        body["warning"] = serde_json::Value::String(w.clone());
+                    }
                     return Ok(TransferResult {
                         tx_id_hex: hex(&job_id),
                         // The field name is FTX2's; for AVA1 it is files (C19).

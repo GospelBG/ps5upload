@@ -409,7 +409,7 @@ impl Sink for LocalSink {
     }
 
     fn write_whole_root(&self, id: u32, root: &[u8; 32], data: &[u8]) -> io::Result<()> {
-        if self.pack.lock().unwrap().is_some() {
+        if self.log && self.pack.lock().unwrap().is_some() {
             return self.write_logged(id, *root, data);
         }
         self.write_whole(id, data)
@@ -421,7 +421,7 @@ impl Sink for LocalSink {
     }
 
     fn write_whole(&self, id: u32, data: &[u8]) -> io::Result<()> {
-        if self.pack.lock().unwrap().is_some() {
+        if self.log && self.pack.lock().unwrap().is_some() {
             return self.write_logged(id, *blake3::hash(data).as_bytes(), data);
         }
         let f = self.file(id, false, true)?;
@@ -457,13 +457,13 @@ impl Sink for LocalSink {
     }
 
     fn enable_log(&self, dir: &Path) {
-        if self.log {
-            *self.pack.lock().unwrap() = Some(PackLog::new(dir, self.pack_opts));
-        }
+        // Always: recovery of a journal that replays unswept files needs the log's files whatever this
+        // run does with new ones. `self.log` decides only whether small files are written to it.
+        *self.pack.lock().unwrap() = Some(PackLog::new(dir, self.pack_opts));
     }
 
     fn sync_batch(&self, small: &[u32], large: &[u32]) -> io::Result<Vec<LoggedGroup>> {
-        if self.pack.lock().unwrap().is_none() {
+        if !self.log || self.pack.lock().unwrap().is_none() {
             let all: Vec<u32> = small.iter().chain(large).copied().collect();
             self.sync(&all)?;
             return Ok(Vec::new());
@@ -2373,6 +2373,171 @@ mod tests {
         let mut expect: BTreeSet<u32> = first.ids();
         expect.insert(last.files.last().unwrap().id);
         assert_eq!(lost.into_iter().collect::<BTreeSet<u32>>(), expect);
+    }
+
+    #[test]
+    fn recovery_runs_whatever_the_log_setting_when_the_replayed_state_has_unswept_files() {
+        // a job that crashed with the log on and restarts with it off (the macOS default, or
+        // PS5UPLOAD_AVA1_LOG_SMALL=0) must still re-make and sweep its files
+        let (t, jd) = log_dirs("logoff");
+        let n = 20;
+        let (sink, _g, st) = logged(&t, &jd, n);
+        drop(sink);
+        for i in 0..n / 2 {
+            std::fs::remove_file(t.join(format!("dest.ava-part/d/{i}"))).unwrap();
+        }
+        let off = LocalSink::new(t.join("dest"), false).with_log(false, quick());
+        off.enable_log(&jd);
+        off.prepare(&log_manifest(n)).unwrap();
+        let lost = off.recover_log(&st).unwrap();
+        assert!(lost.is_empty(), "{lost:?}");
+        for i in 0..n {
+            assert_eq!(
+                std::fs::read(t.join(format!("dest.ava-part/d/{i}"))).unwrap(),
+                log_body(i),
+                "file {i}"
+            );
+        }
+        let ids = off.sweep(true).unwrap();
+        assert_eq!(ids.len(), n);
+        off.sweep_journaled(&ids);
+        off.log_cleanup();
+        // ... and with the log off, new small files still go the per-file way
+        off.write_whole(1, &log_body(0)).unwrap();
+        assert_eq!(off.unswept(), 0);
+    }
+
+    /// A sink that watches the journal at the moments the durability order matters.
+    struct Spy {
+        inner: LocalSink,
+        jd: PathBuf,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl Spy {
+        fn replay(&self) -> State {
+            let (_, recs) = Journal::open(&self.jd).unwrap();
+            let mut st = State::default();
+            for r in &recs {
+                st.apply(r);
+            }
+            st
+        }
+        fn sweeps(&self) -> usize {
+            Journal::open(&self.jd)
+                .unwrap()
+                .1
+                .iter()
+                .filter(|r| matches!(r, Record::Sweep(_)))
+                .count()
+        }
+        fn packs(&self) -> usize {
+            std::fs::read_dir(&self.jd)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("pack."))
+                .count()
+        }
+    }
+
+    impl Sink for Spy {
+        fn prepare(&self, m: &Manifest) -> io::Result<()> {
+            self.inner.prepare(m)
+        }
+        fn write_at(&self, id: u32, off: u64, d: &[u8]) -> io::Result<()> {
+            self.inner.write_at(id, off, d)
+        }
+        fn write_whole(&self, id: u32, d: &[u8]) -> io::Result<()> {
+            self.inner.write_whole(id, d)
+        }
+        fn sync(&self, ids: &[u32]) -> io::Result<()> {
+            self.inner.sync(ids)
+        }
+        fn read_at(&self, id: u32, off: u64, b: &mut [u8]) -> io::Result<usize> {
+            self.inner.read_at(id, off, b)
+        }
+        fn commit(&self, id: u32) -> io::Result<()> {
+            self.inner.commit(id)
+        }
+        fn finish(&self) -> io::Result<()> {
+            self.inner.finish()
+        }
+        fn unswept(&self) -> usize {
+            self.inner.unswept()
+        }
+        fn sweep(&self, force: bool) -> io::Result<Vec<u32>> {
+            let ids = self.inner.sweep(force)?;
+            // I2: the files are synced before the record that says so: no JnlSweep is there yet
+            self.seen.lock().unwrap().push(format!(
+                "sweep returned {} files, {} sweep records so far",
+                ids.len(),
+                self.sweeps()
+            ));
+            Ok(ids)
+        }
+        fn sweep_journaled(&self, ids: &[u32]) {
+            // I3: the segments go only after the sweep is durable: the record is there, the packs still are
+            self.seen.lock().unwrap().push(format!(
+                "journaled {} files: {} sweep records, {} pack files",
+                ids.len(),
+                self.sweeps(),
+                self.packs()
+            ));
+            let st = self.replay();
+            assert!(
+                ids.iter().all(|i| !st.unswept.contains(i)),
+                "the journal still lists swept files as unswept"
+            );
+            self.inner.sweep_journaled(ids)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_is_journaled_after_its_files_and_before_a_segment_is_deleted() {
+        let (t, jd) = log_dirs("order");
+        let n = 24;
+        let (inner, _groups, st0) = logged(&t, &jd, n);
+        // a journal holding what the batches would have written
+        let open = JnlOpen {
+            job_id: [9; 16],
+            manifest_hash: [1; 32],
+            kind: gen::JOB_DOWNLOAD,
+            flags: 0,
+            staged: 1,
+            root: "x".into(),
+        };
+        let mut jnl = Journal::create(&jd, &open).unwrap();
+        let mut st = State::default();
+        st.apply(&Record::Open(open));
+        let rec = Record::Snapshot(st0.snapshot());
+        jnl.append(&rec).unwrap();
+        st.apply(&rec);
+        let spy = Arc::new(Spy {
+            inner,
+            jd: jd.clone(),
+            seen: Mutex::default(),
+        });
+        let sink: Arc<dyn Sink> = spy.clone();
+        let (jnl, st) = sweep_logged(&sink, jnl, st, true).await.unwrap();
+        assert!(st.unswept.is_empty());
+        drop(jnl);
+        let seen = spy.seen.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .any(|l| l.starts_with("sweep returned") && l.ends_with("0 sweep records so far")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|l| l.starts_with("journaled") && l.contains("1 sweep records")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .filter(|l| l.starts_with("journaled"))
+                .all(|l| !l.ends_with("0 pack files")),
+            "a segment was deleted before its sweep was journaled: {seen:?}"
+        );
     }
 
     #[test]
