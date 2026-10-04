@@ -1476,6 +1476,9 @@ pub async fn run_upload(
                 let secs = last_tick.elapsed().as_secs_f64();
                 last_tick = Instant::now();
                 let lanes_now = link.lanes().len() as u8;
+                // Read every tick (never behind a short-circuit) so `seen` always tracks the
+                // previous tick: a park from an earlier tick must not hide this tick's starvation.
+                let budget_waited = budget_wait.waited_since(&mut budget_wait_seen);
                 let sample = {
                     let mut s = sh.sched.lock().unwrap();
                     let mut lane_bytes = std::mem::take(&mut s.lane_bytes);
@@ -1490,7 +1493,7 @@ pub async fn run_upload(
                         // are the limit (SPEC.md 17.4): an empty queue is not the source.
                         source_starved: std::mem::take(&mut s.source_starved)
                             && s.requeue.is_empty()
-                            && !budget_wait.waited_since(&mut budget_wait_seen),
+                            && !budget_waited,
                         receiver_bottleneck: receiver_bn,
                         small_durable: std::mem::take(&mut s.small_durable_tick),
                         large_durable: std::mem::take(&mut s.large_durable_tick),
