@@ -764,7 +764,7 @@ fn a_jobopen_during_a_recovery_pass_is_told_to_retry_and_then_resumes() {
             "never resumed: busy {busy} other {other:?}"
         );
         assert_eq!(
-            unswept_total(),
+            r.unswept_total(),
             0,
             "a recovery throwaway's bytes count against the cap"
         );
@@ -813,7 +813,6 @@ fn a_healthy_job_is_not_gated_by_other_jobs_stuck_log_bytes() {
     let t = tmp("pinned");
     let root = t.join("dest");
     std::fs::create_dir_all(&root).unwrap();
-    pin_unswept_total(600 << 20); // other jobs hold more than the 512 MiB cap (their sweeps keep failing)
     let job = CApplyJob::begin_opts(
         &t.join("jobs"),
         &root,
@@ -823,11 +822,12 @@ fn a_healthy_job_is_not_gated_by_other_jobs_stuck_log_bytes() {
         0,
         LogOpts::ON,
     );
+    job.pin_unswept_total(600 << 20); // other jobs hold more than the 512 MiB cap (their sweeps keep failing)
     for i in 0..50 {
         send(&job, i);
     }
     let r = job.wait(20_000);
-    pin_unswept_total(-(600 << 20));
+    job.pin_unswept_total(-(600 << 20));
     assert_eq!(
         r,
         0,
@@ -859,11 +859,11 @@ fn a_job_in_a_sticky_sweep_error_does_not_count_against_the_others() {
     job.wait_event(&format!("status code={}", gen::ERR_IO), 20_000);
     assert!(job.unswept_bytes() > 0);
     assert_eq!(
-        unswept_total(),
+        job.unswept_total(),
         0,
         "a stuck job's bytes keep other jobs waiting"
     );
     job.fail_sweeps(0);
     settled(&job, 20);
-    assert_eq!(unswept_total(), 0);
+    assert_eq!(job.unswept_total(), 0);
 }

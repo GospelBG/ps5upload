@@ -1658,6 +1658,17 @@ impl CApplyJob {
         unsafe { ffi::ava1_test_apply_unswept() }
     }
 
+    /// Pack bytes counted against the cross-job cap, all jobs together (the data layer is one process-wide
+    /// counter, so this is a method: only the test holding the C server lock may look at it).
+    pub fn unswept_total(&self) -> u64 {
+        unsafe { ffi::ava1_test_unswept_total() }
+    }
+
+    /// Pins (or releases, negative) bytes on the cross-job counter: other jobs' stuck log bytes.
+    pub fn pin_unswept_total(&self, delta: i64) {
+        unsafe { ffi::ava1_test_unswept_global_add(delta) }
+    }
+
     /// Pack bytes of files not yet swept (pending ones included).
     pub fn unswept_bytes(&self) -> u64 {
         unsafe { ffi::ava1_test_apply_unswept_bytes() }
@@ -2126,16 +2137,6 @@ pub fn sweep_failures_left() -> i32 {
 /// Housekeeping loop iterations since the data layer started.
 pub fn house_ticks() -> u32 {
     unsafe { ffi::ava1_test_house_ticks() }
-}
-
-/// Pack bytes counted against the cross-job cap, all jobs together.
-pub fn unswept_total() -> u64 {
-    unsafe { ffi::ava1_test_unswept_total() }
-}
-
-/// Pins (or releases, negative) bytes on the cross-job counter: other jobs' stuck log bytes.
-pub fn pin_unswept_total(delta: i64) {
-    unsafe { ffi::ava1_test_unswept_global_add(delta) }
 }
 
 /// The next `n` file syncs of any console sweep fail with EIO (-1: until set to 0): the wire tests' lever for a

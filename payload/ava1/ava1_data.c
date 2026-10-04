@@ -310,6 +310,7 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     __atomic_store_n(&g_pend_open, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&ava1_data_test_fd_budget, 0, __ATOMIC_SEQ_CST);
     D.admitted = 0;
+    __atomic_store_n(&g_unswept_total, 0, __ATOMIC_RELAXED); /* a new data layer holds no job's log bytes */
     ava1_data_test_open_delay_ms = ava1_data_test_map_delay_ms = ava1_data_test_feed_delay_ms = 0;
     ava1_data_test_open_work_delay_ms = 0;
     ava1_data_test_ack_fail = ava1_data_test_feeder_fail = 0;
