@@ -58,7 +58,7 @@ export function autoRedeployDecision(input: {
 /** How many redeploy ticks (15 s each) a helper that still accepts
  *  connections is left alone before the loop may replace it anyway.
  *
- *  A failed STATUS is not a dead helper. A FW 12.70 report caught :9113
+ *  A failed STATUS is not a dead helper. A FW 12.70 report caught the helper port
  *  accepting connections while STATUS failed, and its helper reported
  *  "prior_instance": "replaced" — started over a predecessor that was still
  *  running. A process that still owns our ports is alive, and a push replaces

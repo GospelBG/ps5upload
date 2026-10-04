@@ -1116,7 +1116,7 @@ function Step2Options(props: {
   const inFlight =
     transferPhase.kind === "starting" || transferPhase.kind === "running";
   // (2.11.0) Mutual-exclusion with QueuePanel. The PS5 payload's
-  // transfer port is single-client — concurrent FTX2 connections
+  // transfer port is single-client — concurrent transfer connections
   // serialize at the socket, but the UI would say both are
   // "running" while one silently waits. Worse: a user clicking
   // "Upload" with a queue already running can stack work the user

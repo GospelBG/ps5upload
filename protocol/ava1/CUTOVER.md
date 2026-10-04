@@ -7,13 +7,13 @@ every box is ticked and `git grep -i ftx2 -- '*.md' ':!CHANGELOG.md'` is empty.
 
 The CHANGELOG keeps its FTX2 entries: they describe releases that shipped FTX2.
 
-- [ ] `README.md` "Test" section — "in-process mock FTX2 server" → the AVA1 mock/host-C tests
-- [ ] `CONTRIBUTING.md:45` — "mock-FTX2 integration tests"
-- [ ] `engine/README.md` — `ps5upload-tests` row ("mock FTX2 server"); dev commands using `:9113` / `:9114`
-- [ ] `TESTING.md` — `PS5_ADDR=…:9113`, `make validate` waiting for `:9113`, curl examples with `:9114`
-- [ ] `tests/README.md` — "full FTX2 stack", `PS5_ADDR` default `:9113`, `--ps5-addr` description
-- [ ] `tests/lab/README.md` — `:9113`/`:9114`, `ftx2_control.py`, `ftx2_probe.py`
-- [ ] `bench/README.md` — `run-ftx2-upload.mjs`, `check-ftx2-baseline.mjs`, `ftx2-upload-main.json` baselines, `--ps5-addr=…:9113`
+- [x] `README.md` "Test" section — "in-process mock FTX2 server" → the AVA1 mock/host-C tests
+- [x] `CONTRIBUTING.md:45` — "mock-FTX2 integration tests"
+- [x] `engine/README.md` — `ps5upload-tests` row ("mock FTX2 server"); dev commands using `:9113` / `:9114`
+- [x] `TESTING.md` — `PS5_ADDR=…:9113`, `make validate` waiting for `:9113`, curl examples with `:9114`
+- [x] `tests/README.md` — "full FTX2 stack", `PS5_ADDR` default `:9113`, `--ps5-addr` description
+- [x] `tests/lab/README.md` — `:9113`/`:9114`, `ftx2_control.py`, `ftx2_probe.py`
+- [x] `bench/README.md` — `run-ftx2-upload.mjs`, `check-ftx2-baseline.mjs`, `ftx2-upload-main.json` baselines, `--ps5-addr=…:9113`
 - [x] `FAQ.md` — `FTX2_ZIP_RAM_THRESHOLD_MB` and `FTX2_ARCHIVE_STAGE_MB` environment variables (P3 Task 17: renamed to `PS5UPLOAD_ZIP_RAM_THRESHOLD_MB` / `PS5UPLOAD_ARCHIVE_STAGE_MB`; the engine still reads the old names once per process with a deprecation line, and both settings are accepted but change nothing now that archives stream)
 - [ ] `MGMT_METHODS.md` — every row `hw-verified` (or `n/a` for a retired frame) on both consoles
 - [x] In-app strings (`client/src/i18n/locales/*.ts`) that mention FTX2, ports 9113/9114 or "transfer port" (Task 20; pinned by `client/src/i18n/noLegacyPorts.test.ts`)

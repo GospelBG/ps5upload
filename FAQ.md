@@ -664,6 +664,20 @@ fight — the payload doesn't lock by destination, it commits the
 shards each transfer ACKs in arrival order. For routine use ("one
 person uploading, another browsing"), no coordination is needed.
 
+**Q: What is the pairing code, and which ports does ps5upload use?**
+ps5upload talks to the console on one port, **9120**, plus the ELF loader's
+**9021** to load the helper. Those two are the only ones to allow in a
+firewall. Every connection is encrypted and each computer pairs with the
+console once. A helper that the app launched pairs automatically, with
+nothing to type. A helper you loaded some other way (a different loader or
+tool) shows a 6-digit code on the console; confirm it in the app to pair.
+
+**Q: How do I cap the upload speed?**
+Set `PS5UPLOAD_BANDWIDTH_MBPS` to a number of megabytes per second before
+starting the app or engine; unset, zero or an unreadable value means no
+cap. The old name from before the AVA1 release still works for one release
+and prints a deprecation line in the engine log.
+
 **Q: Can I run the transfer engine on a different machine (remote /
 self-hosted engine)? (3.3.7)**
 Yes. The app normally launches its transfer engine as a bundled background
@@ -947,12 +961,12 @@ It depends on the format.
 
 A `.zip` entry of any size is inflated as it is sent, so nothing is held back in memory
 or written to temp. The `PS5UPLOAD_ZIP_RAM_THRESHOLD_MB` environment variable (and its old
-`FTX2_ZIP_RAM_THRESHOLD_MB` name) is still accepted so an existing setup does not
+name from before the AVA1 release, which still works for one release and prints a deprecation line) is still accepted so an existing setup does not
 break, but it is ignored.
 
 This changed in a recent version. Older builds extracted a `.rar` in full
 first, which meant a 180 GB game needed 180 GB free on top of the archive.
-If you set `PS5UPLOAD_ARCHIVE_STAGE_MB` (or its old `FTX2_ARCHIVE_STAGE_MB` name)
+If you set `PS5UPLOAD_ARCHIVE_STAGE_MB` (or its old name from before the AVA1 release)
 to work around that, you can remove it — it no longer does anything.
 
 **Q: Which archive formats work on which system?**

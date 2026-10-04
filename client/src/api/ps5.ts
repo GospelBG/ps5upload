@@ -148,7 +148,7 @@ export async function zipInspectStream(
 // 7z support reuses the ZipInspect / ZipInspectProgress shapes — the engine
 // returns the same fields. The host decompresses the archive's single LZMA2
 // stream (commonly one .exfat image) forward-only and streams the files into
-// the same FTX2 shard pipeline, so they land already-extracted on the PS5.
+// the same AVA1 upload pipeline, so they land already-extracted on the PS5.
 // Game metadata (title) is not surfaced for 7z: a 7z-of-.exfat has no
 // host-visible param.json, so `title` etc. stay null.
 
@@ -1692,7 +1692,7 @@ export interface DiscoveredHost {
   services: string[];
   /** :9021 reachable — the universal payload-loader port. */
   loader_port_open: boolean;
-  /** :9114 reachable — our own payload is already running here. */
+  /** The helper's AVA1 port (9120) is reachable — our own payload is already running here. */
   payload_port_open: boolean;
   /** 0-100 score; see commands/discover.rs::confidence for weights. */
   confidence: number;
@@ -2271,8 +2271,8 @@ export interface ProcessKillAck {
   err?: string | null;
 }
 
-/** Enumerate running processes (detailed). `addr` is the mgmt addr
- *  (ip:9114). Read-only. */
+/** Enumerate running processes (detailed). `addr` is the console
+ *  address. Read-only. */
 export async function processList(addr: string): Promise<ProcessListResult> {
   return invoke<ProcessListResult>("process_list_get", { addr });
 }

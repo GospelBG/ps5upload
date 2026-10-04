@@ -27,21 +27,21 @@ client (Tauri/React)  ──HTTP──▶  ps5upload-engine :19113
 | `ps5upload-engine` | The Axum HTTP service (~100 routes), job tracking, SSE progress events, and the desktop + mobile entry points. |
 | `ps5upload-pkg` | `.pkg` parsing — headers, entries, split-file sets. |
 | `ps5upload-lab` | CLI for driving the payload's control channel by hand. Useful when you want one frame, not a workflow. |
-| `ps5upload-tests` | Integration tests against an in-process mock FTX2 server. |
+| `ps5upload-tests` | Integration tests that run against in-process and loopback AVA1 peers, with no console. |
 | `ps5upload-bench` | Throughput benchmarks. |
 
 ## Working on it
 
 ```sh
-cargo test --workspace          # no PS5 required — mock server
+cargo test --workspace          # no PS5 required — loopback peers
 cargo build --release -p ps5upload-engine
 ```
 
 Run it standalone and point it at a console:
 
 ```sh
-PS5_ADDR=<ip>:9113 cargo run -p ps5upload-engine
-curl "http://127.0.0.1:19113/api/ps5/status?addr=<ip>:9114"
+PS5_ADDR=<ip> cargo run -p ps5upload-engine
+curl "http://127.0.0.1:19113/api/ps5/status?addr=<ip>"
 ```
 
 `PS5UPLOAD_ALLOW_IP` lets another machine reach it. The API is

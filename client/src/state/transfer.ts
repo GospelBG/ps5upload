@@ -836,10 +836,10 @@ export const useTransferStore = create<TransferState>((set) => {
   };
 });
 
-/** Pull the host (no port) out of an addr like `192.168.1.2:9113` for
+/** Pull the host (no port) out of an addr like `192.168.1.2:port` for
  *  use as the resume-txid cache key. We deliberately key by host, not
  *  full addr, so the port choice doesn't fragment records — a user who
- *  later lands on a payload with a different transfer port should still
+ *  later lands on a payload with a different port should still
  *  be able to resume, because the payload's tx journal is port-agnostic.
  *
  *  2.12.0: migrated to canonical `hostOf` from lib/addr. Behaviour

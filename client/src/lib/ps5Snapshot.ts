@@ -222,8 +222,7 @@ async function fetchPayloadLogs(host: string): Promise<{
     ["/data/ps5upload_startup.log", "startup_early.log"],
     ["/data/ps5upload/runtime/active_instance.txt", "active_instance.txt"],
     // The AVA1 job event log (open / resume / done / fail with status, bytes and lanes; the
-    // payload rolls it at 1 MiB into .old). It replaces the FTX2 transaction logs
-    // (tx/events.log, tx/runtime_tx_state.txt, tx_*.json, shards_*.log), which no longer exist.
+    // payload rolls it at 1 MiB into .old). It replaces the transaction logs of the helper's former protocol, which no longer exist.
     ["/data/ps5upload/ava/events.log.old", "ava_events_old.log"],
     ["/data/ps5upload/ava/events.log", "ava_events.log"],
     // ShadowMount+ is third-party but owns mounting and registration for

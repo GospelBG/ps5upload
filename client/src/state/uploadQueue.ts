@@ -156,7 +156,7 @@ export interface QueueItem {
    *  user picked these on the Upload screen at queue-add time; the
    *  runner sends the file to this exact path. */
   resolvedDest: string;
-  /** Transfer-port addr (e.g. `192.168.1.2:9113`). */
+  /** Console address (a bare host such as `192.168.1.2`). */
   addr: string;
   strategy: UploadStrategy;
   reconcileMode: ReconcileMode;
@@ -1443,10 +1443,10 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           }
           // Re-deploy the payload, then poll until it answers. force=true:
           // we got here from a connection-class transfer failure, so the
-          // payload is suspect — its transfer port (:9113) may be dead even
-          // if the mgmt port (:9114) still answers the version check. A
+          // payload is suspect — its transfer listener may be dead even
+          // if management still answers the version check. A
           // plain (non-force) call would see "version matches → current" and
-          // skip the redeploy, leaving the dead :9113 in place so the resume
+          // skip the redeploy, leaving the dead listener in place so the resume
           // retry fails again — the "had to re-send the ELF manually" bug.
           // Re-send is idempotent and the resume continues from committed
           // shards, so a needless redeploy on a transient blip only costs the

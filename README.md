@@ -340,8 +340,9 @@ All workflows go through the root `Makefile` (see `make help`).
 
 ## Test
 
-Unit and integration tests run entirely against an in-process mock
-FTX2 server — no PS5 needed:
+Unit and integration tests run entirely on your computer — the AVA1
+protocol is tested against loopback peers and the console-side C code
+is compiled and run on the host. No PS5 needed:
 
 ```bash
 make test-engine

@@ -502,20 +502,20 @@ gen-fixtures:
 	@node scripts/gen-fixtures.mjs
 
 sweep:
-	@echo "Running FTX2 sweep against live PS5 at $(PS5_HOST):9113 ..."
+	@echo "Running FTX2 sweep against live PS5 at $(PS5_HOST) ..."
 	@node bench/run-ftx2-sweep.mjs --spawn-engine --gen-fixtures
 
 # Wait for the payload's runtime port to accept connections after send.
 # Retries 15×/2s = 30s ceiling; exits non-zero if the port never opens.
 _wait-payload-ready:
-	@echo "Waiting for PS5 runtime port 9113 ..."
+	@echo "Waiting for the helper's AVA1 port 9120 ..."
 	@i=0; while [ $$i -lt 15 ]; do \
-		if nc -z -w 1 "$(PS5_HOST)" 9113 >/dev/null 2>&1; then \
+		if nc -z -w 1 "$(PS5_HOST)" 9120 >/dev/null 2>&1; then \
 			echo "✓ runtime port open"; exit 0; \
 		fi; \
 		i=$$((i+1)); sleep 2; \
 	done; \
-	echo "ERROR: PS5 runtime port 9113 did not open within 30s"; exit 1
+	echo "ERROR: PS5 AVA1 port 9120 did not open within 30s"; exit 1
 
 validate: send-payload _wait-payload-ready
 	@echo ""
@@ -695,10 +695,10 @@ docker-engine:
 	@echo "✓ Built image $(DOCKER_ENGINE_IMAGE) — run with: make docker-engine-run"
 
 # Run the locally-built engine image. Binds the published port and points it at
-# the PS5's transfer port. Override PS5_HOST / the bind address as needed.
+# the PS5 (AVA1, port 9120). Override PS5_HOST / the bind address as needed.
 docker-engine-run: docker-engine
-	@echo "Running $(DOCKER_ENGINE_IMAGE) — engine on :19113, PS5 at $(PS5_HOST):9113 ..."
-	@$(DOCKER) run --rm -p 19113:19113 -e PS5_ADDR=$(PS5_HOST):9113 $(DOCKER_ENGINE_IMAGE)
+	@echo "Running $(DOCKER_ENGINE_IMAGE) — engine on :19113, PS5 at $(PS5_HOST) ..."
+	@$(DOCKER) run --rm -p 19113:19113 -e PS5_ADDR=$(PS5_HOST) $(DOCKER_ENGINE_IMAGE)
 
 #──────────────────────────────────────────────────────────────────────────────
 # Testing

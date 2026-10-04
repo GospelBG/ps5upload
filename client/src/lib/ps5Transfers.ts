@@ -3,7 +3,7 @@ import { useTransferStore } from "../state/transfer";
 import { hostOf } from "./addr";
 
 /**
- * Coordination for the PS5's single-client transfer port (:9113) and the
+ * Coordination for the PS5's single-client transfer port and the
  * payload itself. Only ONE of {Upload-screen one-shot, Upload-screen queue,
  * Install-screen .pkg upload, Install-screen install} can safely touch the
  * console at a time — an install swaps the payload out, and the transfer port
@@ -24,7 +24,7 @@ import { hostOf } from "./addr";
  *
  * **Pass `host` in multi-console contexts.** The collision being avoided is
  * per-PS5: it only happens when two operations target the SAME console's
- * :9113 transfer port / payload. With consoles running in parallel, an
+ * transfer port / payload. With consoles running in parallel, an
  * unscoped check would make an install on console B wait — unbounded — behind
  * an unrelated upload on console A. When `host` is given, only work targeting
  * that console counts as busy. When omitted, falls back to the legacy global

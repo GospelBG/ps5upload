@@ -320,7 +320,7 @@ export function installActivityWiring() {
   // Before this subscription, clicking Start on the Upload Queue
   // panel kicked off a real transfer in the engine but the
   // ActivityBar at the bottom of the app stayed dark — the only
-  // activityHistory subscriber for FTX2 uploads was useTransferStore
+  // activityHistory subscriber for uploads was useTransferStore
   // (the single-shot Upload-screen flow). Users had to look in the
   // Upload-screen QueuePanel to see queue progress; navigating away
   // hid it entirely. Now the per-item running state forwards into
@@ -349,7 +349,7 @@ export function installActivityWiring() {
             fromPath: item.sourcePath,
             toPath: item.resolvedDest,
             // Which console this queue item targets — drives the console
-            // chip on ActivityBar/Activity rows. Same `ip:9113` shape the
+            // chip on ActivityBar/Activity rows. Same `ip:port` shape the
             // Activity screen's fsOpCancel path expects (port-tolerant).
             addr: item.addr,
           });
