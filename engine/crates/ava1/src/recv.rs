@@ -1576,6 +1576,7 @@ async fn run_loop(
                             id = r.file_id
                         )));
                     }
+                    eprintln!("DBGROOT {} size {}", r.file_id, e.size);
                     last_progress = Instant::now();
                     large
                         .entry(r.file_id)
