@@ -317,6 +317,17 @@ pub mod ffi {
             sony_peak: *mut c_int,
         );
         pub fn ava1_test_mgmt_last_path(out: *mut u8, cap: usize) -> usize;
+        pub fn ava1_test_mgmt_install_diag() -> c_int;
+        pub fn ava1_test_mgmt_diag_peak() -> c_int;
+        pub fn ava1_test_mgmt_set_syslog(len: u32, mode: c_int);
+        pub fn ava1_test_tail_window(
+            text: *const u8,
+            len: usize,
+            cap: usize,
+            start: *mut usize,
+        ) -> c_int;
+        pub fn ava1_test_events_set(path: *const c_char, limit: u32);
+        pub fn ava1_test_events_log(line: *const c_char);
         pub fn ava1_test_set_allow_read(v: c_int);
         pub fn ava1_test_apply_begin(
             jobs: *const c_char,
@@ -1673,10 +1684,50 @@ pub mod mgmt {
         unsafe { ffi::ava1_test_mgmt_stats(&mut e, &mut l, &mut f, &mut p) };
         (e, l, f, p)
     }
+    /// Installs the Task 9 diagnostics table (klog, syslog, net.*, proc.modules) instead of the
+    /// general stub table. 0 on success.
+    pub fn install_diag() -> i32 {
+        unsafe { ffi::ava1_test_mgmt_install_diag() }
+    }
+    /// The most diagnostics calls the console ran at once since `install_diag`.
+    pub fn diag_peak() -> i32 {
+        unsafe { ffi::ava1_test_mgmt_diag_peak() }
+    }
+    /// The stub `log.syslog` handler: `len` bytes of numbered lines (mode 0), the sysctl error
+    /// frame (1), an empty buffer (2) or text after a 60 ms hold (3).
+    pub fn set_syslog(len: u32, mode: i32) {
+        unsafe { ffi::ava1_test_mgmt_set_syslog(len, mode) }
+    }
+    /// `mgmt_tail_window`: (clipped, start of the window).
+    pub fn tail_window(text: &[u8], cap: usize) -> (bool, usize) {
+        let mut start = 0usize;
+        let c = unsafe { ffi::ava1_test_tail_window(text.as_ptr(), text.len(), cap, &mut start) };
+        (c != 0, start)
+    }
     /// The path the stub `fs.mkdir` handler last received.
     pub fn last_path() -> String {
         let mut b = [0u8; 256];
         let n = unsafe { ffi::ava1_test_mgmt_last_path(b.as_mut_ptr(), b.len()) };
         String::from_utf8_lossy(&b[..n]).into_owned()
+    }
+}
+
+/// The AVA1 event log (payload/ava1/ava1_events.c, P3 Task 9).
+pub mod events {
+    use super::ffi;
+    use std::ffi::CString;
+    use std::path::Path;
+
+    /// Points the log at `path` (None = off) with a roll size of `limit` bytes (0 = 1 MiB).
+    pub fn set(path: Option<&Path>, limit: u32) {
+        let c = path.map(|p| CString::new(p.to_str().unwrap()).unwrap());
+        unsafe {
+            ffi::ava1_test_events_set(c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()), limit)
+        }
+    }
+    /// `ava1_log_event`.
+    pub fn log(line: &str) {
+        let c = CString::new(line).unwrap();
+        unsafe { ffi::ava1_test_events_log(c.as_ptr()) }
     }
 }

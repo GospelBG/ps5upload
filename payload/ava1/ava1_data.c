@@ -13,6 +13,7 @@
 #include "ava1_apply.h"
 #include "ava1_copy.h"
 #include "ava1_op.h"
+#include "ava1_events.h"
 #include "ava1_job.h"
 #include "ava1_platform.h"
 #include "ava1_recv.h"
@@ -907,6 +908,14 @@ static void open_now(opening_t *o, const uint8_t sid[16], const uint8_t peer[32]
             j = NULL;
         }
     }
+    if (j) {
+        ava1_log_job_event(ack.status == AVA1_STATUS_OK ? "open" : "open-refused", j, ack.status);
+    } else {
+        char ev[96];
+        snprintf(ev, sizeof ev, "open-refused job=%02x%02x%02x%02x kind=%u status=%u", q.job_id[0], q.job_id[1],
+                 q.job_id[2], q.job_id[3], (unsigned)q.kind, (unsigned)ack.status);
+        ava1_log_event(ev);
+    }
     /* Any send failure means the session is gone or breaking: a job left attached to it
      * would never be reached (and never reaped), so park it. */
     if ((ava1_data_test_ack_fail ? ava1_data_test_ack_fail : send_ack(sid, &ack, j ? "" : msg, 0)) != 0 && j)
@@ -1113,6 +1122,7 @@ static int route(const uint8_t sid[16], const uint8_t peer[32], uint8_t type, co
         ava1_job_put_nowait(j);
         return 0;
     }
+    if (type == AVA1_TYPE_RESUME) ava1_log_job_event("resume", j, AVA1_STATUS_OK);
     if (j->on_frame) { /* a sender job (Task 18): the receiving peer's acks and map */
         /* A Resume re-attaches it: the new session's lanes that came up before the attach
          * never told the job, so its writers start here (as after a JobOpen's attach). */

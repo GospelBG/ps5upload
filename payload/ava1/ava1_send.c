@@ -11,6 +11,7 @@
 
 #include "ava1_apply.h"
 #include "ava1_b3.h"
+#include "ava1_events.h"
 #include "ava1_data.h"
 #include "ava1_platform.h"
 #include "ava1_server.h"
@@ -678,6 +679,7 @@ static int on_frame(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len
     case AVA1_TYPE_JOB_DONE:
     case AVA1_TYPE_JOB_CANCEL:
         /* The peer concluded the job: stop, never answer with a JobDone of our own (C10). */
+        ava1_log_job_event(type == AVA1_TYPE_JOB_DONE ? "peer-done" : "peer-cancel", j, AVA1_STATUS_OK);
         pthread_mutex_lock(&j->mu);
         s->stop = 1;
         j->finished = 1;

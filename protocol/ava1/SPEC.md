@@ -279,6 +279,15 @@ JSON), carried unchanged in `MgmtText.body`; `more = 1` on a reply means the met
 the caller asks again with the next `offset`. Typing the text methods is deferred (§10): the text
 bodies are stable and tested, and the cutover does not need them typed.
 
+`log.klog` and `log.syslog` are clamped tails, not paged reads: when the console's text is longer than
+`RPC_TEXT_MAX` the reply is its newest `RPC_TEXT_MAX` bytes, starting at a line boundary (else a
+UTF-8 boundary), with `more = 1` meaning "older text was left out"; a text that fits is returned whole
+with `more` absent or 0. `net.reach` is a probe: its negative answer (`{"ok":false,"timed_out":..,
+"errno":..,"ms":..}`) is the measurement and travels as an ordinary OK reply; only a malformed request
+(`bad_request`, `bad_address`) is `ERR_PROTOCOL`. A console writes a human-readable job event log at
+`/data/ps5upload/ava/events.log` (one line per job open, resume, done and fail with status, bytes,
+files and lanes; 1 MiB, rolled to `events.log.old`), read with `fs.read` like the other log files.
+
 Encoding overhead. A `MgmtText` is `u32 length + text + u16 ext count` (6 bytes), plus 7 bytes when
 `more` is present (tag u16, length u32, value u8). It is the `RpcResponse` body, so the largest text
 a handler may return is `RPC_REPLY_MAX - 16 = 262,128` bytes (`RPC_TEXT_MAX`, with 3 bytes to spare);

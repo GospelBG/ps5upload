@@ -138,9 +138,15 @@ int mgmt_legacy_failure(const char *body, size_t len, char *token, size_t token_
 /* Runner helpers the table (mgmt_table.def) names: (request, length, ctx, legacy handler). */
 int mgmt_call_text(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);   /* MgmtText in and out */
 int mgmt_call_paged(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);  /* MgmtText, offset/limit/more */
+int mgmt_call_tail(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);   /* MgmtText, clamped tail (log.klog, log.syslog) */
+int mgmt_call_probe(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn);  /* MgmtText; {"ok":false,...} is an answer (net.reach) */
 int mgmt_call_fs_mkdir(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn); /* FsMkdir -> empty */
 
 int mgmt_call_node_status(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn); /* -> NodeStatus */
+
+/* Where a clamped tail of `len` bytes starts so that at most `cap` bytes remain: 0 and *start = 0
+ * when it all fits; else 1 with *start on a line boundary (or a UTF-8 boundary). */
+int mgmt_tail_window(const char *text, size_t len, size_t cap, size_t *start);
 
 /* JSON string escaping for building a legacy request. Returns the length written (without
  * the NUL), or -1 when it does not fit. */

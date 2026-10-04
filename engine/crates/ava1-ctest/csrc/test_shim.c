@@ -30,6 +30,8 @@
 #include "mgmt_rpc.h"
 #include "ava1_op.h"
 #include "fs_jobs.h"
+#include "net_probe.h"
+#include "ava1_events.h"
 
 static uint32_t g_pair_requests, g_last_code, g_logs;
 
@@ -203,6 +205,121 @@ static int stub_silent(void *st, int fd, uint64_t t, const char *b, uint64_t l) 
     return 0;
 }
 
+/* ---- P3 Task 9: the diagnostics stubs. They answer the way runtime.c's handlers do (same
+ * bodies, same limits), so the runners in mgmt_rpc.c (mgmt_call_tail, mgmt_call_probe) and the
+ * net.reach probe (payload/src/net_probe.c, the real code) run unchanged on the host. ---- */
+
+static int g_diag_inflight, g_diag_peak;
+
+static void diag_enter(void) {
+    int n = __atomic_add_fetch(&g_diag_inflight, 1, __ATOMIC_SEQ_CST), p = __atomic_load_n(&g_diag_peak, __ATOMIC_SEQ_CST);
+    while (n > p && !__atomic_compare_exchange_n(&g_diag_peak, &p, n, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+    }
+}
+static void diag_leave(void) { __atomic_sub_fetch(&g_diag_inflight, 1, __ATOMIC_SEQ_CST); }
+static void diag_env_enter(uint16_t frame) {
+    (void)frame;
+    diag_enter();
+}
+static void diag_env_leave(void) { diag_leave(); }
+
+static uint32_t g_stub_syslog_len = 200000;
+static int g_stub_syslog_mode; /* 0 = text, 1 = the sysctl error frame, 2 = empty */
+
+/* A reproducible log: numbered lines of 40 bytes ("line 00000001 .... \n"), `n` bytes in all. */
+static char *numbered_log(size_t n) {
+    char *b = malloc(n + 1);
+    size_t off = 0, i = 0;
+    if (!b) return NULL;
+    while (off < n) {
+        char line[48];
+        int w = snprintf(line, sizeof line, "line %08zu ..............................\n", i++);
+        size_t take = (size_t)w < n - off ? (size_t)w : n - off;
+        memcpy(b + off, line, take);
+        off += take;
+    }
+    b[n] = '\0';
+    return b;
+}
+
+/* log.klog: {"max_bytes":N}; like handle_klog_read, default 16 KiB, ceiling 64 KiB. */
+static int stub_klog(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    const char *p = strstr(b, "\"max_bytes\"");
+    size_t n = 16 * 1024;
+    char *log;
+    int rc;
+    (void)st; (void)fd; (void)t; (void)l;
+    if (p && (p = strchr(p, ':')) && atoll(p + 1) > 0) n = (size_t)atoll(p + 1);
+    if (n > 64 * 1024) n = 64 * 1024;
+    log = numbered_log(n);
+    if (!log) return -1;
+    rc = stub_send_frame(109, log, n);
+    free(log);
+    return rc;
+}
+
+/* log.syslog: kern.msgbuf, up to 1 MiB (the handler's HARD_CAP). */
+static int stub_syslog(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    char *log;
+    int rc;
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    if (g_stub_syslog_mode == 3) { /* slow: holds its slot (the in-flight bound tests) */
+        usleep(60 * 1000);
+    }
+    if (g_stub_syslog_mode == 1) return stub_send_frame(STUB_FRAME_ERROR, "syslog_tail_sysctl_errno_12", 27);
+    if (g_stub_syslog_mode == 2) return stub_send_frame(145, "", 0);
+    log = numbered_log(g_stub_syslog_len);
+    if (!log) return -1;
+    rc = stub_send_frame(145, log, g_stub_syslog_len);
+    free(log);
+    return rc;
+}
+
+static int stub_netif(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    static const char body[] =
+        "{\"interfaces\":[{\"name\":\"eth0\",\"mac\":\"aa:bb:cc:dd:ee:ff\",\"ipv4\":\"192.168.1.50\",\"mtu\":1500,\"flags\":65,\"up\":true}],"
+        "\"source\":\"getifaddrs\"}";
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    return stub_send_frame(111, body, sizeof body - 1);
+}
+
+/* net.reach: the real probe. */
+static int stub_reach(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    char resp[320];
+    size_t n = net_probe_reach(b, (size_t)l, resp, sizeof resp);
+    (void)st; (void)fd; (void)t;
+    return stub_send_frame(149, resp, n);
+}
+
+static int stub_speed(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    return stub_send_frame(123, "{\"ok\":true}", 11);
+}
+
+static int stub_modules(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    static const char body[] =
+        "{\"modules\":[{\"handle\":1,\"name\":\"libkernel.sprx\",\"base\":\"0x800000000\",\"code_size\":4096}]}";
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    return stub_send_frame(115, body, sizeof body - 1);
+}
+
+void ava1_test_mgmt_set_syslog(uint32_t len, int mode) {
+    g_stub_syslog_len = len;
+    g_stub_syslog_mode = mode;
+}
+
+/* mgmt_tail_window(): returns clipped; *start is the window's first byte. */
+int ava1_test_tail_window(const char *text, size_t len, size_t cap, size_t *start) {
+    return mgmt_tail_window(text, len, cap, start);
+}
+
+/* The event log (ava1_events.c). */
+void ava1_test_events_set(const char *path, uint32_t limit) {
+    ava1_events_set_path(path);
+    ava1_events_set_limit(limit);
+}
+void ava1_test_events_log(const char *line) { ava1_log_event(line); }
+
 #define STUB_RUN(name, helper) \
     static int run_##name(const uint8_t *q, uint32_t n, mgmt_ctx_t *cx) { return helper(q, n, cx, name); }
 STUB_RUN(stub_volumes, mgmt_call_text)
@@ -214,6 +331,12 @@ STUB_RUN(stub_env, mgmt_call_text)
 STUB_RUN(stub_two_frames, mgmt_call_text)
 STUB_RUN(stub_silent, mgmt_call_text)
 STUB_RUN(stub_status, mgmt_call_node_status)
+STUB_RUN(stub_klog, mgmt_call_tail)
+STUB_RUN(stub_syslog, mgmt_call_tail)
+STUB_RUN(stub_netif, mgmt_call_text)
+STUB_RUN(stub_reach, mgmt_call_probe)
+STUB_RUN(stub_speed, mgmt_call_text)
+STUB_RUN(stub_modules, mgmt_call_text)
 
 static const mgmt_entry_t k_stub_table[] = {
     {AVA1_METHOD_NODE_STATUS, 20, 21, 0, run_stub_status},
@@ -226,6 +349,25 @@ static const mgmt_entry_t k_stub_table[] = {
     {AVA1_METHOD_FS_UNMOUNT, 54, 55, 0, run_stub_two_frames},
     {AVA1_METHOD_FS_MOUNT_PKG, 124, 125, 0, run_stub_silent},
 };
+
+/* P3 Task 9: its own table (installed by ava1_test_mgmt_install_diag), so it can never collide
+ * with the methods other tasks add to k_stub_table. */
+static const mgmt_entry_t k_diag_table[] = {
+    {AVA1_METHOD_LOG_KLOG, 108, 109, 0, run_stub_klog},
+    {AVA1_METHOD_LOG_SYSLOG, 144, 145, 0, run_stub_syslog},
+    {AVA1_METHOD_NET_INTERFACES, 110, 111, 0, run_stub_netif},
+    {AVA1_METHOD_NET_REACH, 148, 149, 0, run_stub_reach},
+    {AVA1_METHOD_NET_SPEEDTEST, 122, 123, 0, run_stub_speed},
+    {AVA1_METHOD_PROC_MODULES, 114, 115, 0, run_stub_modules},
+};
+
+int ava1_test_mgmt_install_diag(void) {
+    __atomic_store_n(&g_diag_inflight, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_diag_peak, 0, __ATOMIC_SEQ_CST);
+    return mgmt_rpc_install(k_diag_table, sizeof k_diag_table / sizeof k_diag_table[0], NULL, diag_env_enter,
+                            diag_env_leave);
+}
+int ava1_test_mgmt_diag_peak(void) { return __atomic_load_n(&g_diag_peak, __ATOMIC_SEQ_CST); }
 
 int ava1_test_mgmt_install(void) {
     __atomic_store_n(&g_stub_enters, 0, __ATOMIC_SEQ_CST);

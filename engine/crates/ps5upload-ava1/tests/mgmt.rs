@@ -985,3 +985,42 @@ fn call_from_a_current_thread_runtime_does_not_panic() {
     assert_eq!(r.unwrap().unwrap(), b"fine");
     drop(rt);
 }
+
+// ---- P3 Task 9: the log tails ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clamped_log_tail_is_led_by_a_note_and_a_whole_one_is_not() {
+    let (t, _p, c) = console(
+        "tails",
+        Box::new(|method, body| {
+            let n: usize = text_of(body).parse().unwrap_or(0);
+            let more = match method {
+                gen::METHOD_LOG_SYSLOG => Some(1),
+                gen::METHOD_LOG_KLOG => Some(0),
+                _ => None,
+            };
+            ok(MgmtText {
+                body: vec![b'x'; n],
+                more,
+            }
+            .to_bytes()
+            .unwrap())
+        }),
+    )
+    .await;
+    // the console clamped it (`more` = 1): the text says so, then the newest part follows
+    let r = call(&t, &c, m::LOG_SYSLOG, "SYSLOG_TAIL", b"5", T)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        r,
+        [ps5upload_ava1::mgmt::TAIL_CLIPPED.as_bytes(), b"xxxxx"].concat()
+    );
+    // not clamped (`more` = 0): the bytes untouched
+    let r = call(&t, &c, m::LOG_KLOG, "KLOG_READ", b"5", T)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r, b"xxxxx");
+}

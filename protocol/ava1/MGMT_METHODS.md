@@ -58,14 +58,14 @@ Generated from the tree at the Task 1 commit; line numbers drift, re-find with
 | IndexCancel 102 | 70 `index.cancel` | `MgmtText` | todo | `src/runtime.c:13703` `handle_index_cancel`; dispatch `runtime.c:16374` | `ps5upload-core/src/search_index.rs:131` |
 | AppLifecycle 104 | 53 `app.lifecycle` | `MgmtText` | todo | `src/runtime.c:12107` `handle_app_lifecycle`; dispatch `runtime.c:16377` | `ps5upload-core/src/app_lifecycle.rs:60` |
 | ToastSend 106 | 125 `toast.send` | `MgmtText` | todo | `src/runtime.c:13661` `handle_toast_send`; dispatch `runtime.c:15889` | `ps5upload-core/src/app_lifecycle.rs:136` |
-| KlogRead 108 | 7 `log.klog` | `MgmtText` {max_bytes} -> text | todo | `src/runtime.c:12260` `handle_klog_read`; dispatch `runtime.c:16381` | `ps5upload-core/src/diagnostics.rs:24` |
-| NetInterfaces 110 | 9 `net.interfaces` | `MgmtText` | todo | `src/runtime.c:12308` `handle_net_interfaces`; dispatch `runtime.c:16385` | `ps5upload-core/src/diagnostics.rs:60` |
+| KlogRead 108 | 7 `log.klog` | `MgmtText` {max_bytes} -> text | ported | `src/runtime.c:12260` `handle_klog_read`; dispatch `runtime.c:16381` | `ps5upload-core/src/diagnostics.rs:24` |
+| NetInterfaces 110 | 9 `net.interfaces` | `MgmtText` | ported | `src/runtime.c:12308` `handle_net_interfaces`; dispatch `runtime.c:16385` | `ps5upload-core/src/diagnostics.rs:60` |
 | PeripheralControl 112 | 86 `periph.control` | `MgmtText` | todo | `src/runtime.c:12501` `handle_peripheral_control`; dispatch `runtime.c:16388` | `ps5upload-core/src/diagnostics.rs:118` |
-| ProcModules 114 | 61 `proc.modules` | `MgmtText` | todo | `src/runtime.c:13597` `handle_proc_modules`; dispatch `runtime.c:16392` | `ps5upload-core/src/diagnostics.rs:642` |
+| ProcModules 114 | 61 `proc.modules` | `MgmtText` | ported | `src/runtime.c:13597` `handle_proc_modules`; dispatch `runtime.c:16392` | `ps5upload-core/src/diagnostics.rs:642` |
 | ShellExec 116 | 87 `shell.exec` | `MgmtText` | todo | `src/runtime.c:12705` `handle_shell_exec`; dispatch `runtime.c:16396` | `ps5upload-core/src/diagnostics.rs:193`; +1 test/bench |
 | Crc32File 118 | 20 `job.run (op CRC32)` | `JobRun` -> `Status` (ext `state`, `result`, `code`) | todo | `src/runtime.c:12843` `handle_crc32_file`; dispatch `runtime.c:16400` | `ps5upload-core/src/diagnostics.rs:224` |
 | AppDbQuery 120 | 56 `app.db_query` | `MgmtText` | todo | `src/runtime.c:12918` `handle_appdb_query`; dispatch `runtime.c:16404` | `ps5upload-core/src/diagnostics.rs:265` |
-| NetSpeedTest 122 | 11 `net.speedtest` | `MgmtText` | todo | `src/runtime.c:13581` `handle_net_speed_test`; dispatch `runtime.c:16415` | `ps5upload-core/src/diagnostics.rs:579` |
+| NetSpeedTest 122 | 11 `net.speedtest` | `MgmtText` | ported | `src/runtime.c:13581` `handle_net_speed_test`; dispatch `runtime.c:16415` | `ps5upload-core/src/diagnostics.rs:579` |
 | PkgDirectMount 124 | 42 `fs.mount_pkg` | `MgmtText` | todo | `src/runtime.c:13115` `handle_pkg_direct_mount`; dispatch `runtime.c:16423` | `ps5upload-core/src/diagnostics.rs:399` |
 | UfsFsck 126 | 20 `job.run (op FSCK)` | `JobRun` -> `Status` (ext `state`, `result`, `code`) | todo | `src/runtime.c:13174` `handle_ufs_fsck`; dispatch `runtime.c:16427` | `ps5upload-core/src/diagnostics.rs:548` |
 | LwfsMount 128 | 43 `fs.mount_lwfs` | `MgmtText` | todo | `src/runtime.c:13254` `handle_lwfs_mount`; dispatch `runtime.c:16431` | `ps5upload-core/src/diagnostics.rs:516` |
@@ -76,8 +76,8 @@ Generated from the tree at the Task 1 commit; line numbers drift, re-find with
 | TimeStateSet 138 | 85 `time.state_set` | `MgmtText` | todo | `src/runtime.c:9792` `handle_time_state_set`; dispatch `runtime.c:16142` | `ps5upload-core/src/sys_time.rs:621` |
 | SmpMetaControl 140 | 112 `smp.meta_control` | `MgmtText` | todo | `src/runtime.c:9890` `handle_smp_meta_control`; dispatch `runtime.c:16146` | `ps5upload-core/src/smp_meta.rs:68` |
 | SmpMetaStats 142 | 113 `smp.meta_stats` | `MgmtText` | todo | `src/runtime.c:10010` `handle_smp_meta_stats`; dispatch `runtime.c:16150` | `ps5upload-core/src/smp_meta.rs:85` |
-| SyslogTail 144 | 8 `log.syslog` | `MgmtText` {max_bytes} -> text | todo | `src/runtime.c:14020` `handle_syslog_tail`; dispatch `runtime.c:16167` | `ps5upload-core/src/hw.rs:651` |
-| NetReach 148 | 10 `net.reach` | `MgmtText` | todo | `src/runtime.c:13504` `handle_net_reach`; dispatch `runtime.c:16419` | `ps5upload-core/src/diagnostics.rs:629` |
+| SyslogTail 144 | 8 `log.syslog` | `MgmtText` {max_bytes} -> text | ported | `src/runtime.c:14020` `handle_syslog_tail`; dispatch `runtime.c:16167` | `ps5upload-core/src/hw.rs:651` |
+| NetReach 148 | 10 `net.reach` | `MgmtText` | ported | `src/runtime.c:13504` `handle_net_reach`; dispatch `runtime.c:16419` | `ps5upload-core/src/diagnostics.rs:629` |
 | ProfileInfo 150 | 88 `profile.info` | `MgmtText` | todo | `src/runtime.c:14119` `handle_profile_info`; dispatch `runtime.c:16170` | `ps5upload-core/src/profile.rs:506` |
 | ProfileSetUsername 152 | 89 `profile.set_username` | `MgmtText` | todo | `src/runtime.c:14259` `handle_profile_set_username`; dispatch `runtime.c:16173` | `ps5upload-core/src/profile.rs:528` |
 | ProfileActivate 154 | 90 `profile.activate` | `MgmtText` | todo | `src/runtime.c:14282` `handle_profile_activate`; dispatch `runtime.c:16177` | `ps5upload-core/src/profile.rs:586` |
@@ -142,8 +142,8 @@ detect truncation (SPEC §7.3): a buffer smaller than the answer is `ERR_INTERNA
 |---|---|---|
 | node.status | ~0.7 KiB (`NodeStatus`) | fits |
 | node.cleanup | <= 0.3 KiB | fits |
-| log.klog | <= 64 KiB (clamped `max_bytes`) | fits; clamp `max_bytes` to `RPC_TEXT_MAX` |
-| log.syslog | up to 1 MiB (`HARD_CAP`, runtime.c:14024) | clamp: reply is the last `RPC_TEXT_MAX` bytes (a tail), documented as such |
+| log.klog | <= 64 KiB (clamped `max_bytes`) | fits; if it ever did not, the tail rule below applies |
+| log.syslog | up to 1 MiB (`HARD_CAP`, runtime.c:14024) | **clamped tail** (`mgmt_call_tail`): the reply is the newest `RPC_TEXT_MAX` bytes, cut at a line start (else a UTF-8 boundary), `more` = 1 when older text was left out; the Rust transport leads such a reply with a one-line note |
 | net.interfaces | < 4 KiB (16 interfaces) | fits |
 | net.reach, net.speedtest | <= 0.3 KiB | fits |
 | fs.volumes | 16 KiB (`RESP_CAP`, runtime.c:5903) | fits |

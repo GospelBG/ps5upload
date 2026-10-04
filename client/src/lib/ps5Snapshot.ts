@@ -148,7 +148,7 @@ const PROBED_PORTS: { port: number; role: string }[] = [
 
 /** One on-PS5 diagnostic file fetched for the bundle. */
 export interface PayloadLogFile {
-  /** Zip-entry leaf name (e.g. "startup.log", "tx_events.log"). */
+  /** Zip-entry leaf name (e.g. "startup.log", "ava_events.log"). */
   name: string;
   text: string;
 }
@@ -170,6 +170,8 @@ export interface Ps5SnapshotResult {
 /** Cap the embedded process list so a busy console can't bloat report.json;
  *  the full count is preserved in `processes_total`. */
 const PROC_CAP = 400;
+/** Most bytes of one on-console log in a report (the engine's read-preview ceiling). */
+export const PAYLOAD_LOG_CAP = 256 * 1024;
 /** Installed-title cap. A full console runs to a few hundred titles; the ids
  *  matter, the tail does not, and the bundle is posted to a chat channel. */
 const INSTALLED_APP_CAP = 500;
@@ -188,9 +190,10 @@ function decodeB64Utf8(b64: string): string {
 
 /**
  * Pull the payload's on-PS5 black-box files via the existing FS_READ RPC (no
- * payload change). Paths are HARDWARE-VERIFIED against live 2.26.1 helpers —
- * the on-disk layout differs from a naive code read (e.g. the tx-state file is
- * `tx/runtime_tx_state.txt`, not `runtime/state`). Each fetch is best-effort;
+ * payload change). Paths are HARDWARE-VERIFIED against live helpers — the
+ * on-disk layout differs from a naive code read (e.g. the helper's stderr is
+ * `stderr.log` with the previous instance's rotated to `stderr.log.old`).
+ * Each fetch is best-effort;
  * a missing file is normal (e.g. `crash.log` only exists after a crash).
  */
 async function fetchPayloadLogs(host: string): Promise<{
@@ -215,8 +218,11 @@ async function fetchPayloadLogs(host: string): Promise<{
     ["/data/ps5upload/startup.log", "startup.log"],
     ["/data/ps5upload_startup.log", "startup_early.log"],
     ["/data/ps5upload/runtime/active_instance.txt", "active_instance.txt"],
-    ["/data/ps5upload/tx/events.log", "tx_events.log"],
-    ["/data/ps5upload/tx/runtime_tx_state.txt", "tx_state.txt"],
+    // The AVA1 job event log (open / resume / done / fail with status, bytes and lanes; the
+    // payload rolls it at 1 MiB into .old). It replaces the FTX2 transaction logs
+    // (tx/events.log, tx/runtime_tx_state.txt, tx_*.json, shards_*.log), which no longer exist.
+    ["/data/ps5upload/ava/events.log.old", "ava_events_old.log"],
+    ["/data/ps5upload/ava/events.log", "ava_events.log"],
     // ShadowMount+ is third-party but owns mounting and registration for
     // disk images, so its log and config explain a whole class of "my game
     // didn't mount / didn't appear" reports that our own logs cannot. Its
@@ -232,30 +238,16 @@ async function fetchPayloadLogs(host: string): Promise<{
     ["/data/ps5upload/editing/checkout.json", "edit_checkout.json"],
   ];
 
-  // Discover any per-transaction journal/shard logs in the tx dir (present
-  // when an upload was in flight — exactly the helper-crash case).
-  try {
-    const entries = await fsListDir(transferAddr(host), "/data/ps5upload/tx");
-    for (const e of entries) {
-      if (e.kind !== "file") continue;
-      if (/^tx_.*\.json$/.test(e.name) || /^shards_.*\.log$/.test(e.name)) {
-        fixed.push([`/data/ps5upload/tx/${e.name}`, e.name]);
-      }
-    }
-  } catch (e) {
-    errors["payload_logs_listdir"] = e instanceof Error ? e.message : String(e);
-  }
-
   // Read only the files that exist. Most are absent on a healthy console, and
   // each miss was a failed request in the console log. One listing per
   // directory; a directory that cannot be listed falls back to trying the read.
-  const present = new Map<string, Set<string> | null>();
+  const present = new Map<string, Map<string, number> | null>();
   for (const [path] of fixed) {
     const dir = path.slice(0, path.lastIndexOf("/"));
     if (present.has(dir)) continue;
     try {
       const entries = await fsListDir(transferAddr(host), dir);
-      present.set(dir, new Set(entries.map((e) => e.name)));
+      present.set(dir, new Map(entries.map((e) => [e.name, e.size])));
     } catch {
       present.set(dir, null);
     }
@@ -265,12 +257,26 @@ async function fetchPayloadLogs(host: string): Promise<{
     const names = present.get(path.slice(0, slash));
     return names === null || names === undefined || names.has(path.slice(slash + 1));
   };
+  /** The size the directory listing reported (0 when unknown). */
+  const sizeOf = (path: string): number => {
+    const slash = path.lastIndexOf("/");
+    return present.get(path.slice(0, slash))?.get(path.slice(slash + 1)) ?? 0;
+  };
 
-  // Bound total work/size: up to 14 files, 256 KB each.
+  // Bound total work/size: up to 14 files, 256 KB each. The console serves a read in 48 KiB
+  // pages (the engine joins them). A log that has outgrown the cap is read from the END: the
+  // newest lines are the ones that explain a crash, and the head of a long stderr.log is old news.
   for (const [path, name] of fixed.filter(([p]) => exists(p)).slice(0, 14)) {
     try {
-      const r = await fsReadPreview(maddr, path);
-      const text = decodeB64Utf8(r.base64);
+      const size = sizeOf(path);
+      const tail = size > PAYLOAD_LOG_CAP;
+      const r = tail
+        ? await fsReadPreview(maddr, path, PAYLOAD_LOG_CAP, size - PAYLOAD_LOG_CAP)
+        : await fsReadPreview(maddr, path);
+      const body = decodeB64Utf8(r.base64);
+      const text = tail
+        ? `[earlier ${size - PAYLOAD_LOG_CAP} bytes omitted: showing the last ${PAYLOAD_LOG_CAP} of ${size}]\n${body}`
+        : body;
       if (text.length > 0) out.push({ name, text });
     } catch {
       // Missing/unreadable file is the common case (fresh install, no crash).

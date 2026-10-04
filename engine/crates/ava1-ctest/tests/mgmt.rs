@@ -50,6 +50,8 @@ async fn rig(tag: &str) -> (Rig, Session) {
 }
 
 /// `install = false`: the server starts with no management table (no CAP_MGMT).
+// The guard serialises whole tests, each on its own runtime; no other task of the test waits on it.
+#[allow(clippy::await_holding_lock)]
 async fn rig_with(tag: &str, install: bool) -> (Rig, Session) {
     let lock = rig_lock();
     if install {
