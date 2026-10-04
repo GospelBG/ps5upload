@@ -189,7 +189,9 @@ kept.
       diff.
 - [ ] Code items the SPEC states and the code does not yet do (see the Task 29 report): the console
       receiver's `ERR_CREDIT` handling ends the lane, not the session (`ava1_data.c:1288`);
-      `Resume` does not re-send credit and the engine's host ignores `Resume`;
+      (`Resume` credit: done, see review 007 #7 in `EVAL-007.md`: both receivers re-send the grant as a
+      `Credit`, `SPEC.md` §11.5, pinned by `wire_upload::a_resume_after_a_dropped_session_sends_credit_and_the_job_completes`
+      and `data_rust` `resume`);
       the engine's `LocalSink` re-hashes more than the console does on resume (allowed, see §13.4).
 - [ ] The workspace gate is green on the release commit: `cargo fmt --check`, `cargo clippy --workspace
       --all-targets -- -D warnings`, `cargo test --workspace`, `cargo test -p ava1-ctest -- --test-threads=1`,

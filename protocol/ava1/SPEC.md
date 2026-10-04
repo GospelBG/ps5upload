@@ -609,7 +609,9 @@ never silence.
 Credit restarts after any interruption and nothing outstanding carries across a reconnect: the
 grant in a `JobOpenAck` is an absolute number that sets the sender's window (a `Credit` that
 arrives later adds to it), and a `Resume` restarts the window the same way — the receiver resets
-the job's outstanding-credit count to its current grant and re-sends that grant as `Credit`.
+the job's outstanding-credit count to its current grant and re-sends that grant as `Credit`. (Conformance: the console receiver sends the grant minus what the job still holds, the engine host its full
+grant; the sender's window is exactly that number either way. Tests: `wire_upload.rs`
+`a_resume_after_a_dropped_session_sends_credit_and_the_job_completes`, `data_rust.rs` the Resume test.)
 
 11.6 Staging: when the job root does not exist, the receiver writes the whole tree under
 `<root>.ava-part/` and, after the last file, renames it to `<root>` (same parent, `st_dev`
