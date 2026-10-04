@@ -22,12 +22,12 @@
  * do not need it.
  *
  * `XDEV_UNKNOWN` is deliberately a third value rather than being folded
- * into "safe": the caller has to make an explicit choice about it. The
- * safe choice is to let rename() proceed, because the cases that produce
- * UNKNOWN (missing source, missing destination directory) are exactly
- * the cases where rename() fails with an ordinary errno before it can
- * reach the cross-device path. What must never happen is UNKNOWN being
- * silently read as SAME by a caller that assumed a boolean.
+ * into "safe", and it is FAIL CLOSED: a caller proceeds to rename() only on
+ * XDEV_SAME. Use xdev_rename_is_safe() rather than comparing to CROSSES.
+ * (An earlier version of this note said UNKNOWN should let rename() proceed
+ * because the usual causes fail with an ordinary errno; that reasoned from
+ * the common case and left the one error that costs a kernel panic
+ * fail-open - review 007 #4.)
  *
  * Header-only so the payload and the host-built selftest share one
  * implementation — same pattern as hw_guard.h and appdb_scan.h.
@@ -113,6 +113,9 @@ static inline xdev_result_t xdev_rename_crosses_l(const char *from,
 
     return dev_from == dev_to ? XDEV_SAME : XDEV_CROSSES;
 }
+
+/* The only answer that lets a rename go ahead. */
+static inline int xdev_rename_is_safe(xdev_result_t r) { return r == XDEV_SAME; }
 
 /* One lookup for both ends (the selftest's fake mount table). Real callers use
  * xdev_rename_crosses_l with xdev_lstat_dev for the source. */

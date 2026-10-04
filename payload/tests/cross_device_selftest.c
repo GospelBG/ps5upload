@@ -128,6 +128,11 @@ int main(void) {
     CHECK(XDEV_CROSSES != XDEV_UNKNOWN);
     CHECK(XDEV_SAME != XDEV_CROSSES);
 
+    /* Fail closed (review 007 #4): only SAME is safe to rename; UNKNOWN is refused. */
+    CHECK(xdev_rename_is_safe(XDEV_SAME));
+    CHECK(!xdev_rename_is_safe(XDEV_CROSSES));
+    CHECK(!xdev_rename_is_safe(XDEV_UNKNOWN));
+
     printf("cross_device_selftest: %s\n", failures == 0 ? "ALL PASS" : "FAILED");
     return failures == 0 ? 0 : 1;
 }

@@ -2680,9 +2680,18 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
     if (strcmp(part, fin) != 0) {
         parent_of(fin, parent, sizeof parent);
         /* Same directory by construction; checked anyway (SPEC.md §12.6, the kernel panic). */
-        if (cfg->same_device && cfg->same_device(part, parent) == 0) {
-            commit_fail(j, AVA1_ERR_CROSS_DEVICE, "the destination is on another drive", 0, 1);
-            return;
+        if (cfg->same_device) {
+            /* Fail closed: only a definite 1 may reach rename(). -1 (a stat failed) is not "same";
+             * a false refusal costs a retry, a false allow costs a kernel panic (review 007 #4). */
+            int sd = cfg->same_device(part, parent);
+            if (sd == 0) {
+                commit_fail(j, AVA1_ERR_CROSS_DEVICE, "the destination is on another drive", 0, 1);
+                return;
+            }
+            if (sd != 1) {
+                commit_fail(j, AVA1_ERR_IO, "could not verify the destination drive", errno, 1);
+                return;
+            }
         }
         if (rename(part, fin) != 0) {
             int e = errno;
@@ -2806,9 +2815,16 @@ static void finish(ava1_job_t *j) {
             ava1_apply_fail(j, AVA1_ERR_EXISTS, "the destination appeared during the upload; the files are in .ava-part", 0, 1);
             return;
         }
-        if (cfg->same_device && cfg->same_device(j->base, parent) == 0) {
-            ava1_apply_fail(j, AVA1_ERR_CROSS_DEVICE, "the destination is on another drive", 0, 1);
-            return;
+        if (cfg->same_device) {
+            int sd = cfg->same_device(j->base, parent); /* only a definite 1 may rename (review 007 #4) */
+            if (sd == 0) {
+                ava1_apply_fail(j, AVA1_ERR_CROSS_DEVICE, "the destination is on another drive", 0, 1);
+                return;
+            }
+            if (sd != 1) {
+                ava1_apply_fail(j, AVA1_ERR_IO, "could not verify the destination drive", errno, 1);
+                return;
+            }
         }
         if (rename(j->base, j->root) != 0) {
             e = errno;

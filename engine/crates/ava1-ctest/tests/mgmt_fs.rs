@@ -364,11 +364,31 @@ async fn fs_rename_cross_device_is_refused_before_any_rename() {
         .await;
     assert_eq!((st, b.len()), (OK, 0));
     assert!(r.path("dst").exists() && !r.path("src").exists());
-    // And an unknown device (a missing source) is not read as "same": the plain errno comes back.
+    // And an unknown device (a missing source) is not read as "same": it is refused (review 007 #4).
     let (st, b) = r
         .rpc(gen::METHOD_FS_RENAME, &rename(&r, "ghost", "dst2", 1))
         .await;
-    assert_eq!((st, cause(&b).as_str()), (gen::ERR_IO, "fs_move_failed"));
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_IO, "fs_move_device_unknown")
+    );
+}
+
+/// DISCRIMINATING (review 007 #4): the devices cannot be read, yet the source exists and a host
+/// rename would succeed. Fail open would move the file; fail closed leaves it.
+#[tokio::test(flavor = "multi_thread")]
+async fn fs_rename_with_an_unreadable_device_is_refused_and_moves_nothing() {
+    let r = rig("xdev-unknown").await;
+    std::fs::write(r.path("src"), b"data").unwrap();
+    mgmt_fs::set_unreadable_devices();
+    let (st, b) = r
+        .rpc(gen::METHOD_FS_RENAME, &rename(&r, "src", "dst", 1))
+        .await;
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_IO, "fs_move_device_unknown")
+    );
+    assert!(r.path("src").exists() && !r.path("dst").exists(), "moved");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1112,6 +1132,19 @@ fn lint_the_guard_header_judges_a_source_link_by_lstat() {
     )
     .unwrap();
     assert!(sh.contains("mv_same_dev = (lstat(argv[i]"));
+    // Fail closed (review 007 #4): every guard caller refuses anything but a definite SAME.
+    for f in ["src/runtime.c", "src/ftp_server.c", "src/mgmt_fs.c"] {
+        let c = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../payload")
+                .join(f),
+        )
+        .unwrap();
+        assert!(
+            c.contains("xdev_rename_is_safe("),
+            "{f} must refuse UNKNOWN"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
