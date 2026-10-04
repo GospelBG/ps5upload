@@ -357,7 +357,9 @@ A console in `needs_pairing` or `helper_old` is a live helper: it does not count
 the auto-redeploy loop never fires on it.
 
 **Pairing routes** (loopback-guarded like every engine route; passkey entry, SPEC.md §5.5):
-`GET /api/ava1/pairing?addr=` starts or re-reads the handshake and answers
+`GET /api/ava1/pairing?addr=` is read-only (no handshake): `{state: "accepted"}` for a live session,
+`{state: "code", console_name}` while a handshake is pending, else `{state: "none"}`;
+`POST /api/ava1/pairing/start` `{addr}` starts or re-reads the handshake and answers
 `{state: "code", console_name}` (the user types the six digits the console shows; the
 engine never sends its own copy), `{state: "accepted"}` (already trusted), `{state: "closed"}`
 (the console's pairing window is shut), `{state: "wrong_console"}` (a different console than

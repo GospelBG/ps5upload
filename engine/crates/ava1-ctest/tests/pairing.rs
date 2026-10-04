@@ -297,3 +297,20 @@ async fn a_poll_never_knocks_while_the_dialog_is_waiting_on_a_code() {
         "the pending handshake is the only one"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn peeking_at_pairing_never_opens_a_handshake() {
+    let d = dir("pool-peek");
+    let srv = CServer::start_with(SECRET, &d.join("srv-peers"), opts(60));
+    let pool = Pool::new(d.join("ava")).with_addr(srv.addr());
+    assert_eq!(pool.peek_pairing("192.0.2.9").await, None);
+    assert_eq!(pool.attempts(), 0, "a read never dials the console");
+    assert_eq!(srv.pair_requests().0, 0, "and shows nothing on it");
+    start_pairing(&pool).await;
+    let before = pool.attempts();
+    assert!(matches!(
+        pool.peek_pairing("192.0.2.9").await,
+        Some(Pairing::Code { .. })
+    ));
+    assert_eq!(pool.attempts(), before);
+}

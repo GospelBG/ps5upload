@@ -185,13 +185,30 @@ pub struct PairingQuery {
     addr: Option<String>,
 }
 
-/// `GET /api/ava1/pairing?addr=` — starts (or re-reads) the pairing handshake with the
-/// console and reports the code to compare. The handshake is held until confirmed.
+/// `GET /api/ava1/pairing?addr=` — read-only: what is already known (`accepted` for a live
+/// session, `code` while a handshake is pending, `none` otherwise). It never opens a
+/// handshake, so a headerless or prefetching request cannot make a console show a code.
 pub async fn pairing_handler(
     State(state): State<crate::AppState>,
     Query(q): Query<PairingQuery>,
 ) -> Response {
     let addr = q.addr.unwrap_or_else(|| state.default_ps5_addr.clone());
+    let known = ps5upload_ava1::pool().peek_pairing(&addr).await;
+    let (code, body) = match known {
+        Some(p) => pairing_body(Ok(p)),
+        None => (StatusCode::OK, serde_json::json!({ "state": "none" })),
+    };
+    (code, Json(body)).into_response()
+}
+
+/// `POST /api/ava1/pairing/start` `{addr}` — starts (or re-reads) the pairing handshake with
+/// the console: the console shows its code, the user types it. The handshake is held until
+/// confirmed, so asking twice shows one code.
+pub async fn pairing_start_handler(
+    State(state): State<crate::AppState>,
+    Json(req): Json<PairingAddr>,
+) -> Response {
+    let addr = req.addr.unwrap_or_else(|| state.default_ps5_addr.clone());
     let (code, body) = pairing_body(ps5upload_ava1::pool().pairing_status(&addr).await);
     (code, Json(body)).into_response()
 }

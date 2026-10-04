@@ -23,9 +23,10 @@ describe("pairing routes", () => {
     vi.stubGlobal("fetch", f);
     const v = await pairingStatus("10.0.0.2:9113");
     expect(v).toEqual({ state: "code", consoleName: "PS5-Pro" });
-    expect(f.mock.calls[0][0]).toBe(
-      "http://engine.test:19113/api/ava1/pairing?addr=10.0.0.2",
-    );
+    const [url, init] = f.mock.calls[0];
+    expect(url).toBe("http://engine.test:19113/api/ava1/pairing/start");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({ addr: "10.0.0.2" });
   });
 
   it("posts the typed code and maps the closed window", async () => {

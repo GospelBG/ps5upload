@@ -47,13 +47,16 @@ async function readWire(res: Response): Promise<PairingWire> {
   return body;
 }
 
-/** Starts (or re-reads) the pairing handshake with the console. Asking again while the
- *  dialog is open returns the same code. Throws when the console cannot be reached. */
+/** Starts (or re-reads) the pairing handshake with the console (`POST /pairing/start`: it
+ *  makes the console show a code, so it is not a GET). Asking again while the dialog is open
+ *  returns the same handshake. Throws when the console cannot be reached. */
 export async function pairingStatus(host: string): Promise<PairingView> {
-  const res = await fetch(
-    `${getEngineUrl()}/api/ava1/pairing?addr=${encodeURIComponent(consoleAddr(host))}`,
-    { signal: AbortSignal.timeout(15_000) },
-  );
+  const res = await fetch(`${getEngineUrl()}/api/ava1/pairing/start`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ addr: consoleAddr(host) }),
+    signal: AbortSignal.timeout(15_000),
+  });
   return toView(await readWire(res));
 }
 

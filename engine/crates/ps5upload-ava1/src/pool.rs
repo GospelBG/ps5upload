@@ -585,6 +585,26 @@ impl Pool {
         Ok(Pairing::Paired)
     }
 
+    /// What the pool already knows about pairing with `console`, with no handshake and no
+    /// other side effect (the read-only `GET`): `Paired` for a live session, `Code` while a
+    /// dialog's handshake is pending, `Closed` is never guessed. `None`: nothing in progress
+    /// (starting one is `pairing_status`, a `POST`).
+    pub async fn peek_pairing(&self, console: &str) -> Option<Pairing> {
+        let host = host_of(console);
+        if let Some(s) = self.pending.lock().await.get(&host) {
+            if !s.is_closed() && s.pairing_code().is_some() {
+                return Some(Pairing::Code {
+                    code: s.pairing_code().unwrap_or(0),
+                    peer_name: s.peer_name().to_string(),
+                });
+            }
+        }
+        let map = self.sessions.lock().await;
+        map.get(&host)
+            .is_some_and(|c| !c.session.is_closed())
+            .then_some(Pairing::Paired)
+    }
+
     /// The user typed the code the console shows (passkey entry, SPEC.md §5.5): the app checks
     /// it against its own derivation, the console against its own, and only then is the
     /// console's key stored (and ours told to it). Then opens the session every job will

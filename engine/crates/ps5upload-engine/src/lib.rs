@@ -871,7 +871,6 @@ impl HostPolicy {
 /// GET routes that change state (they predate the rule that mutations are POST). A request to one
 /// with no browser headers is treated like a POST by [`browser_request_decision`].
 const STATE_CHANGING_GET_PATHS: &[&str] = &[
-    "/api/ava1/pairing",
     "/api/ps5/cheats/delete",
     "/api/ps5/cheats/reload",
     "/api/debug/crash",
@@ -9413,6 +9412,10 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
             post(ava1_api::pairing_confirm_handler),
         )
         .route(
+            "/api/ava1/pairing/start",
+            post(ava1_api::pairing_start_handler),
+        )
+        .route(
             "/api/ava1/pairing/cancel",
             post(ava1_api::pairing_cancel_handler),
         )
@@ -10314,13 +10317,21 @@ mod loopback_guard_tests {
             "/api/pkg/install",
             &policy
         ));
-        // GET routes that change state (pairing, cheats delete/reload) count as state-changing.
-        assert!(!browser_request_decision(
+        // Pairing: the GET only reports state (old Safari sends it headerless), starting a
+        // handshake is a POST and is refused like any other state change.
+        assert!(browser_request_decision(
             &h,
             &get,
             "/api/ava1/pairing",
             &policy
         ));
+        assert!(!browser_request_decision(
+            &h,
+            &post,
+            "/api/ava1/pairing/start",
+            &policy
+        ));
+        // GET routes that change state (cheats delete/reload) count as state-changing.
         assert!(!browser_request_decision(
             &h,
             &get,
