@@ -2,6 +2,7 @@
 #define _GNU_SOURCE /* pthread_getattr_np on glibc */
 #endif
 /* Starts the payload's AVA1 server on the host with a node.info handler (tests only). */
+#include <dirent.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -1307,6 +1308,22 @@ static void *pre_watcher(void *arg) {
     return NULL;
 }
 
+/* Durable-by-log options for the next job (ava1_test_apply_opts); 0 = default: off, or on when the
+ * environment sets AVA1_TEST_LOG_SMALL (the suite is run both ways). The sweep age defaults to 100 ms. */
+static uint32_t g_opt_mode, g_opt_seg, g_opt_age;
+static uint64_t g_opt_max;
+void ava1_test_apply_opts(uint32_t mode, uint32_t pack_segment, uint64_t unswept_max, uint32_t sweep_age_ms) {
+    g_opt_mode = mode;
+    g_opt_seg = pack_segment;
+    g_opt_max = unswept_max;
+    g_opt_age = sweep_age_ms;
+}
+static void apply_opts(ava1_data_cfg_t *cfg) {
+    cfg->log_small = (uint8_t)(g_opt_mode ? g_opt_mode : (getenv("AVA1_TEST_LOG_SMALL") ? AVA1_LOG_SMALL_ON : AVA1_LOG_SMALL_OFF));
+    cfg->pack_segment = g_opt_seg;
+    cfg->unswept_max = g_opt_max;
+    cfg->sweep_age_ms = g_opt_age ? g_opt_age : 100;
+}
 static int g_hold_commit;                           /* commits wait at COMMIT_VERIFIED while set */
 static uint32_t g_prealloc_fault = UINT32_MAX - 1;  /* a file whose preallocation answers ENOSPC */
 static void t_hook(ava1_job_t *j, int point, uint32_t id) {
@@ -1381,6 +1398,7 @@ void ava1_test_fsync_fault(int point, int n, int err) {
         __atomic_store_n(&g_arm_point, point, __ATOMIC_SEQ_CST);
     }
 }
+unsigned ava1_test_fsync_calls(void) { return __atomic_load_n(&ava1_fsync_calls_total, __ATOMIC_RELAXED); }
 unsigned ava1_test_fsync_retries(void) { return __atomic_load_n(&ava1_fsync_retries_total, __ATOMIC_RELAXED); }
 int ava1_test_fsync_pending_faults(void) { return __atomic_load_n(&ava1_fsync_test_fail_n, __ATOMIC_SEQ_CST); }
 
@@ -1415,6 +1433,25 @@ void ava1_test_apply_probe_prep(uint64_t out[3]) {
 /* Each directory sync the apply engine reports (hooks 7 and 10) then takes `ms` more. */
 void ava1_test_apply_hook_sleep(uint32_t ms) { __atomic_store_n(&g_hook_sleep_ms, ms, __ATOMIC_SEQ_CST); }
 
+uint32_t ava1_test_apply_unswept(void) {
+    uint32_t n;
+    if (!g_job) return 0;
+    pthread_mutex_lock(&g_job->mu);
+    n = g_job->unswept_n;
+    pthread_mutex_unlock(&g_job->mu);
+    return n;
+}
+/* How many pack.* files the job directory holds right now. */
+uint32_t ava1_test_apply_segments(void) {
+    uint32_t n = 0;
+    DIR *dp;
+    struct dirent *de;
+    if (!g_job || !(dp = opendir(g_job->dir))) return 0;
+    while ((de = readdir(dp)) != NULL)
+        if (strncmp(de->d_name, "pack.", 5) == 0) n++;
+    closedir(dp);
+    return n;
+}
 void ava1_test_apply_hold_commit(int on) { __atomic_store_n(&g_hold_commit, on, __ATOMIC_SEQ_CST); }
 void ava1_test_apply_fault_prealloc(uint32_t id) { __atomic_store_n(&g_prealloc_fault, id, __ATOMIC_SEQ_CST); }
 /* ava1_apply_compact's answer now (0 compacted, -1 skipped). */
@@ -1523,9 +1560,10 @@ static void rec_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *
         if (ava1_job_done_decode(body, len, &d) != 0) return;
         /* one ev_add: a waiter released by the done flag also sees the message */
         if (d.has_message)
-            snprintf(line, sizeof line, "done %u\nmsg %.*s\n", d.status, (int)d.message_len, (const char *)d.message);
+            snprintf(line, sizeof line, "%sdone %u\nmsg %.*s\n", d.has_settling && d.settling ? "settling\n" : "", d.status,
+                     (int)d.message_len, (const char *)d.message);
         else
-            snprintf(line, sizeof line, "done %u\n", d.status);
+            snprintf(line, sizeof line, "%sdone %u\n", d.has_settling && d.settling ? "settling\n" : "", d.status);
         ev_add(line, 1);
     } else if (type == AVA1_TYPE_JOB_MAP) {
         ava1_job_map_t m;
@@ -1574,6 +1612,7 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
     cfg.same_device = t_same_device;
     cfg.fsync_delay_us = fsync_delay_us;
     cfg.crash_at = crash_at;
+    apply_opts(&cfg);
     if (ava1_data_start(&cfg) != 0) return -1;
     g_trace = 0;
     ava1_apply_hook = t_hook;
@@ -1733,6 +1772,7 @@ size_t ava1_test_apply_events(char *out, size_t cap) {
 }
 
 void ava1_test_apply_end(void) {
+    ava1_test_apply_opts(0, 0, 0, 0);
     __atomic_store_n(&g_hold_commit, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_prealloc_fault, UINT32_MAX - 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_hook_sleep_ms, 0, __ATOMIC_SEQ_CST);
@@ -1809,6 +1849,7 @@ int ava1_test_recv_open(const char *jobs_dir, const char *root, uint32_t flags, 
     g_cfg.may_write = t_allow;
     g_cfg.may_read = t_allow_read;
     g_cfg.same_device = t_same_device;
+    apply_opts(&g_cfg);
     snprintf(g_root, sizeof g_root, "%s", root);
     g_flags = flags;
     g_policy = policy;
@@ -2035,6 +2076,7 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     dc.may_read = t_allow_read;
     dc.same_device = t_same_device;
     dc.fsync_delay_us = fsync_delay_us;
+    apply_opts(&dc);
     dc.workers_start = dc.workers_min = dc.workers_max = workers;
     ava1_test_set_same_device(1);
     __atomic_store_n(&ava1_send_test_fail_sends, 0, __ATOMIC_SEQ_CST); /* the download sender's knobs */

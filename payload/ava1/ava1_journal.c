@@ -34,6 +34,7 @@ static int write_all_fd(int fd, const uint8_t *p, size_t n) {
  * fail with this errno instead of reaching the disk. */
 int ava1_fsync_test_fail_n, ava1_fsync_test_errno;
 unsigned ava1_fsync_retries_total; /* retries made since start (a statistic) */
+unsigned ava1_fsync_calls_total;   /* fsync tries made since start (tests count them per batch) */
 
 /* Sony's kernel hands some errors back as 0x8002xxxx instead of an errno; the low 16 bits are the errno. */
 static int fsync_errno(int e) {
@@ -48,6 +49,7 @@ int ava1_fsync_transient(int e) {
 }
 
 static int fsync_once(int fd) {
+    __atomic_add_fetch(&ava1_fsync_calls_total, 1, __ATOMIC_RELAXED);
     int n = __atomic_load_n(&ava1_fsync_test_fail_n, __ATOMIC_SEQ_CST);
     while (n > 0) {
         if (__atomic_compare_exchange_n(&ava1_fsync_test_fail_n, &n, n - 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))

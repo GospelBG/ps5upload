@@ -1,5 +1,6 @@
 #include "ava1_recv.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -23,7 +24,56 @@
 typedef struct {
     ava1_job_t *j;
     int opened;
+    /* durable-by-log: done files not yet swept, and the pack ranges that hold them (SPEC.md §15.7) */
+    ava1_bits_t unswept;
+    ava1_pack_ref_t *refs;
+    uint32_t nrefs, cap_refs;
 } replay_t;
+
+static void replay_free(replay_t *r) {
+    ava1_bits_free(&r->unswept);
+    free(r->refs);
+    r->refs = NULL;
+    r->nrefs = r->cap_refs = 0;
+}
+
+static void ref_push(replay_t *r, const ava1_pack_ref_t *p) {
+    if (r->nrefs == r->cap_refs) {
+        uint32_t c = r->cap_refs ? r->cap_refs * 2 : 16;
+        ava1_pack_ref_t *q = realloc(r->refs, (size_t)c * sizeof *q);
+        if (!q) return; /* a lost ref only fails its files over to a resend */
+        r->refs = q;
+        r->cap_refs = c;
+    }
+    r->refs[r->nrefs++] = *p;
+}
+
+/* Refs with no unswept file left in their span are dropped. */
+static void refs_prune(replay_t *r) {
+    uint32_t i, k = 0;
+    for (i = 0; i < r->nrefs; i++) {
+        uint64_t f;
+        int live = 0;
+        for (f = r->refs[i].first_file; f < (uint64_t)r->refs[i].first_file + r->refs[i].count && !live; f++)
+            live = f < r->j->m.n && ava1_bits_get(&r->unswept, (uint32_t)f);
+        if (live) r->refs[k++] = r->refs[i];
+    }
+    r->nrefs = k;
+}
+
+/* Marks the files of FileRun runs unswept (set != 0) or swept. */
+static void unswept_runs(replay_t *r, const uint8_t *p, uint32_t len, int set) {
+    ava1_r_t it;
+    ava1_file_run_t run;
+    ava1_r_init(&it, p, len);
+    while (ava1_file_run_next(&it, &run) == 1) {
+        uint64_t f;
+        for (f = run.first; f < (uint64_t)run.first + run.count && f < r->j->m.n; f++) {
+            if (set) ava1_bits_set(&r->unswept, (uint32_t)f);
+            else ava1_bits_clear(&r->unswept, (uint32_t)f);
+        }
+    }
+}
 
 static void remember(ava1_job_t *j, const ava1_file_range_t *g) {
     ava1_file_range_t *a = realloc(j->last_ranges, (j->last_ranges_n + 1) * sizeof *a);
@@ -122,12 +172,42 @@ static int replay(void *ctx, uint8_t kind, const uint8_t *body, size_t len) {
         add_ranges(j, b.ranges, b.ranges_len, 1);
         add_roots(j, b.roots, b.roots_len);
         add_done(j, b.files, b.files_len);
+        if (b.has_pack_segment && b.has_pack_offset && b.has_pack_len) {
+            /* a logged batch: its files are durable through the log until a JnlSweep says otherwise */
+            ava1_pack_ref_t ref;
+            ava1_r_t it;
+            ava1_file_run_t run;
+            uint32_t lo = UINT32_MAX, hi = 0;
+            unswept_runs(r, b.files, b.files_len, 1);
+            ava1_r_init(&it, b.files, b.files_len);
+            while (ava1_file_run_next(&it, &run) == 1) {
+                if (run.first < lo) lo = run.first;
+                if (run.count && run.first + run.count - 1 > hi) hi = run.first + run.count - 1;
+            }
+            if (lo != UINT32_MAX) {
+                ref.segment = b.pack_segment;
+                ref.offset = b.pack_offset;
+                ref.len = b.pack_len;
+                ref.first_file = lo;
+                ref.count = hi - lo + 1;
+                ref_push(r, &ref);
+            }
+        }
         return 0;
     }
     case AVA1_JNL_RESET: {
         ava1_jnl_reset_t x;
         if (ava1_jnl_reset_decode(body, len, &x) != 0) return 1;
-        if (x.file_id < j->m.n) forget_file(j, x.file_id);
+        if (x.file_id < j->m.n) {
+            forget_file(j, x.file_id);
+            ava1_bits_clear(&r->unswept, x.file_id);
+        }
+        return 0;
+    }
+    case AVA1_JNL_SWEEP: {
+        ava1_jnl_sweep_t x;
+        if (ava1_jnl_sweep_decode(body, len, &x) != 0) return 1;
+        unswept_runs(r, x.files, x.files_len, 0);
         return 0;
     }
     case AVA1_JNL_SNAPSHOT: {
@@ -139,6 +219,15 @@ static int replay(void *ctx, uint8_t kind, const uint8_t *body, size_t len) {
         add_ranges(j, s.ranges, s.ranges_len, 2);
         add_roots(j, s.roots, s.roots_len);
         add_done(j, s.done, s.done_len);
+        for (i = 0; i < j->m.n; i++) ava1_bits_clear(&r->unswept, i);
+        r->nrefs = 0;
+        if (s.has_unswept) unswept_runs(r, s.unswept, s.unswept_len, 1);
+        if (s.has_segments) {
+            ava1_r_t it;
+            ava1_pack_ref_t ref;
+            ava1_r_init(&it, s.segments, s.segments_len);
+            while (ava1_pack_ref_next(&it, &ref) == 1) ref_push(r, &ref);
+        }
         return 0;
     }
     case AVA1_JNL_DONE: {
@@ -206,17 +295,73 @@ static int load_from_disk(ava1_job_t *j) {
     uint8_t *blob, hash[32];
     size_t len;
     int rc;
-    replay_t r = { j, 0 };
+    replay_t r;
+    memset(&r, 0, sizeof r);
+    r.j = j;
     if (ava1_manifest_file_read(j->dir, &blob, &len) != 0) return -1;
     rc = ava1_mstore_from_blob(&j->m, blob, len);
     free(blob);
-    if (rc != 0 || alloc_state(j) != 0) return -1;
-    if (ava1_jnl_open(&j->jnl, j->dir, replay, &r) != 0 || !r.opened) return -1;
+    if (rc != 0 || alloc_state(j) != 0 || ava1_bits_init(&r.unswept, j->m.n) != 0) {
+        replay_free(&r);
+        return -1;
+    }
+    if (ava1_jnl_open(&j->jnl, j->dir, replay, &r) != 0 || !r.opened) {
+        replay_free(&r);
+        return -1;
+    }
     ava1_mstore_hash(&j->m, hash);
-    if (memcmp(hash, j->manifest_hash, 32) != 0) return -1; /* a crash between the two writes */
+    if (memcmp(hash, j->manifest_hash, 32) != 0) { /* a crash between the two writes */
+        replay_free(&r);
+        return -1;
+    }
     j->have_manifest = 1;
+    /* Durable-by-log recovery (§4): the files the journal calls done but not yet swept are made again from
+     * the pack log where a crash lost them, and swept, before anything is counted or answered. */
+    refs_prune(&r);
+    snprintf(j->base, sizeof j->base, "%s%s", j->root, j->staged ? ".ava-part" : "");
+    if (ava1_pack_recover(j, &r.unswept, r.refs, r.nrefs) != 0) {
+        replay_free(&r);
+        return -1;
+    }
+    replay_free(&r);
     recount(j);
     return 0;
+}
+
+/* Every job directory under `jobs_dir` whose journal leaves unswept files: recovered at helper start, so a
+ * power cut inside the sweep's lag is repaired before any session can ask. Each is loaded into a throwaway
+ * job exactly as a JobOpen would (load_from_disk runs the recovery) and freed again. */
+void ava1_recv_recover_all(const char *jobs_dir) {
+    DIR *dp = opendir(jobs_dir);
+    struct dirent *de;
+    static const uint8_t zero_owner[32];
+    while (dp && (de = readdir(dp)) != NULL) {
+        uint8_t id[16], buf[AVA1_MAX_PATH + 256];
+        char dir[sizeof ((ava1_job_t *)0)->dir];
+        ava1_jnl_open_t o;
+        ava1_job_t *j;
+        size_t i;
+        if (strlen(de->d_name) != 32) continue;
+        for (i = 0; i < 16; i++) {
+            unsigned v;
+            if (sscanf(de->d_name + 2 * i, "%2x", &v) != 1) break;
+            id[i] = (uint8_t)v;
+        }
+        if (i != 16) continue;
+        ava1_job_dir(jobs_dir, id, dir, sizeof dir);
+        if (ava1_jnl_peek_open(dir, buf, sizeof buf, &o) != 0 || o.kind != AVA1_JOB_UPLOAD || o.root_len >= AVA1_MAX_PATH)
+            continue;
+        if (!(j = ava1_job_create(id, zero_owner))) continue;
+        j->kind = o.kind;
+        j->flags = o.flags;
+        memcpy(j->root, o.root, o.root_len);
+        j->root[o.root_len] = 0;
+        snprintf(j->dir, sizeof j->dir, "%s", dir);
+        (void)load_from_disk(j); /* recovers; a job that is not ours or has nothing unswept changes nothing */
+        ava1_job_free_one(j->id);
+        ava1_job_put(j);
+    }
+    if (dp) closedir(dp);
 }
 
 /* ---- messages ---------------------------------------------------------------------- */

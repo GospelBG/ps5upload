@@ -13,6 +13,7 @@
 #define AVA1_W_CHUNK 1
 #define AVA1_W_BUNDLE 2
 #define AVA1_W_CALL 3
+#define AVA1_W_SWEEP 5  /* durable-by-log: make logged small files durable in place (SPEC.md §15.7) */
 #define AVA1_W_COMMIT 4 /* commit_large of one file (review 003 §3.3), run by a worker */
 #define AVA1_PEND_MAX 512u          /* small-file fds held open until their batch */
 #define AVA1_CRASH_AFTER_SYNC 1     /* tests: die after fsync, before the journal */
@@ -23,6 +24,7 @@
 #define AVA1_CRASH_STAGED_RENAMED 6 /* tests: die after the staging rename + sync, before Done */
 #define AVA1_CRASH_MID_REMAP 7      /* tests: die after a remap's outboard renames */
 #define AVA1_CRASH_AFTER_DATA 8     /* tests: die after the batch's data fsync, before any directory sync */
+#define AVA1_CRASH_AFTER_SWEEP 10   /* tests: die after a JnlSweep is journaled, before its pack segment is deleted */
 #define AVA1_CRASH_MID_DIRS 9       /* tests: die once the first of a batch's directories is synced */
 
 /* `owned` buffers are freed by the apply engine (always, including on error); their
@@ -62,6 +64,13 @@ void ava1_apply_commit_ready(ava1_job_t *j);
  * fsyncs, journal on the job thread; commit and preallocate summed over workers, so they can pass
  * 100% together). Printed once when the job ends, always. Returns the length written. */
 size_t ava1_apply_summary(const ava1_job_t *j, char *out, size_t cap);
+/* Durable-by-log: re-materialises and sweeps the files `unswept` (bits over file ids) still names, from
+ * the pack ranges `refs`; files whose record is gone are reset (JnlReset). Run on JobOpen and at start;
+ * leaves no pack segment behind when it succeeds. 0, or -1 when the journal cannot be written. */
+int ava1_pack_recover(ava1_job_t *j, const ava1_bits_t *unswept, const ava1_pack_ref_t *refs, uint32_t nrefs);
+/* Makes every logged file durable in place now (a changed manifest, a staged job's final rename).
+ * 0, or an errno. */
+int ava1_pack_drain(ava1_job_t *j);
 /* Sends a finished job's JobDone again (a sender that lost the first one asks again). */
 void ava1_apply_done_again(ava1_job_t *j);
 /* The staged tree was renamed before a crash or sync failure: sync its parent and
@@ -80,6 +89,7 @@ void ava1_apply_finish_landed(ava1_job_t *j);
 #define AVA1_HOOK_BATCH_DIR_SYNCED 7 /* one directory that gained an entry, fsynced */
 #define AVA1_HOOK_BATCH_JOURNALED 8 /* the batch appended to the journal */
 #define AVA1_HOOK_PREP_DIR_SYNCED 10 /* one directory prepare synced (job thread's wait, workers' sync) */
+#define AVA1_HOOK_SWEPT 11          /* a JnlSweep was appended (the files are durable in place) */
 #define AVA1_HOOK_PREALLOC 9        /* a part file is about to be preallocated (job mutex NOT held) */
 extern void (*ava1_apply_hook)(ava1_job_t *j, int point, uint32_t id);
 /* Tests only (NULL in the payload): an errno to inject at a point instead of doing the work.

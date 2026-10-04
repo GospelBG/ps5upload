@@ -349,6 +349,14 @@ pub mod ffi {
         pub fn ava1_test_apply_trace(on: c_int);
         pub fn ava1_test_apply_probe(out: *mut u64);
         pub fn ava1_test_apply_probe_prep(out: *mut u64);
+        pub fn ava1_test_apply_opts(
+            mode: u32,
+            pack_segment: u32,
+            unswept_max: u64,
+            sweep_age_ms: u32,
+        );
+        pub fn ava1_test_apply_unswept() -> u32;
+        pub fn ava1_test_apply_segments() -> u32;
         pub fn ava1_test_apply_hold_commit(on: c_int);
         pub fn ava1_test_apply_fault_prealloc(id: u32);
         pub fn ava1_test_apply_compact() -> c_int;
@@ -361,6 +369,7 @@ pub mod ffi {
         pub fn ava1_test_apply_hold(on: c_int);
         pub fn ava1_test_fsync_fault(point: c_int, n: c_int, err: c_int);
         pub fn ava1_test_fsync_retries() -> u32;
+        pub fn ava1_test_fsync_calls() -> u32;
         pub fn ava1_test_fsync_pending_faults() -> c_int;
         pub fn ava1_test_apply_pending() -> u32;
         pub fn ava1_test_recv_open(
@@ -760,7 +769,41 @@ impl CServer {
         fsync_delay_us: u32,
         workers: u8,
     ) -> Self {
+        Self::start_data_opts(
+            secret,
+            peers,
+            jobs,
+            ping_ms,
+            dead_ms,
+            hs_ms,
+            fsync_delay_us,
+            workers,
+            LogOpts::default(),
+        )
+    }
+
+    /// `start_data_with` and the durable-by-log options of the data layer (see `LogOpts`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_data_opts(
+        secret: [u8; 32],
+        peers: &Path,
+        jobs: &Path,
+        ping_ms: u32,
+        dead_ms: u32,
+        hs_ms: u32,
+        fsync_delay_us: u32,
+        workers: u8,
+        opts: LogOpts,
+    ) -> Self {
         let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            ffi::ava1_test_apply_opts(
+                opts.mode,
+                opts.pack_segment,
+                opts.unswept_max,
+                opts.sweep_age_ms,
+            )
+        };
         let a = DataArgs {
             secret,
             peers: CString::new(peers.to_str().unwrap()).unwrap(),
@@ -1347,6 +1390,32 @@ pub struct Probe {
     pub per_chunk_fsync: bool,
 }
 
+/// Durable-by-log options for the next job begun or opened (zero = the engine's defaults; the
+/// test default is off unless AVA1_TEST_LOG_SMALL is set in the environment).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LogOpts {
+    /// 0 default, 1 on, 2 off.
+    pub mode: u32,
+    pub pack_segment: u32,
+    pub unswept_max: u64,
+    pub sweep_age_ms: u32,
+}
+
+impl LogOpts {
+    pub const ON: LogOpts = LogOpts {
+        mode: 1,
+        pack_segment: 0,
+        unswept_max: 0,
+        sweep_age_ms: 0,
+    };
+    pub const OFF: LogOpts = LogOpts {
+        mode: 2,
+        pack_segment: 0,
+        unswept_max: 0,
+        sweep_age_ms: 0,
+    };
+}
+
 /// The payload's apply engine on a hand-built job (one at a time: it shares the C
 /// server lock, since both use the data layer's globals).
 pub struct CApplyJob {
@@ -1372,7 +1441,35 @@ impl CApplyJob {
         fsync_delay_us: u32,
         crash_at: i32,
     ) -> Self {
+        Self::begin_opts(
+            jobs,
+            root,
+            flags,
+            m,
+            fsync_delay_us,
+            crash_at,
+            LogOpts::default(),
+        )
+    }
+
+    pub fn begin_opts(
+        jobs: &Path,
+        root: &Path,
+        flags: u32,
+        m: &ava1::manifest::Manifest,
+        fsync_delay_us: u32,
+        crash_at: i32,
+        opts: LogOpts,
+    ) -> Self {
         let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            ffi::ava1_test_apply_opts(
+                opts.mode,
+                opts.pack_segment,
+                opts.unswept_max,
+                opts.sweep_age_ms,
+            )
+        };
         let dir = std::env::temp_dir().join(format!("ava1-blob-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         ava1::journal::write_manifest(&dir, m).unwrap();
@@ -1417,6 +1514,11 @@ impl CApplyJob {
     /// at once when `point` is None, else when the apply engine next reaches that hook.
     pub fn fault_fsync(&self, point: Option<i32>, n: i32, err: i32) {
         unsafe { ffi::ava1_test_fsync_fault(point.unwrap_or(-1), n, err) }
+    }
+
+    /// fsync tries (every file, directory and journal sync) made by the C engine since the process started.
+    pub fn fsync_calls(&self) -> u32 {
+        unsafe { ffi::ava1_test_fsync_calls() }
     }
 
     /// fsync retries made by the C engine since the process started.
@@ -1481,6 +1583,16 @@ impl CApplyJob {
             batch_dir_sync_threads: o[6],
             per_chunk_fsync: o[7] != 0,
         }
+    }
+
+    /// Files done but not yet durable in place (the job's `unswept`).
+    pub fn unswept(&self) -> u32 {
+        unsafe { ffi::ava1_test_apply_unswept() }
+    }
+
+    /// Pack segment files currently on disk in the job directory.
+    pub fn segments(&self) -> u32 {
+        unsafe { ffi::ava1_test_apply_segments() }
     }
 
     /// While on, every commit waits as it is verified (so commits stay in flight).
@@ -1620,7 +1732,26 @@ pub struct CRecv {
 
 impl CRecv {
     pub fn open(jobs: &Path, root: &Path, flags: u32, policy: u8, crash_at: i32) -> Self {
+        Self::open_opts(jobs, root, flags, policy, crash_at, LogOpts::default())
+    }
+
+    pub fn open_opts(
+        jobs: &Path,
+        root: &Path,
+        flags: u32,
+        policy: u8,
+        crash_at: i32,
+        opts: LogOpts,
+    ) -> Self {
         let lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            ffi::ava1_test_apply_opts(
+                opts.mode,
+                opts.pack_segment,
+                opts.unswept_max,
+                opts.sweep_age_ms,
+            )
+        };
         let inner = CApplyJob::from_lock(lock); // from here on, Drop stops the data layer
         assert_eq!(
             recv_open_raw(jobs, root, flags, policy, 0, crash_at),

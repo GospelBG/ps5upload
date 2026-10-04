@@ -25,7 +25,23 @@ typedef struct {
     /* Control-frame bytes queued for jobs (their inboxes and the frames behind a JobOpen
      * still opening), all jobs together; 0 = 64 MiB. Past it, the job ends with ERR_BUSY. */
     uint32_t ctl_cap;
+    /* Durable-by-log for small files (SPEC.md §15.7). 0 = the default (on), AVA1_LOG_SMALL_ON,
+     * AVA1_LOG_SMALL_OFF: the per-file-fsync path, kept for one release. */
+    uint8_t log_small;
+    uint32_t pack_segment;                /* bytes per pack segment; 0 = 64 MiB */
+    uint64_t unswept_max;                 /* pack bytes whose files are not yet durable in place; 0 = 256 MiB */
+    uint32_t sweep_age_ms;                /* a batch's files are swept after this; 0 = 3000 (tests set 1) */
 } ava1_data_cfg_t;
+#define AVA1_LOG_SMALL_ON 1
+#define AVA1_LOG_SMALL_OFF 2
+#define AVA1_PACK_SEGMENT (64u << 20)
+#define AVA1_UNSWEPT_MAX (256ull << 20)
+#define AVA1_SWEEP_AGE_MS 3000u
+/* 1 when small files go through the pack log (the data layer's effective setting). */
+int ava1_data_log_small(void);
+/* Crash recovery of durable-by-log, one pass over the jobs directory (SPEC.md §15.7): every job
+ * whose journal leaves unswept files has them re-materialised and swept. Run at start. */
+void ava1_recv_recover_all(const char *jobs_dir);
 
 int ava1_data_start(const ava1_data_cfg_t *cfg);  /* starts housekeeping; 0 or -errno */
 void ava1_data_stop(void);                         /* stops and frees every job */

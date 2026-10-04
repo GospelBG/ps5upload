@@ -222,7 +222,7 @@ fn a_batchs_directory_syncs_run_on_the_workers_not_the_job_thread() {
     std::fs::create_dir_all(&root).unwrap();
     let (nd, per) = (16usize, 2usize);
     let m = small_dirs(nd, per);
-    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    let job = CApplyJob::begin_opts(&t.join("jobs"), &root, 0, &m, 0, 0, LogOpts::OFF); // the per-file path
     job.hook_sleep(20);
     job.hold_batches(true);
     let ids = small_ids(nd, per);
@@ -276,12 +276,13 @@ fn dir_crash(tag: &str, crash_at: i32) {
     let (nd, per) = (6usize, 3usize);
     let m = small_dirs(nd, per);
     let ids = small_ids(nd, per);
-    let r = CRecv::open(
+    let r = CRecv::open_opts(
         &t.join("jobs"),
         &t.join("dest"),
         0,
         gen::POLICY_REPLACE,
         crash_at,
+        LogOpts::OFF, // the per-file path: its crash points sit in the directory syncs
     );
     r.manifest(&m);
     r.wait_event("map status=0", 5000);

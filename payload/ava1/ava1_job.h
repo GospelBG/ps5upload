@@ -52,6 +52,23 @@ typedef struct {        /* one large file being assembled */
     int committing;        /* its commit is queued or running on a worker (review 003 §3.3) */
 } ava1_lfile_t;
 
+/* Durable-by-log (SPEC.md §15.7). A small file's bytes go to `pack.<n>` in the job directory and
+ * the file is made durable in place later by the sweep. */
+typedef struct { /* where a pending small file's record sits */
+    uint32_t seg, len; /* len == 0: not logged (the per-file fsync path) */
+    uint64_t off;
+} ava1_ploc_t;
+typedef struct { /* a done file waiting for the sweep */
+    uint32_t id, seg, len;
+    uint64_t off, t_ms;
+} ava1_usw_t;
+typedef struct { /* one pack segment, indexed by its number */
+    int fd;
+    uint64_t tail;
+    uint32_t nusw;          /* unswept files whose record is in it */
+    int dirty, closed, removed;
+} ava1_pseg_t;
+
 typedef struct ava1_work { /* a unit for the worker pool */
     struct ava1_work *next;
     uint8_t kind;          /* AVA1_W_CHUNK, AVA1_W_BUNDLE, AVA1_W_CALL */
@@ -95,6 +112,17 @@ struct ava1_job {
      * follows the large files in flight, not the file count. May hold stale or duplicate
      * ids (a freed lf); lfl_snapshot sorts and filters them. Under j->mu. `lfl_all`: the
      * list could not grow, so the scans fall back to every manifest entry. */
+    /* ---- durable-by-log (all under j->mu unless noted) ---- */
+    pthread_mutex_t pack_mu;        /* one pack writer at a time: allocate the offset and pwrite */
+    ava1_pseg_t *psegs;
+    uint32_t npsegs, psegs_cap;     /* segment n is psegs[n]; the last one open is the tail */
+    ava1_ploc_t *pend_loc;          /* parallel to pend_small */
+    ava1_usw_t *usw;                /* queue of done files not yet swept, oldest first */
+    uint32_t usw_head, usw_n, usw_cap;
+    uint32_t unswept_n;             /* usw + the ones a sweep holds */
+    uint64_t unswept_bytes;         /* pack bytes of files not yet swept (pending ones included) */
+    uint32_t sweeps_inflight;       /* sweeps queued or running (a compaction waits for none) */
+    int sweep_queued, settled;
     uint32_t *lfl;
     uint32_t lfl_n, lfl_cap;
     int lfl_all;
@@ -137,6 +165,7 @@ struct ava1_job {
     int *pend_fd;
     uint8_t (*pend_root)[32];       /* their BLAKE3 roots (re-read after a retried fsync) */
     uint32_t pend_n, pend_cap;
+    uint32_t pend_n_fd;             /* of those, the ones holding an open descriptor (and a budget slot) */
     uint32_t batch_max;             /* small files per sync batch (tuned, Task 12) */
     uint64_t last_batch_ms, unsynced_bytes;
     uint32_t roots_new;             /* FileRoots not yet journaled */

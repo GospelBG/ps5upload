@@ -249,6 +249,8 @@ int ava1_rpc_text(uint8_t *out, size_t cap, size_t *out_len, const char *fmt, ..
     return AVA1_STATUS_OK;
 }
 
+int ava1_data_log_small(void) { return D.cfg.log_small != AVA1_LOG_SMALL_OFF; }
+
 int ava1_data_start(const ava1_data_cfg_t *cfg) {
     if (D.running) return -EBUSY; /* one housekeeping thread; a second start changes nothing */
     D.cfg = *cfg;
@@ -262,6 +264,9 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     if (D.cfg.workers_start > D.cfg.workers_max) D.cfg.workers_start = D.cfg.workers_max;
     if (D.cfg.workers_start < D.cfg.workers_min) D.cfg.workers_start = D.cfg.workers_min;
     if (!D.cfg.cutoff) D.cfg.cutoff = 256u << 10;
+    if (!D.cfg.pack_segment) D.cfg.pack_segment = AVA1_PACK_SEGMENT;
+    if (!D.cfg.unswept_max) D.cfg.unswept_max = AVA1_UNSWEPT_MAX;
+    if (!D.cfg.sweep_age_ms) D.cfg.sweep_age_ms = AVA1_SWEEP_AGE_MS;
     D.budget_free = D.cfg.budget;
     fd_limit_init();
     __atomic_store_n(&g_pend_open, 0, __ATOMIC_SEQ_CST);
@@ -276,6 +281,9 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
         D.running = 0;
         return -EAGAIN;
     }
+    /* A helper that died (or was stopped) with files not yet durable in place finishes them now,
+     * before any session can ask: re-materialise from the pack log and sweep. */
+    if (D.cfg.jobs_dir[0]) ava1_recv_recover_all(D.cfg.jobs_dir);
     return 0;
 }
 
@@ -940,6 +948,10 @@ static int encode_status(ava1_job_t *j, uint8_t *out, size_t cap, size_t *out_le
     st.bytes_durable = j->bytes_durable;
     st.bytes_total = j->have_manifest ? j->m.bytes : j->m_in.bytes;
     st.workers = j->want_workers;
+    if (j->unswept_n) {
+        st.has_unswept = 1;
+        st.unswept = j->unswept_n;
+    }
     st.has_state = 1;
     st.state = !j->finished || (j->kind == AVA1_JOB_COPY && j->copy_move && !j->copy_delete_done)
                    ? 0 : (j->final_status == AVA1_STATUS_OK ? 1 : 2);

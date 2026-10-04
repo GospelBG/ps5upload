@@ -84,6 +84,7 @@ static ava1_job_t *create(const uint8_t id[16], const uint8_t owner[32], const u
     }
     pthread_mutex_init(&j->mu, NULL);
     pthread_mutex_init(&j->jnl_mu, NULL);
+    pthread_mutex_init(&j->pack_mu, NULL);
     pthread_cond_init(&j->cv, NULL);
     pthread_mutex_init(&j->cmu, NULL);
     pthread_cond_init(&j->ccv, NULL);
@@ -110,6 +111,7 @@ static ava1_job_t *create(const uint8_t id[16], const uint8_t owner[32], const u
     if (slot < 0) {
         pthread_mutex_destroy(&j->mu);
         pthread_mutex_destroy(&j->jnl_mu);
+        pthread_mutex_destroy(&j->pack_mu);
         pthread_cond_destroy(&j->cv);
         pthread_mutex_destroy(&j->cmu);
         pthread_cond_destroy(&j->ccv);
@@ -208,8 +210,14 @@ static void job_destroy(ava1_job_t *j) {
         free(w->owned);
         free(w);
     }
-    for (i = 0; i < j->pend_n; i++) close(j->pend_fd[i]);
-    ava1_pend_release(j->pend_n);
+    for (i = 0; i < j->pend_n; i++)
+        if (j->pend_fd[i] >= 0) close(j->pend_fd[i]);
+    ava1_pend_release(j->pend_n_fd);
+    for (i = 0; i < j->npsegs; i++)
+        if (j->psegs[i].fd >= 0) close(j->psegs[i].fd); /* the files stay: recovery sweeps them */
+    free(j->psegs);
+    free(j->usw);
+    free(j->pend_loc);
     free(j->pend_small);
     free(j->pend_fd);
     free(j->pend_root);
@@ -236,6 +244,7 @@ static void job_destroy(ava1_job_t *j) {
     free_frames(j->in_head);
     pthread_mutex_destroy(&j->mu);
     pthread_mutex_destroy(&j->jnl_mu);
+    pthread_mutex_destroy(&j->pack_mu);
     pthread_cond_destroy(&j->cv);
     pthread_mutex_destroy(&j->cmu);
     pthread_cond_destroy(&j->ccv);
@@ -325,6 +334,9 @@ void ava1_job_reap(uint64_t now_ms) {
          * reaps later. */
         if (!j || j->attached || j->parked_at_ms == 0) continue;
         fin = __atomic_load_n(&j->finished, __ATOMIC_ACQUIRE);
+        /* Files still settling (durable-by-log) keep their job alive for the full park age: it owns the
+         * sweep, and the engine polls its Status for `unswept`. */
+        if (fin && __atomic_load_n(&j->unswept_n, __ATOMIC_RELAXED) && now_ms - j->parked_at_ms <= age) continue;
         /* The receiver marks finished before the copy role removes its source. A move
          * must remain listed throughout that delete phase, however long it takes. */
         if (j->kind == AVA1_JOB_COPY && __atomic_load_n(&j->copy_move, __ATOMIC_ACQUIRE) &&
