@@ -77,7 +77,7 @@ use ps5upload_core::{
     cleanup::{cleanup_path, CleanupResult},
     diagnostics::appdb_query,
     diagnostics::{klog_read, net_interfaces},
-    download::{enumerate_download_set, DownloadKind},
+    download::DownloadKind,
     focus::{focus_probe, FocusProbe},
     fs_ops::{
         app_launch, app_list_registered, app_register, app_unregister, backup_content_databases,
@@ -8560,145 +8560,14 @@ async fn transfer_download_zip_handler(
         }
     }
 
-    // AVA1 (Task 25): after the parent-directory check, before the FTX2 enumeration.
-    let probe_addr = mgmt_addr.clone();
-    if tokio::task::spawn_blocking(move || ps5upload_ava1::route::use_ava1(&probe_addr))
-        .await
-        .unwrap_or(false)
-    {
-        return start_ava1_download(
-            &state,
-            mgmt_addr,
-            req.src_path.clone(),
-            kind,
-            req_unsafe_zip,
-            Ava1DownloadTarget::Zip(dest_zip, zip_compression),
-        );
-    }
-
-    let job_id = Uuid::new_v4();
-    let started_at_ms = now_ms();
-
-    let src_path_clone = req.src_path.clone();
-    let mgmt_addr_for_enum = mgmt_addr.clone();
-    let plan = match tokio::task::spawn_blocking(move || {
-        enumerate_download_set(&mgmt_addr_for_enum, &src_path_clone, kind)
-    })
-    .await
-    {
-        Ok(Ok(m)) => m,
-        Ok(Err(e)) => return json_err(StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
-        Err(e) => {
-            return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
-        }
-    };
-    let manifest = plan.manifest;
-    let total_bytes: u64 = manifest.iter().map(|e| e.size).sum();
-    let files: Vec<PlannedFile> = manifest
-        .iter()
-        .map(|e| PlannedFile {
-            rel_path: e.rel_path.clone(),
-            size: e.size,
-        })
-        .collect();
-    let files_count = files.len() as u64;
-
-    let progress = Arc::new(AtomicU64::new(0));
-    let progress_files = Arc::new(AtomicU64::new(0));
-    let progress_files_finalized = Arc::new(AtomicU64::new(0));
-    let progress_bytes_finalized = Arc::new(AtomicU64::new(0));
-    let ctx = TickerContext {
-        started_at_ms,
-        total_bytes,
-        dynamic_total_bytes: None,
-        skipped_files: 0,
-        skipped_bytes: 0,
-    };
-    set_job(
-        &state.jobs,
-        &state.events_tx,
-        job_id,
-        JobState::Running {
-            stage: None,
-            started_at_ms,
-            bytes_sent: 0,
-            total_bytes,
-            files,
-            skipped_files: 0,
-            skipped_bytes: 0,
-            files_processing: 0,
-            files_finalized: 0,
-            files_finalizing_total: 0,
-            bytes_finalized: 0,
-        },
-    );
-
-    let jobs = Arc::clone(&state.jobs);
-    let events_tx = state.events_tx.clone();
-    let stop_ticker = spawn_progress_ticker(
-        Arc::clone(&jobs),
-        events_tx.clone(),
-        job_id,
-        ctx,
-        Arc::clone(&progress),
-        Arc::clone(&progress_files),
-        Arc::clone(&progress_files_finalized),
-        Arc::clone(&progress_bytes_finalized),
-    );
-
-    let dest_display = dest_zip.to_string_lossy().to_string();
-    tokio::task::spawn_blocking(move || {
-        let _stop_guard = TickerStopGuard::new(stop_ticker);
-        let mut fail_guard =
-            JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
-        match ps5upload_core::download::download_to_zip_ex(
-            &mgmt_addr,
-            &dest_zip,
-            &manifest,
-            Some(&progress),
-            req_unsafe_zip,
-        ) {
-            Ok(bytes_written) => {
-                let completed_at_ms = now_ms();
-                set_job(
-                    &jobs,
-                    &events_tx,
-                    job_id,
-                    JobState::Done {
-                        started_at_ms,
-                        completed_at_ms,
-                        elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
-                        tx_id_hex: String::new(),
-                        shards_sent: 0,
-                        bytes_sent: bytes_written,
-                        dest: dest_display,
-                        files_sent: files_count,
-                        skipped_files: 0,
-                        skipped_bytes: 0,
-                        commit_ack: None,
-                    },
-                );
-            }
-            Err(e) => {
-                let completed_at_ms = now_ms();
-                set_job(
-                    &jobs,
-                    &events_tx,
-                    job_id,
-                    job_failed_from_err(started_at_ms, completed_at_ms, &e),
-                );
-            }
-        }
-        fail_guard.mark_succeeded();
-    });
-
-    (
-        StatusCode::ACCEPTED,
-        Json(JobCreated {
-            job_id: job_id.to_string(),
-        }),
+    start_ava1_download(
+        &state,
+        mgmt_addr,
+        req.src_path.clone(),
+        kind,
+        req_unsafe_zip,
+        Ava1DownloadTarget::Zip(dest_zip, zip_compression),
     )
-        .into_response()
 }
 
 /// POST /api/transfer/dir-diff-preview

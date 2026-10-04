@@ -250,6 +250,27 @@ async fn transfer_download_with_no_ava1_listener_is_helper_not_ava1() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn transfer_download_zip_with_no_ava1_listener_is_helper_not_ava1() {
+    let dir = std::env::temp_dir().join(format!("p5-ava1only-dz-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let jobs: Arc<Mutex<HashMap<Uuid, JobState>>> = Arc::new(Mutex::new(HashMap::new()));
+    let req = TransferDownloadZipReq {
+        addr: Some("127.0.0.1:9113".to_string()),
+        src_path: "/data/x".to_string(),
+        kind: "folder".to_string(),
+        dest_zip: dir.join("x.zip").to_string_lossy().into_owned(),
+        unsafe_read: false,
+        compression: None,
+    };
+    let resp = transfer_download_zip_handler(State(state_for(&jobs)), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_helper_not_ava1(&jobs).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A console that has not accepted this app fails with `not_paired` (the pairing dialog's
 /// trigger), as a job failure and as a management refusal.
 #[test]
