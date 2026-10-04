@@ -314,6 +314,17 @@ pub(crate) fn busy_failure(tries: u32, message: &str) -> anyhow::Error {
     .into()
 }
 
+/// The failure when a console never answered a JobOpen the bound allowed.
+pub(crate) fn open_timeout_failure(tries: u32, waited: Duration) -> anyhow::Error {
+    UploadFailure {
+        reason: "ava1_open_timeout".into(),
+        detail: format!(
+            "the console did not answer the job open ({waited:?} each, {tries} retries) and could not take this job"
+        ),
+    }
+    .into()
+}
+
 pub(crate) fn refusal_reason(status: u16) -> String {
     match status {
         gen::ERR_NO_SPACE => "ava1_no_space".into(),
@@ -638,6 +649,7 @@ pub fn upload_with_seq_in(
                 // 7z passes its source as `seq`; RAR sets it on `opts`.
                 seq: seq.clone().or_else(|| opts.seq.clone()),
                 settle_max: None,
+                open_ack_timeout: pool.open_ack_timeout(),
             };
             match send_job(&mut link, manifest.clone(), source.clone(), o).await {
                 Ok(r) if r.status == gen::STATUS_OK => {
@@ -692,6 +704,19 @@ pub fn upload_with_seq_in(
                         return Err(busy_failure(pool.busy_tries(), &message));
                     }
                     wait(&mut backoff, &format!("the console is busy: {message}")).await;
+                }
+                // The console never answered the JobOpen (the open was lost behind a job it was closing):
+                // retried like BUSY within the same bound, then a typed failure.
+                Err(SendError::OpenTimeout(t)) => {
+                    busy += 1;
+                    if busy > pool.busy_tries() {
+                        return Err(open_timeout_failure(pool.busy_tries(), t));
+                    }
+                    wait(
+                        &mut backoff,
+                        &format!("the console did not answer the open in {t:?}"),
+                    )
+                    .await;
                 }
                 Err(SendError::Refused { status, message }) if status == gen::ERR_EXISTS => {
                     return Err(PostCommitError::new(PostCommitKind::Exists, Some(message)).into());

@@ -620,6 +620,15 @@ pub fn ps5_to_ps5_between(
                     backoff = (backoff * 2).min(Duration::from_secs(5));
                     continue;
                 }
+                Err(SendError::OpenTimeout(t)) => {
+                    busy += 1;
+                    if busy > to_pool.busy_tries() {
+                        return Err(crate::upload::open_timeout_failure(to_pool.busy_tries(), t));
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    continue;
+                }
                 Err(e) => return Err(e.into()),
             };
             let skip = ava1::send::skip_set(&m, &opened.1, Some(&persist));

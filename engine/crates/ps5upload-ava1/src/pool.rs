@@ -64,6 +64,8 @@ pub struct Pool {
     pending: tokio::sync::Mutex<HashMap<String, Session>>,
     /// How many times a `JobOpen` answered `ERR_BUSY` is retried before the transfer gives up.
     busy_tries: u32,
+    /// Overrides the JobOpenAck timeout (tests).
+    open_ack_timeout: Option<Duration>,
 }
 
 /// Where a console stands for the pairing dialog.
@@ -211,6 +213,7 @@ impl Pool {
             connecting: Mutex::default(),
             pending: Default::default(),
             busy_tries: DEFAULT_BUSY_TRIES,
+            open_ack_timeout: None,
         }
     }
 
@@ -219,6 +222,16 @@ impl Pool {
     pub fn with_busy_tries(mut self, n: u32) -> Pool {
         self.busy_tries = n;
         self
+    }
+
+    /// Overrides how long an upload waits for a JobOpenAck before retrying it (tests).
+    pub fn with_open_ack_timeout(mut self, t: Duration) -> Pool {
+        self.open_ack_timeout = Some(t);
+        self
+    }
+
+    pub(crate) fn open_ack_timeout(&self) -> Option<Duration> {
+        self.open_ack_timeout
     }
 
     pub(crate) fn busy_tries(&self) -> u32 {
@@ -250,6 +263,7 @@ impl Pool {
             connecting: Mutex::default(),
             pending: Default::default(),
             busy_tries: DEFAULT_BUSY_TRIES,
+            open_ack_timeout: None,
         }
     }
 

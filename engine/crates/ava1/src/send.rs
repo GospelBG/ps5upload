@@ -51,6 +51,8 @@ pub struct SendOptions {
     /// How long to wait for a receiver's files to settle after its JobDone (SPEC.md §15.7); `None` =
     /// `SETTLE_MAX`. Tests shorten it.
     pub settle_max: Option<Duration>,
+    /// How long `open_upload` waits for the JobOpenAck; `None` = `OPEN_ACK_TIMEOUT`. Tests shorten it.
+    pub open_ack_timeout: Option<Duration>,
 }
 
 impl SendOptions {
@@ -68,6 +70,7 @@ impl SendOptions {
             bandwidth_cap: None,
             seq: None,
             settle_max: None,
+            open_ack_timeout: None,
         }
     }
 }
@@ -123,6 +126,10 @@ pub enum SendError {
     Refused { status: u16, message: String },
     #[error("cancelled")]
     Cancelled,
+    /// The receiver did not answer a JobOpen in time (SPEC.md: it must answer OK or BUSY). The sender
+    /// retries like a BUSY answer, within the same bound.
+    #[error("the console did not answer the job open within {0:?}")]
+    OpenTimeout(Duration),
     #[error("reading the source: {0}")]
     Source(#[from] std::io::Error),
     #[error("protocol: {0}")]
@@ -501,6 +508,10 @@ pub(crate) async fn next_ctl(link: &mut JobLink) -> Result<Frame, SendError> {
     }
 }
 
+/// How long a sender waits for a JobOpenAck before it treats the open as lost. Generous: a receiver replays a
+/// journal and may hold the open behind other work, but it answers.
+pub const OPEN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// JobOpen → ack → manifest pages → ManifestEnd → map pages. Returns (credit, need).
 pub async fn open_upload(
     link: &mut JobLink,
@@ -519,10 +530,26 @@ pub async fn open_upload(
             credit: None,
         })
         .await?;
+    // A receiver answers a JobOpen promptly, OK or BUSY. One that stays silent (the open lost behind
+    // a job it was closing) must not hold the sender forever: bounded wait, cancel honoured.
+    let wait = o.open_ack_timeout.unwrap_or(OPEN_ACK_TIMEOUT);
+    let deadline = Instant::now() + wait;
     let ack: JobOpenAck = loop {
-        let f = next_ctl(link).await?;
-        if f.ty == JobOpenAck::TYPE {
-            break f.decode().map_err(|e| SendError::Protocol(e.to_string()))?;
+        if o.cancel.load(Ordering::Relaxed) {
+            return Err(SendError::Cancelled);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(SendError::OpenTimeout(wait));
+        }
+        match tokio::time::timeout(left.min(Duration::from_millis(100)), next_ctl(link)).await {
+            Err(_) => continue, // re-check the cancel flag and the deadline
+            Ok(f) => {
+                let f = f?;
+                if f.ty == JobOpenAck::TYPE {
+                    break f.decode().map_err(|e| SendError::Protocol(e.to_string()))?;
+                }
+            }
         }
     };
     if ack.status != gen::STATUS_OK {
