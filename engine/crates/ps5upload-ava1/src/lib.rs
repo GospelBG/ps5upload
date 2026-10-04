@@ -8,6 +8,7 @@
 //! runtime" behaviour — C15).
 
 mod archive_time;
+pub mod console;
 pub mod copy;
 pub mod download;
 pub mod mgmt;
