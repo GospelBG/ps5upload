@@ -265,8 +265,9 @@ static int legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_
                 mgmt_reply_error(cx, st, token);
             }
         } else {
-            /* the whole body (err, errno, reason, codes) when it fits a cause, else its token */
-            mgmt_reply_error(cx, st, c.len <= MGMT_CAUSE_MAX ? (const char *)c.buf : token);
+            /* the whole body (err, errno, reason, codes) when it fits a cause, else its token; a
+             * probe's refusal is a malformed request, whose token is the whole story */
+            mgmt_reply_error(cx, st, mode != LC_PROBE && c.len <= MGMT_CAUSE_MAX ? (const char *)c.buf : token);
         }
         free(c.buf);
         return st;
