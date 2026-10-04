@@ -29,6 +29,9 @@ fn main() {
         .define("BLAKE3_NO_AVX512", None)
         .define("BLAKE3_USE_NEON", "0")
         .include(&b3)
+        // -O2 like the payload build (review P5): cargo's debug profile would otherwise
+        // compile it at -O0, and the differential tests hash a lot.
+        .opt_level(2)
         .warnings(false)
         .compile("ava1b3");
     // P3 Task 7: the shim expands the REAL rows of the "P3 Task 7" block of mgmt_table.def, with the

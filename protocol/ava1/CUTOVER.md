@@ -132,6 +132,13 @@ kept.
 - [ ] Engine tests that stub or assert FTX2 (list in section 1) are replaced by their AVA1
       equivalents, and `git grep -n -i ftx2` over engine, client and payload is empty except for the
       CHANGELOG.
+- [ ] Review 002 L1, deferred: a RAR entry's mtime comes from a DOS local time read through the
+      host's time zone with a "more than a day in the future is none" rule, and the mtime is part of the
+      manifest hash. A resume after a host time-zone change, or after such a stamp comes within a day of
+      now, no longer matches its journal and restarts that upload. Rare and only costs a restart; fix
+      by recording the plan-time mtimes in the job, or by dropping RAR mtimes from the hash.
+- [ ] Review 002 L3: the sender's tick reads the decode thread's budget-wait counter every tick (fixed
+      after review); the call site has no test of its own, only the tracker and the decoder park do.
 
 ## 3. Release gates
 

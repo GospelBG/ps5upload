@@ -89,7 +89,7 @@ fn sevenz_failure(e: &anyhow::Error) -> Option<UploadFailure> {
         SevenzFault::Corrupt(_) => "ava1_7z_corrupt",
         SevenzFault::Encrypted(_) => "ava1_7z_encrypted",
         SevenzFault::UnsafePath(_) => "ava1_7z_unsafe_path",
-        SevenzFault::Unsupported(_) => "ava1_7z_unsupported",
+        SevenzFault::Unsupported(_) | SevenzFault::Conflict(_) => "ava1_7z_unsupported",
         SevenzFault::UnsupportedLayout => "ava1_7z_unsupported_layout",
     };
     Some(UploadFailure {
@@ -174,12 +174,10 @@ pub fn upload_zip(
     upload_zip_in(pool(), cfg, job_id, dest_root, zip_path)
 }
 
-/// The archive cannot be an AVA1 source because its entries cannot be carried by the
-/// manifest as listed: a duplicate path, or two paths that differ only in case
-/// (console filesystems may fold case). The engine falls back to FTX2 for these
-/// (`rar_unsupported_by_ava1`). An *unsafe* path (`../x`, absolute) is different: it
-/// fails planning with the terminal reason `ava1_rar_failed` and does not fall back,
-/// because FTX2 refuses the same archive with the same zip-slip rule.
+/// Retained for the engine's fallback arm; AVA1 no longer raises it. Duplicate paths,
+/// case clashes, file/directory clashes and unsafe paths in a RAR are terminal
+/// (`ava1_rar_unsupported`): FTX2 writes both variants or refuses the same path (review
+/// M5), so a fallback gains nothing.
 #[cfg(not(target_os = "android"))]
 #[derive(Debug, thiserror::Error)]
 #[error("rar is not usable as an AVA1 source: {0}")]
@@ -202,7 +200,15 @@ pub fn upload_rar_in(
     let (manifest, source) = match RarSource::open(archive, password, &cfg.excludes) {
         Ok(v) => v,
         Err(RarOpenError::Plan(f)) => return Err(rar_upload_failure(f.reason, f.message).into()),
-        Err(RarOpenError::Unsupported(m)) => return Err(RarUnsupported(m).into()),
+        // A duplicate, a case clash, a file/dir clash or an unsafe path: FTX2 writes both
+        // variants (or refuses the same path), so it is terminal, not a fallback.
+        Err(RarOpenError::Unsupported(m)) => {
+            return Err(UploadFailure {
+                reason: "ava1_rar_unsupported".into(),
+                detail: m,
+            }
+            .into())
+        }
     };
     let source = Arc::new(source);
     let mut opts = SendOptions::upload(dest_root);

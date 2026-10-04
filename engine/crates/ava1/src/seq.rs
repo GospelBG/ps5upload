@@ -110,7 +110,27 @@ impl Retries {
     }
 }
 
+/// Whether the decode thread has been parked on the read-ahead budget. While it is,
+/// lanes that find the queue empty are waiting on the network or the receiver (the
+/// permits are held by frames in flight), not on the source (SPEC.md 17.4).
+#[derive(Default)]
+pub(crate) struct BudgetWait {
+    waits: std::sync::atomic::AtomicU64,
+    parked: AtomicBool,
+}
+
+impl BudgetWait {
+    /// True when the decode thread parked since `*seen` (or is parked now); advances `seen`.
+    pub(crate) fn waited_since(&self, seen: &mut u64) -> bool {
+        let n = self.waits.load(Ordering::Relaxed);
+        let waited = n != *seen || self.parked.load(Ordering::Relaxed);
+        *seen = n;
+        waited
+    }
+}
+
 pub(crate) struct DecodeCtx {
+    pub budget_wait: Arc<BudgetWait>,
     pub seq: Arc<dyn SeqSource>,
     pub manifest: Arc<Manifest>,
     pub need: Need,
@@ -366,10 +386,22 @@ fn stopped() -> io::Error {
 impl Feeder<'_> {
     fn acquire(&self, kib: u64) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
         let kib = kib.clamp(1, u32::MAX as u64) as u32;
-        self.c
+        match self.c.budget.clone().try_acquire_many_owned(kib) {
+            Ok(p) => return Ok(p),
+            Err(tokio::sync::TryAcquireError::Closed) => return Err(stopped()),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {}
+        }
+        // Parked on the budget: the lanes, not the source, are the limit.
+        let w = &self.c.budget_wait;
+        w.waits.fetch_add(1, Ordering::Relaxed);
+        w.parked.store(true, Ordering::Relaxed);
+        let r = self
+            .c
             .rt
             .block_on(self.c.budget.clone().acquire_many_owned(kib))
-            .map_err(|_| stopped())
+            .map_err(|_| stopped());
+        w.parked.store(false, Ordering::Relaxed);
+        r
     }
 
     fn changed(&self, id: u32) -> io::Error {
@@ -654,6 +686,8 @@ mod tests {
     }
 
     struct Run {
+        budget: Arc<Semaphore>,
+        bw: Arc<BudgetWait>,
         rx: mpsc::UnboundedReceiver<Read>,
         retries: Arc<Retries>,
         stop: Arc<AtomicBool>,
@@ -675,13 +709,16 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
+        let bw = Arc::new(BudgetWait::default());
+        let budget = Arc::new(Semaphore::new(budget_kib));
         let ctx = DecodeCtx {
             seq: s.clone(),
             manifest: m.clone(),
             need,
             cutoff: CUT,
             persist,
-            budget: Arc::new(Semaphore::new(budget_kib)),
+            budget: budget.clone(),
+            budget_wait: bw.clone(),
             chunk: Box::new(move || chunk),
             tx,
             stop: stop.clone(),
@@ -691,6 +728,8 @@ mod tests {
         };
         let h = std::thread::spawn(move || run(ctx));
         Run {
+            budget,
+            bw,
             rx,
             retries,
             stop,
@@ -708,6 +747,7 @@ mod tests {
         }
         fn end(self) {
             self.stop.store(true, Ordering::Relaxed);
+            self.budget.close(); // the sender's teardown does the same, waking a parked decoder
             self.h.join().unwrap();
         }
     }
@@ -1044,6 +1084,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_decoder_parked_on_the_budget_reports_it() {
+        let (m, s) = fixture(vec![("big", big())], 1);
+        // One chunk of budget: holding the first message leaves the decoder parked.
+        let r = start(
+            &m,
+            &s,
+            Need::default(),
+            None,
+            (GROUP / 1024) as usize + 1,
+            GROUP,
+        );
+        let mut seen = 0;
+        let t = Instant::now();
+        while !r.bw.waited_since(&mut seen) {
+            assert!(t.elapsed() < Duration::from_secs(10), "never parked");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        r.end();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn seq_stop_reaches_a_source_that_is_skipping() {
         let (m, _s) = fixture(vec![("a", bytes(9, 1))], 1);
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -1055,6 +1116,7 @@ mod tests {
             cutoff: CUT,
             persist: None,
             budget: Arc::new(Semaphore::new(1024)),
+            budget_wait: Arc::default(),
             chunk: Box::new(|| GROUP),
             tx,
             stop: stop.clone(),
@@ -1124,5 +1186,28 @@ mod tests {
             x => panic!("{}", tag(&x)),
         }
         r.end();
+    }
+}
+
+#[cfg(test)]
+mod budget_wait_tests {
+    use super::*;
+
+    #[test]
+    fn a_parked_decode_thread_is_seen_by_the_governor_tick() {
+        let w = BudgetWait::default();
+        let mut seen = 0;
+        assert!(
+            !w.waited_since(&mut seen),
+            "no wait yet: the source is the limit"
+        );
+        w.waits.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            w.waited_since(&mut seen),
+            "a wait began since the last tick"
+        );
+        assert!(!w.waited_since(&mut seen), "and is consumed");
+        w.parked.store(true, Ordering::Relaxed);
+        assert!(w.waited_since(&mut seen), "still parked across ticks");
     }
 }
