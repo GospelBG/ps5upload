@@ -136,11 +136,6 @@ fn c_derivations_and_sealing_match_rust() {
         )
     };
     assert_eq!(out16, keys::join_ack_tag(&dir, &sid, 5, &cn, &sn));
-    let hash = [0x77u8; 64];
-    assert_eq!(
-        unsafe { ffi::ava1_pairing_code(hash.as_ptr(), cn.as_ptr(), sn.as_ptr()) },
-        keys::pairing_code(&hash, &cn, &sn)
-    );
 
     for len in [0usize, 1, 15, 16, 17, 4096, 70_000] {
         let body: Vec<u8> = (0..len).map(|i| i as u8).collect();
@@ -231,9 +226,9 @@ fn c_refuses_garbage_and_out_of_turn_messages() {
     assert!(init.read(&m2).is_err(), "a tampered message 2 is refused");
 }
 
-/// S1: the pairing code and the server's commitment, from the shared vectors, in C.
+/// S1: the server's commitment, from the shared vectors, in C.
 #[test]
-fn c_pairing_code_and_commit_reproduce_the_vectors() {
+fn c_pairing_commit_reproduces_the_vectors() {
     let h = |s: &str| hex::decode(s).unwrap();
     let mut n = 0;
     for l in include_str!("../../../../protocol/ava1/vectors/pairing.txt").lines() {
@@ -241,17 +236,103 @@ fn c_pairing_code_and_commit_reproduce_the_vectors() {
             continue;
         }
         let f: Vec<&str> = l.split_whitespace().collect();
-        let (hash, nc, ns) = (h(f[1]), h(f[2]), h(f[3]));
+        let ns = h(f[1]);
         let mut commit = [0u8; 32];
-        let code = unsafe {
-            ffi::ava1_pair_commit(ns.as_ptr(), commit.as_mut_ptr());
-            ffi::ava1_pairing_code(hash.as_ptr(), nc.as_ptr(), ns.as_ptr())
-        };
-        assert_eq!(hex::encode(&commit), f[4], "{l}");
-        assert_eq!(code.to_string(), f[5], "{l}");
+        unsafe { ffi::ava1_pair_commit(ns.as_ptr(), commit.as_mut_ptr()) };
+        assert_eq!(hex::encode(&commit), f[2], "{l}");
         n += 1;
     }
     assert!(n >= 3);
+}
+
+/// The pairing PAKE (SPEC.md 5.5): G, both public values, K and both confirmations, from the
+/// shared vectors, in C. Rust checks the same file (cpace.rs), so the two agree byte for byte.
+#[test]
+fn c_cpace_reproduces_the_vectors() {
+    let h = |s: &str| hex::decode(s).unwrap();
+    let mut n = 0;
+    for l in include_str!("../../../../protocol/ava1/vectors/cpace.txt").lines() {
+        if l.starts_with('#') || l.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let (hash, xa, xb) = (h(f[1]), h(f[3]), h(f[4]));
+        let code: u32 = f[2].parse().unwrap();
+        let (mut g, mut ya, mut yb, mut k, mut k2) =
+            ([0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32]);
+        let (mut mc, mut ms) = ([0u8; 32], [0u8; 32]);
+        unsafe {
+            ffi::ava1_cpace_generator(hash.as_ptr(), code, g.as_mut_ptr());
+            assert_eq!(
+                ffi::ava1_cpace_public(xa.as_ptr(), g.as_ptr(), ya.as_mut_ptr()),
+                0
+            );
+            assert_eq!(
+                ffi::ava1_cpace_public(xb.as_ptr(), g.as_ptr(), yb.as_mut_ptr()),
+                0
+            );
+            assert_eq!(
+                ffi::ava1_cpace_key(
+                    hash.as_ptr(),
+                    xa.as_ptr(),
+                    yb.as_ptr(),
+                    ya.as_ptr(),
+                    yb.as_ptr(),
+                    k.as_mut_ptr()
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::ava1_cpace_key(
+                    hash.as_ptr(),
+                    xb.as_ptr(),
+                    ya.as_ptr(),
+                    ya.as_ptr(),
+                    yb.as_ptr(),
+                    k2.as_mut_ptr()
+                ),
+                0
+            );
+            ffi::ava1_cpace_mac(k.as_ptr(), 0, hash.as_ptr(), mc.as_mut_ptr());
+            ffi::ava1_cpace_mac(k.as_ptr(), 1, hash.as_ptr(), ms.as_mut_ptr());
+        }
+        assert_eq!(k, k2, "both sides agree: {l}");
+        for (got, want, what) in [
+            (&g, f[5], "G"),
+            (&ya, f[6], "Ya"),
+            (&yb, f[7], "Yb"),
+            (&k, f[8], "K"),
+            (&mc, f[9], "client mac"),
+            (&ms, f[10], "server mac"),
+        ] {
+            assert_eq!(hex::encode(got), want, "{what}: {l}");
+        }
+        n += 1;
+    }
+    assert!(n >= 5);
+}
+
+/// The Elligator2 map is the one place two implementations could drift: Rust's port against
+/// Monocypher's, on many inputs (the code feeds it through a hash, so these stand in for
+/// every code).
+#[test]
+fn the_rust_elligator_map_equals_monocypher_on_many_inputs() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    for i in 0..3000u32 {
+        let mut hidden = [0u8; 32];
+        for c in hidden.chunks_mut(8) {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            c.copy_from_slice(&seed.to_le_bytes());
+        }
+        if i == 0 {
+            hidden = [0xff; 32];
+        }
+        let mut c = [0u8; 32];
+        unsafe { ffi::crypto_elligator_map(c.as_mut_ptr(), hidden.as_ptr()) };
+        assert_eq!(c, ava1::cpace::elligator_map(&hidden), "{i}");
+    }
 }
 
 #[test]

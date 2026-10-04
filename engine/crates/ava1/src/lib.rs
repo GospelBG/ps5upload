@@ -1,5 +1,6 @@
 //! AVA1 — Adaptive Verified Assembly, version 1. Normative spec: `protocol/ava1/SPEC.md`.
 pub mod conn;
+pub mod cpace;
 pub mod crc32c;
 mod error;
 pub mod frame;

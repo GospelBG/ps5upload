@@ -225,8 +225,8 @@ mod tests {
         };
         assert_eq!(r.to_bytes().unwrap(), hex("010002000000aabb0000"));
         assert_eq!(
-            PairConfirm { code: 123456 }.to_bytes().unwrap(),
-            hex("40e201000000")
+            PairConfirm { mac: [0xab; 32] }.to_bytes().unwrap(),
+            hex(&format!("{}0000", "ab".repeat(32)))
         );
         let n = NodeInfo {
             version: "5".into(),

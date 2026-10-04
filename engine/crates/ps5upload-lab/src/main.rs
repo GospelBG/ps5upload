@@ -559,7 +559,7 @@ mod ava1_cmds {
             Timing::default(),
         )
         .await?;
-        if s.pairing_code().is_some() {
+        if s.pairing_pending() {
             print!(
                 "Pairing with {}. Enter the 6-digit code shown on the console: ",
                 s.peer_name()

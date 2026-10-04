@@ -334,15 +334,15 @@ impl FrameMessage for Welcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PairConfirm {
-    pub code: u32,
+pub struct PairPakeClient {
+    pub y: [u8; 32],
 }
 
-impl Message for PairConfirm {
-    const NAME: &'static str = "PairConfirm";
+impl Message for PairPakeClient {
+    const NAME: &'static str = "PairPakeClient";
 
     fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.u32(self.code);
+        w.fixed(&self.y);
         w.u16(0);
         Ok(())
     }
@@ -350,7 +350,75 @@ impl Message for PairConfirm {
     fn decode(b: &[u8]) -> Result<Self, DecodeError> {
         let mut r = Reader::new(b);
         let mut m = Self::default();
-        m.code = r.u32()?;
+        m.y = r.fixed::<32>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for PairPakeClient {
+    const TYPE: u8 = 0x0d;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PairPakeServer {
+    pub y: [u8; 32],
+}
+
+impl Message for PairPakeServer {
+    const NAME: &'static str = "PairPakeServer";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.y);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.y = r.fixed::<32>()?;
+        let ext_n = r.u16()?;
+        for _ in 0..ext_n {
+            let tag = r.u16()?;
+            let len = r.u32()? as usize;
+            let v = r.take(len)?;
+            let _ = (tag, v);
+        }
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FrameMessage for PairPakeServer {
+    const TYPE: u8 = 0x0e;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PairConfirm {
+    pub mac: [u8; 32],
+}
+
+impl Message for PairConfirm {
+    const NAME: &'static str = "PairConfirm";
+
+    fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.fixed(&self.mac);
+        w.u16(0);
+        Ok(())
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(b);
+        let mut m = Self::default();
+        m.mac = r.fixed::<32>()?;
         let ext_n = r.u16()?;
         for _ in 0..ext_n {
             let tag = r.u16()?;
@@ -370,6 +438,7 @@ impl FrameMessage for PairConfirm {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PairResult {
     pub accepted: u8,
+    pub mac: [u8; 32],
 }
 
 impl Message for PairResult {
@@ -377,6 +446,7 @@ impl Message for PairResult {
 
     fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.u8(self.accepted);
+        w.fixed(&self.mac);
         w.u16(0);
         Ok(())
     }
@@ -385,6 +455,7 @@ impl Message for PairResult {
         let mut r = Reader::new(b);
         let mut m = Self::default();
         m.accepted = r.u8()?;
+        m.mac = r.fixed::<32>()?;
         let ext_n = r.u16()?;
         for _ in 0..ext_n {
             let tag = r.u16()?;
@@ -3105,7 +3176,7 @@ impl Message for JnlDone {
 }
 
 /// Every message and struct, by name (conformance tests).
-pub const ALL: &[&str] = &["Hs1", "Hs2", "Hs3", "Welcome", "PairConfirm", "PairResult", "Join", "JoinAck", "Ping", "Pong", "Error", "Bye", "RpcRequest", "RpcResponse", "JobOpen", "JobOpenAck", "ManifestPage", "ManifestEnd", "JobMap", "Resume", "Chunk", "Bundle", "Received", "Credit", "Durable", "FileRoot", "FileRetry", "Status", "JobDone", "JobCancel", "NodeInfo", "HelloInfo", "ServerInfo", "ClientInfo", "PairingOpen", "CryptoBench", "CryptoBenchResult", "ManifestEntry", "FileRun", "FileRange", "BundleRecord", "RootItem", "JobCopy", "JobRef", "DiskCalibrate", "CalPoint", "DiskCalibrateResult", "MgmtText", "NodeStatus", "FsList", "FsEntry", "FsListResult", "FsPath", "FsStat", "FsMkdir", "FsRename", "FsChmod", "FsRead", "FsReadResult", "FsWrite", "JobRun", "JobEntry", "JobListResult", "JnlOpen", "JnlBatch", "PackRef", "JnlSweep", "JnlReset", "JnlSnapshot", "JnlDone", ];
+pub const ALL: &[&str] = &["Hs1", "Hs2", "Hs3", "Welcome", "PairPakeClient", "PairPakeServer", "PairConfirm", "PairResult", "Join", "JoinAck", "Ping", "Pong", "Error", "Bye", "RpcRequest", "RpcResponse", "JobOpen", "JobOpenAck", "ManifestPage", "ManifestEnd", "JobMap", "Resume", "Chunk", "Bundle", "Received", "Credit", "Durable", "FileRoot", "FileRetry", "Status", "JobDone", "JobCancel", "NodeInfo", "HelloInfo", "ServerInfo", "ClientInfo", "PairingOpen", "CryptoBench", "CryptoBenchResult", "ManifestEntry", "FileRun", "FileRange", "BundleRecord", "RootItem", "JobCopy", "JobRef", "DiskCalibrate", "CalPoint", "DiskCalibrateResult", "MgmtText", "NodeStatus", "FsList", "FsEntry", "FsListResult", "FsPath", "FsStat", "FsMkdir", "FsRename", "FsChmod", "FsRead", "FsReadResult", "FsWrite", "JobRun", "JobEntry", "JobListResult", "JnlOpen", "JnlBatch", "PackRef", "JnlSweep", "JnlReset", "JnlSnapshot", "JnlDone", ];
 
 #[doc(hidden)]
 pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
@@ -3114,8 +3185,10 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "Hs2" => Hs2 { noise: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
         "Hs3" => Hs3 { noise: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
         "Welcome" => Welcome { knows_you: rng.next_u64() as u8, nonce_s: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, launch_proof: if rng.below(2) == 1 { Some({ let mut a = [0u8; 16]; rng.fill(&mut a); a }) } else { None }, }.to_bytes().ok(),
-        "PairConfirm" => PairConfirm { code: rng.next_u64() as u32, }.to_bytes().ok(),
-        "PairResult" => PairResult { accepted: rng.next_u64() as u8, }.to_bytes().ok(),
+        "PairPakeClient" => PairPakeClient { y: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, }.to_bytes().ok(),
+        "PairPakeServer" => PairPakeServer { y: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, }.to_bytes().ok(),
+        "PairConfirm" => PairConfirm { mac: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, }.to_bytes().ok(),
+        "PairResult" => PairResult { accepted: rng.next_u64() as u8, mac: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, }.to_bytes().ok(),
         "Join" => Join { session_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, lane_id: rng.next_u64() as u16, client_nonce: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, tag: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, }.to_bytes().ok(),
         "JoinAck" => JoinAck { lane_id: rng.next_u64() as u16, server_nonce: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, tag: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, }.to_bytes().ok(),
         "Ping" => Ping { seq: rng.next_u64() as u32, t_us: rng.next_u64(), }.to_bytes().ok(),
@@ -3194,6 +3267,8 @@ pub fn roundtrip(name: &str, bytes: &[u8]) -> Option<Result<Vec<u8>, String>> {
         "Hs2" => rt::<Hs2>(bytes),
         "Hs3" => rt::<Hs3>(bytes),
         "Welcome" => rt::<Welcome>(bytes),
+        "PairPakeClient" => rt::<PairPakeClient>(bytes),
+        "PairPakeServer" => rt::<PairPakeServer>(bytes),
         "PairConfirm" => rt::<PairConfirm>(bytes),
         "PairResult" => rt::<PairResult>(bytes),
         "Join" => rt::<Join>(bytes),

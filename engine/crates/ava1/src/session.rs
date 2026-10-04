@@ -10,7 +10,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 use crate::conn::{Frame, FrameReader, FrameWriter};
-use crate::gen::{self, Bye, Join, JoinAck, PairConfirm, PairResult, RpcRequest, RpcResponse};
+use crate::cpace;
+use crate::gen::{
+    self, Bye, Join, JoinAck, PairConfirm, PairPakeClient, PairPakeServer, PairResult, RpcRequest,
+    RpcResponse,
+};
 use crate::handshake::{self, Established};
 use crate::keys::{self, Identity, SessionKeys};
 use crate::link::{drive, Link, Outbox, DELIVER_DEPTH};
@@ -173,7 +177,8 @@ pub async fn connect_expecting(
     let r2 = router.clone();
     let dispatcher = tokio::spawn(async move {
         while let Some(f) = rx.recv().await {
-            if f.ty == RpcResponse::TYPE || f.ty == PairResult::TYPE {
+            if f.ty == RpcResponse::TYPE || f.ty == PairResult::TYPE || f.ty == PairPakeServer::TYPE
+            {
                 let waiter = p2.lock().unwrap().remove(&f.channel);
                 if let Some(tx) = waiter {
                     let _ = tx.send(f);
@@ -210,9 +215,11 @@ impl Session {
         &self.est.peer_name
     }
 
-    /// The code to show the user while the devices are not yet paired.
-    pub fn pairing_code(&self) -> Option<u32> {
-        self.est.pairing.map(|p| p.code)
+    /// True while the devices are not yet paired and a person must type the code the console
+    /// shows. The code itself is not known to this side: it exists only on the console's
+    /// screen (SPEC.md §5.5).
+    pub fn pairing_pending(&self) -> bool {
+        self.est.pairing.is_some()
     }
 
     pub fn rtt(&self) -> Option<Duration> {
@@ -344,29 +351,41 @@ impl Session {
     }
 
     /// Passkey entry (SPEC.md §5.5): `typed` is the code the user read off the console's
-    /// screen. A code that is not the one this side derived for the session is a man in
-    /// the middle (or a typo) and is refused here, before anything is sent: the console
-    /// is not told, so a typo costs it no attempt. Otherwise the code goes in
-    /// `PairConfirm`, and the console checks it against its own; only then is its key
-    /// stored. A server that already trusts us (the launch path) needs no code: use
-    /// `confirm_trusted`.
+    /// screen. It is the password of a PAKE (CPace) on this session: both sides derive a
+    /// generator from the handshake hash and the code, exchange public values, and prove
+    /// they derived the same key. The console stores this device only if our proof verifies
+    /// (so a wrong code, which this side cannot detect, is refused by the console), and this
+    /// side stores the console only if the console's proof verifies (so a fake console that
+    /// does not know the code is refused here). A refusal ends the session: the next try
+    /// is a new handshake with a new code on the console. A server that already trusts us
+    /// (the launch path) needs no code: use `confirm_trusted`.
     pub async fn confirm_pairing(&mut self, typed: u32) -> Result<(), Ava1Error> {
         let Some(p) = self.est.pairing else {
             return Ok(());
         };
         if p.server_must_confirm {
-            if typed != p.code {
-                return Err(Ava1Error::Refused {
-                    code: gen::ERR_PAIRING_CODE,
-                    message: "that code is not the one the console shows".into(),
-                });
+            let wrong = |why: &str| Ava1Error::Refused {
+                code: gen::ERR_PAIRING_CODE,
+                message: why.into(),
+            };
+            if typed >= 1_000_000 {
+                return Err(wrong("the code is six digits"));
             }
-            let r: PairResult = self.request(PairConfirm { code: typed }).await?.decode()?;
+            let h = self.est.keys.hash;
+            let g = cpace::generator(&h, typed);
+            let mut x = keys::random_bytes::<32>()?;
+            let ya = cpace::public(&x, &g).ok_or_else(|| wrong("degenerate pairing value"))?;
+            let yb: PairPakeServer = self.request(PairPakeClient { y: ya }).await?.decode()?;
+            let k = cpace::key(&h, &x, &yb.y, &ya, &yb.y);
+            zeroize::Zeroize::zeroize(&mut x);
+            let k = k.ok_or_else(|| wrong("degenerate pairing value"))?;
+            let mac = cpace::mac(&k, b"client", &h);
+            let r: PairResult = self.request(PairConfirm { mac }).await?.decode()?;
             if r.accepted == 0 {
-                return Err(Ava1Error::Refused {
-                    code: gen::ERR_PAIRING_CLOSED,
-                    message: "the other device did not accept the pairing".into(),
-                });
+                return Err(wrong("the console did not accept that code"));
+            }
+            if !cpace::ct_eq32(&r.mac, &cpace::mac(&k, b"server", &h)) {
+                return Err(wrong("the console could not prove it knows the code"));
             }
         }
         self.store_peer()

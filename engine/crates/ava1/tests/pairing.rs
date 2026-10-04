@@ -47,6 +47,23 @@ async fn stranger(addr: std::net::SocketAddr) -> Result<Session, Ava1Error> {
     .await
 }
 
+/// A device that knocks and then reads the code off the console's screen (the one place it
+/// exists), as a person would.
+async fn knocker(addr: std::net::SocketAddr, ctx: &ServerCtx) -> (Session, u32) {
+    let id = Arc::new(Identity::generate().unwrap());
+    let s = connect(
+        &addr.to_string(),
+        id.clone(),
+        Arc::new(Mutex::new(PeerStore::in_memory())),
+        "phone",
+        fast(),
+    )
+    .await
+    .unwrap();
+    let code = console_code(ctx, &id.public()).await;
+    (s, code)
+}
+
 fn is_busy<T: std::fmt::Debug>(r: &Result<T, Ava1Error>) -> bool {
     matches!(r, Err(Ava1Error::Refused { code, .. }) if *code == gen::ERR_BUSY)
 }
@@ -59,7 +76,7 @@ fn is_pairing_closed<T: std::fmt::Debug>(r: &Result<T, Ava1Error>) -> bool {
 async fn an_unconfirmed_session_ends_when_the_window_closes() {
     let (addr, ctx, _) = open_server(Limits::default()).await;
     let s = stranger(addr).await.unwrap();
-    assert!(s.pairing_code().is_some());
+    assert!(s.pairing_pending());
     assert_eq!(ctx.sessions(), 1);
     ctx.close_pairing();
     let why = tokio::time::timeout(Duration::from_secs(5), s.closed())
@@ -84,8 +101,8 @@ async fn an_unconfirmed_session_ends_at_the_confirm_deadline() {
         .expect("closed at the deadline");
     assert!(ctx.pairing_open(), "the window itself is still open");
     // A paired session is not subject to the deadline.
-    let mut p = stranger(addr).await.unwrap();
-    p.confirm_pairing(p.pairing_code().unwrap()).await.unwrap();
+    let (mut p, code) = knocker(addr, &ctx).await;
+    p.confirm_pairing(code).await.unwrap();
     tokio::time::sleep(Duration::from_millis(900)).await;
     assert!(!p.is_closed());
     p.node_info().await.unwrap();
@@ -163,12 +180,9 @@ async fn pairing_notifications_are_rate_limited() {
 async fn a_successful_pairing_closes_the_window() {
     // The automatic window.
     let (addr, ctx, _) = open_server(Limits::default()).await;
-    let mut first = stranger(addr).await.unwrap();
+    let (mut first, code) = knocker(addr, &ctx).await;
     let waiting = stranger(addr).await.unwrap();
-    first
-        .confirm_pairing(first.pairing_code().unwrap())
-        .await
-        .unwrap();
+    first.confirm_pairing(code).await.unwrap();
     assert!(!ctx.pairing_open(), "one window, one pairing");
     let r = stranger(addr).await;
     assert!(is_pairing_closed(&r), "{r:?}");
@@ -179,11 +193,8 @@ async fn a_successful_pairing_closes_the_window() {
     // A window opened by pairing.open closes the same way.
     first.open_pairing(60).await.unwrap();
     assert!(ctx.pairing_open());
-    let mut second = stranger(addr).await.unwrap();
-    second
-        .confirm_pairing(second.pairing_code().unwrap())
-        .await
-        .unwrap();
+    let (mut second, code) = knocker(addr, &ctx).await;
+    second.confirm_pairing(code).await.unwrap();
     assert!(!ctx.pairing_open());
     assert!(!first.is_closed());
     first.node_info().await.unwrap();
@@ -223,8 +234,8 @@ async fn an_unreadable_peers_file_keeps_pairing_closed_and_is_never_overwritten(
     assert!(is_pairing_closed(&r), "{r:?}");
     // Even with the window forced open, a pairing that cannot be stored is refused.
     ctx.open_pairing(Duration::from_secs(60));
-    let mut s = stranger(addr).await.unwrap();
-    let r = s.confirm_pairing(s.pairing_code().unwrap()).await;
+    let (mut s, code) = knocker(addr, &ctx).await;
+    let r = s.confirm_pairing(code).await;
     assert!(matches!(r, Err(Ava1Error::Refused { .. })), "{r:?}");
     assert!(path.is_dir());
     assert!(logged
@@ -262,11 +273,8 @@ async fn two_devices_confirming_at_the_same_moment_get_one_pairing() {
     }));
     assert!(ctx.open_pairing_if_unpaired(Duration::from_secs(60)));
     let (addr, ctx) = start(ctx).await;
-    let (mut a, mut b) = (stranger(addr).await.unwrap(), stranger(addr).await.unwrap());
-    let (ra, rb) = tokio::join!(
-        a.confirm_pairing(a.pairing_code().unwrap()),
-        b.confirm_pairing(b.pairing_code().unwrap())
-    );
+    let ((mut a, ca), (mut b, cb)) = (knocker(addr, &ctx).await, knocker(addr, &ctx).await);
+    let (ra, rb) = tokio::join!(a.confirm_pairing(ca), b.confirm_pairing(cb));
     assert_eq!(
         u8::from(ra.is_ok()) + u8::from(rb.is_ok()),
         1,
@@ -275,30 +283,30 @@ async fn two_devices_confirming_at_the_same_moment_get_one_pairing() {
     assert!(!ctx.pairing_open());
 }
 
-// ---- passkey entry (SPEC.md §4.6, §5.5): the console checks the code the user typed ----
+// ---- the pairing PAKE (SPEC.md §4.6, §5.5): the code exists only on the console's screen ----
 
-use ava1::gen::{PairConfirm, PairResult};
-use ava1::wire::{FrameMessage, Message};
+use ava1::conn::{FrameReader, FrameWriter};
+use ava1::cpace;
+use ava1::gen::{PairConfirm, PairPakeClient, PairPakeServer, PairResult};
+use ava1::wire::FrameMessage;
 use common::{RawReader, RawWriter};
 
 struct Rogue {
     r: RawReader,
     w: RawWriter,
-    code: u32,
+    h: [u8; 64],
     key: [u8; 32],
+    /// Everything the console sent that is not a ping: all this host ever gets to see.
+    seen: Vec<Vec<u8>>,
 }
 
-/// A LAN host with a throwaway key: completes Noise and is welcomed with knows_you = 0.
-/// `code` is what its own transcript derived; the user's code comes off the console's
-/// screen, which a host on the wire cannot read.
+/// A LAN host with a throwaway key: completes Noise, is welcomed with knows_you = 0, and
+/// holds the connection. It sees the handshake hash and every frame, and nothing else.
 async fn rogue(addr: std::net::SocketAddr) -> Rogue {
     let me = Identity::generate().unwrap();
     let sock = TcpStream::connect(addr).await.unwrap();
     let (rh, wh) = sock.into_split();
-    let (mut r, mut w) = (
-        ava1::conn::FrameReader::new(rh),
-        ava1::conn::FrameWriter::new(wh),
-    );
+    let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
     let est = ava1::handshake::client(&mut r, &mut w, &me, "rogue", |_| false, 0)
         .await
         .unwrap();
@@ -306,69 +314,128 @@ async fn rogue(addr: std::net::SocketAddr) -> Rogue {
     Rogue {
         r,
         w,
-        code: est.code,
+        h: est.keys.hash,
         key: me.public(),
+        seen: Vec::new(),
     }
 }
 
 impl Rogue {
-    /// Sends `body` as a PairConfirm; true when the console accepted.
-    async fn confirm_raw(&mut self, body: &[u8]) -> bool {
-        self.w.send(PairConfirm::TYPE, 1, body).await.unwrap();
+    async fn next(&mut self, ty: u8) -> Option<ava1::conn::Frame> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match self.r.recv().await {
-                    Ok(f) if f.ty == PairResult::TYPE => {
-                        return f.decode::<PairResult>().unwrap().accepted != 0
-                    }
-                    Ok(_) => {} // pings, notices
-                    Err(_) => return false,
+                    Ok(f) if f.ty == ty => return Some(f),
+                    Ok(_) => {}
+                    Err(_) => return None,
                 }
             }
         })
         .await
-        .unwrap_or(false)
+        .unwrap_or(None)
     }
-    async fn confirm(&mut self, code: u32) -> bool {
-        self.confirm_raw(&PairConfirm { code }.to_bytes().unwrap())
-            .await
-    }
-}
 
-fn wrong(code: u32) -> u32 {
-    (code + 1) % 1_000_000
+    /// The whole exchange with `guess` as the code; Some(y_client, mac_client) of what it sent
+    /// and whether the console accepted.
+    async fn pake(&mut self, guess: u32) -> (Option<([u8; 32], [u8; 32])>, bool) {
+        let g = cpace::generator(&self.h, guess);
+        let x = [0x5au8; 32];
+        let ya = cpace::public(&x, &g).unwrap();
+        self.w.send_msg(1, &PairPakeClient { y: ya }).await.unwrap();
+        let Some(f) = self.next(PairPakeServer::TYPE).await else {
+            return (None, false);
+        };
+        self.seen.push(f.body.to_vec());
+        let yb: PairPakeServer = f.decode().unwrap();
+        let k = cpace::key(&self.h, &x, &yb.y, &ya, &yb.y).unwrap();
+        let mac = cpace::mac(&k, b"client", &self.h);
+        self.w.send_msg(2, &PairConfirm { mac }).await.unwrap();
+        let Some(f) = self.next(PairResult::TYPE).await else {
+            return (Some((ya, mac)), false);
+        };
+        self.seen.push(f.body.to_vec());
+        (
+            Some((ya, mac)),
+            f.decode::<PairResult>().unwrap().accepted != 0,
+        )
+    }
 }
 
 #[tokio::test]
-async fn a_pairconfirm_without_the_code_is_refused_and_not_stored() {
+async fn a_rogue_that_skips_the_proof_is_refused_and_not_stored() {
     let (addr, ctx, _) = open_server(Limits::default()).await;
+    // The old PairConfirm shape, with nothing to prove, and no PAKE before it.
     let mut g = rogue(addr).await;
-    // The old, empty PairConfirm: it carries no code field.
-    assert!(!g.confirm_raw(&[0, 0]).await);
-    assert!(
-        !ctx.knows(&g.key),
-        "a stranger without the code is not stored"
-    );
-}
-
-#[tokio::test]
-async fn a_pairconfirm_with_a_wrong_code_is_refused_and_not_stored() {
-    let (addr, ctx, _) = open_server(Limits::default()).await;
-    let mut g = rogue(addr).await;
-    let bad = wrong(g.code);
-    assert!(!g.confirm(bad).await);
+    g.w.send(PairConfirm::TYPE, 1, &[0, 0]).await.unwrap();
+    assert!(g.next(PairResult::TYPE).await.is_none_or(|f| f
+        .decode::<PairResult>()
+        .unwrap()
+        .accepted
+        == 0));
     assert!(!ctx.knows(&g.key));
-    assert!(ctx.pairing_open(), "one failure does not close the window");
+    // A full-size PairConfirm without having run the PAKE.
+    let mut g = rogue(addr).await;
+    g.w.send_msg(1, &PairConfirm { mac: [7; 32] })
+        .await
+        .unwrap();
+    assert!(g.next(PairResult::TYPE).await.is_none_or(|f| f
+        .decode::<PairResult>()
+        .unwrap()
+        .accepted
+        == 0));
+    assert!(!ctx.knows(&g.key));
+}
+
+#[tokio::test]
+async fn a_rogue_that_does_not_know_the_code_fails_and_learns_nothing() {
+    let (addr, ctx, _) = open_server(Limits::default()).await;
+    let mut g = rogue(addr).await;
+    let code = console_code(&ctx, &g.key).await;
+    // Everything a host on the wire has: h (it ran the handshake), so it can derive any
+    // transcript-bound value. None of it is the code: a derived-from-transcript guess fails.
+    let derived = u32::from_le_bytes(g.h[..4].try_into().unwrap()) % 1_000_000;
+    let guess = if derived == code {
+        (code + 1) % 1_000_000
+    } else {
+        derived
+    };
+    let (_, accepted) = g.pake(guess).await;
+    assert!(!accepted);
+    assert!(!ctx.knows(&g.key));
+    // What it received does not contain the code, in either of its encodings.
+    let ascii = format!("{code:06}").into_bytes();
+    let le = code.to_le_bytes();
+    for body in &g.seen {
+        assert!(!body.windows(6).any(|w| w == ascii.as_slice()));
+        assert!(!body.windows(4).any(|w| w == le.as_slice()) || code == 0);
+    }
 }
 
 #[tokio::test]
 async fn the_right_code_pairs() {
     let (addr, ctx, _) = open_server(Limits::default()).await;
     let mut g = rogue(addr).await;
-    let ok = g.code;
-    assert!(g.confirm(ok).await);
+    let code = console_code(&ctx, &g.key).await;
+    let (_, accepted) = g.pake(code).await;
+    assert!(accepted);
     assert!(ctx.knows(&g.key));
     assert!(!ctx.pairing_open());
+}
+
+#[tokio::test]
+async fn the_session_api_pairs_with_the_right_code_and_not_a_wrong_one() {
+    let (addr, ctx, _) = open_server(Limits::default()).await;
+    let (mut s, code) = knocker(addr, &ctx).await;
+    let wrong = (code + 1) % 1_000_000;
+    let r = s.confirm_pairing(wrong).await;
+    assert!(
+        matches!(&r, Err(Ava1Error::Refused { code, .. }) if *code == gen::ERR_PAIRING_CODE),
+        "{r:?}"
+    );
+    assert_eq!(ctx.pair_failures(), 1, "the console counted it");
+    let (mut s, code) = knocker(addr, &ctx).await;
+    s.confirm_pairing(code).await.unwrap();
+    s.node_info().await.unwrap();
 }
 
 #[tokio::test]
@@ -377,8 +444,9 @@ async fn five_wrong_codes_close_the_window() {
     for i in 0..ava1::server::MAX_PAIR_FAILURES {
         assert!(ctx.pairing_open(), "still open before failure {i}");
         let mut g = rogue(addr).await;
-        let bad = wrong(g.code);
-        assert!(!g.confirm(bad).await);
+        let code = console_code(&ctx, &g.key).await;
+        let (_, accepted) = g.pake((code + 1) % 1_000_000).await;
+        assert!(!accepted);
         drop(g);
         wait_for(Duration::from_secs(5), || ctx.sessions() == 0)
             .await
@@ -390,46 +458,113 @@ async fn five_wrong_codes_close_the_window() {
     // Reopened (by a paired device or a restart), it pairs again.
     ctx.open_pairing(Duration::from_secs(60));
     let mut g = rogue(addr).await;
-    let ok = g.code;
-    assert!(g.confirm(ok).await, "reopened: pairs");
+    let code = console_code(&ctx, &g.key).await;
+    assert!(g.pake(code).await.1, "reopened: pairs");
 }
 
 #[tokio::test]
 async fn a_session_gets_one_attempt() {
     let (addr, ctx, _) = open_server(Limits::default()).await;
     let mut g = rogue(addr).await;
-    let bad = wrong(g.code);
-    assert!(!g.confirm(bad).await);
-    // The same session, now with the right code: closed already.
-    let ok = PairConfirm { code: g.code }.to_bytes().unwrap();
-    let _ = g.w.send(PairConfirm::TYPE, 2, &ok).await;
-    let got = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match g.r.recv().await {
-                Ok(f) if f.ty == PairResult::TYPE => return true,
-                Ok(_) => {}
-                Err(_) => return false,
-            }
-        }
-    })
-    .await;
-    assert!(!matches!(got, Ok(true)), "closed after one attempt");
+    let code = console_code(&ctx, &g.key).await;
+    assert!(!g.pake((code + 1) % 1_000_000).await.1);
+    // The same session, now with the right code: it ended with the refusal.
+    let (sent, accepted) = g.pake(code).await;
+    assert!(!accepted && sent.is_some() || sent.is_none());
     assert!(!ctx.knows(&g.key));
 }
 
 #[tokio::test]
-async fn a_mismatched_code_is_refused_before_it_is_sent_and_stores_nothing() {
-    // The man in the middle: the app's own code differs from the one on the console's
-    // screen (the user types what the console shows).
+async fn a_relayed_exchange_fails_on_the_other_handshake() {
+    // A man in the middle holds two handshakes (client <-> MITM <-> console), so h differs
+    // on the two legs. The user types the console's code into the app; everything the app
+    // sends is bound to the first leg's h. Replaying it on the console's leg cannot verify,
+    // even though the code is right.
     let (addr, ctx, _) = open_server(Limits::default()).await;
-    let mut s = stranger(addr).await.unwrap();
-    let mine = s.pairing_code().unwrap();
-    let r = s.confirm_pairing(wrong(mine)).await;
+    let mut leg1 = rogue(addr).await; // stands for the app's own session
+    let code = console_code(&ctx, &leg1.key).await;
+    let (sent, accepted) = leg1.pake(code).await;
+    assert!(accepted);
+    let (ya, mac) = sent.unwrap();
+    ctx.open_pairing(Duration::from_secs(60));
+    // The console's leg: another handshake, another h.
+    let mut leg2 = rogue(addr).await;
+    assert_ne!(leg1.h, leg2.h);
+    leg2.w.send_msg(1, &PairPakeClient { y: ya }).await.unwrap();
+    assert!(leg2.next(PairPakeServer::TYPE).await.is_some());
+    leg2.w.send_msg(2, &PairConfirm { mac }).await.unwrap();
+    let accepted = leg2
+        .next(PairResult::TYPE)
+        .await
+        .is_some_and(|f| f.decode::<PairResult>().unwrap().accepted != 0);
+    assert!(
+        !accepted,
+        "the relayed proof does not verify on the other leg"
+    );
+    assert!(!ctx.knows(&leg2.key));
+}
+
+/// A console that does not know the code: it answers the exchange anyway (accepted, with
+/// a made-up confirmation). The app must not store it.
+async fn fake_console() -> (std::net::SocketAddr, [u8; 32]) {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let id = Identity::generate().unwrap();
+    let key = id.public();
+    tokio::spawn(async move {
+        let (sock, _) = l.accept().await.unwrap();
+        let (rh, wh) = sock.into_split();
+        let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+        let hs1 = r.recv().await.unwrap();
+        let _est = ava1::handshake::server(
+            &mut r,
+            &mut w,
+            hs1,
+            &id,
+            "fake",
+            |_| ava1::handshake::Admission::Pairing,
+            0,
+        )
+        .await
+        .unwrap();
+        while let Ok(f) = r.recv().await {
+            if f.ty == PairPakeClient::TYPE {
+                let y = cpace::public(&[9u8; 32], &cpace::generator(&[0u8; 64], 1)).unwrap();
+                let _ = w.send_msg(f.channel, &PairPakeServer { y }).await;
+            } else if f.ty == PairConfirm::TYPE {
+                let _ = w
+                    .send_msg(
+                        f.channel,
+                        &PairResult {
+                            accepted: 1,
+                            mac: [0x11; 32],
+                        },
+                    )
+                    .await;
+            }
+        }
+    });
+    (addr, key)
+}
+
+#[tokio::test]
+async fn a_fake_console_cannot_pass_the_clients_check() {
+    let (addr, fake_key) = fake_console().await;
+    let peers = Arc::new(Mutex::new(PeerStore::in_memory()));
+    let mut s = connect(
+        &addr.to_string(),
+        Arc::new(Identity::generate().unwrap()),
+        peers.clone(),
+        "phone",
+        fast(),
+    )
+    .await
+    .unwrap();
+    assert!(s.pairing_pending());
+    let r = s.confirm_pairing(123456).await;
     assert!(
         matches!(&r, Err(Ava1Error::Refused { code, .. }) if *code == gen::ERR_PAIRING_CODE),
         "{r:?}"
     );
-    assert_eq!(ctx.pair_failures(), 0, "it never reached the console");
-    s.confirm_pairing(mine).await.unwrap();
-    s.node_info().await.unwrap();
+    assert!(!peers.lock().unwrap().contains(&fake_key), "never stored");
 }

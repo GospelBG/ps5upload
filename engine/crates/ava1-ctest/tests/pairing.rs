@@ -30,20 +30,17 @@ fn wait_for_console_code(srv: &CServer) -> u32 {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_code_is_the_one_the_console_shows_and_confirm_pairs() {
+async fn the_code_the_console_shows_confirms_the_pairing() {
     let d = dir("pool-pair");
     let srv = CServer::start_with(SECRET, &d.join("srv-peers"), opts(60));
     let pool = Pool::new(d.join("ava")).with_addr(srv.addr());
 
     let first = pool.pairing_status("192.0.2.9").await.unwrap();
-    let Pairing::Code { code, peer_name } = first else {
-        panic!("expected a code, got {first:?}")
+    let Pairing::Code { peer_name } = first else {
+        panic!("expected a code prompt, got {first:?}")
     };
-    assert_eq!(
-        code,
-        wait_for_console_code(&srv),
-        "same code on both screens"
-    );
+    // The code exists only on the console's screen: the user types what it shows.
+    let code = wait_for_console_code(&srv);
     assert_eq!(peer_name, "C test server");
 
     // Asking again while the dialog is open must not open a second handshake: the code on
@@ -53,7 +50,6 @@ async fn the_code_is_the_one_the_console_shows_and_confirm_pairs() {
     assert_eq!(
         again,
         Pairing::Code {
-            code,
             peer_name: "C test server".into()
         }
     );
@@ -156,25 +152,26 @@ async fn start_pairing(pool: &Pool) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_typo_keeps_the_console_code_on_screen_and_the_right_code_then_pairs() {
+async fn a_wrong_typed_code_is_refused_by_the_console_and_starts_over_with_a_new_code() {
     let d = dir("pool-wrongcode");
     let srv = CServer::start_with(SECRET, &d.join("srv-peers"), opts(60));
     let pool = Pool::new(d.join("ava")).with_addr(srv.addr());
     start_pairing(&pool).await;
-    let shown = wait_for_console_code(&srv);
-    // Five typos in a row: the app catches each, the console is never asked, so its window
-    // stays open and its code unchanged.
-    for i in 1..=6 {
-        let r = pool
-            .confirm_or_status("192.0.2.9", (shown + i) % 1_000_000)
-            .await
-            .unwrap();
-        assert!(matches!(r, Pairing::WrongCode { .. }), "{r:?}");
+    let first = wait_for_console_code(&srv);
+    let wrong = (first + 1) % 1_000_000;
+    // This side cannot tell a typo from a guess: only the console knows the code, so the
+    // console refuses it; the retry is a fresh handshake with a new code on the screen.
+    let r = pool.confirm_or_status("192.0.2.9", wrong).await.unwrap();
+    assert!(matches!(r, Pairing::WrongCode { .. }), "{r:?}");
+    let t = Instant::now();
+    while srv.pair_requests().0 < 2 && t.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(srv.pairing_open());
-    assert_eq!(srv.pair_requests().0, 1, "no second pop-up was needed");
+    assert_eq!(srv.pair_requests().0, 2, "a second pop-up with a new code");
+    let second = srv.pair_requests().1;
+    assert!(!srv.pairing_open() || second < 1_000_000);
     assert_eq!(
-        pool.confirm_or_status("192.0.2.9", shown).await.unwrap(),
+        pool.confirm_or_status("192.0.2.9", second).await.unwrap(),
         Pairing::Paired
     );
 }

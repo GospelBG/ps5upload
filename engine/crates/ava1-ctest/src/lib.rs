@@ -97,7 +97,18 @@ pub mod ffi {
             len: usize,
             opened: *mut u32,
         ) -> c_int;
-        pub fn ava1_pairing_code(hash: *const u8, nonce_c: *const u8, nonce_s: *const u8) -> u32;
+        pub fn ava1_cpace_generator(h: *const u8, code: u32, g: *mut u8);
+        pub fn ava1_cpace_public(x: *const u8, g: *const u8, y: *mut u8) -> c_int;
+        pub fn ava1_cpace_key(
+            h: *const u8,
+            x: *const u8,
+            y_peer: *const u8,
+            ya: *const u8,
+            yb: *const u8,
+            k: *mut u8,
+        ) -> c_int;
+        pub fn ava1_cpace_mac(k: *const u8, server: c_int, h: *const u8, out: *mut u8);
+        pub fn crypto_elligator_map(curve: *mut u8, hidden: *const u8);
         pub fn ava1_pair_commit(nonce_s: *const u8, out: *mut u8);
         pub fn ava1_noise_init(
             ns: *mut CNoise,

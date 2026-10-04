@@ -2719,8 +2719,52 @@ int ava1_welcome_decode(const uint8_t *buf, size_t len, ava1_welcome_t *m) {
     return ava1_r_finish(&r);
 }
 
+int ava1_pair_pake_client_encode(const ava1_pair_pake_client_t *m, ava1_w_t *w) {
+    ava1_w_fixed(w, m->y, 32);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_pair_pake_client_decode(const uint8_t *buf, size_t len, ava1_pair_pake_client_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    ava1_r_fixed(&r, m->y, 32);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
+int ava1_pair_pake_server_encode(const ava1_pair_pake_server_t *m, ava1_w_t *w) {
+    ava1_w_fixed(w, m->y, 32);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_pair_pake_server_decode(const uint8_t *buf, size_t len, ava1_pair_pake_server_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    ava1_r_fixed(&r, m->y, 32);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
 int ava1_pair_confirm_encode(const ava1_pair_confirm_t *m, ava1_w_t *w) {
-    ava1_w_u32(w, m->code);
+    ava1_w_fixed(w, m->mac, 32);
     ava1_w_u16(w, 0);
     return w->err;
 }
@@ -2730,7 +2774,7 @@ int ava1_pair_confirm_decode(const uint8_t *buf, size_t len, ava1_pair_confirm_t
     uint16_t ext_n, i;
     memset(m, 0, sizeof(*m));
     ava1_r_init(&r, buf, len);
-    m->code = ava1_r_u32(&r);
+    ava1_r_fixed(&r, m->mac, 32);
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {
         uint32_t vlen;
@@ -2743,6 +2787,7 @@ int ava1_pair_confirm_decode(const uint8_t *buf, size_t len, ava1_pair_confirm_t
 
 int ava1_pair_result_encode(const ava1_pair_result_t *m, ava1_w_t *w) {
     ava1_w_u8(w, m->accepted);
+    ava1_w_fixed(w, m->mac, 32);
     ava1_w_u16(w, 0);
     return w->err;
 }
@@ -2753,6 +2798,7 @@ int ava1_pair_result_decode(const uint8_t *buf, size_t len, ava1_pair_result_t *
     memset(m, 0, sizeof(*m));
     ava1_r_init(&r, buf, len);
     m->accepted = ava1_r_u8(&r);
+    ava1_r_fixed(&r, m->mac, 32);
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {
         uint32_t vlen;
@@ -3637,6 +3683,8 @@ const char *const ava1_message_names[] = {
     "Hs2",
     "Hs3",
     "Welcome",
+    "PairPakeClient",
+    "PairPakeServer",
     "PairConfirm",
     "PairResult",
     "Join",
@@ -3664,7 +3712,7 @@ const char *const ava1_message_names[] = {
     "JobDone",
     "JobCancel",
 };
-const size_t ava1_message_count = 70;
+const size_t ava1_message_count = 72;
 
 int ava1_roundtrip(const char *name, const uint8_t *in, size_t in_len, uint8_t *out, size_t cap,
                    size_t *out_len) {
@@ -3891,6 +3939,16 @@ int ava1_roundtrip(const char *name, const uint8_t *in, size_t in_len, uint8_t *
         ava1_welcome_t m;
         rc = ava1_welcome_decode(in, in_len, &m);
         if (rc == 0) rc = ava1_welcome_encode(&m, &w);
+    }
+    else if (strcmp(name, "PairPakeClient") == 0) {
+        ava1_pair_pake_client_t m;
+        rc = ava1_pair_pake_client_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_pair_pake_client_encode(&m, &w);
+    }
+    else if (strcmp(name, "PairPakeServer") == 0) {
+        ava1_pair_pake_server_t m;
+        rc = ava1_pair_pake_server_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_pair_pake_server_encode(&m, &w);
     }
     else if (strcmp(name, "PairConfirm") == 0) {
         ava1_pair_confirm_t m;

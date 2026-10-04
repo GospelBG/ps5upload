@@ -63,7 +63,10 @@ typedef struct {
     uint8_t c2s[32];
     uint8_t s2c[32];
     int paired;
-    uint32_t pair_code; /* the code this session derived (SPEC.md 4.6): what PairConfirm must carry */
+    uint32_t pair_code; /* the random code this session's screen shows (SPEC.md 5.5): never sent */
+    uint8_t h[64];      /* the Noise handshake hash: part of the PAKE inputs */
+    int pake_state;     /* 0 none, 1 PairPakeClient seen, 2 key ready, 3 spent by the confirm */
+    uint8_t pake_k[32];
     int unpaired_hold;  /* reserved slot whose client is about to be welcomed unpaired */
     uint64_t since_ms;  /* when the session was welcomed */
     uint8_t peer_key[32];
@@ -502,54 +505,115 @@ static int send_status(ava1_conn_t *c, uint32_t ch, uint16_t status, const uint8
     return rc;
 }
 
-/* Constant-time equality of two codes: no early exit on the first differing byte. */
-static int code_eq(uint32_t a, uint32_t b) {
-    uint32_t d = a ^ b;
-    d |= d >> 16;
-    d |= d >> 8;
-    d |= d >> 4;
-    d |= d >> 2;
-    d |= d >> 1;
-    return (int)(~d & 1u);
-}
-
-/* SPEC.md 5.5, passkey entry: the code the user typed (read off this console's screen)
- * must equal the one this session derived. A missing, malformed or wrong code is refused
- * and logged, counts toward MAX_PAIR_FAILURES (at which the window closes), and ends the
- * session: one attempt each. Caller holds mu. Returns 1 when the code is right. */
-static int pair_code_ok_locked(const sess_t *s, const uint8_t *body, size_t len) {
-    ava1_pair_confirm_t m;
-    int right = ava1_pair_confirm_decode(body, len, &m) == 0 && code_eq(m.code, s->pair_code);
-    if (!right) {
-        S.pair_fails++;
-        slog("ava1: pairing refused: wrong or missing code from %s (%u of %u)", s->peer_name, S.pair_fails,
-             MAX_PAIR_FAILURES);
-        /* The next attempt shows a new code: the rate limit must not swallow it. */
-        S.notified = 0;
-        if (S.pair_fails >= MAX_PAIR_FAILURES) {
-            S.pairing_until_ms = 0;
-            slog("ava1: too many wrong pairing codes: the window is closed");
-        }
+/* A failed pairing attempt (a wrong code, or a missing or malformed proof): logged, and at
+ * MAX_PAIR_FAILURES the window closes until a paired device (or a restart) reopens it. The
+ * next knock shows a fresh code, so the notification limit is lifted. Caller holds mu. */
+static void pair_failed_locked(const sess_t *s, const char *why) {
+    S.pair_fails++;
+    slog("ava1: pairing refused: %s from %s (%u of %u)", why, s->peer_name, S.pair_fails, MAX_PAIR_FAILURES);
+    S.notified = 0;
+    if (S.pair_fails >= MAX_PAIR_FAILURES) {
+        S.pairing_until_ms = 0;
+        slog("ava1: too many failed pairing attempts: the window is closed");
     }
-    return right;
 }
 
+/* SPEC.md 5.5, the first half of the pairing: the client's public value arrives, ours is
+ * computed from the code only this console's screen shows. Once per session. 1 closes. */
+static int pair_pake(ava1_conn_t *c, int idx, uint32_t ch, const uint8_t *body, size_t len) {
+    ava1_pair_pake_client_t m;
+    ava1_pair_pake_server_t r;
+    uint8_t h[64], x[32], g[32], yb[32], k[32], b[64];
+    uint32_t code;
+    ava1_w_t w;
+    int ok = 0, rc;
+    pthread_mutex_lock(&mu);
+    {
+        sess_t *s = &S.sessions[idx];
+        if (s->paired || s->pake_state) {
+            pthread_mutex_unlock(&mu);
+            return 1;
+        }
+        s->pake_state = 1;
+        if (now_ms() >= S.pairing_until_ms) {
+            pthread_mutex_unlock(&mu);
+            (void)send_error(c, AVA1_ERR_PAIRING_CLOSED, "pairing is closed");
+            return 1;
+        }
+        memcpy(h, s->h, 64);
+        code = s->pair_code;
+    }
+    pthread_mutex_unlock(&mu);
+    if (ava1_pair_pake_client_decode(body, len, &m) != 0 || ava1_platform_random(x, 32) != 0) {
+        pthread_mutex_lock(&mu);
+        pair_failed_locked(&S.sessions[idx], "malformed pairing message");
+        pthread_mutex_unlock(&mu);
+        return 1;
+    }
+    ava1_cpace_generator(h, code, g);
+    if (ava1_cpace_public(x, g, yb) == 0 && ava1_cpace_key(h, x, m.y, m.y, yb, k) == 0) ok = 1;
+    crypto_wipe(x, sizeof x);
+    if (!ok) {
+        pthread_mutex_lock(&mu);
+        pair_failed_locked(&S.sessions[idx], "degenerate pairing value");
+        pthread_mutex_unlock(&mu);
+        return 1;
+    }
+    pthread_mutex_lock(&mu);
+    memcpy(S.sessions[idx].pake_k, k, 32);
+    S.sessions[idx].pake_state = 2;
+    pthread_mutex_unlock(&mu);
+    crypto_wipe(k, sizeof k);
+    memset(&r, 0, sizeof r);
+    memcpy(r.y, yb, 32);
+    ava1_w_init(&w, b, sizeof b);
+    rc = ava1_pair_pake_server_encode(&r, &w);
+    if (rc == 0) rc = ava1_conn_send(c, AVA1_TYPE_PAIR_PAKE_SERVER, ch, b, w.len);
+    return rc != 0;
+}
+
+/* SPEC.md 5.5, the second half: the client's key confirmation must verify (it knew the
+ * code), and ours goes back so the client can tell this is the console it meant. A refusal
+ * is counted and ends the session: one attempt each. */
 static int pair_confirm(ava1_conn_t *c, int idx, uint32_t ch, const uint8_t *body, size_t len) {
     ava1_pair_result_t r;
-    uint8_t b[16];
+    ava1_pair_confirm_t m;
+    uint8_t b[64], k[32], h[64], want[32];
     ava1_w_t w;
-    int accepted = 0, attempt = 0;
+    int accepted = 0, attempt = 0, have_k = 0, was_paired = 0;
     ava1_peers_t *next = malloc(sizeof *next);
+    memset(k, 0, sizeof k);
+    memset(h, 0, sizeof h);
+    memset(want, 0, sizeof want);
     pthread_mutex_lock(&store_mu);
     pthread_mutex_lock(&mu);
     {
         sess_t *s = &S.sessions[idx];
         if (s->paired) {
             accepted = 1;
-        } else if (next && S.peers_ok && now_ms() < S.pairing_until_ms && pair_code_ok_locked(s, body, len)) {
-            *next = S.peers;
-            ava1_peers_put(next, s->peer_key, s->peer_name, (uint64_t)time(NULL));
-            attempt = 1;
+            was_paired = 1;
+        } else {
+            if (s->pake_state == 2) {
+                memcpy(k, s->pake_k, 32);
+                memcpy(h, s->h, 64);
+                have_k = 1;
+            }
+            crypto_wipe(s->pake_k, sizeof s->pake_k);
+            s->pake_state = 3;
+            if (next && S.peers_ok && now_ms() < S.pairing_until_ms) {
+                int proof_ok = 0;
+                if (have_k && ava1_pair_confirm_decode(body, len, &m) == 0) {
+                    ava1_cpace_mac(k, 0, h, want);
+                    proof_ok = ava1_ct_eq32(want, m.mac);
+                }
+                if (!proof_ok) {
+                    pair_failed_locked(s, "wrong or missing code");
+                } else {
+                    *next = S.peers;
+                    ava1_peers_put(next, s->peer_key, s->peer_name, (uint64_t)time(NULL));
+                    attempt = 1;
+                }
+            }
         }
     }
     pthread_mutex_unlock(&mu);
@@ -572,6 +636,8 @@ static int pair_confirm(ava1_conn_t *c, int idx, uint32_t ch, const uint8_t *bod
     free(next);
     memset(&r, 0, sizeof r);
     r.accepted = (uint8_t)accepted;
+    if (accepted && !was_paired) ava1_cpace_mac(k, 1, h, r.mac);
+    crypto_wipe(k, sizeof k);
     ava1_w_init(&w, b, sizeof b);
     if (ava1_pair_result_encode(&r, &w) != 0 || ava1_conn_send(c, AVA1_TYPE_PAIR_RESULT, ch, b, w.len) != 0)
         return 1;
@@ -719,6 +785,9 @@ static int handle_frame(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane
     }
     case AVA1_TYPE_PONG:
         return 0;
+    case AVA1_TYPE_PAIR_PAKE_CLIENT:
+        if (lane != 0) break;
+        return pair_pake(&k->io, idx, ch, body, len);
     case AVA1_TYPE_PAIR_CONFIRM:
         if (lane != 0) break;
         return pair_confirm(&k->io, idx, ch, body, len);
@@ -920,7 +989,6 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
         (void)send_error(&k->io, AVA1_ERR_PROTOCOL, "bad ClientInfo");
         goto out;
     }
-    pair_code = ava1_pairing_code(ns.h, ci.nonce_c, nonce_s);
     pthread_mutex_lock(&mu);
     known = ava1_peers_contains(&S.peers, ns.rs);
     open = now_ms() < S.pairing_until_ms;
@@ -940,6 +1008,12 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
         (void)send_error(&k->io, AVA1_ERR_BUSY, "too many devices are pairing");
         goto out;
     }
+    /* A random code for this session, shown on this console's screen only: never derived from
+     * the transcript and never sent (SPEC.md 5.5). */
+    if (!known && ava1_random_code(&pair_code) != 0) {
+        (void)send_error(&k->io, AVA1_ERR_INTERNAL, "no random source");
+        goto out;
+    }
     memset(&wel, 0, sizeof wel);
     wel.knows_you = known ? 1 : 0;
     memcpy(wel.nonce_s, nonce_s, 16); /* the reveal; the client checks it against si.pair_commit */
@@ -954,6 +1028,7 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     filled = 1;
     pthread_mutex_lock(&mu);
     S.sessions[idx].pair_code = pair_code;
+    memcpy(S.sessions[idx].h, ns.h, 64);
     pthread_mutex_unlock(&mu);
     if (!known) {
         /* Only a device that was welcomed is shown, and a stranger reconnecting in a loop

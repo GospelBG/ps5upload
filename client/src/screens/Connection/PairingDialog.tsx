@@ -88,7 +88,7 @@ export function PairingPanel({
               {tr(
                 "pairing_wrong_code",
                 undefined,
-                "That code didn't match. Check the code on your PS5 and try again.",
+                "That code didn't match. The PS5 now shows a new code: enter that one.",
               )}
             </p>
           )}

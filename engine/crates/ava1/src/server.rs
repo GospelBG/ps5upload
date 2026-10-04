@@ -10,8 +10,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 
 use crate::conn::{Frame, FrameReader, FrameWriter};
+use crate::cpace;
 use crate::gen::{
-    self, Hs1, Join, JoinAck, PairConfirm, PairResult, Ping, Pong, RpcRequest, RpcResponse,
+    self, Hs1, Join, JoinAck, PairConfirm, PairPakeClient, PairPakeServer, PairResult, Ping, Pong,
+    RpcRequest, RpcResponse,
 };
 use crate::handshake::{self, refuse, Admission};
 use crate::keys::{self, Identity, SessionKeys};
@@ -80,6 +82,11 @@ pub(crate) struct SessionEntry {
     pub(crate) keys: SessionKeys,
     peer_key: [u8; 32],
     pub(crate) paired: AtomicBool,
+    /// The six-digit code this session's console shows (random, never sent anywhere).
+    code: u32,
+    /// The PAKE key once the client's public value arrived (SPEC.md §5.5), taken by the confirm.
+    pake: Mutex<Option<[u8; 32]>>,
+    pake_started: AtomicBool,
     pub(crate) router: Arc<Router>,
     /// Per lane id, how many connections have taken it over. A lane connection ends when
     /// its number is no longer the current one.
@@ -287,6 +294,17 @@ impl ServerCtx {
         self.pair_failures.load(Ordering::SeqCst)
     }
 
+    /// The code the console shows for the session of `peer` (tests: the console's screen).
+    #[doc(hidden)]
+    pub fn code_for_test(&self, peer: &[u8; 32]) -> Option<u32> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .values()
+            .find(|e| &e.peer_key == peer)
+            .map(|e| e.code)
+    }
+
     /// Whether `key` is a paired device.
     pub fn knows(&self, key: &[u8; 32]) -> bool {
         self.peers.lock().unwrap().contains(key)
@@ -320,30 +338,34 @@ impl ServerCtx {
         }
     }
 
-    /// Decides a PairConfirm (SPEC.md §5.5, passkey entry): the code the user typed must
-    /// equal the one this side derived for this session, compared in constant time; a
-    /// missing or wrong code fails, is logged, and counts toward `MAX_PAIR_FAILURES`, at
-    /// which the window closes. One window, one pairing: the window check, the store and
-    /// the closing of the window happen under one lock, so two devices confirming at the
-    /// same moment cannot both get in. An owner hook (which may wait on a person) is asked
-    /// outside the lock, and the window checked again after it.
-    fn accept_pairing(&self, req: &PairRequest, typed: Option<u32>) -> bool {
+    /// Counts a failed pairing attempt (a wrong code, a missing or malformed proof): logged,
+    /// and at `MAX_PAIR_FAILURES` the window closes until a paired device (or a restart)
+    /// reopens it. The next knock shows a fresh code, so the notification limit is lifted.
+    fn pair_failed(&self, req: &PairRequest, why: &str) {
+        let n = self.pair_failures.fetch_add(1, Ordering::SeqCst) + 1;
+        (self.log)(&format!(
+            "ava1: pairing refused: {why} from {} ({n} of {MAX_PAIR_FAILURES})",
+            req.peer_name
+        ));
+        *self.last_notify.lock().unwrap() = None;
+        if n >= MAX_PAIR_FAILURES {
+            self.close_pairing();
+            (self.log)("ava1: too many failed pairing attempts: the window is closed");
+        }
+    }
+
+    /// Decides a PairConfirm (SPEC.md §5.5): `proof_ok` is whether the client's key
+    /// confirmation verified, i.e. it knew the code the console shows. A failure is counted
+    /// (`pair_failed`). One window, one pairing: the window check, the store and the closing
+    /// of the window happen under one lock, so two devices confirming at the same moment
+    /// cannot both get in. An owner hook (which may wait on a person) is asked outside the
+    /// lock, and the window checked again after it.
+    fn accept_pairing(&self, req: &PairRequest, proof_ok: bool) -> bool {
         if !self.pairing_open() {
             return false;
         }
-        let right = typed.is_some_and(|t| ct_eq_u32(t, req.code));
-        if !right {
-            let n = self.pair_failures.fetch_add(1, Ordering::SeqCst) + 1;
-            (self.log)(&format!(
-                "ava1: pairing refused: wrong or missing code from {} ({n} of {MAX_PAIR_FAILURES})",
-                req.peer_name
-            ));
-            // The next attempt shows a new code: it must not be swallowed by the rate limit.
-            *self.last_notify.lock().unwrap() = None;
-            if n >= MAX_PAIR_FAILURES {
-                self.close_pairing();
-                (self.log)("ava1: too many wrong pairing codes: the window is closed");
-            }
+        if !proof_ok {
+            self.pair_failed(req, "wrong or missing code");
             return false;
         }
         if self.approve.as_ref().is_some_and(|a| !a(req)) {
@@ -379,15 +401,6 @@ impl ServerCtx {
         }
         (self.notify)(req);
     }
-}
-
-/// Constant-time equality of two codes: no early exit on the first differing byte.
-fn ct_eq_u32(a: u32, b: u32) -> bool {
-    a.to_le_bytes()
-        .iter()
-        .zip(b.to_le_bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
 }
 
 /// One connection's place in the global and per-address counts.
@@ -598,12 +611,21 @@ async fn control(
     let req = PairRequest {
         peer_key: est.peer_key,
         peer_name: est.peer_name.clone(),
-        code: est.code,
+        // A random code for this session, from the CSPRNG; shown on the console's screen
+        // only, never derived from the transcript and never sent (SPEC.md §5.5).
+        code: if est.pairing.is_some() {
+            cpace::random_code()?
+        } else {
+            0
+        },
     };
     let entry = Arc::new(SessionEntry {
         keys: est.keys.clone(),
         peer_key: est.peer_key,
         paired: AtomicBool::new(est.pairing.is_none()),
+        code: req.code,
+        pake: Mutex::new(None),
+        pake_started: AtomicBool::new(false),
         router: Arc::new(Router::default()),
         lane_gen: watch::Sender::new([0; 9]),
         nonces: Mutex::new(VecDeque::new()),
@@ -728,21 +750,70 @@ async fn control(
                     drop(permit);
                 });
             }
+            PairPakeClient::TYPE => {
+                // The first half of the pairing (SPEC.md §5.5): our public value, computed
+                // from the code only this console's screen shows. Once per session.
+                let h = &entry.keys.hash;
+                if entry.paired.load(Ordering::SeqCst)
+                    || entry.pake_started.swap(true, Ordering::SeqCst)
+                {
+                    break;
+                }
+                if !ctx.pairing_open() {
+                    refuse_on(&outbox, gen::ERR_PAIRING_CLOSED, "pairing is closed").await;
+                    break;
+                }
+                let Ok(m) = f.decode::<PairPakeClient>() else {
+                    ctx.pair_failed(&req, "malformed pairing message");
+                    outbox.flush(FAREWELL).await;
+                    break;
+                };
+                let (Ok(mut x), g) = (keys::random_bytes::<32>(), cpace::generator(h, req.code))
+                else {
+                    break;
+                };
+                let k = cpace::public(&x, &g)
+                    .and_then(|yb| cpace::key(h, &x, &m.y, &m.y, &yb).map(|k| (yb, k)));
+                zeroize::Zeroize::zeroize(&mut x);
+                let Some((yb, k)) = k else {
+                    ctx.pair_failed(&req, "degenerate pairing value");
+                    outbox.flush(FAREWELL).await;
+                    break;
+                };
+                *entry.pake.lock().unwrap() = Some(k);
+                if outbox
+                    .try_send(f.channel, &PairPakeServer { y: yb })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             PairConfirm::TYPE => {
                 let already = entry.paired.load(Ordering::SeqCst);
+                let h = &entry.keys.hash;
                 // One attempt per session: whatever the outcome, a refusal ends it below.
-                let typed = if already {
+                let k = if already {
                     None
                 } else {
-                    f.decode::<PairConfirm>().ok().map(|c| c.code)
+                    entry.pake.lock().unwrap().take()
                 };
-                let accepted = already || ctx.accept_pairing(&req, typed);
+                let proof_ok = match (k, f.decode::<PairConfirm>()) {
+                    (Some(k), Ok(c)) => cpace::ct_eq32(&c.mac, &cpace::mac(&k, b"client", h)),
+                    _ => false,
+                };
+                let accepted = already || ctx.accept_pairing(&req, proof_ok);
                 entry.paired.store(accepted, Ordering::SeqCst);
                 if accepted && !already {
                     entry.unpaired.lock().unwrap().take();
                 }
+                // The console proves it knew the code too: the client stores nothing without it.
+                let mac = match (accepted && !already, k) {
+                    (true, Some(k)) => cpace::mac(&k, b"server", h),
+                    _ => [0; 32],
+                };
                 let result = PairResult {
                     accepted: u8::from(accepted),
+                    mac,
                 };
                 if outbox.try_send(f.channel, &result).is_err() || !accepted {
                     outbox.flush(FAREWELL).await;

@@ -181,3 +181,16 @@ pub fn temp_dir(tag: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&d).unwrap();
     d
 }
+
+/// The code the console shows for the session of `key` (its screen: the one place the code
+/// exists). Waits for the session to be registered after its Welcome.
+pub async fn console_code(ctx: &ServerCtx, key: &[u8; 32]) -> u32 {
+    let mut code = None;
+    wait_for(Duration::from_secs(5), || {
+        code = ctx.code_for_test(key);
+        code.is_some()
+    })
+    .await
+    .expect("the console shows a code");
+    code.unwrap()
+}

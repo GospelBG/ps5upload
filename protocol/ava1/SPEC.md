@@ -77,29 +77,41 @@ nonce can never repeat under one key. A frame that fails to open closes the conn
 the Join tag uses dir = c2s and m = "join" ‖ session_id ‖ u16le(lane) ‖ cn; the
 JoinAck tag uses dir = s2c and m = "join-ack" ‖ session_id ‖ u16le(lane) ‖ cn ‖ sn.
 
-4.6 Pairing code: u32le(BLAKE2b-256("AVA1 pairing" ‖ h ‖ nonce_c ‖ nonce_s)[0..4])
-mod 10⁶, shown as six digits. nonce_c and nonce_s are 16 random bytes from the client
-and the server; the server commits to its own, `pair_commit = BLAKE2b-256(nonce_s)`,
-in ServerInfo (message 2) before it has seen nonce_c (in ClientInfo, message 3), and
-reveals nonce_s in the sealed Welcome. A man in the middle yields different h, but h
-alone is not enough: the last thing mixed into h is message 3's payload, which the
-initiator chooses, so an attacker running two handshakes could search payloads until
-both codes agree. With the commit-then-reveal round, facing the client the attacker
-commits before it sees nonce_c, and facing the console it must send its own nonce
-before the console reveals nonce_s, so each active attempt is a single 1-in-10⁶ guess
-(and costs a visible pairing notification). `vectors/pairing.txt` pins the commitment
-and the code. The three fields are required (a node that omits one is refused, since
-an optional field could be stripped); a trusted reconnect carries them too.
+4.6 Pairing PAKE. Pairing proves, to the console, that the person at the app has read the
+console's screen. The console draws a random six-digit code from its CSPRNG for each
+unconfirmed session and shows it in its notification ("enter 123456 in the app"); the code is
+never derived from the transcript and never sent. It is the password of a CPace-style PAKE run
+inside the encrypted session (messages `PairPakeClient`, `PairPakeServer`, `PairConfirm`,
+`PairResult`, §5.5). With h the Noise handshake hash (64 bytes) and `code` as six ASCII digits:
 
-Passkey entry. The code is a secret that never crosses the network: the console shows
-it on its own screen (a notification) and the user types it into the app, which sends it
-in `PairConfirm` (§5.5). Threat model: a host on the LAN can complete the Noise handshake
-with a throwaway key and be welcomed, and it can derive the code from its own transcript,
-but it cannot read the console's screen, so it cannot send the console's code; a man in
-the middle has a different h on each leg, so the code the console shows is the code of
-the console's leg, which the man in the middle cannot learn either. Comparing two
-displayed codes is not enough: nothing would then stop a host that skips the comparison
-from pairing, so the console itself checks the typed code (§5.5).
+* `d = BLAKE2b-256("AVA1 CPace" ‖ h ‖ code)`; `G = Elligator2(d)`, the u coordinate of
+  Curve25519, by the map of Monocypher's `crypto_elligator_map` (RFC 9380
+  `map_to_curve_elligator2_curve25519`, Z = 2; the top two bits of `d` are ignored).
+* each side draws a fresh 32-byte scalar x and sends `Y = X25519(x, G)` (X25519 clamps x); a
+  result of all zero bytes is refused.
+* `K = BLAKE2b-256("AVA1 CPace K" ‖ h ‖ X25519(x, Y_peer) ‖ Y_client ‖ Y_server)`; an all-zero
+  shared secret (a low-order `Y_peer`) is refused.
+* key confirmation: `MAC_client = BLAKE2b-256(key = K, "client" ‖ h)`, sent in `PairConfirm`;
+  `MAC_server = BLAKE2b-256(key = K, "server" ‖ h)`, returned in `PairResult` only when the
+  client's verified. Every comparison is constant time.
+
+`vectors/cpace.txt` pins G, both public values, K and both MACs; the Rust and C implementations
+both reproduce it, and a differential test compares the two Elligator2 implementations on
+thousands of inputs.
+
+Threat model. The code is a secret that exists only on the console's screen. A host on the LAN
+can complete Noise with a throwaway key and be welcomed (it sees h, both nonces, every frame),
+but none of that depends on the code, so it cannot compute `G`, hence not `K`, hence not a
+valid `MAC_client`: each attempt is one online guess at one in 10^6, costs the attacker its
+session (one attempt per session) and counts toward the window's five-failure limit (§5.5),
+and there is nothing on the wire to test a guess against offline (`Y = x·G` hides G behind a
+discrete logarithm). A man in the middle holds two handshakes with different h, and the code
+is shown by the console, not by the app; what the app sends is bound to the first leg's h and
+the console's code, so it verifies on neither leg without the code. A fake console that does
+not know the code cannot return a valid `MAC_server`, so the app stores nothing. What this does
+not defend against: someone who can see the console's screen (or the user's typing), and a
+user who types the code into a pairing they did not start. The `pair_commit`, `nonce_c` and
+`nonce_s` fields of §5 are retained for wire stability; no code is derived from them any more.
 
 ## 5. Handshake and pairing
 1. Client → `Hs1{noise}` (unsealed): Noise message 1, payload `HelloInfo`
@@ -126,28 +138,28 @@ from pairing, so the console itself checks the typed code (§5.5).
    pair_commit of message 2 before it shows any code or trusts anything else in the
    Welcome; a mismatch, or a ServerInfo or Welcome without its field, closes the
    connection (after a best-effort `Error(ERR_PROTOCOL)`).
-5. Pairing (§5.5, passkey entry): while either side does not know the other, the
-   console shows the pairing code (§4.6) on its screen and the user types it into
-   the app. A client whose server sent knows_you = 0 sends `PairConfirm{code}`
-   (channel = request id), `code` being the typed number (a required field: a
-   `PairConfirm` without it does not decode and is refused like a wrong code). The
-   client first compares the typed code with its own derivation and does not send a
-   code that differs (a typo, or a man in the middle: the session stays, the user
-   types again). The server compares the code, in constant time, with the one it
-   derived for this session, and answers `PairResult{accepted}` on the same channel,
-   accepting only while its pairing window is open and the code is equal (and its
-   owner, where there is a hook, does not veto), then stores the client's key; a key
-   that cannot be stored is not accepted. A session gets one attempt: a wrong or
-   missing code is refused (`accepted = 0`) and the session ends. Each such failure is
-   logged and counted; after 5 since the window was last opened (by `pairing.open`
-   or at start) the window closes and stays shut until a paired device reopens it
-   or the node restarts, and a refusal makes the next welcome show a new
-   notification at once. A client that cannot be told apart from a paired one (a
-   trusted reconnect, §5.1, or a launch proof, §5.2) never sends `PairConfirm` and
-   needs no code. `ERR_PAIRING_CODE` (19) is the local refusal of a mismatched code. Until accepted, RPCs answer
-   `ERR_NOT_PAIRED` and lanes are refused. A client sends nothing but
-   `PairConfirm` (no RPC, no Join) while either side is unconfirmed: until the
-   user has compared the codes, the server is unverified. A data-plane frame (§11–§16) on a
+5. Pairing (§5.5, PAKE over the Noise session; §4.6): while the console does not know the
+   client it shows the session's random code on its screen, and the user types it into the
+   app. A client whose server sent knows_you = 0 sends `PairPakeClient{y}` (channel = request
+   id) and the server answers `PairPakeServer{y}` on that channel (once per session; a second
+   `PairPakeClient`, or one while the window is closed, ends the session). The client then
+   sends `PairConfirm{mac}` and the server answers `PairResult{accepted, mac}`. The server
+   accepts only while its pairing window is open and the client's `mac` verifies (and its
+   owner, where there is a hook, does not veto), then stores the client's key (a key that
+   cannot be stored is not accepted) and returns its own `mac`; the client stores the
+   server's key only if `accepted` is set and the server's `mac` verifies. Otherwise
+   `accepted = 0` with a zero `mac`, and the session ends: one attempt per session. A
+   `PairConfirm` before the PAKE, one that does not decode (the old empty body), or a
+   malformed or low-order `PairPakeClient` is a failed attempt like a wrong code. Each failed
+   attempt is logged and counted; after 5 since the window was last opened (by
+   `pairing.open` or at start) the window closes and stays shut until a paired device
+   reopens it or the node restarts, and a failure makes the next welcome show a new
+   notification at once. The client cannot tell a wrong code from a typo, only that the console
+   refused; its next try is a new handshake with a new code on the screen. A client that cannot
+   be told apart from a paired one (a trusted reconnect, §5.1, or a launch proof, §5.2) never
+   sends these messages and needs no code. Until accepted, RPCs answer
+   `ERR_NOT_PAIRED` and lanes are refused. A client sends nothing but the pairing messages (no RPC, no Join) while
+   either side is unconfirmed. A data-plane frame (§11–§16) on a
    control connection whose pairing is not accepted is a protocol error: the server answers a sealed
    `Error(ERR_NOT_PAIRED)` and closes the connection.
 6. Pairing window: opens by itself for 5 minutes after start only while the node
@@ -314,7 +326,7 @@ normative table; the second column names the constant in the generated code.
 | 16 | `ERR_CROSS_DEVICE` | a staged or part-file rename whose two sides are on different devices (`st_dev`); never attempted, because a cross-device `rename` panics the console's kernel |
 | 17 | `ERR_CREDIT` | a lane frame larger than the credit the receiver granted (§12.4) |
 | 18 | `ERR_STALLED` | the receiver ended a job whose sender sent no file data for the progress deadline while heartbeating (§12.8) |
-| 19 | `ERR_PAIRING_CODE` | a client-side refusal: the code typed in the app is not the one this session derived (§5.5) |
+| 19 | `ERR_PAIRING_CODE` | a client-side refusal of the pairing: the console refused the typed code, or could not prove it knows it (§5.5) |
 
 7.3 Management methods (the console operations FTX2 carried on :9114). Numbers are assigned by
 block; the tracked list, one row per FTX2 frame with its payload handler and engine caller, is

@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "ava1_platform.h"
 #include "monocypher.h"
 
 void ava1_identity_from_secret(ava1_identity_t *id, const uint8_t secret[32]) {
@@ -70,18 +71,81 @@ void ava1_pair_commit(const uint8_t nonce_s[16], uint8_t out[32]) {
     crypto_blake2b(out, 32, nonce_s, 16);
 }
 
-uint32_t ava1_pairing_code(const uint8_t hash[64], const uint8_t nonce_c[16], const uint8_t nonce_s[16]) {
-    static const char label[] = "AVA1 pairing";
+void ava1_cpace_generator(const uint8_t h[64], uint32_t code, uint8_t g[32]) {
+    static const char label[] = "AVA1 CPace";
     crypto_blake2b_ctx c;
-    uint8_t d[32];
+    uint8_t d[32], digits[6];
+    int i;
+    for (i = 5; i >= 0; i--) {
+        digits[i] = (uint8_t)('0' + code % 10u);
+        code /= 10u;
+    }
     crypto_blake2b_init(&c, 32);
     crypto_blake2b_update(&c, (const uint8_t *)label, sizeof label - 1);
-    crypto_blake2b_update(&c, hash, 64);
-    crypto_blake2b_update(&c, nonce_c, 16);
-    crypto_blake2b_update(&c, nonce_s, 16);
+    crypto_blake2b_update(&c, h, 64);
+    crypto_blake2b_update(&c, digits, 6);
     crypto_blake2b_final(&c, d);
-    return ((uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24)) %
-           1000000u;
+    crypto_elligator_map(g, d);
+    crypto_wipe(d, sizeof d);
+}
+
+static int all_zero32(const uint8_t v[32]) {
+    uint8_t acc = 0;
+    int i;
+    for (i = 0; i < 32; i++) acc |= v[i];
+    return acc == 0;
+}
+
+int ava1_ct_eq32(const uint8_t a[32], const uint8_t b[32]) { return crypto_verify32(a, b) == 0; }
+
+int ava1_cpace_public(const uint8_t x[32], const uint8_t g[32], uint8_t y[32]) {
+    crypto_x25519(y, x, g);
+    if (all_zero32(y)) return -1;
+    return 0;
+}
+
+int ava1_cpace_key(const uint8_t h[64], const uint8_t x[32], const uint8_t y_peer[32], const uint8_t ya[32],
+                   const uint8_t yb[32], uint8_t k[32]) {
+    static const char label[] = "AVA1 CPace K";
+    crypto_blake2b_ctx c;
+    uint8_t shared[32];
+    crypto_x25519(shared, x, y_peer);
+    if (all_zero32(shared)) {
+        crypto_wipe(shared, sizeof shared);
+        return -1;
+    }
+    crypto_blake2b_init(&c, 32);
+    crypto_blake2b_update(&c, (const uint8_t *)label, sizeof label - 1);
+    crypto_blake2b_update(&c, h, 64);
+    crypto_blake2b_update(&c, shared, 32);
+    crypto_blake2b_update(&c, ya, 32);
+    crypto_blake2b_update(&c, yb, 32);
+    crypto_blake2b_final(&c, k);
+    crypto_wipe(shared, sizeof shared);
+    return 0;
+}
+
+void ava1_cpace_mac(const uint8_t k[32], int server, const uint8_t h[64], uint8_t out[32]) {
+    crypto_blake2b_ctx c;
+    crypto_blake2b_keyed_init(&c, 32, k, 32);
+    if (server) crypto_blake2b_update(&c, (const uint8_t *)"server", 6);
+    else crypto_blake2b_update(&c, (const uint8_t *)"client", 6);
+    crypto_blake2b_update(&c, h, 64);
+    crypto_blake2b_final(&c, out);
+}
+
+int ava1_random_code(uint32_t *code) {
+    uint8_t b[4];
+    uint32_t v;
+    for (;;) {
+        if (ava1_platform_random(b, 4) != 0) return -1;
+        v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+        if (v < 4294000000u) {
+            *code = v % 1000000u;
+            crypto_wipe(b, sizeof b);
+            return 0;
+        }
+    }
 }
 
 void ava1_launch_proof(const uint8_t token[16], const uint8_t h[64], uint8_t out[16]) {

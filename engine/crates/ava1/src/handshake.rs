@@ -10,8 +10,6 @@ use crate::Ava1Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PairingState {
-    /// Both devices show this; the user confirms they match.
-    pub code: u32,
     /// The server does not know us yet and must accept a PairConfirm.
     pub server_must_confirm: bool,
 }
@@ -28,9 +26,6 @@ pub struct Established {
     /// Client side: the server proved a launch token this side issued (SPEC.md §5.2),
     /// so it is trusted without pairing; the caller stores its key.
     pub launched: bool,
-    /// The pairing code of this handshake (SPEC.md §4.6): from the Noise hash and both
-    /// pairing nonces. Shown to the user only while `pairing` is `Some`.
-    pub code: u32,
 }
 
 /// What a server decides about a client once the handshake has shown its key.
@@ -206,11 +201,9 @@ where
         refuse(w, gen::ERR_PROTOCOL, "pairing commitment mismatch").await;
         return Err(Ava1Error::PairingCommitMismatch);
     }
-    let code = keys::pairing_code(&keys.hash, &nonce_c, &welcome.nonce_s);
     let known = knows(&peer_key);
     let launched = proves_our_launch(known, &welcome, &keys.hash, launched);
     let pairing = (!(known || launched) || welcome.knows_you == 0).then_some(PairingState {
-        code,
         server_must_confirm: welcome.knows_you == 0,
     });
     Ok(Established {
@@ -221,7 +214,6 @@ where
         peer_caps: info.caps,
         pairing,
         launched,
-        code,
     })
 }
 
@@ -334,11 +326,8 @@ where
         },
     )
     .await?;
-    let code = keys::pairing_code(&keys.hash, &ci.nonce_c, &nonce_s);
     Ok(Established {
-        code,
         pairing: (!known).then_some(PairingState {
-            code,
             server_must_confirm: true,
         }),
         keys,
@@ -482,7 +471,7 @@ mod tests {
         let c = c.unwrap();
         assert_eq!(seen.len(), 1);
         assert!(!c.launched);
-        let p = c.pairing.expect("pairing code shown");
+        let p = c.pairing.expect("pairing still needed");
         assert!(
             !p.server_must_confirm,
             "the server already trusts its launcher"
@@ -811,17 +800,13 @@ mod tests {
             ("console", "laptop")
         );
         assert_eq!((c.pairing, s.pairing), (None, None));
-        // The nonces ride every handshake, trusted or not (an optional field could be
-        // stripped), and both ends agree on the code even though nobody shows it.
-        assert_eq!(c.code, s.code);
     }
 
     #[tokio::test]
-    async fn an_unknown_client_pairs_with_matching_codes_while_the_window_is_open() {
+    async fn an_unknown_client_must_be_confirmed_while_the_window_is_open() {
         let e = run(false, false, true).await;
         let (cp, sp) = (e.c.unwrap().pairing.unwrap(), e.s.unwrap().pairing.unwrap());
-        assert_eq!(cp.code, sp.code);
-        assert!(cp.server_must_confirm);
+        assert!(cp.server_must_confirm && sp.server_must_confirm);
     }
 
     #[tokio::test]

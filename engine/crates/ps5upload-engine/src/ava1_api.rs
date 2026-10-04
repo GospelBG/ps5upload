@@ -169,7 +169,7 @@ fn pairing_body(
             StatusCode::OK,
             serde_json::json!({ "state": "wrong_code", "console_name": peer_name }),
         ),
-        Ok(Pairing::Code { peer_name, .. }) => (
+        Ok(Pairing::Code { peer_name }) => (
             StatusCode::OK,
             serde_json::json!({ "state": "code", "console_name": peer_name }),
         ),
@@ -290,7 +290,6 @@ mod tests {
     #[test]
     fn the_pairing_body_names_the_state_and_pads_the_code() {
         let (st, b) = super::pairing_body(Ok(Pairing::Code {
-            code: 4821,
             peer_name: "PS5-Pro".into(),
         }));
         assert_eq!(st, axum::http::StatusCode::OK);

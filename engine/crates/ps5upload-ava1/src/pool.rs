@@ -103,11 +103,10 @@ pub enum Pairing {
     /// The console trusts this engine (or was launched by it): nothing to enter.
     Paired,
     /// A person must read the code off the console's screen and type it in the app (SPEC.md
-    /// §5.5). `code` is the engine's own derivation, kept for tests and debugging: it is
-    /// never shown.
-    Code { code: u32, peer_name: String },
-    /// The code that was typed was not the console's. The handshake is pending (the same
-    /// code, or a new one after a console-side refusal): the user types again.
+    /// §5.5). This side does not know the code: it exists only on the console's screen.
+    Code { peer_name: String },
+    /// The console refused the code that was typed. A new handshake is pending and the console
+    /// shows a new code: the user reads it and types again.
     WrongCode { peer_name: String },
     /// A different console answered at this address than the one this engine pinned.
     WrongConsole,
@@ -548,13 +547,10 @@ impl Pool {
             let _connecting = one_at_a_time.lock().await;
             let mut pending = self.pending.lock().await;
             if let Some(s) = pending.get(&host) {
-                if !s.is_closed() {
-                    if let Some(code) = s.pairing_code() {
-                        return Ok(Pairing::Code {
-                            code,
-                            peer_name: s.peer_name().to_string(),
-                        });
-                    }
+                if !s.is_closed() && s.pairing_pending() {
+                    return Ok(Pairing::Code {
+                        peer_name: s.peer_name().to_string(),
+                    });
                 }
                 pending.remove(&host);
             }
@@ -568,10 +564,9 @@ impl Pool {
             }
             match self.connect_raw(console).await {
                 Ok((s, _)) if s.needs_user_pairing() => {
-                    let code = s.pairing_code().unwrap_or(0);
                     let peer_name = s.peer_name().to_string();
                     self.pending.lock().await.insert(host.clone(), s);
-                    return Ok(Pairing::Code { code, peer_name });
+                    return Ok(Pairing::Code { peer_name });
                 }
                 Ok((s, _)) => s.close().await, // already trusted: the cached path below
                 Err(Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CLOSED => {
@@ -592,9 +587,8 @@ impl Pool {
     pub async fn peek_pairing(&self, console: &str) -> Option<Pairing> {
         let host = host_of(console);
         if let Some(s) = self.pending.lock().await.get(&host) {
-            if !s.is_closed() && s.pairing_code().is_some() {
+            if !s.is_closed() && s.pairing_pending() {
                 return Some(Pairing::Code {
-                    code: s.pairing_code().unwrap_or(0),
                     peer_name: s.peer_name().to_string(),
                 });
             }
@@ -626,15 +620,9 @@ impl Pool {
                 return Err(Ava1Error::NotPaired);
             };
             if let Err(e) = s.confirm_pairing(typed).await {
-                // A code that is not even this app's own derivation (a typo, or a man in the
-                // middle) was never sent: the console still waits for the right one, so the
-                // handshake stays and the user types again. Anything else used the session up.
-                if matches!(&e, Ava1Error::Refused { code, .. } if *code == ava1::gen::ERR_PAIRING_CODE)
-                {
-                    self.pending.lock().await.insert(host, s);
-                } else {
-                    s.close().await;
-                }
+                // The console refused the code (or could not prove its own): the session is
+                // used up. A retry is a new handshake with a new code on the console.
+                s.close().await;
                 return Err(e);
             }
             if self.pinned(&host).is_none() {
@@ -650,22 +638,16 @@ impl Pool {
     /// A confirm that never fails just because nothing is pending: a late or concurrent
     /// confirm (the handshake was already confirmed, or it timed out) answers with the
     /// console's current state (`Paired`, a fresh `Code`, or `Closed`) instead of an error.
-    /// A typo answers `WrongCode` on the same handshake (the console's code is still on its
-    /// screen); a code the console itself refused starts a new handshake and answers
-    /// `WrongCode` (a new code is on its screen), or `Closed` when five wrong codes shut its
-    /// window.
+    /// A code the console refused starts a new handshake at once and answers `WrongCode` (a
+    /// new code is on its screen), or `Closed` when five wrong codes shut its window. This side
+    /// cannot tell a typo from a wrong guess: only the console knows the code.
     pub async fn confirm_or_status(&self, console: &str, typed: u32) -> Result<Pairing, Ava1Error> {
         match self.confirm_pairing(console, typed).await {
             Ok(()) => Ok(Pairing::Paired),
             Err(Ava1Error::NotPaired) => self.pairing_status(console).await,
-            Err(Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CODE => {
-                let peer_name = match self.pending.lock().await.get(&host_of(console)) {
-                    Some(s) => s.peer_name().to_string(),
-                    None => String::new(),
-                };
-                Ok(Pairing::WrongCode { peer_name })
-            }
-            Err(Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CLOSED => {
+            Err(Ava1Error::Refused { code, .. })
+                if code == ava1::gen::ERR_PAIRING_CODE || code == ava1::gen::ERR_PAIRING_CLOSED =>
+            {
                 match self.pairing_status(console).await? {
                     Pairing::Code { peer_name, .. } => Ok(Pairing::WrongCode { peer_name }),
                     other => Ok(other),
@@ -786,7 +768,7 @@ impl Pool {
             // A person must compare codes (SPEC.md §5), not a transfer.
             return Err(Ava1Error::NotPaired);
         }
-        if s.pairing_code().is_some() {
+        if s.pairing_pending() {
             // The console already trusts us (it was launched by us): record its key.
             s.confirm_trusted()?;
         }

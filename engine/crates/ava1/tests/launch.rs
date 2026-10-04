@@ -67,7 +67,7 @@ async fn the_launched_helper_pairs_with_no_code_and_is_remembered() {
     )
     .await
     .unwrap();
-    assert_eq!(s.pairing_code(), None, "no prompt");
+    assert!(!s.pairing_pending(), "no prompt");
     assert!(
         peers.lock().unwrap().contains(&server_key),
         "stored silently"
@@ -83,7 +83,7 @@ async fn the_launched_helper_pairs_with_no_code_and_is_remembered() {
     let s = connect(&addr.to_string(), me, fresh, "laptop", fast())
         .await
         .unwrap();
-    assert_eq!(s.pairing_code(), None);
+    assert!(!s.pairing_pending());
 }
 
 #[tokio::test]
@@ -95,7 +95,7 @@ async fn a_token_this_client_did_not_issue_means_pairing() {
     let s = connect(&addr.to_string(), me, peers.clone(), "laptop", fast())
         .await
         .unwrap();
-    assert!(s.pairing_code().is_some());
+    assert!(s.pairing_pending());
     assert!(!peers.lock().unwrap().contains(&server_key));
     assert!(matches!(s.node_info().await, Err(Ava1Error::NotPaired)));
 }
@@ -110,7 +110,7 @@ async fn an_expired_token_means_pairing() {
     let s = connect(&addr.to_string(), me, peers, "laptop", fast())
         .await
         .unwrap();
-    assert!(s.pairing_code().is_some());
+    assert!(s.pairing_pending());
 }
 
 #[tokio::test]
@@ -122,10 +122,7 @@ async fn a_key_only_stamp_pairs_as_before() {
     let mut s = connect(&addr.to_string(), me, peers, "laptop", fast())
         .await
         .unwrap();
-    assert!(
-        s.pairing_code().is_some(),
-        "the client still compares a code once"
-    );
+    assert!(s.pairing_pending(), "the client still compares a code once");
     // ... and the server needs no confirmation of its own: it trusts its launcher.
     s.confirm_trusted().unwrap();
     s.node_info().await.unwrap();
@@ -142,7 +139,7 @@ async fn another_client_gets_no_proof_even_holding_the_token() {
     let s = connect(&addr.to_string(), me, peers.clone(), "phone", fast())
         .await
         .unwrap();
-    assert!(s.pairing_code().is_some());
+    assert!(s.pairing_pending());
     assert!(!peers.lock().unwrap().contains(&server_key));
 }
 
@@ -156,7 +153,7 @@ async fn a_client_without_tokens_pairs_as_before() {
     let s = connect(&addr.to_string(), me, peers, "laptop", fast())
         .await
         .unwrap();
-    assert!(s.pairing_code().is_some());
+    assert!(s.pairing_pending());
 }
 
 #[tokio::test]
@@ -174,16 +171,13 @@ async fn a_sniffed_token_cannot_impersonate_the_console_after_the_real_one_used_
     )
     .await
     .unwrap();
-    assert_eq!(s.pairing_code(), None, "the real helper pairs silently");
+    assert!(!s.pairing_pending(), "the real helper pairs silently");
     // A sniffer read the unauthenticated ELF, so it holds the token and the launcher's key.
     let (fake, _c2, fake_key) = launched_server(me.public(), Some(token)).await;
     assert_ne!(real_key, fake_key);
     let s = connect(&fake.to_string(), me, peers.clone(), "laptop", fast())
         .await
         .unwrap();
-    assert!(
-        s.pairing_code().is_some(),
-        "the replayed proof is not accepted"
-    );
+    assert!(s.pairing_pending(), "the replayed proof is not accepted");
     assert!(!peers.lock().unwrap().contains(&fake_key));
 }

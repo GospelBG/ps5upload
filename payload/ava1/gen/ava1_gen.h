@@ -190,6 +190,8 @@
 #define AVA1_TYPE_HS2 0x02u
 #define AVA1_TYPE_HS3 0x03u
 #define AVA1_TYPE_WELCOME 0x04u
+#define AVA1_TYPE_PAIR_PAKE_CLIENT 0x0du
+#define AVA1_TYPE_PAIR_PAKE_SERVER 0x0eu
 #define AVA1_TYPE_PAIR_CONFIRM 0x05u
 #define AVA1_TYPE_PAIR_RESULT 0x06u
 #define AVA1_TYPE_JOIN 0x07u
@@ -854,7 +856,21 @@ int ava1_welcome_encode(const ava1_welcome_t *m, ava1_w_t *w);
 int ava1_welcome_decode(const uint8_t *buf, size_t len, ava1_welcome_t *m);
 
 typedef struct {
-    uint32_t code;
+    uint8_t y[32];
+} ava1_pair_pake_client_t;
+
+int ava1_pair_pake_client_encode(const ava1_pair_pake_client_t *m, ava1_w_t *w);
+int ava1_pair_pake_client_decode(const uint8_t *buf, size_t len, ava1_pair_pake_client_t *m);
+
+typedef struct {
+    uint8_t y[32];
+} ava1_pair_pake_server_t;
+
+int ava1_pair_pake_server_encode(const ava1_pair_pake_server_t *m, ava1_w_t *w);
+int ava1_pair_pake_server_decode(const uint8_t *buf, size_t len, ava1_pair_pake_server_t *m);
+
+typedef struct {
+    uint8_t mac[32];
 } ava1_pair_confirm_t;
 
 int ava1_pair_confirm_encode(const ava1_pair_confirm_t *m, ava1_w_t *w);
@@ -862,6 +878,7 @@ int ava1_pair_confirm_decode(const uint8_t *buf, size_t len, ava1_pair_confirm_t
 
 typedef struct {
     uint8_t accepted;
+    uint8_t mac[32];
 } ava1_pair_result_t;
 
 int ava1_pair_result_encode(const ava1_pair_result_t *m, ava1_w_t *w);

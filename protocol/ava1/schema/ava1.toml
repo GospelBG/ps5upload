@@ -92,17 +92,32 @@ type = 0x04
 fields = [{ name = "knows_you", ty = "u8" }, { name = "nonce_s", ty = "b16" }]
 ext = [{ tag = 1, name = "launch_proof", ty = "b16" }]
 
+# Pairing is a PAKE keyed by a random code that only the console's screen shows (SPEC.md
+# §4.6, §5.5). The client sends PairPakeClient, the console answers PairPakeServer, then the
+# client proves it derived the same key with PairConfirm and the console answers PairResult.
+# y: a CPace public value, scalar * G with G derived from the handshake hash and the code.
+[[message]]
+name = "PairPakeClient"
+type = 0x0D
+fields = [{ name = "y", ty = "b32" }]
+
+[[message]]
+name = "PairPakeServer"
+type = 0x0E
+fields = [{ name = "y", ty = "b32" }]
+
+# mac: keyed BLAKE2b-256(key = K, "client" || h): the client's key confirmation. Required.
 [[message]]
 name = "PairConfirm"
 type = 0x05
-# code: the six digits the user read off the console's screen and typed into the app
-# (SPEC.md §4.6, §5.5, passkey entry). Required: a PairConfirm without it does not decode.
-fields = [{ name = "code", ty = "u32" }]
+fields = [{ name = "mac", ty = "b32" }]
 
+# mac: keyed BLAKE2b-256(key = K, "server" || h) when accepted, else zero: the console's key
+# confirmation, which the client must check before it stores the console. Required.
 [[message]]
 name = "PairResult"
 type = 0x06
-fields = [{ name = "accepted", ty = "u8" }]
+fields = [{ name = "accepted", ty = "u8" }, { name = "mac", ty = "b32" }]
 
 # A data lane (SPEC.md §9). Both nonces are fresh random per join and feed the lane
 # keys, so no two joins of one lane id ever share a key (§4.3).

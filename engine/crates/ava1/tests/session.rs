@@ -19,7 +19,7 @@ async fn paired_devices_connect_and_call_node_info() {
     let s = connect(&addr.to_string(), me, peers, "laptop", fast())
         .await
         .unwrap();
-    assert_eq!(s.pairing_code(), None);
+    assert!(!s.pairing_pending());
     assert_eq!(s.peer_name(), "Rust test server");
     assert_eq!(s.node_info().await.unwrap().name, "Rust test server");
     let r = s.rpc(999, &[]).await.unwrap();
@@ -87,15 +87,11 @@ async fn pairing_shows_the_same_code_and_persists_on_both_sides() {
     )
     .await
     .unwrap();
-    let code = s.pairing_code().expect("pairing needed");
+    assert!(s.pairing_pending());
     wait_for(Duration::from_secs(5), || seen.lock().unwrap().is_some())
         .await
         .expect("the server shows a code");
-    assert_eq!(
-        *seen.lock().unwrap(),
-        Some(code),
-        "the server shows the same code"
-    );
+    let code = seen.lock().unwrap().unwrap();
     // Until the user has confirmed the code the server is unverified: the client sends
     // it nothing but PairConfirm, and the server answers anything else ERR_NOT_PAIRED.
     assert!(matches!(
@@ -114,7 +110,7 @@ async fn pairing_shows_the_same_code_and_persists_on_both_sides() {
             .status,
         gen::ERR_NOT_PAIRED
     );
-    s.confirm_pairing(s.pairing_code().unwrap()).await.unwrap();
+    s.confirm_pairing(code).await.unwrap();
     assert_eq!(s.node_info().await.unwrap().name, "console");
 
     let server_file = std::fs::read_to_string(dir.join("server-peers")).unwrap();
@@ -127,7 +123,7 @@ async fn pairing_shows_the_same_code_and_persists_on_both_sides() {
     let again = connect(&addr.to_string(), me, peers, "laptop", fast())
         .await
         .unwrap();
-    assert_eq!(again.pairing_code(), None);
+    assert!(!again.pairing_pending());
 }
 
 #[tokio::test]
@@ -141,17 +137,19 @@ async fn a_server_that_declines_the_pairing_is_reported() {
     .with_timing(fast())
     .with_approve(Box::new(|_| false));
     ctx.open_pairing(Duration::from_secs(60));
-    let (addr, _ctx) = start(ctx).await;
+    let (addr, ctx) = start(ctx).await;
+    let id = Arc::new(Identity::generate().unwrap());
     let mut s = connect(
         &addr.to_string(),
-        Arc::new(Identity::generate().unwrap()),
+        id.clone(),
         Arc::new(Mutex::new(PeerStore::in_memory())),
         "c",
         fast(),
     )
     .await
     .unwrap();
-    let r = s.confirm_pairing(s.pairing_code().unwrap()).await;
+    let code = console_code(&ctx, &id.public()).await;
+    let r = s.confirm_pairing(code).await;
     assert!(matches!(r, Err(Ava1Error::Refused { .. })), "{r:?}");
 }
 
@@ -248,7 +246,7 @@ async fn a_paired_device_opens_the_pairing_window_for_another() {
     let p = connect(&addr.to_string(), stranger, none, "phone", fast())
         .await
         .unwrap();
-    assert!(p.pairing_code().is_some());
+    assert!(p.pairing_pending());
 }
 
 #[tokio::test]

@@ -57,7 +57,8 @@ static int same_device(const char *from, const char *to_dir) {
 
 static void on_pair_request(const char *peer_name, uint32_t code) {
     char msg[160];
-    snprintf(msg, sizeof msg, "PS5Upload: pairing request from %s. Code %06u", peer_name, (unsigned)code);
+    /* The code exists only on this screen (SPEC.md 5.5): the user types it into the app. */
+    snprintf(msg, sizeof msg, "PS5Upload pairing: enter %06u in the app (%s)", (unsigned)code, peer_name);
     pop_notification(msg);
 }
 
