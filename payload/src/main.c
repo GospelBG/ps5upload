@@ -769,7 +769,7 @@ int main(void) {
     runtime_arm_shutdown_watchdog(&state, rc == 0 ? 0 : 1);
 
     /* The AVA1 half: stop accepting, wait for the sessions (2 s) and for any in-flight Sony call
-     * (this does NOT return while one runs: only the 8 s exit watchdog armed above can end the
+     * (this does NOT return while one runs: only the exit watchdog armed above (8 s, or up to 60 s while a Sony call runs) can end the
      * process then), then stop the data layer so journals are closed and durable jobs resume. */
     {
         int sr = ava1_payload_stop(2000, 3000);

@@ -2240,6 +2240,10 @@ int runtime_sweep_our_instances(void) {
 
 /* ── Shutdown watchdog ────────────────────────────────────────────────────── */
 
+/* The exit watchdog: it may exit from WATCHDOG_BASE_MS once no Sony call is in flight, and at all
+ * events from WATCHDOG_CEILING_MS. */
+#define WATCHDOG_BASE_MS 8000
+#define WATCHDOG_CEILING_MS 60000
 static int g_watchdog_exit_code = 0;
 /* Set once by runtime_arm_shutdown_watchdog, before the watchdog thread is
  * created — never mutated after, so the watchdog thread reads it race-free
@@ -2256,8 +2260,48 @@ static void *runtime_shutdown_watchdog(void *arg) {
      * process exits via main()'s return long before this fires and this thread
      * dies with it. If shutdown WEDGES (e.g. pthread_join on a mgmt thread
      * stuck in an uninterruptible Sony API never returns), force the process
-     * out so it can't linger as an orphan the next resend would duplicate. */
-    sleep(8);
+     * out so it can't linger as an orphan the next resend would duplicate.
+     *
+     * But never while a Sony call is in flight: a call cut by _exit can wedge the console, and
+     * ava1_payload_stop promises not to return (or exit) inside one. So after the base time the
+     * watchdog waits for sony_api_lock to be free (and HOLDS it from then on, so no new call starts
+     * while the process goes down), up to a hard ceiling that it logs loudly (final review: console). */
+    {
+        struct timespec t0, now;
+        int announced = 0, held = 0, d;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (;;) {
+            long long elapsed;
+            int busy;
+            usleep(100000);
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            elapsed = (long long)(now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000;
+            if (elapsed < WATCHDOG_BASE_MS) continue;
+            busy = pthread_mutex_trylock(&sony_api_lock) != 0;
+            held = !busy;
+            d = ava1_exit_decide(elapsed, busy, WATCHDOG_BASE_MS, WATCHDOG_CEILING_MS);
+            if (d == AVA1_EXIT_OK) break;
+            if (d == AVA1_EXIT_FORCED) {
+                fprintf(stderr,
+                        "[payload2] SHUTDOWN WATCHDOG: a Sony call is STILL in flight after %lld ms; exiting anyway "
+                        "(hard ceiling %d ms). The console may need a restart.\n",
+                        elapsed, WATCHDOG_CEILING_MS);
+                break;
+            }
+            if (held) pthread_mutex_unlock(&sony_api_lock); /* not at the exit yet: do not block the others */
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "[payload2] shutdown watchdog: %d ms passed but a Sony call is in flight; waiting for it "
+                        "(up to %d ms)\n",
+                        WATCHDOG_BASE_MS, WATCHDOG_CEILING_MS);
+            }
+        }
+        (void)held; /* when held, the lock stays taken: _exit below, nothing else runs a Sony call */
+    }
+    /* Journals are fsynced on every append; make the last ones certain, bounded (an fsync on a wedged
+     * drive must not stop the forced exit this thread exists to guarantee). */
+    if (ava1_exit_flush(2000) != 0) fprintf(stderr, "[payload2] shutdown watchdog: journal flush abandoned after 2 s\n");
     /* We are exiting deliberately — clear the ownership record BEFORE
      * _exit() so the next instance doesn't read a leftover record + dead
      * pid as `killed_externally`. runtime_clear_ownership is just unlink()

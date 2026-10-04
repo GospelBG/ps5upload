@@ -382,6 +382,19 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     return 0;
 }
 
+static void flush_one(ava1_job_t *j, void *ctx) {
+    uint32_t k;
+    (void)ctx;
+    if (j->jnl.fd >= 0) (void)fsync(j->jnl.fd);
+    if (pthread_mutex_trylock(&j->mu) == 0) { /* psegs may be reallocated under it */
+        for (k = 0; k < j->npsegs; k++)
+            if (j->psegs[k].fd >= 0 && !j->psegs[k].removed) (void)fsync(j->psegs[k].fd);
+        pthread_mutex_unlock(&j->mu);
+    }
+}
+
+void ava1_data_flush_for_exit(void) { ava1_job_foreach(flush_one, NULL); }
+
 void ava1_data_stop(void) {
     if (!D.running) return;
     D.running = 0;
