@@ -86,8 +86,7 @@ use ps5upload_core::{
         app_launch, app_list_registered, app_register, app_unregister, backup_content_databases,
         fs_copy_robust, fs_delete_with_op_id, fs_mkdir, fs_mount, fs_move_with_timeout,
         fs_op_cancel, fs_op_status, fs_read, fs_read_with_timeout, fs_unmount, list_dir, reconcile,
-        walk_local_inventory, DirListing, ListDirOptions, MountResult, ReconcileFile,
-        ReconcileMode, ReconcilePlan, RegisterResult,
+        DirListing, ListDirOptions, MountResult, ReconcileMode, RegisterResult,
     },
     game_meta::{parse_param_json_bytes, parse_param_sfo_bytes},
     hw::{
@@ -104,8 +103,8 @@ use ps5upload_core::{
         power_telemetry, system_control, PowerAction, PowerTelemetry, SystemControlAck,
     },
     transfer::{
-        inspect_7z, inspect_zip, sevenz_plan_preview, transfer_file_list_multistream,
-        zip_plan_preview, FileListEntry, TransferConfig, DEFAULT_RESUME_RETRIES, TX_FLAG_RESUME,
+        inspect_7z, inspect_zip, sevenz_plan_preview, zip_plan_preview, FileListEntry,
+        TransferConfig,
     },
     users::{user_list, UserList},
     volumes::{list_volumes, VolumeList},
@@ -1778,18 +1777,16 @@ struct TransferDirReconcileReq {
     tx_id: Option<String>,
     dest_root: String,
     src_dir: String,
-    /// "fast" = size-only equality (default), "safe" = size + BLAKE3 hash.
+    /// "fast" = size and mtime (default), "safe" = content.
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
     excludes: Vec<String>,
     #[serde(default)]
     bandwidth_cap_mbps: Option<f64>,
-    /// Parallel upload streams. The client resolves this as
-    /// `min(user_setting, payload's max_transfer_streams)` and passes it here;
-    /// the engine just hands it to the multi-stream orchestrator. Absent / <=1
-    /// → single-stream (unchanged behaviour). See docs/multistream-upload.md.
+    /// Accepted for older clients and ignored: AVA1 spreads one job over its own lanes.
     #[serde(default)]
+    #[allow(dead_code)]
     streams: Option<usize>,
 }
 
@@ -8208,6 +8205,7 @@ struct TransferDownloadReq {
     /// disjoint file subset). None / <=1 = single stream. Capped at
     /// `MAX_DOWNLOAD_STREAMS`. Ignored for single-file downloads.
     #[serde(default)]
+    #[allow(dead_code)]
     streams: Option<usize>,
     /// When true, bypasses the payload's writable-root allowlist so system
     /// files (/system/, /system_data/, /system_ex/) can be downloaded.
@@ -8971,38 +8969,22 @@ async fn transfer_dir_diff_preview_handler(
 
 /// POST /api/transfer/dir-reconcile
 ///
-/// Resume-friendly directory upload: walks the destination tree on the
-/// PS5, diffs against the local source by file size (Fast mode) or by
-/// BLAKE3 hash (Safe mode), and uploads only the delta via the existing
-/// `transfer_file_list` path. The job's `total_bytes` + progress bar
-/// reflect the *delta* — what the user actually sees uploading.
+/// Resume-friendly directory upload: the console decides what to skip (size and mtime in
+/// `fast` mode, content in `safe` mode, SPEC §11.4), so this is the folder upload with the
+/// user's skip-existing choice. The job's `total_bytes` and progress reflect what is sent.
+/// Remote (NAS) sources go the same way.
 ///
-/// Request body mirrors `TransferDirReq` plus an optional `mode`
-/// ("fast"|"safe"; default "fast"). Response is the same `JobCreated`
-/// shape as the other transfer handlers.
+/// Request body mirrors `TransferDirReq` plus an optional `mode` ("fast"|"safe"; default
+/// "fast"). `streams` is accepted for older clients and ignored (AVA1 spreads one job over its
+/// own lanes). Response is the same `JobCreated` shape as the other transfer handlers.
 async fn transfer_dir_reconcile_handler(
     State(state): State<AppState>,
     Json(req): Json<TransferDirReconcileReq>,
 ) -> impl IntoResponse {
     let addr = req.addr.unwrap_or_else(|| state.default_ps5_addr.clone());
-    let caller_supplied_tx_id = req.tx_id.is_some();
-    let tx_id = match parse_or_random_tx_id(req.tx_id.as_deref()) {
-        Ok(id) => id,
-        Err(e) => return json_err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    };
-    // Reconcile is the user's explicit "Resume" endpoint. If they
-    // supplied a tx_id we treat attempt 0 as a resume (payload adopts
-    // any existing entry); if they didn't, this is a first-time
-    // reconcile against a fresh random id and attempt 0 runs as a
-    // normal fresh BEGIN_TX.
-    let initial_flags = if caller_supplied_tx_id {
-        TX_FLAG_RESUME
-    } else {
-        0
-    };
-    let mode = match req.mode.as_deref().unwrap_or("fast") {
-        "fast" => ReconcileMode::Fast,
-        "safe" => ReconcileMode::Safe,
+    let skip = match req.mode.as_deref().unwrap_or("fast") {
+        "fast" => "fast",
+        "safe" => "safe",
         other => {
             return json_err(
                 StatusCode::BAD_REQUEST,
@@ -9011,379 +8993,17 @@ async fn transfer_dir_reconcile_handler(
             .into_response();
         }
     };
-
-    // An AVA1 console decides what to skip itself (size and mtime, or content,
-    // SPEC §11.4), so the FTX2 listing-based plan below is not needed: run the folder
-    // upload with the skip-existing choice. Remote (NAS) sources go the same way.
-    let probe_addr = addr.clone();
-    if tokio::task::spawn_blocking(move || ps5upload_ava1::route::use_ava1(&probe_addr))
+    let dir_req = TransferDirReq {
+        addr: Some(addr),
+        tx_id: req.tx_id,
+        dest_root: req.dest_root,
+        src_dir: req.src_dir,
+        excludes: req.excludes,
+        bandwidth_cap_mbps: req.bandwidth_cap_mbps,
+        skip_existing: Some(skip.to_string()),
+    };
+    transfer_dir_handler(State(state), Json(dir_req))
         .await
-        .unwrap_or(false)
-    {
-        let skip = match mode {
-            ReconcileMode::Fast => "fast",
-            ReconcileMode::Safe => "safe",
-        };
-        let dir_req = TransferDirReq {
-            addr: Some(addr),
-            tx_id: req.tx_id,
-            dest_root: req.dest_root,
-            src_dir: req.src_dir,
-            excludes: req.excludes,
-            bandwidth_cap_mbps: req.bandwidth_cap_mbps,
-            skip_existing: Some(skip.to_string()),
-        };
-        return transfer_dir_handler(State(state), Json(dir_req))
-            .await
-            .into_response();
-    }
-
-    let job_id = Uuid::new_v4();
-    let started_at_ms = now_ms();
-    set_job(
-        &state.jobs,
-        &state.events_tx,
-        job_id,
-        JobState::Running {
-            stage: None,
-            started_at_ms,
-            bytes_sent: 0,
-            total_bytes: 0, // unknown until reconcile finishes
-            files: vec![],
-            skipped_files: 0,
-            skipped_bytes: 0,
-            files_processing: 0,
-            // P3 / v2.18.0 — apply-phase counters start at 0; the
-            // ticker fills them in once APPLY_PROGRESS frames begin
-            // arriving from the payload during commit.
-            files_finalized: 0,
-            files_finalizing_total: 0,
-            bytes_finalized: 0,
-        },
-    );
-
-    let jobs = Arc::clone(&state.jobs);
-    let events_tx = state.events_tx.clone();
-
-    tokio::task::spawn_blocking(move || {
-        // Install the panic-survive guard at the TOP of the closure so that
-        // a panic anywhere in Phase 1 (reconcile, local walk) doesn't leave
-        // the job stuck in Running forever. The other three transfer
-        // handlers do the same; this one was previously deferring guard
-        // install until Phase 2, which let pre-Phase-2 panics orphan jobs.
-        // The two existing early-return branches (walk failure / empty
-        // plan) call mark_succeeded() before returning since they already
-        // set the terminal job state themselves.
-        let mut fail_guard =
-            JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
-        let src_path = std::path::PathBuf::from(&req.src_dir);
-        let mgmt = console_addr(&addr);
-        crate::log_info!(
-            "resume: job={job_id} src={src} dest={dest} mode={mode:?} mgmt={mgmt}",
-            job_id = job_id,
-            src = src_path.display(),
-            dest = req.dest_root,
-            mode = mode,
-            mgmt = mgmt,
-        );
-        // ── Phase 1: best-effort reconcile. We ATTEMPT to compute which
-        //    files are already present on the PS5 (skip list), but we
-        //    don't let a reconcile failure block the upload. If the
-        //    mgmt service is busy/crashed/slow, we fall through to
-        //    "upload everything" on the transfer port — which doesn't
-        //    need the mgmt port at all. The user still gets their
-        //    upload; they just lose the per-file skip optimization.
-        //    Shard-level resume (TX_FLAG_RESUME, see
-        //    transfer_file_list_resumable below) still works either way,
-        //    so an interrupted upload picks up from the last acked
-        //    shard even in the fallback path.
-        //
-        //    One attempt only: the reconcile has its own 10 s per-call
-        //    timeout inside list_dir_with_timeout. A second attempt
-        //    after that already-generous budget wouldn't change the
-        //    outcome — it would just double the pre-transfer stall
-        //    before the fallback kicks in.
-        let reconcile_started = std::time::Instant::now();
-        let plan: ReconcilePlan = match reconcile(
-            &mgmt,
-            &src_path,
-            &req.dest_root,
-            mode,
-            &req.excludes,
-            // true: this is the real upload — wait for the remote-walk gate
-            // so we never run concurrently with a diff-preview walk.
-            true,
-        ) {
-            Ok(p) => {
-                crate::log_info!(
-                    "resume: reconcile OK in {} ms — to_send={} bytes={} already={} already_bytes={}",
-                    reconcile_started.elapsed().as_millis(),
-                    p.to_send.len(),
-                    p.bytes_to_send,
-                    p.already_present,
-                    p.bytes_already_present,
-                );
-                p
-            }
-            Err(e) => {
-                crate::log_warn!(
-                    "resume: reconcile failed after {} ms ({}), falling back to uploading all local files without skip optimization",
-                    reconcile_started.elapsed().as_millis(),
-                    e,
-                );
-                // Fallback: walk the local tree and treat every file as
-                // to-send. The upload proceeds on the transfer port;
-                // shard-level TX_FLAG_RESUME below still picks up any
-                // interrupted prior attempt.
-                match walk_local_inventory(&src_path, &req.excludes) {
-                    Ok(local) => {
-                        let to_send: Vec<ReconcileFile> = local
-                            .into_iter()
-                            .map(|(rel_path, size)| ReconcileFile { rel_path, size })
-                            .collect();
-                        let bytes_to_send: u64 = to_send.iter().map(|f| f.size).sum();
-                        crate::log_info!(
-                            "resume: fallback local walk produced {} file(s) / {} bytes",
-                            to_send.len(),
-                            bytes_to_send,
-                        );
-                        ReconcilePlan {
-                            to_send,
-                            bytes_to_send,
-                            already_present: 0,
-                            bytes_already_present: 0,
-                        }
-                    }
-                    Err(walk_err) => {
-                        // Local walk itself failed — can't even enumerate
-                        // the source. This is genuinely fatal (source
-                        // doesn't exist or permission denied); surface
-                        // with a clear error.
-                        let completed_at_ms = now_ms();
-                        set_job(
-                            &jobs,
-                            &events_tx,
-                            job_id,
-                            JobState::Failed {
-                                started_at_ms,
-                                completed_at_ms,
-                                elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
-                                error: format!("can't read source folder: {walk_err}"),
-                                error_reason: None,
-                                error_detail: None,
-                            },
-                        );
-                        fail_guard.mark_succeeded();
-                        return;
-                    }
-                }
-            }
-        };
-        let total_bytes = plan.bytes_to_send;
-        let skipped_files_count = plan.already_present;
-        let skipped_bytes_count = plan.bytes_already_present;
-        let files_sent_count = plan.to_send.len() as u64;
-        if plan.to_send.is_empty() {
-            // Nothing to do — mark done immediately.
-            let completed_at_ms = now_ms();
-            set_job(
-                &jobs,
-                &events_tx,
-                job_id,
-                JobState::Done {
-                    started_at_ms,
-                    completed_at_ms,
-                    elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
-                    tx_id_hex: "".to_string(),
-                    shards_sent: 0,
-                    bytes_sent: 0,
-                    dest: req.dest_root.clone(),
-                    files_sent: 0,
-                    skipped_files: skipped_files_count,
-                    skipped_bytes: skipped_bytes_count,
-                    commit_ack: None,
-                },
-            );
-            fail_guard.mark_succeeded();
-            return;
-        }
-
-        // ── Phase 2: transfer_file_list on the delta. From here on the
-        //    progress ticker owns Running.bytes_sent. The `files` list
-        //    surfaced to the UI is the planned delta — not the full
-        //    tree — so the file-progress view only shows what's
-        //    actually being sent.
-        let files: Vec<PlannedFile> = plan
-            .to_send
-            .iter()
-            .map(|f| PlannedFile {
-                rel_path: f.rel_path.clone(),
-                size: f.size,
-            })
-            .collect();
-        let progress = Arc::new(AtomicU64::new(0));
-        let progress_files = Arc::new(AtomicU64::new(0));
-        let progress_files_finalized = Arc::new(AtomicU64::new(0));
-        let progress_bytes_finalized = Arc::new(AtomicU64::new(0));
-        let ctx = TickerContext {
-            started_at_ms,
-            total_bytes,
-            dynamic_total_bytes: None,
-            skipped_files: skipped_files_count,
-            skipped_bytes: skipped_bytes_count,
-        };
-        set_job(
-            &jobs,
-            &events_tx,
-            job_id,
-            JobState::Running {
-                stage: None,
-                started_at_ms,
-                bytes_sent: 0,
-                total_bytes,
-                files,
-                skipped_files: skipped_files_count,
-                skipped_bytes: skipped_bytes_count,
-                files_processing: 0,
-                files_finalized: 0,
-                files_finalizing_total: 0,
-                bytes_finalized: 0,
-            },
-        );
-        let stop_ticker = spawn_progress_ticker(
-            Arc::clone(&jobs),
-            events_tx.clone(),
-            job_id,
-            ctx,
-            Arc::clone(&progress),
-            Arc::clone(&progress_files),
-            Arc::clone(&progress_files_finalized),
-            Arc::clone(&progress_bytes_finalized),
-        );
-        // Same panic-survive contract as the other transfer endpoints.
-        // (fail_guard was installed at the top of this closure.)
-        let _stop_guard = TickerStopGuard::new(stop_ticker);
-
-        let entries: Vec<FileListEntry> = plan
-            .to_send
-            .iter()
-            .map(|f| {
-                let local = src_path.join(f.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-                FileListEntry {
-                    src: local.to_string_lossy().into_owned(),
-                    dest: format!("{}/{}", req.dest_root, f.rel_path),
-                }
-            })
-            .collect();
-
-        if fail_job_if_capacity_insufficient(
-            &jobs,
-            &events_tx,
-            job_id,
-            started_at_ms,
-            &addr,
-            &req.dest_root,
-            total_bytes,
-            caller_supplied_tx_id,
-        ) {
-            fail_guard.mark_succeeded();
-            return;
-        }
-
-        let streams = req.streams.unwrap_or(1);
-        let mut cfg = make_transfer_config(&addr);
-        // Make this transfer cancellable: register a flag the core checks at
-        // every shard boundary, flipped by POST /api/jobs/{id}/cancel.
-        cfg.cancel = Some(register_transfer_cancel(job_id));
-        cfg.excludes = req.excludes;
-        cfg.progress_bytes = Some(Arc::clone(&progress));
-        cfg.progress_files = Some(Arc::clone(&progress_files));
-        cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
-        cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
-        cfg.progress_live = Some(live_notes_for(job_id));
-        apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
-        // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes. Covers several
-        // payload hiccups mid-transfer (incl. the serial accept loop briefly
-        // busy draining a dropped connection); if the payload is hard-dead,
-        // the reconnect fails fast (ConnectionRefused is non-retryable) and we
-        // surface the underlying error.
-        //
-        // Multi-stream: when the client requests >1 stream (having confirmed the
-        // payload advertises support), the orchestrator splits `entries` across
-        // parallel connections. With streams<=1 it delegates to the exact
-        // single-stream path above, so this is a no-op when disabled.
-        // AVA1 (Task 22) or FTX2 for this job. The probe may take up to
-        // ~3 s on the first AUTO job per console; it runs here, on the
-        // blocking thread, and its session is reused by the transfer.
-        let use_ava1 = ps5upload_ava1::route::use_ava1(&addr)
-            && ps5upload_ava1::upload::upload_list_supported(&req.dest_root, &entries);
-        crate::log_info!(
-            "reconcile: job={job_id} protocol={}{}",
-            if use_ava1 { "ava1" } else { "ftx2" },
-            if use_ava1 {
-                format!(" streams={streams} (ignored: AVA1 spreads over its lanes)")
-            } else {
-                String::new()
-            }
-        );
-        let result = if use_ava1 {
-            // Resume is by job_id (the sender reopens with JobOpen); retries
-            // live in the adapter's loop, and `streams` has no AVA1 analogue
-            // (the log line above says it is ignored), so no flags/retry
-            // count here (C3).
-            ps5upload_ava1::upload::upload_list(&cfg, tx_id, &req.dest_root, &entries)
-        } else {
-            transfer_file_list_multistream(
-                &cfg,
-                tx_id,
-                &req.dest_root,
-                &entries,
-                streams,
-                DEFAULT_RESUME_RETRIES,
-                initial_flags,
-            )
-        };
-        match result {
-            Ok(r) => {
-                let completed_at_ms = now_ms();
-                set_job(
-                    &jobs,
-                    &events_tx,
-                    job_id,
-                    JobState::Done {
-                        started_at_ms,
-                        completed_at_ms,
-                        elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
-                        tx_id_hex: r.tx_id_hex,
-                        shards_sent: r.shards_sent,
-                        bytes_sent: r.bytes_sent,
-                        dest: r.dest,
-                        files_sent: files_sent_count,
-                        skipped_files: skipped_files_count,
-                        skipped_bytes: skipped_bytes_count,
-                        commit_ack: serde_json::from_str(&r.commit_ack_body).ok(),
-                    },
-                )
-            }
-            Err(e) => {
-                let completed_at_ms = now_ms();
-                set_job(
-                    &jobs,
-                    &events_tx,
-                    job_id,
-                    job_failed_from_err(started_at_ms, completed_at_ms, &e),
-                )
-            }
-        }
-        fail_guard.mark_succeeded();
-    });
-
-    (
-        StatusCode::ACCEPTED,
-        Json(JobCreated {
-            job_id: job_id.to_string(),
-        }),
-    )
         .into_response()
 }
 

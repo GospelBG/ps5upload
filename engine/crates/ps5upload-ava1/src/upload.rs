@@ -834,11 +834,6 @@ pub fn upload_list_first_unsupported(dest_root: &str, entries: &[FileListEntry])
         .map(|e| e.dest.clone())
 }
 
-/// Whether every destination fits under the job root.
-pub fn upload_list_supported(dest_root: &str, entries: &[FileListEntry]) -> bool {
-    upload_list_first_unsupported(dest_root, entries).is_none()
-}
-
 pub fn upload_list_in(
     pool: &Pool,
     cfg: &TransferConfig,
