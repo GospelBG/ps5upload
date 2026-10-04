@@ -1156,7 +1156,7 @@ async fn a_sender_that_only_pings_is_cancelled_with_err_stalled() {
 /// alive across several deadlines and it completes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_but_moving_sender_is_not_cut() {
-    let (mut link, _s, mut ended, d, n) =
+    let (link, _s, mut ended, d, n) =
         deadline_job("rr-slow-moving", 0x92, 4, Duration::from_millis(800), None).await;
     let lane = link.opener().unwrap().open().await.unwrap();
     for i in 0..n {

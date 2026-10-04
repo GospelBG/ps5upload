@@ -62,7 +62,7 @@ async fn a_flood_of_job_opens_is_refused_busy_once_the_table_is_full() {
         }
         links.push(link);
     }
-    assert!(admitted >= 1 && admitted <= 32, "{admitted} admitted");
+    assert!((1..=32).contains(&admitted), "{admitted} admitted");
     assert!(
         busy >= 16,
         "the flood past the table is refused: {busy} busy"
