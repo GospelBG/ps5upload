@@ -29,6 +29,7 @@ struct Counters {
     files: Option<Arc<std::sync::atomic::AtomicU64>>,
     files_finalized: Option<Arc<std::sync::atomic::AtomicU64>>,
     bytes_finalized: Option<Arc<std::sync::atomic::AtomicU64>>,
+    settling: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Bridge {
@@ -39,6 +40,7 @@ impl Bridge {
             files: cfg.progress_files.clone(),
             files_finalized: cfg.progress_files_finalized.clone(),
             bytes_finalized: cfg.progress_bytes_finalized.clone(),
+            settling: cfg.progress_settling.clone(),
         });
         let ticker = counters.clone();
         let handle = tokio::spawn(async move {
@@ -74,6 +76,9 @@ impl Counters {
                 Ordering::Relaxed,
             );
         }
+        if let Some(x) = &self.settling {
+            x.store(self.p.settling.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
         if let Some(x) = &self.bytes_finalized {
             x.store(
                 self.p.bytes_durable.load(Ordering::Relaxed),
@@ -100,5 +105,26 @@ pub fn bottleneck_name(b: u8) -> &'static str {
         ava1::gen::BN_WORKERS => "console workers",
         ava1::gen::BN_CREDIT => "console memory",
         _ => "none",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[tokio::test]
+    async fn the_senders_settling_flag_reaches_the_transfer_config() {
+        let p = Arc::new(Progress::default());
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut cfg = TransferConfig::new("127.0.0.1:1");
+        cfg.progress_settling = Some(flag.clone());
+        let bridge = Bridge::start(p.clone(), &cfg);
+        p.settling.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(flag.load(Ordering::Relaxed));
+        p.settling.store(false, Ordering::Relaxed);
+        drop(bridge); // the final values are stored on drop
+        assert!(!flag.load(Ordering::Relaxed));
     }
 }

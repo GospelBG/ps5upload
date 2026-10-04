@@ -171,6 +171,9 @@ pub struct TransferConfig {
     /// AVA1 only: bytes of the source hashed so far while a `verify` job reads every
     /// file up front (SPEC.md §11.4). The engine shows it as the job's "verify" stage.
     pub progress_verify: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// AVA1 only: set while the console reports files still settling after the upload's JobDone
+    /// (durable-by-log, SPEC.md §15.7); the engine shows it as the job's `settling` note.
+    pub progress_settling: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Optional outbound bandwidth cap, in bytes per second. `None` =
     /// unlimited (current behaviour). When set, the transfer loop
     /// sleeps after each shard's wire write to bring the running
@@ -211,6 +214,7 @@ impl TransferConfig {
             progress_files_finalized: None,
             progress_bytes_finalized: None,
             progress_verify: None,
+            progress_settling: None,
             bandwidth_cap_bps: None,
             cancel: None,
             source_fs: None,

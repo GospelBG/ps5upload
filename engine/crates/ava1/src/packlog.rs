@@ -376,7 +376,7 @@ impl PackLog {
                     break;
                 }
                 let body = u32::from_le_bytes(hdr);
-                if body < 1 || body > REC_MAX || pos + 8 + body as u64 > end {
+                if !(1..=REC_MAX).contains(&body) || pos + 8 + body as u64 > end {
                     break;
                 }
                 let len = body + 8;
@@ -509,15 +509,17 @@ mod tests {
         let path = pack_name(&d, 0);
         let f = OpenOptions::new().write(true).open(&path).unwrap();
         f.set_len(b.off + b.len as u64 - 3).unwrap();
-        let mut st = State::default();
-        st.unswept = [1, 2].into_iter().collect();
-        st.packs = vec![crate::gen::PackRef {
-            segment: g.segment,
-            offset: g.offset,
-            len: g.len,
-            first_file: 1,
-            count: 2,
-        }];
+        let st = State {
+            unswept: [1, 2].into_iter().collect(),
+            packs: vec![crate::gen::PackRef {
+                segment: g.segment,
+                offset: g.offset,
+                len: g.len,
+                first_file: 1,
+                count: 2,
+            }],
+            ..State::default()
+        };
         let mut q = PackLog::new(&d, PackOpts::default());
         let mut remade = vec![];
         let lost = q

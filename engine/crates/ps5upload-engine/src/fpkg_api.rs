@@ -276,6 +276,7 @@ pub(crate) async fn fpkg_build_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
 
@@ -564,6 +565,7 @@ pub(crate) async fn ffpfsc_compress_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
     let jobs = state.jobs.clone();
@@ -821,6 +823,7 @@ pub(crate) async fn fpkg_extract_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
     let jobs = state.jobs.clone();

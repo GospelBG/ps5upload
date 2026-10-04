@@ -283,6 +283,10 @@ pub(crate) enum JobState {
         /// The stage a staged job (an FPKG build) is in; `None` for jobs without stages.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stage: Option<JobStage>,
+        /// Present (true) while the console has acknowledged the whole upload but is still making
+        /// files durable in place (durable-by-log, SPEC.md §15.7): "finishing on the console".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settling: Option<bool>,
     },
     Done {
         started_at_ms: u64,
@@ -919,6 +923,48 @@ struct TickerContext {
     skipped_bytes: u64,
 }
 
+/// Mirrors an AVA1 upload's `settling` flag (the console says files are still settling after the whole
+/// upload was acknowledged, SPEC.md §15.7) into the job's Running snapshot as `settling: true`, until
+/// `stop` is set. Returns the flag the transfer's `TransferConfig::progress_settling` stores into.
+fn watch_settling(
+    jobs: Arc<Mutex<HashMap<Uuid, JobState>>>,
+    events_tx: broadcast::Sender<String>,
+    job_id: Uuid,
+    stop: Arc<AtomicBool>,
+) -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let watched = Arc::clone(&flag);
+    tokio::spawn(async move {
+        let mut last = false;
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let now = watched.load(Ordering::Relaxed);
+            if now == last {
+                continue;
+            }
+            last = now;
+            let snapshot = {
+                let mut g = jobs.lock().unwrap_or_else(|e| e.into_inner());
+                match g.get_mut(&job_id) {
+                    Some(JobState::Running { settling, .. }) => {
+                        *settling = now.then_some(true);
+                        g.get(&job_id).cloned()
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(state) = snapshot {
+                let msg = serde_json::json!({ "job_id": job_id.to_string(), "job": state });
+                let _ = events_tx.send(msg.to_string());
+            }
+        }
+    });
+    flag
+}
+
 // Eight parameters reflects the actual lifecycle data this ticker
 // needs to broadcast and the four progress sinks it reads. Bundling
 // them into a struct would just move the surface area without
@@ -1498,6 +1544,7 @@ async fn ps5_to_ps5_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
     let jobs = Arc::clone(&state.jobs);
@@ -5080,6 +5127,7 @@ async fn transfer_file_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
 
@@ -5094,6 +5142,12 @@ async fn transfer_file_handler(
         Arc::clone(&progress_files),
         Arc::clone(&progress_files_finalized),
         Arc::clone(&progress_bytes_finalized),
+    );
+    let progress_settling = watch_settling(
+        Arc::clone(&jobs),
+        events_tx.clone(),
+        job_id,
+        Arc::clone(&stop_ticker),
     );
 
     let bandwidth_cap = req.bandwidth_cap_mbps;
@@ -5117,6 +5171,7 @@ async fn transfer_file_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_settling = Some(Arc::clone(&progress_settling));
         apply_per_request_bandwidth(&mut cfg, bandwidth_cap);
 
         if fail_job_if_capacity_insufficient(
@@ -5301,6 +5356,7 @@ async fn transfer_dir_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
 
@@ -5442,6 +5498,7 @@ async fn transfer_dir_handler(
                 files_finalized: 0,
                 files_finalizing_total: 0,
                 bytes_finalized: 0,
+                settling: None,
             },
         );
 
@@ -5455,6 +5512,12 @@ async fn transfer_dir_handler(
             Arc::clone(&progress_files_finalized),
             Arc::clone(&progress_bytes_finalized),
         );
+        let progress_settling = watch_settling(
+            Arc::clone(&jobs),
+            events_tx.clone(),
+            job_id,
+            Arc::clone(&stop_ticker),
+        );
         // See ticker stop-guard rationale at the file-upload spawn site.
         let _stop_guard = TickerStopGuard::new(stop_ticker);
         let mut cfg = make_transfer_config(&addr);
@@ -5467,6 +5530,7 @@ async fn transfer_dir_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_settling = Some(Arc::clone(&progress_settling));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes. Folder uploads
         // previously used only 2 retries while single-file used 5, so a single
@@ -5989,6 +6053,7 @@ async fn transfer_zip_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
 
@@ -6003,6 +6068,12 @@ async fn transfer_zip_handler(
         Arc::clone(&progress_files),
         Arc::clone(&progress_files_finalized),
         Arc::clone(&progress_bytes_finalized),
+    );
+    let progress_settling = watch_settling(
+        Arc::clone(&jobs),
+        events_tx.clone(),
+        job_id,
+        Arc::clone(&stop_ticker),
     );
 
     tokio::task::spawn_blocking(move || {
@@ -6031,6 +6102,7 @@ async fn transfer_zip_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_settling = Some(Arc::clone(&progress_settling));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes, matching the file
         // and folder routes. The archive routes used to hard-code 2, so a
@@ -7515,6 +7587,7 @@ async fn transfer_7z_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
 
@@ -7530,6 +7603,12 @@ async fn transfer_7z_handler(
         Arc::clone(&progress_files_finalized),
         Arc::clone(&progress_bytes_finalized),
     );
+    let progress_settling = watch_settling(
+        Arc::clone(&jobs),
+        events_tx.clone(),
+        job_id,
+        Arc::clone(&stop_ticker),
+    );
 
     tokio::task::spawn_blocking(move || {
         let _stop_guard = TickerStopGuard::new(stop_ticker);
@@ -7544,6 +7623,7 @@ async fn transfer_7z_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_settling = Some(Arc::clone(&progress_settling));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes, matching the file
         // and folder routes. The archive routes used to hard-code 2, so a
@@ -7762,6 +7842,7 @@ async fn transfer_rar_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
 
@@ -7776,6 +7857,12 @@ async fn transfer_rar_handler(
         Arc::clone(&progress_files),
         Arc::clone(&progress_files_finalized),
         Arc::clone(&progress_bytes_finalized),
+    );
+    let progress_settling = watch_settling(
+        Arc::clone(&jobs),
+        events_tx.clone(),
+        job_id,
+        Arc::clone(&stop_ticker),
     );
 
     tokio::task::spawn_blocking(move || {
@@ -7804,6 +7891,7 @@ async fn transfer_rar_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_settling = Some(Arc::clone(&progress_settling));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes, matching the file
         // and folder routes. The archive routes used to hard-code 2, so a
@@ -8032,6 +8120,7 @@ async fn transfer_file_list_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
 
@@ -8046,6 +8135,12 @@ async fn transfer_file_list_handler(
         Arc::clone(&progress_files),
         Arc::clone(&progress_files_finalized),
         Arc::clone(&progress_bytes_finalized),
+    );
+    let progress_settling = watch_settling(
+        Arc::clone(&jobs),
+        events_tx.clone(),
+        job_id,
+        Arc::clone(&stop_ticker),
     );
 
     tokio::task::spawn_blocking(move || {
@@ -8073,6 +8168,7 @@ async fn transfer_file_list_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_settling = Some(Arc::clone(&progress_settling));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // All transfer endpoints share the same 3-attempt resume policy
         // (1 fresh + 2 resumes). See `transfer_dir_handler` for rationale.
@@ -8245,6 +8341,7 @@ fn start_ava1_download(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
     let jobs = Arc::clone(&state.jobs);
@@ -8545,6 +8642,7 @@ async fn transfer_download_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
 
@@ -8761,6 +8859,7 @@ async fn transfer_download_zip_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
 
@@ -9003,6 +9102,7 @@ async fn transfer_dir_reconcile_handler(
             files_finalized: 0,
             files_finalizing_total: 0,
             bytes_finalized: 0,
+            settling: None,
         },
     );
 
@@ -9192,6 +9292,7 @@ async fn transfer_dir_reconcile_handler(
                 files_finalized: 0,
                 files_finalizing_total: 0,
                 bytes_finalized: 0,
+                settling: None,
             },
         );
         let stop_ticker = spawn_progress_ticker(
@@ -9203,6 +9304,12 @@ async fn transfer_dir_reconcile_handler(
             Arc::clone(&progress_files),
             Arc::clone(&progress_files_finalized),
             Arc::clone(&progress_bytes_finalized),
+        );
+        let progress_settling = watch_settling(
+            Arc::clone(&jobs),
+            events_tx.clone(),
+            job_id,
+            Arc::clone(&stop_ticker),
         );
         // Same panic-survive contract as the other transfer endpoints.
         // (fail_guard was installed at the top of this closure.)
@@ -9244,6 +9351,7 @@ async fn transfer_dir_reconcile_handler(
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
+        cfg.progress_settling = Some(Arc::clone(&progress_settling));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes. Covers several
         // payload hiccups mid-transfer (incl. the serial accept loop briefly
@@ -10883,6 +10991,7 @@ mod helpers_tests {
                 files_finalized: 0,
                 files_finalizing_total: 0,
                 bytes_finalized: 0,
+                settling: None,
             },
         )])));
         let (events_tx, _) = broadcast::channel::<String>(8);
@@ -10923,6 +11032,50 @@ mod helpers_tests {
             _ => panic!("expected running job"),
         }
         drop(guard);
+        stop.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn the_running_job_carries_settling_while_the_console_finishes_and_only_then() {
+        // Durable-by-log (SPEC.md §15.7): the console acknowledged the whole upload but is still making
+        // files durable in place; the job stays Running with `settling: true`, and the note goes away.
+        let job_id = Uuid::new_v4();
+        let running = JobState::Running {
+            stage: None,
+            started_at_ms: 1,
+            bytes_sent: 5,
+            total_bytes: 5,
+            files: vec![],
+            skipped_files: 0,
+            skipped_bytes: 0,
+            files_processing: 0,
+            files_finalized: 0,
+            files_finalizing_total: 0,
+            bytes_finalized: 0,
+            settling: None,
+        };
+        let j = serde_json::to_value(&running).unwrap();
+        assert!(j.get("settling").is_none(), "absent unless settling: {j}");
+        let jobs = Arc::new(Mutex::new(HashMap::from([(job_id, running)])));
+        let (events_tx, mut events_rx) = broadcast::channel::<String>(8);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = watch_settling(Arc::clone(&jobs), events_tx, job_id, Arc::clone(&stop));
+        let settling_now = |jobs: &Arc<Mutex<HashMap<Uuid, JobState>>>| {
+            let g = jobs.lock().unwrap_or_else(|e| e.into_inner());
+            match g.get(&job_id) {
+                Some(JobState::Running { settling, .. }) => *settling,
+                _ => panic!("expected a running job"),
+            }
+        };
+        assert_eq!(settling_now(&jobs), None);
+        flag.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(settling_now(&jobs), Some(true));
+        let msg = events_rx.try_recv().expect("the change was broadcast");
+        assert!(msg.contains("\"settling\":true"), "{msg}");
+        flag.store(false, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(settling_now(&jobs), None);
         stop.store(true, Ordering::Release);
     }
 
@@ -11428,6 +11581,7 @@ mod job_stage_tests {
             files_finalizing_total: 0,
             bytes_finalized: 0,
             stage,
+            settling: None,
         }
     }
 

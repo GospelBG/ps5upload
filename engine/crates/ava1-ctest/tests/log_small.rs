@@ -328,7 +328,7 @@ fn a_crash_after_the_sweep_is_journaled_before_the_segment_goes_leaves_nothing_b
     // crash point 10: JnlSweep is durable, the pack file still exists; recovery finds nothing unswept
     // and removes the stray segment
     let (r, t, done) = crash_and_resume("c-after-sweep", 10, 30, |_| {});
-    assert!(done.len() >= 1, "{done:?}");
+    assert!(!done.is_empty(), "{done:?}");
     assert_eq!(r.wait(15_000), 0, "{}", r.events());
     all_there(&t, 30);
     settled(&r);

@@ -2820,6 +2820,7 @@ static void maybe_sweep(ava1_job_t *j, uint64_t now) {
         pthread_mutex_lock(&j->mu);
         j->settled = 1;
         pthread_mutex_unlock(&j->mu);
+        ava1_apply_status(j); /* the last one: unswept is gone, a waiting sender may report */
     }
     if (!want) return;
     w = calloc(1, sizeof *w);
@@ -2880,7 +2881,8 @@ static void *job_main(void *arg) {
         if (all_done(j)) finish(j);
         if (now - j->status_ms >= 250) {
             j->status_ms = now;
-            if (!j->finished) ava1_apply_status(j);
+            /* while files settle behind JobDone the sender still reads Status (its `unswept`) */
+            if (!j->finished || j->unswept_n) ava1_apply_status(j);
         }
         if (now - j->tune_ms >= 2000 && j->prepared && !j->finished) tune_workers(j, now);
     }

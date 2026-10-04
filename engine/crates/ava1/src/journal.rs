@@ -306,13 +306,13 @@ impl State {
                 self.unswept = s
                     .unswept
                     .as_deref()
-                    .map(|b| item_stream::<FileRun>(b))
+                    .map(item_stream::<FileRun>)
                     .map(|v| from_runs(&v))
                     .unwrap_or_default();
                 self.packs = s
                     .segments
                     .as_deref()
-                    .map(|b| item_stream::<PackRef>(b))
+                    .map(item_stream::<PackRef>)
                     .unwrap_or_default();
             }
             Record::Done(s) => self.finished = Some(*s),
