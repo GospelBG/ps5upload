@@ -89,6 +89,15 @@ int ava1_pend_full(void);  /* the global pending-fd count has reached its share 
 /* Tests only: 0 = derive from the limit; else forces the budget. Peaks are high-water marks
  * since the last reset. */
 extern uint32_t ava1_data_test_fd_budget;
+/* Large-file descriptors (a part file, and an outboard from two groups up, per open file): all jobs
+ * share a quarter of the budget, one job half of that. try_reserve takes `n` or returns 0. */
+uint32_t ava1_lf_share(void);
+uint32_t ava1_lf_job_share(void);
+int ava1_lf_try_reserve(uint32_t n);
+void ava1_lf_release(uint32_t n);
+void ava1_lf_force_reserve(uint32_t n);
+uint32_t ava1_lf_peak(void);
+void ava1_lf_peak_reset(void);
 uint32_t ava1_pend_peak(void);
 void ava1_pend_peak_reset(void);
 extern uint32_t ava1_data_test_cal_peak; /* most fds disk.calibrate held at once */

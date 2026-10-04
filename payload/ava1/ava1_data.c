@@ -251,6 +251,55 @@ void ava1_pend_release(uint32_t n) {
     }
 }
 
+/* Descriptors held by large files (each open one holds a part file and, from two groups up, an
+ * outboard) until the file commits. They used to be uncapped: a first group that spanned thousands
+ * of files kept two descriptors per file and used the whole table (about 600 on the console), so
+ * every accept() and open() failed (final review: console). A quarter of the budget, all jobs
+ * together; the pending small files take half, and the rest covers the writers' transient dups,
+ * the journals, the pack logs and the sockets. */
+static uint32_t g_lf_open, g_lf_peak;
+
+uint32_t ava1_lf_share(void) {
+    uint32_t s = ava1_fd_budget() / 4;
+    return s < 8 ? 8 : s;
+}
+
+uint32_t ava1_lf_job_share(void) {
+    uint32_t s = ava1_lf_share() / 2;
+    return s < 4 ? 4 : s;
+}
+
+int ava1_lf_try_reserve(uint32_t n) {
+    uint32_t cur = __atomic_load_n(&g_lf_open, __ATOMIC_SEQ_CST);
+    while (cur + n <= ava1_lf_share()) {
+        if (__atomic_compare_exchange_n(&g_lf_open, &cur, cur + n, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            uint32_t pk = __atomic_load_n(&g_lf_peak, __ATOMIC_SEQ_CST);
+            while (cur + n > pk &&
+                   !__atomic_compare_exchange_n(&g_lf_peak, &pk, cur + n, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* A reserve that cannot refuse (a commit's reopen): counted, so the peak shows an overshoot. */
+void ava1_lf_force_reserve(uint32_t n) {
+    uint32_t now = __atomic_add_fetch(&g_lf_open, n, __ATOMIC_SEQ_CST);
+    uint32_t pk = __atomic_load_n(&g_lf_peak, __ATOMIC_SEQ_CST);
+    while (now > pk && !__atomic_compare_exchange_n(&g_lf_peak, &pk, now, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
+}
+
+void ava1_lf_release(uint32_t n) {
+    uint32_t cur = __atomic_load_n(&g_lf_open, __ATOMIC_SEQ_CST);
+    while (n) {
+        uint32_t take = cur < n ? cur : n;
+        if (__atomic_compare_exchange_n(&g_lf_open, &cur, cur - take, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;
+    }
+}
+
+uint32_t ava1_lf_peak(void) { return __atomic_load_n(&g_lf_peak, __ATOMIC_SEQ_CST); }
+void ava1_lf_peak_reset(void) { __atomic_store_n(&g_lf_peak, __atomic_load_n(&g_lf_open, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST); }
+
 uint32_t ava1_pend_peak(void) { return __atomic_load_n(&g_pend_peak, __ATOMIC_SEQ_CST); }
 void ava1_pend_peak_reset(void) { __atomic_store_n(&g_pend_peak, __atomic_load_n(&g_pend_open, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST); }
 
