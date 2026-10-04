@@ -109,9 +109,16 @@ kept.
       desktop's directory) evict each other's console session. Give each engine its own data
       directory. The engine warns ("another ps5upload engine using the same identity is
       connected to this console") when a session is superseded 3 times in 120 s.
-- [ ] Zip downloads restart the archive from zero on a reconnect (a fresh job per attempt; the
-      reported progress stays monotonic). FTX2 resumes mid-entry, so this is a measured regression:
-      implement an in-run resume, or accept it explicitly in the release notes.
+- [x] Zip downloads resume on a reconnect (review 003 section 5, P3 Task 15): the archive is Stored
+      by default and resumes mid-entry from the receiver's journal (`SPEC.md` section 10.1). The
+      optional Deflate archive cannot resume and restarts from zero on a drop.
+- [ ] Zip resume restart window: a drop after a file's last range is journaled but before the file's
+      Done record makes `StoredZipSink::position` refuse (the file is whole but unfinished) and the
+      receiver restarts the archive from zero. The window is one sync batch wide (about 250 ms per
+      file boundary). Not fixed: finishing such a file needs the receiver to commit it without any
+      new frame, which it does not do for a fully durable partial file. Finished entries' data is
+      trusted from the journal (only their headers and descriptors are re-read); the in-flight
+      entry's durable groups are re-hashed by the receiver's resume check.
 - [ ] A failed download into an existing folder leaves its per-file `.ava-part` behind; cleanup is
       only done for new destinations.
 - [ ] The engine never removes `<data dir>/ava/jobs/*` or `<data dir>/ava/send/*` (`SPEC.md` §14.3
@@ -226,3 +233,37 @@ The Phat's usb0 numbers are far below the Pro's for both protocols and its AVA1 
 third of FTX2's there; that is unexplained and is a reason to re-run the Phat before the release.
 FTX2 resume failed in every Phat run (the harness did not wait for the helper's ports after a
 restart; fixed in `a67ea278`, re-run pending on the Phat).
+
+### 4.1 Benchmark knobs, bottleneck line and the lane-path changes (review 003)
+
+Engine environment, for benchmarking only (they override the governor; never set them in
+production):
+
+| variable | effect |
+|----------|--------|
+| `PS5UPLOAD_AVA1_LANES=n` | pin the lane count at n (1-8) for the whole job |
+| `PS5UPLOAD_AVA1_CHUNK=m` | pin the chunk at m MiB (1-15) for the whole job |
+| `PS5UPLOAD_AVA1_LANES_FIRST=0` | turn the lanes-before-chunk governor policy off (default on) to A/B it |
+
+Matrix to run on the Pro and the Phat (4 GiB to `/data`): lanes in {2, 4, 8} x chunk in {1, 4, 15}, plus
+`crypto.bench mib=64` and `disk.calibrate` for the drive. Every job now ends with one engine stderr line:
+
+    [ava1] job bottlenecks over N ticks: credit-starved X%, source-starved Y%, receiver-bound Z%; receiver reported disk; avg lanes L, avg chunk C MiB
+
+Copy that line, `crypto.bench` and `disk.calibrate`'s `create_us`/`fsync_us` into each row so a result says
+where the time went. Rows to fill (not measured yet; the consoles were reserved):
+
+| lanes x chunk | MB/s | credit-starved | source-starved | receiver-bound | receiver reported |
+|---------------|------|----------------|----------------|----------------|-------------------|
+| (pending hardware) | | | | | |
+
+Landed in code, all host-tested, none yet measured on a console: 4 MiB socket buffers on every lane
+(both ends, effective sizes logged once: the engine on stderr, the console in its log), a frame-buffer
+pool on the console (1/4/8/15/16 MiB classes for class-sized chunks, every other size allocated exactly, so live frame memory is the credit window's byte count; idle pool memory capped at the admit budget), a single copy per
+sent frame on the engine (the in-flight frame is shared with the writer, which seals into one
+buffer), the lanes-first governor policy (default on, to A/B), and `dead_after` 12 s with the ping
+at 2 s.
+
+Deferred: decrypt off the lane reader thread (03 section 2) waits for the matrix above; the
+`open_us_per_mib` receiver hint (03 section 5) is optional and also waits.
+

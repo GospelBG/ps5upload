@@ -1,4 +1,5 @@
 #include "ava1_job.h"
+#include "ava1_frame.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -174,7 +175,8 @@ void ava1_job_foreach(void (*fn)(ava1_job_t *j, void *ctx), void *ctx) {
 static void free_frames(ava1_inframe_t *f) {
     while (f) {
         ava1_inframe_t *n = f->next;
-        free(f->body);
+        if (f->cap) (void)ava1_frame_free(f->body, f->cap);
+        else free(f->body);
         free(f);
         f = n;
     }
@@ -203,7 +205,8 @@ static void job_destroy(ava1_job_t *j) {
     if (j->role_free) j->role_free(j);
     while ((w = j->q_head) != NULL) {
         j->q_head = w->next;
-        free(w->owned);
+        if (w->owned_cap) (void)ava1_frame_free(w->owned, w->owned_cap);
+        else free(w->owned);
         free(w);
     }
     for (i = 0; i < j->pend_n; i++) close(j->pend_fd[i]);

@@ -55,3 +55,17 @@ fn payload_ava1_uses_only_monotonic_clocks() {
         "the generated sources under gen/ were not scanned"
     );
 }
+
+/// The console's liveness defaults must match the engine's (`Timing::default`, SPEC.md
+/// section 6): a 2 s ping and a 12 s verdict. The glue file is not built on the host, so
+/// this reads its text.
+#[test]
+fn the_payload_glue_uses_the_spec_liveness_defaults() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let glue = std::fs::read_to_string(root.join("payload/src/ava1_glue.c")).unwrap();
+    assert!(glue.contains("cfg.ping_every_ms = 2000;"), "ping is 2 s");
+    assert!(
+        glue.contains("cfg.dead_after_ms = 12000;"),
+        "dead_after is 12 s"
+    );
+}

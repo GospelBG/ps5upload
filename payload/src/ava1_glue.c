@@ -24,7 +24,8 @@
 #include "config.h"
 #include "fs_jobs.h"
 #include "mgmt_rpc.h"
-#include "cross_device.h" /* payload/include, not next to the AVA1 sources */
+#include "cross_device.h"
+#include "path_policy.h" /* payload/include, not next to the AVA1 sources */
 #include "monocypher.h"
 #include "ps5_firmware.h"
 #include "runtime.h"
@@ -36,18 +37,21 @@
  * Without it the data plane's methods are unknown here, matching the missing CAP. */
 static int g_data_on;
 
-static int may_write(const char *p) { return is_path_allowed(p); }
+/* Data-plane jobs (upload root, download root, job.copy source and destination) walk trees, so they refuse the
+ * trust store AND its ancestors (path_policy.h: path_tree_op_refused). */
+static int may_write(const char *p) { return is_path_allowed(p) && !path_tree_op_refused(p); }
 
 /* The same rule the FTX2 read handlers use (runtime.c): the writable allowlist, or a system
  * partition read when the peer asked for an unsafe read. */
 static int may_read(const char *p, int unsafe_read) {
+    if (path_tree_op_refused(p)) return 0;
     return is_path_allowed(p) || (unsafe_read && is_safe_unsafe_read_path(p));
 }
 
 /* 1 same device, 0 crosses (refuse: a cross-device rename panics this kernel), -1 unknown. */
 static int same_device(const char *from, const char *to_dir) {
     unsigned long long a, b;
-    if (xdev_stat_dev(from, &a) != 0 || xdev_stat_dev(to_dir, &b) != 0) return -1;
+    if (xdev_lstat_dev(from, &a) != 0 || xdev_stat_dev(to_dir, &b) != 0) return -1;
     return a == b ? 1 : 0;
 }
 
@@ -175,7 +179,7 @@ int ava1_payload_start(void) {
     snprintf(cfg.name, sizeof cfg.name, "%s", "PS5");
     cfg.port = AVA1_DEFAULT_PORT;
     cfg.ping_every_ms = 2000;
-    cfg.dead_after_ms = 6000;
+    cfg.dead_after_ms = 12000; /* SPEC.md section 6: the ping stays at 2 s */
     cfg.handshake_ms = 10000;
     cfg.pairing_window_s = 300;
     cfg.on_pair_request = on_pair_request;
@@ -188,6 +192,7 @@ int ava1_payload_start(void) {
         snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "%s", AVA1_JOBS);
         dc.may_write = may_write;
         dc.may_read = may_read;
+        dc.refuse_link = path_tree_op_refused;
         dc.same_device = same_device;
         if (mkdir(AVA1_JOBS, 0755) != 0 && errno != EEXIST) {
             /* Not fatal: the server and FTX2 keep working without the data plane. */

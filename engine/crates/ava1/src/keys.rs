@@ -316,6 +316,16 @@ pub fn seal(key: &[u8; 32], n: u64, ad: &[u8], buf: &mut Vec<u8>) {
     seal_nonce(key, &nonce(n), ad, buf)
 }
 
+/// `seal` for a buffer the caller already laid out: encrypts `buf` in place and returns the
+/// MAC, so a frame can be assembled (header, body) in one allocation and sealed where it
+/// lies, with no intermediate copy.
+pub fn seal_slice(key: &[u8; 32], n: u64, ad: &[u8], buf: &mut [u8]) -> [u8; MAC_LEN] {
+    let tag = aead_key(key)
+        .seal_in_place_separate_tag(Nonce::assume_unique_for_key(nonce(n)), Aad::from(ad), buf)
+        .expect("frames are far below ChaCha20's length limit");
+    tag.as_ref().try_into().expect("a 16-byte MAC")
+}
+
 /// Verifies and decrypts in place, stripping the MAC. `false` = forged, reordered or damaged.
 pub fn open(key: &[u8; 32], n: u64, ad: &[u8], buf: &mut Vec<u8>) -> bool {
     open_nonce(key, &nonce(n), ad, buf)
@@ -524,6 +534,17 @@ mod tests {
         }
         assert!(!is_low_order(&Identity::generate().unwrap().public()));
         assert!(!is_low_order(&[9u8; 32]));
+    }
+
+    #[test]
+    fn seal_slice_matches_seal_without_the_copy() {
+        let k = [8u8; 32];
+        let mut a = vec![0x5a; 4099];
+        let mut b = a.clone();
+        seal(&k, 9, b"hdr", &mut a);
+        let tag = seal_slice(&k, 9, b"hdr", &mut b);
+        b.extend_from_slice(&tag);
+        assert_eq!(a, b);
     }
 
     #[test]

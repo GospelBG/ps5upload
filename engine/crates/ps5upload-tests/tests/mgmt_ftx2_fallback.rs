@@ -104,3 +104,82 @@ fn a_method_ftx2_never_had_fails_clearly_instead_of_sending_garbage() {
     let e = mgmt::call("127.0.0.1:1", m::FS_STAT, br#"{"path":"/a"}"#).unwrap_err();
     assert!(e.to_string().contains("older one"), "{e}");
 }
+
+// ---- the Task 4 call sites keep working against an FTX2-only helper ----
+
+#[test]
+fn fs_stat_on_an_ftx2_helper_is_the_one_byte_read_it_replaced() {
+    let (_t, _g) = not_served();
+    let (addr, srv) = serve_once((FrameType::FsReadAck, b"x"));
+    let s = ps5upload_core::fs_ops::fs_stat(&addr, "/data/f").unwrap();
+    assert_eq!((s.kind.as_str(), s.size), ("file", 1));
+    let (hdr, body) = srv.join().unwrap();
+    assert_eq!(hdr.frame_type, FrameType::FsRead as u16);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        (v["path"].as_str(), v["limit"].as_u64()),
+        (Some("/data/f"), Some(1))
+    );
+    // and an absent path is still "not found", not an error the caller must guess about
+    let (addr, srv) = serve_once((FrameType::Error, b"fs_read_stat_failed"));
+    assert!(!ps5upload_core::fs_ops::fs_exists(&addr, "/data/nope").unwrap());
+    srv.join().unwrap();
+}
+
+#[test]
+fn shutdown_list_volumes_and_cleanup_use_their_legacy_frames_over_ftx2() {
+    let (_t, _g) = not_served();
+    let (addr, srv) = serve_once((FrameType::ShutdownAck, b"{}"));
+    assert!(ps5upload_core::payload_lifecycle::shutdown_running_payload(&addr).unwrap());
+    assert_eq!(srv.join().unwrap().0.frame_type, FrameType::Shutdown as u16);
+    // a process that answers with another frame is not a payload that acknowledged
+    let (addr, srv) = serve_once((FrameType::HwInfoAck, b""));
+    assert!(!ps5upload_core::payload_lifecycle::shutdown_running_payload(&addr).unwrap());
+    srv.join().unwrap();
+
+    let (addr, srv) = serve_once((FrameType::FsListVolumesAck, br#"{"volumes":[]}"#));
+    assert!(ps5upload_core::volumes::list_volumes(&addr)
+        .unwrap()
+        .volumes
+        .is_empty());
+    assert_eq!(
+        srv.join().unwrap().0.frame_type,
+        FrameType::FsListVolumes as u16
+    );
+
+    let (addr, srv) = serve_once((
+        FrameType::CleanupAck,
+        br#"{"ok":true,"path":"/data/x","removed_files":3,"removed_dirs":1}"#,
+    ));
+    let c = ps5upload_core::cleanup::cleanup_path(&addr, "/data/x").unwrap();
+    assert_eq!(c.removed_files, 3);
+    srv.join().unwrap();
+    let (addr, srv) = serve_once((FrameType::Error, b"cleanup_path_denied"));
+    let e = ps5upload_core::cleanup::cleanup_path(&addr, "/system").unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "payload rejected CLEANUP: cleanup_path_denied"
+    );
+    srv.join().unwrap();
+}
+
+#[test]
+fn net_reach_and_mounts_read_their_ok_false_bodies_over_ftx2() {
+    let (_t, _g) = not_served();
+    // FTX2 answered an unreachable host as a SUCCESS frame with ok:false; it still parses.
+    let (addr, srv) = serve_once((
+        FrameType::NetReachAck,
+        br#"{"ok":false,"timed_out":true,"errno":0,"err":"timed out","ms":3000}"#,
+    ));
+    let r = ps5upload_core::diagnostics::net_reach(&addr, "10.0.0.9", 9, 100).unwrap();
+    assert!(!r.ok && r.timed_out && r.ms == 3000);
+    srv.join().unwrap();
+    let (addr, srv) = serve_once((
+        FrameType::PkgDirectMountAck,
+        br#"{"ok":false,"code":-5,"mount_point":"/mnt/ps5upload/x"}"#,
+    ));
+    let e =
+        ps5upload_core::diagnostics::pkg_direct_mount(&addr, "/mnt/ext0/x.pkg", None).unwrap_err();
+    assert!(e.to_string().contains("PKG_DIRECT_MOUNT failed"), "{e}");
+    srv.join().unwrap();
+}

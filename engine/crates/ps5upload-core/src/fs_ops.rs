@@ -110,6 +110,69 @@ pub fn list_dir_with_timeout(
     Ok(parsed)
 }
 
+// ─── fs.stat ────────────────────────────────────────────────────────────────
+
+/// What `fs.stat` says about a path (a symbolic link is followed; a dangling one is `link`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathStat {
+    /// `file`, `dir`, `link`, `other` or `unknown`.
+    pub kind: String,
+    pub size: u64,
+    pub mtime: u64,
+    pub mode: u32,
+    /// The device id (`st_dev`): two paths with the same value share a mount.
+    #[serde(default)]
+    pub dev: u64,
+}
+
+/// `fs.stat`: metadata of one path. An absent path is an error whose text carries
+/// `fs_stat_failed_errno_2` (see [`is_not_found`]).
+///
+/// An FTX2-only helper has no such method, so there the answer is the old existence probe, a
+/// 1-byte `fs.read`: it can say a regular file is there and non-empty (`kind` file, `size` 1) or
+/// empty (`size` 0), and nothing more (`mtime`, `mode` and `dev` are 0).
+pub fn fs_stat(addr: &str, path: &str) -> Result<PathStat> {
+    let body = serde_json::to_vec(&serde_json::json!({ "path": path }))
+        .context("serialize fs_stat body")?;
+    match mgmt::call_as(addr, m::FS_STAT, &format!("FS_STAT({path})"), &body) {
+        Ok(resp) => serde_json::from_slice(&resp).context("decode FS_STAT reply as JSON"),
+        Err(e) if mgmt::is_unsupported(&e) => {
+            let b = fs_read(addr, path, 0, 1)?;
+            Ok(PathStat {
+                kind: "file".into(),
+                size: b.len() as u64,
+                mtime: 0,
+                mode: 0,
+                dev: 0,
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// True when an error from [`fs_stat`], [`fs_read`] or [`list_dir`] means "no such path".
+pub fn is_not_found(message: &str) -> bool {
+    message.contains("ENOENT")
+        || message.contains("No such file")
+        || message.split("_errno_").skip(1).any(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                == "2"
+        })
+        || message.contains("fs_read_stat_failed")
+}
+
+/// Whether `path` exists. `Ok(false)` only for a definite "no such path"; any other failure (a
+/// busy port, a timeout) is an error the caller decides about.
+pub fn fs_exists(addr: &str, path: &str) -> Result<bool> {
+    match fs_stat(addr, path) {
+        Ok(_) => Ok(true),
+        Err(e) if is_not_found(&format!("{e:#}")) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 // ─── FS_HASH ────────────────────────────────────────────────────────────────
 
 /// Response body from FS_HASH_ACK. `hash` is 64 lowercase hex characters
@@ -211,52 +274,6 @@ pub fn fs_read_with_timeout(
 }
 
 // ─── Destructive ops (delete / move / chmod / mkdir) ────────────────────────
-
-/// Send a management-port frame that expects an empty ACK body (or an
-/// error frame). Used for delete/move/chmod/mkdir which have no data
-/// to return on success — the frame type itself is the confirmation.
-fn send_empty_ack_op(
-    addr: &str,
-    frame: FrameType,
-    body: &[u8],
-    expected: FrameType,
-    what: &str,
-) -> Result<()> {
-    send_empty_ack_op_with_timeout(addr, frame, body, expected, what, None)
-}
-
-/// Same as [`send_empty_ack_op`] but with a caller-supplied per-socket
-/// I/O timeout. Used for long-running ops (fs_copy of multi-GiB files,
-/// fs_move that cross-volume falls through to copy) where the default
-/// 30 s read timeout would fire long before the payload finishes the
-/// internal disk-to-disk copy.
-fn send_empty_ack_op_with_timeout(
-    addr: &str,
-    frame: FrameType,
-    body: &[u8],
-    expected: FrameType,
-    what: &str,
-    io_timeout: Option<std::time::Duration>,
-) -> Result<()> {
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .with_context(|| format!("applying {what} I/O timeout"))?;
-    }
-    c.send_frame(frame, body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected {what}: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != expected {
-        bail!("expected {expected:?}, got {ft:?}");
-    }
-    Ok(())
-}
 
 /// Delete a file or directory recursively on the PS5. Path must be under
 /// the payload's writable-root allowlist (/data, /user, /mnt/ext*, /mnt/usb*).
@@ -817,7 +834,6 @@ pub fn fs_mount(
     mount_point: Option<&str>,
     read_only: bool,
 ) -> Result<MountResult> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::to_vec(&serde_json::json!({
         "image_path": image_path,
         "mount_name": mount_name,
@@ -825,19 +841,7 @@ pub fn fs_mount(
         "read_only": if read_only { 1 } else { 0 },
     }))
     .context("serialize fs_mount body")?;
-    c.send_frame(FrameType::FsMount, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_MOUNT({}): {}",
-            image_path,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::FsMountAck {
-        bail!("expected FS_MOUNT_ACK, got {:?}", ft);
-    }
+    let resp = mgmt::call_as(addr, m::FS_MOUNT, &format!("FS_MOUNT({image_path})"), &body)?;
     let parsed: MountResult =
         serde_json::from_slice(&resp).context("decode FS_MOUNT_ACK body as JSON")?;
     Ok(parsed)
@@ -849,13 +853,8 @@ pub fn fs_mount(
 pub fn fs_unmount(addr: &str, mount_point: &str) -> Result<()> {
     let body = serde_json::to_vec(&serde_json::json!({ "mount_point": mount_point }))
         .context("serialize fs_unmount")?;
-    send_empty_ack_op(
-        addr,
-        FrameType::FsUnmount,
-        &body,
-        FrameType::FsUnmountAck,
-        "FS_UNMOUNT",
-    )
+    mgmt::call(addr, m::FS_UNMOUNT, &body)?;
+    Ok(())
 }
 
 /// Rename/move a file or directory intra-volume. Cross-volume moves
@@ -877,14 +876,8 @@ pub fn fs_move_with_timeout(
 ) -> Result<()> {
     let body = serde_json::to_vec(&serde_json::json!({ "from": from, "to": to }))
         .context("serialize fs_move")?;
-    send_empty_ack_op_with_timeout(
-        addr,
-        FrameType::FsMove,
-        &body,
-        FrameType::FsMoveAck,
-        "FS_MOVE",
-        io_timeout,
-    )
+    mgmt::call_with(addr, m::FS_RENAME, "FS_MOVE", &body, io_timeout)?;
+    Ok(())
 }
 
 /// Change permissions. `mode` is octal like "0777" (passed as string so
@@ -927,14 +920,8 @@ pub fn fs_chmod_with_timeout(
         )?;
         return Ok(());
     }
-    send_empty_ack_op_with_timeout(
-        addr,
-        FrameType::FsChmod,
-        &body,
-        FrameType::FsChmodAck,
-        "FS_CHMOD",
-        io_timeout,
-    )
+    mgmt::call_with(addr, m::FS_CHMOD, "FS_CHMOD", &body, io_timeout)?;
+    Ok(())
 }
 
 /// Create a directory (and any missing parents). Idempotent — succeeds

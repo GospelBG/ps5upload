@@ -98,11 +98,12 @@ async function main() {
   console.log("  run-2: re-issuing SAME tx_id (resume)...");
   const r2 = await jpost("/api/transfer/file", { src: SRC, dest: DEST, addr: ADDR, tx_id: TXID });
   if (!r2.job_id) { console.log("  ✗ run-2 start failed", JSON.stringify(r2)); process.exit(1); }
-  // Diagnostic: log run-2 progress + payload active-tx every 5s so a stall is visible.
+  // Diagnostic: log run-2 progress + the payload's command count every 5s so a stall is visible
+  // (AVA1's node.status has no transaction fields; the FTX2 ones were dropped).
   const diag = setInterval(async () => {
     const j = await jget(`/api/jobs/${r2.job_id}`).catch(() => ({}));
     const st = await jget(`/api/ps5/status?addr=${encodeURIComponent(ADDR)}`).catch(() => ({}));
-    console.log(`    [diag] job=${j.status} sent=${((j.bytes_sent||0)/1048576).toFixed(0)}MiB | payload active_tx=${st.active_transactions} last_seq=${st.last_tx_seq}`);
+    console.log(`    [diag] job=${j.status} sent=${((j.bytes_sent||0)/1048576).toFixed(0)}MiB | payload commands=${st.command_count}`);
   }, 5000);
   const res2 = await pollJob(r2.job_id, 150000);
   clearInterval(diag);

@@ -41,8 +41,8 @@ struct Rig {
 }
 
 fn rig_lock() -> std::sync::MutexGuard<'static, ()> {
-    static L: Mutex<()> = Mutex::new(());
-    L.lock().unwrap_or_else(|e| e.into_inner())
+    // one serialisation scheme for every shim-global test: the shared guard (src/lib.rs)
+    CServer::lock_for_shim_tests()
 }
 
 async fn rig(tag: &str) -> (Rig, Session) {
@@ -145,11 +145,12 @@ fn audit(check: &str) {
 fn real_table() -> Vec<(String, String)> {
     let src = std::fs::read_to_string(payload().join("src/mgmt_table.def")).unwrap();
     src.lines()
-        .filter(|l| l.starts_with("MGMT_H"))
+        .filter(|l| l.starts_with("MGMT_H") || l.starts_with("MGMT_N"))
         .map(|l| {
             let inner = &l[l.find('(').unwrap() + 1..l.rfind(')').unwrap()];
             let f: Vec<&str> = inner.split(',').map(str::trim).collect();
-            assert_eq!(f.len(), 6, "{l}");
+            // MGMT_H0/H1/HS: method, frame, ack, flags, handler, runner. MGMT_N: ..., run.
+            assert_eq!(f.len(), if l.starts_with("MGMT_N") { 5 } else { 6 }, "{l}");
             (f[0].to_string(), f[3].to_string())
         })
         .collect()

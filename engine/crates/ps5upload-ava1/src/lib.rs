@@ -23,6 +23,8 @@ pub mod seq;
 pub mod source;
 pub mod upload;
 pub mod zip_source;
+mod zip_stored;
+pub use zip_stored::StoredZipSink;
 
 pub use pool::{pool, Pool, JOURNAL_GC_EVERY, JOURNAL_MAX_AGE_S};
 pub use upload::{PostCommitError, PostCommitKind};

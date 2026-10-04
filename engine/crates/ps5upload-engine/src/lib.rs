@@ -67,11 +67,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use ftx2_proto::FrameType;
 use ps5upload_core::{
     app_lifecycle::{app_lifecycle, AppAction},
     cleanup::{cleanup_path, CleanupResult},
-    connection::Connection,
     diagnostics::appdb_query,
     diagnostics::{klog_read, net_interfaces},
     download::{
@@ -4104,12 +4102,11 @@ async fn ps5_game_meta(
                     application_category_type,
                 )
             };
-        // icon0.png probe — read the first byte to confirm it exists.
-        // Avoids pulling the full image just to know whether to set
-        // `has_icon`. Errors (path denied, not found) treated as "no icon".
+        // icon0.png probe — `fs.stat` confirms a non-empty regular file without pulling
+        // the image. Errors (path denied, not found) treated as "no icon".
         let icon_path = format!("{}/sce_sys/icon0.png", path.trim_end_matches('/'));
-        let has_icon = fs_read(&addr, &icon_path, 0, 1)
-            .map(|b| !b.is_empty())
+        let has_icon = ps5upload_core::fs_ops::fs_stat(&addr, &icon_path)
+            .map(|s| s.kind == "file" && s.size > 0)
             .unwrap_or(false);
         Ok(GameMetaResponse {
             title,
@@ -4830,14 +4827,12 @@ async fn ps5_status(
     Query(q): Query<AddrQuery>,
 ) -> impl IntoResponse {
     let addr = mgmt_addr_or_default(q.addr, &state.default_ps5_addr);
+    // `node.status` through the management seam: the typed AVA1 NodeStatus is rebuilt into the
+    // legacy JSON (`ucred_elevated` a bool, `prior_instance` only when present). The FTX2
+    // transaction fields (runtime_port, shutdown, takeover_requested, active_transactions,
+    // last_tx_seq, recovered_transactions) no longer exist; nothing reads them.
     let result = tokio::task::spawn_blocking(move || {
-        let mut c = Connection::connect(&addr)?;
-        c.send_frame(FrameType::Status, b"")?;
-        let (hdr, body) = c.recv_frame()?;
-        let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-        if ft != FrameType::StatusAck {
-            anyhow::bail!("expected STATUS_ACK, got {ft:?}");
-        }
+        let body = ps5upload_core::mgmt::call(&addr, ps5upload_core::mgmt::m::NODE_STATUS, b"")?;
         let json: serde_json::Value = serde_json::from_slice(&body)?;
         Ok::<_, anyhow::Error>(json)
     })
@@ -8180,8 +8175,8 @@ struct TransferDownloadReq {
 enum Ava1DownloadTarget {
     /// A tree under this directory: `dest_dir/<basename>`.
     Folder(std::path::PathBuf),
-    /// One `.zip` at this path.
-    Zip(std::path::PathBuf),
+    /// One `.zip` at this path, Stored (resumable) or Deflated (cannot resume).
+    Zip(std::path::PathBuf, ps5upload_ava1::download::ZipCompression),
 }
 
 /// Starts a console -> computer download over AVA1 and answers `ACCEPTED` with the job id,
@@ -8214,7 +8209,7 @@ fn start_ava1_download(
         .to_string();
     let dest_display = match &target {
         Ava1DownloadTarget::Folder(dir) => dir.join(&basename).to_string_lossy().to_string(),
-        Ava1DownloadTarget::Zip(zip) => zip.to_string_lossy().to_string(),
+        Ava1DownloadTarget::Zip(zip, _) => zip.to_string_lossy().to_string(),
     };
     crate::log_info!("transfer_download: job={job_id} protocol=ava1 src={src} dest={dest_display}");
     let progress = Arc::new(AtomicU64::new(0));
@@ -8283,12 +8278,13 @@ fn start_ava1_download(
                 &counters,
                 Some(cancel),
             ),
-            Ava1DownloadTarget::Zip(zip) => ps5upload_ava1::download::to_zip(
+            Ava1DownloadTarget::Zip(zip, compression) => ps5upload_ava1::download::to_zip_with(
                 &addr,
                 &src,
                 kind,
                 zip,
                 unsafe_read,
+                *compression,
                 id,
                 &counters,
                 Some(cancel),
@@ -8633,6 +8629,10 @@ struct TransferDownloadZipReq {
     /// allow-list (e.g. /system, /system_data). Read-only. Default false.
     #[serde(default)]
     unsafe_read: bool,
+    /// "stored" (default: resumes mid-entry after a dropped connection) or "deflate"
+    /// (smaller for text-heavy trees; cannot resume, so a drop restarts the archive).
+    #[serde(default)]
+    compression: Option<String>,
 }
 
 /// POST /api/transfer/download-zip — pull a PS5 file/folder straight into a
@@ -8670,6 +8670,17 @@ async fn transfer_download_zip_handler(
         return json_err(StatusCode::BAD_REQUEST, "dest_zip cannot be empty").into_response();
     }
     let dest_zip = std::path::PathBuf::from(&req.dest_zip);
+    let zip_compression = match req.compression.as_deref() {
+        None | Some("") | Some("stored") => ps5upload_ava1::download::ZipCompression::Stored,
+        Some("deflate") => ps5upload_ava1::download::ZipCompression::Deflate,
+        Some(other) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                &format!("compression must be \"stored\" or \"deflate\", not {other:?}"),
+            )
+            .into_response();
+        }
+    };
     let req_unsafe_zip = req.unsafe_read;
     // The save dialog hands us a path inside an existing dir, but verify the
     // parent is a real directory (off-reactor — it may be a network mount) so a
@@ -8703,7 +8714,7 @@ async fn transfer_download_zip_handler(
             req.src_path.clone(),
             kind,
             req_unsafe_zip,
-            Ava1DownloadTarget::Zip(dest_zip),
+            Ava1DownloadTarget::Zip(dest_zip, zip_compression),
         );
     }
 

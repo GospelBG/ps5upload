@@ -9,9 +9,41 @@ use zeroize::Zeroizing;
 use crate::frame::{
     Header, HeaderError, CONTROL_MAX_BODY, FLAG_IGNORABLE, FLAG_SEALED, HEADER_LEN, MAX_BODY,
 };
-use crate::keys::{open, seal, MAC_LEN};
+use crate::keys::{open, seal_slice, MAC_LEN};
 use crate::wire::FrameMessage;
 use crate::Ava1Error;
+
+/// A frame body on its way out: owned, or shared with the sender's bookkeeping. The data
+/// plane keeps every in-flight frame (a lane death requeues it), so the writer borrows the
+/// same bytes instead of taking a copy: the one copy per frame is the sealed output buffer
+/// (review 003 §5 of 01).
+#[derive(Debug, Clone)]
+pub enum FrameBody {
+    Owned(Vec<u8>),
+    Shared(Arc<Vec<u8>>),
+}
+
+impl std::ops::Deref for FrameBody {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            FrameBody::Owned(v) => v,
+            FrameBody::Shared(a) => a,
+        }
+    }
+}
+
+impl From<Vec<u8>> for FrameBody {
+    fn from(v: Vec<u8>) -> Self {
+        FrameBody::Owned(v)
+    }
+}
+
+impl From<Arc<Vec<u8>>> for FrameBody {
+    fn from(a: Arc<Vec<u8>>) -> Self {
+        FrameBody::Shared(a)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -130,14 +162,15 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
             body_len,
         }
         .encode();
+        // One buffer: header, then the body sealed where it lies, then the MAC.
         let mut out = Vec::with_capacity(HEADER_LEN + total);
         out.extend_from_slice(&h);
-        let mut sealed = body.to_vec();
+        out.extend_from_slice(body);
         if let Some(k) = &self.key {
-            seal(k, self.ctr, &h[..12], &mut sealed);
+            let tag = seal_slice(k, self.ctr, &h[..12], &mut out[HEADER_LEN..]);
+            out.extend_from_slice(&tag);
             self.ctr += 1;
         }
-        out.extend_from_slice(&sealed);
         // Broken until proven whole: a failure (or a dropped future) anywhere below leaves
         // a partial frame or a spent counter, after which nothing more may be sent.
         self.broken = true;
@@ -292,6 +325,32 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_body_is_borrowed_not_copied() {
+        let a = Arc::new(vec![7u8; 1 << 20]);
+        let b: FrameBody = a.clone().into();
+        assert_eq!(b.as_ptr(), a.as_ptr(), "same bytes, no memcpy");
+        assert_eq!(b.len(), 1 << 20);
+        let o: FrameBody = vec![1u8, 2, 3].into();
+        assert_eq!(&*o, &[1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_shared_body_seals_to_the_same_wire_bytes_as_an_owned_one() {
+        let key = [0x33u8; 32];
+        let body: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
+        let mut w = FrameWriter::new(Vec::new());
+        w.set_key(key);
+        let shared: FrameBody = Arc::new(body.clone()).into();
+        w.send_with_flags(0x20, 0, 5, &shared).await.unwrap();
+        // The shared body is untouched (it may be resent), and the frame opens.
+        assert_eq!(&*shared, &body[..]);
+        let wire = w.into_inner();
+        let mut r = FrameReader::new(&wire[..]);
+        r.set_key(key);
+        assert_eq!(r.recv().await.unwrap().body, body);
+    }
 
     async fn sealed_frame(key: [u8; 32]) -> Vec<u8> {
         let mut w = FrameWriter::new(Vec::new());

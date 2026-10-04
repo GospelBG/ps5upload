@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use ava1::gen::{self, MgmtText};
@@ -28,7 +28,7 @@ mod paged;
 
 use crate::mgmt_convert as conv;
 use crate::pool::{host_of, pool, Pool};
-use crate::route::{mode, use_ava1_in, Mode};
+use crate::route::{mode, use_ava1_mgmt_in, Mode};
 
 /// In-flight calls the payload allows per session (`RPC_WORKERS`, SPEC.md section 7.4).
 pub const IN_FLIGHT: usize = ava1::server::RPC_WORKERS;
@@ -43,9 +43,6 @@ pub const BUSY_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(300),
     Duration::from_millis(900),
 ];
-/// How long a console that answered `ERR_UNKNOWN_METHOD` (an older AVA1 helper without the
-/// management methods) is sent to FTX2 without asking again.
-const NO_MGMT_TTL: Duration = Duration::from_secs(30);
 
 /// True for the methods the reserved slots exist for.
 pub fn is_priority(method: u16) -> bool {
@@ -72,6 +69,9 @@ fn is_read_only(method: u16) -> bool {
             | gen::METHOD_FS_READ
             | gen::METHOD_LOG_KLOG
             | gen::METHOD_LOG_SYSLOG
+            | gen::METHOD_NET_INTERFACES
+            | gen::METHOD_NET_REACH
+            | gen::METHOD_NET_SPEEDTEST
             | gen::METHOD_HW_INFO
             | gen::METHOD_HW_TEMPS
             | gen::METHOD_HW_POWER
@@ -221,7 +221,6 @@ pub const TAIL_CLIPPED: &str =
 pub struct AvaTransport {
     pool: PoolRef,
     gates: Mutex<HashMap<String, Arc<MgmtGate>>>,
-    no_mgmt: Mutex<HashMap<String, Instant>>,
     busy_delays: [Duration; 3],
 }
 
@@ -245,7 +244,6 @@ impl AvaTransport {
         Self {
             pool,
             gates: Mutex::default(),
-            no_mgmt: Mutex::default(),
             busy_delays: BUSY_RETRY_DELAYS,
         }
     }
@@ -274,27 +272,11 @@ impl AvaTransport {
             .clone()
     }
 
-    /// Whether this console is served over AVA1 for management: the same `use_ava1`
-    /// decision uploads make, minus a console that just said it has no management methods.
+    /// Whether this console is served over AVA1 for management: it advertises `CAP_MGMT`
+    /// (the node says so in its `ServerInfo`; nothing is sent to find out). An older AVA1
+    /// helper that has transfers but no management methods goes to FTX2.
     pub(crate) fn serves(&self, console: &str) -> bool {
-        if mode() == Mode::Auto {
-            let mut n = self.no_mgmt.lock().unwrap_or_else(|e| e.into_inner());
-            match n.get(&host_of(console)) {
-                Some(t) if t.elapsed() < NO_MGMT_TTL => return false,
-                Some(_) => {
-                    n.remove(&host_of(console));
-                }
-                None => {}
-            }
-        }
-        use_ava1_in(self.pool(), console)
-    }
-
-    pub(crate) fn mark_no_mgmt(&self, console: &str) {
-        self.no_mgmt
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(host_of(console), Instant::now());
+        use_ava1_mgmt_in(self.pool(), console)
     }
 
     /// One RPC: gate permit, `ERR_BUSY` retries, one resend on a lost session for
@@ -414,15 +396,17 @@ impl AvaTransport {
         timeout: Duration,
     ) -> Result<Option<Vec<u8>>> {
         let r = self.dispatch(console, method, label, body, timeout).await;
-        if let Err(e) = &r {
-            let unknown = e
-                .downcast_ref::<MgmtError>()
-                .is_some_and(|m| m.status == gen::ERR_UNKNOWN_METHOD);
-            if unknown && mode() == Mode::Auto {
-                // An older AVA1 helper: it speaks transfers but has no management methods.
-                self.mark_no_mgmt(console);
-                return Ok(None);
-            }
+        // The two methods that run as job.run ops: see run_job (a CAP_MGMT helper without job.run).
+        if matches!(method.id, gen::METHOD_NODE_CLEANUP | gen::METHOD_SDK_SCAN)
+            && is_unknown_method(&r)
+            && mode() == Mode::Auto
+        {
+            // Still a CAP_MGMT helper: ask for the plain method (Task 7 serves sdk.scan as one too).
+            let plain = self.text(console, method, label, body, timeout).await;
+            return match plain {
+                Ok(b) => Ok(Some(b)),
+                Err(_) => Ok(None),
+            };
         }
         r
     }
@@ -457,6 +441,11 @@ impl AvaTransport {
                     .rpc(console, id, label, &req.to_bytes()?, timeout)
                     .await?;
                 json(conv::fs_stat_reply(&gen::FsStat::decode(&r)?))
+            }
+            gen::METHOD_NODE_SHUTDOWN => {
+                // An empty reply; the FTX2 ack was `{}`.
+                self.rpc(console, id, label, &[], timeout).await?;
+                Ok(Some(b"{}".to_vec()))
             }
             gen::METHOD_FS_MKDIR => {
                 let req = conv::fs_mkdir_request(body, label)?;
@@ -665,15 +654,11 @@ impl MgmtTransport for AvaTransport {
                 return Ok(None);
             }
             let r = crate::block_on(self.run_job_async(addr, op, label, body, call));
-            if let Err(e) = &r {
-                let unknown = e
-                    .downcast_ref::<MgmtError>()
-                    .is_some_and(|m| m.status == gen::ERR_UNKNOWN_METHOD);
-                if unknown && mode() == Mode::Auto {
-                    // An older helper without job.run: FTX2 serves the operation.
-                    self.mark_no_mgmt(addr);
-                    return Ok(None);
-                }
+            if is_unknown_method(&r) && mode() == Mode::Auto {
+                // Routing is by CAP_MGMT (review M1) and nothing is probed for methods. The one exception: a
+                // helper that advertises CAP_MGMT but predates `job.run` (the Task 2-4 payloads) answers
+                // ERR_UNKNOWN_METHOD to it, and FTX2 serves the operation.
+                return Ok(None);
             }
             r
         })
@@ -714,6 +699,13 @@ fn run_blocking<R: Send>(f: impl FnOnce() -> R + Send) -> R {
         }),
         Err(_) => f(),
     }
+}
+
+fn is_unknown_method<T>(r: &Result<T>) -> bool {
+    r.as_ref().err().is_some_and(|e| {
+        e.downcast_ref::<MgmtError>()
+            .is_some_and(|m| m.status == gen::ERR_UNKNOWN_METHOD)
+    })
 }
 
 /// A non-zero reply status as the error callers know: the body is the legacy token.
