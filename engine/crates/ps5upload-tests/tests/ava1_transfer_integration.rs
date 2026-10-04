@@ -419,6 +419,166 @@ async fn upload_file_list_lands_each_file_at_its_destination() {
     assert_eq!(got.len(), 2);
 }
 
+// ─── File lists with destinations outside the upload root ─────────────────────
+
+fn entry(src: &Path, dest: &str) -> FileListEntry {
+    FileListEntry {
+        src: src.to_string_lossy().into_owned(),
+        dest: dest.into(),
+    }
+}
+
+/// A file list whose destinations sit under the upload root AND elsewhere (absolute paths) used
+/// to work over the retired protocol. One AVA1 job is one manifest under one root, so the list
+/// becomes one job per destination directory, run in sequence: everything lands, the jobs are
+/// grouped by directory, and the progress counters aggregate across them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_list_with_destinations_outside_the_root_becomes_one_job_per_directory() {
+    let a = abs_console(false).await;
+    let t = tempdir();
+    let (f1, f2, f3, f4) = (
+        t.path().join("1"),
+        t.path().join("2"),
+        t.path().join("3"),
+        t.path().join("4"),
+    );
+    write(&f1, &pattern(1, 3000));
+    write(&f2, &pattern(2, 5000));
+    write(&f3, &pattern(3, 7000));
+    write(&f4, &pattern(4, 11_000));
+    let entries = vec![
+        entry(&f1, "in/a.bin"),
+        entry(&f2, "/data/other/b.bin"),
+        entry(&f3, "/data/other/c.bin"),
+        entry(&f4, "/data/third/deep/d.bin"),
+    ];
+    let (bytes, files) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let mut config = cfg();
+    config.progress_bytes = Some(bytes.clone());
+    config.progress_files = Some(files.clone());
+    let pool = a.console.pool.clone();
+    let r = run(60, move || {
+        upload::upload_list_in(&pool, &config, job_id(50), "/data/games", &entries)
+    })
+    .await
+    .expect("the list uploads");
+    let share = &a.console.share;
+    assert_eq!(
+        std::fs::read(share.join("data/games/in/a.bin")).unwrap(),
+        pattern(1, 3000)
+    );
+    assert_eq!(
+        std::fs::read(share.join("data/other/b.bin")).unwrap(),
+        pattern(2, 5000)
+    );
+    assert_eq!(
+        std::fs::read(share.join("data/other/c.bin")).unwrap(),
+        pattern(3, 7000)
+    );
+    assert_eq!(
+        std::fs::read(share.join("data/third/deep/d.bin")).unwrap(),
+        pattern(4, 11_000)
+    );
+    let mut roots = a.roots.lock().unwrap().clone();
+    roots.sort();
+    roots.dedup();
+    assert_eq!(
+        roots,
+        vec!["/data/games", "/data/other", "/data/third/deep"]
+    );
+    assert_eq!(
+        r.bytes_sent,
+        3000 + 5000 + 7000 + 11_000,
+        "bytes aggregate across the jobs"
+    );
+    assert_eq!(
+        bytes.load(Ordering::Relaxed),
+        26_000,
+        "the progress counter aggregates too"
+    );
+    assert_eq!(files.load(Ordering::Relaxed), 4);
+    let ack: serde_json::Value = serde_json::from_str(&r.commit_ack_body).unwrap();
+    assert_eq!(ack["files"], 4);
+    assert_eq!(ack["jobs"], 3);
+}
+
+/// A list that is entirely inside the root is still one job (nothing changes for the common case).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_list_inside_the_root_stays_one_job() {
+    let a = abs_console(false).await;
+    let t = tempdir();
+    write(&t.path().join("1"), b"one");
+    write(&t.path().join("2"), b"two");
+    let entries = vec![
+        entry(&t.path().join("1"), "x/1"),
+        entry(&t.path().join("2"), "/data/games/x/2"),
+    ];
+    let pool = a.console.pool.clone();
+    run(60, move || {
+        upload::upload_list_in(&pool, &cfg(), job_id(51), "/data/games", &entries)
+    })
+    .await
+    .unwrap();
+    assert_eq!(a.roots.lock().unwrap().len(), 1);
+    assert_eq!(landed(&a.console.share.join("data/games")).len(), 2);
+}
+
+/// Cancel stops every job of the list: a cancel during the first job means the later
+/// directories are never opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_split_file_list_stops_all_of_it() {
+    let a = abs_console(true).await;
+    let t = tempdir();
+    write(&t.path().join("big"), &pattern(9, 12 * 1024 * 1024));
+    write(&t.path().join("small"), b"later");
+    let entries = vec![
+        entry(&t.path().join("big"), "big.bin"),
+        entry(&t.path().join("small"), "/data/later/small.bin"),
+    ];
+    let pool = a.console.pool.clone();
+    let e = cancel_midway(&cfg(), move |config| {
+        upload::upload_list_in(&pool, &config, job_id(52), "/data/games", &entries)
+    })
+    .await;
+    assert!(format!("{e:#}").contains("cancel"), "{e:#}");
+    assert!(
+        !a.roots.lock().unwrap().iter().any(|r| r == "/data/later"),
+        "the second directory's job must never start"
+    );
+    assert!(!a.console.share.join("data/later").exists());
+}
+
+/// A failure reports the first failing path, with the console's own reason kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_directory_reports_its_first_path() {
+    let a = abs_console(false).await;
+    let t = tempdir();
+    write(&t.path().join("ok"), b"fine");
+    write(&t.path().join("bad1"), b"x");
+    write(&t.path().join("bad2"), b"y");
+    let entries = vec![
+        entry(&t.path().join("ok"), "ok.bin"),
+        entry(&t.path().join("bad1"), "/forbidden/a/one.bin"),
+        entry(&t.path().join("bad2"), "/forbidden/a/two.bin"),
+    ];
+    let pool = a.console.pool.clone();
+    let e = run(60, move || {
+        upload::upload_list_in(&pool, &cfg(), job_id(53), "/data/games", &entries)
+    })
+    .await
+    .unwrap_err();
+    let msg = format!("{e:#}");
+    assert!(
+        msg.contains("/forbidden/a/one.bin"),
+        "names the first failing path: {msg}"
+    );
+    assert!(!msg.contains("two.bin"), "only the first: {msg}");
+    assert!(
+        a.console.share.join("data/games/ok.bin").exists(),
+        "the jobs before the failure stay done"
+    );
+}
+
 // ─── Cancel and resume ─────────────────────────────────────────────────────────
 
 /// Ports `abort_tx_marks_aborted` and `abort_transaction_helper_marks_aborted`: cancelling stops

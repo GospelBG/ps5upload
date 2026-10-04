@@ -8115,21 +8115,9 @@ async fn transfer_file_list_handler(
         cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
         crate::log_info!("transfer_file_list: job={job_id} protocol=ava1");
-        // One job is one manifest under one root, so a destination outside the root cannot
-        // ride along: say which one instead of sending the rest.
-        let result =
-            match ps5upload_ava1::upload::upload_list_first_unsupported(&req.dest_root, &entries) {
-                Some(dest) => Err(anyhow::Error::from(ps5upload_ava1::upload::UploadFailure {
-                    reason: "ava1_list_outside_root".into(),
-                    detail: format!(
-                        "{dest} is outside the upload folder {}; send it as its own upload",
-                        req.dest_root
-                    ),
-                })),
-                // Resume is by job_id (the sender reopens with JobOpen); retries live in the
-                // adapter's loop.
-                None => ps5upload_ava1::upload::upload_list(&cfg, tx_id, &req.dest_root, &entries),
-            };
+        // Resume is by job_id (the sender reopens with JobOpen); retries live in the adapter's
+        // loop. A list that names several directories becomes one job per directory.
+        let result = ps5upload_ava1::upload::upload_list(&cfg, tx_id, &req.dest_root, &entries);
         let skipped_files_count: u64 = 0;
         let skipped_bytes_count: u64 = 0;
         match result {

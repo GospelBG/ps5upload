@@ -825,15 +825,231 @@ fn relative_list_path(dest_root: &str, dest: &str) -> Result<String> {
     Ok(rel.to_owned())
 }
 
-/// A file list may contain absolute destinations outside the job's root, which one job (one
-/// manifest under one root) cannot carry. The first such destination, for the error message.
-pub fn upload_list_first_unsupported(dest_root: &str, entries: &[FileListEntry]) -> Option<String> {
-    entries
-        .iter()
-        .find(|e| relative_list_path(dest_root, &e.dest).is_err())
-        .map(|e| e.dest.clone())
+/// Where one file-list destination goes: below the list's root (relative to it), or in another
+/// directory (an absolute destination outside the root), which needs a job of its own.
+enum Placed {
+    In(String),
+    Out { dir: String, name: String },
 }
 
+fn place_list_path(dest_root: &str, dest: &str) -> Result<Placed> {
+    match relative_list_path(dest_root, dest) {
+        Ok(rel) => Ok(Placed::In(rel)),
+        Err(e) if dest.starts_with('/') => {
+            // Absolute and not under the root: its own directory, if it is a plain file path.
+            let p = Path::new(dest);
+            let (Some(dir), Some(name)) = (
+                p.parent().and_then(|d| d.to_str()),
+                p.file_name().and_then(|n| n.to_str()),
+            ) else {
+                return Err(e);
+            };
+            manifest::check_path(name)?;
+            if dir.split('/').any(|c| c == "..") {
+                return Err(e);
+            }
+            Ok(Placed::Out {
+                dir: dir.to_string(),
+                name: name.to_string(),
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// One AVA1 job is one manifest under one root. A file list may name destinations in several
+/// directories, so it is split: the files under `dest_root` first, then one job per other
+/// destination directory (sorted, so a resume sees the same jobs). Each entry is
+/// `(job root, [(path relative to that root, source)])`.
+type ListGroup = (String, Vec<(String, PathBuf)>);
+
+fn split_list(dest_root: &str, entries: &[FileListEntry]) -> Result<Vec<ListGroup>> {
+    let root = if dest_root == "/" {
+        "/"
+    } else {
+        dest_root.trim_end_matches('/')
+    };
+    let mut inside: Vec<(String, PathBuf)> = Vec::new();
+    let mut outside: std::collections::BTreeMap<String, Vec<(String, PathBuf)>> =
+        Default::default();
+    for e in entries {
+        match place_list_path(root, &e.dest)? {
+            Placed::In(rel) => inside.push((rel, e.src.clone().into())),
+            Placed::Out { dir, name } => outside
+                .entry(dir)
+                .or_default()
+                .push((name, e.src.clone().into())),
+        }
+    }
+    let mut groups = Vec::new();
+    if !inside.is_empty() || outside.is_empty() {
+        groups.push((root.to_string(), inside));
+    }
+    groups.extend(outside);
+    Ok(groups)
+}
+
+/// The destination of a group's first file, for an error that says which path failed.
+fn first_dest(root: &str, files: &[(String, PathBuf)]) -> String {
+    let rel = files.iter().map(|f| f.0.as_str()).min().unwrap_or("");
+    format!("{}/{rel}", root.trim_end_matches('/'))
+}
+
+/// Names the failing path while keeping the error's type (a typed failure keeps its reason).
+fn named(e: anyhow::Error, path: &str) -> anyhow::Error {
+    if e.to_string().contains("transfer_cancelled") {
+        return e;
+    }
+    if let Some(f) = e.downcast_ref::<UploadFailure>() {
+        return UploadFailure {
+            reason: f.reason.clone(),
+            detail: format!("{path}: {}", f.detail),
+        }
+        .into();
+    }
+    if let Some(p) = e.downcast_ref::<PostCommitError>() {
+        return PostCommitError {
+            kind: p.kind,
+            detail: format!("{path}: {}", p.detail),
+        }
+        .into();
+    }
+    e.context(path.to_string())
+}
+
+/// The job id of group `k`: group 0 keeps the caller's id, the others derive from it, so a
+/// resume of the whole list finds each job's journal again.
+fn group_job_id(base: [u8; 16], k: usize) -> [u8; 16] {
+    let mut id = base;
+    for (b, x) in id[8..].iter_mut().zip((k as u64).to_le_bytes()) {
+        *b ^= x;
+    }
+    id
+}
+
+/// Counters of the jobs already finished, added to the running job's own.
+#[derive(Default, Clone, Copy)]
+struct Done {
+    bytes: u64,
+    files: u64,
+    files_finalized: u64,
+    bytes_finalized: u64,
+}
+
+/// Runs one job of a list with private counters and mirrors `done + private` into the caller's
+/// absolute counters while it runs, so the engine's ticker sees one progressing transfer.
+fn run_aggregated<T>(
+    cfg: &TransferConfig,
+    done: &mut Done,
+    f: impl FnOnce(&TransferConfig) -> Result<T>,
+) -> Result<T> {
+    use std::sync::atomic::AtomicU64;
+    type C = Option<Arc<AtomicU64>>;
+    let fresh = |c: &C| c.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
+    let mut inner = cfg.clone();
+    inner.progress_bytes = fresh(&cfg.progress_bytes);
+    inner.progress_files = fresh(&cfg.progress_files);
+    inner.progress_files_finalized = fresh(&cfg.progress_files_finalized);
+    inner.progress_bytes_finalized = fresh(&cfg.progress_bytes_finalized);
+    let pairs = |d: Done| -> Vec<(C, C, u64)> {
+        vec![
+            (
+                cfg.progress_bytes.clone(),
+                inner.progress_bytes.clone(),
+                d.bytes,
+            ),
+            (
+                cfg.progress_files.clone(),
+                inner.progress_files.clone(),
+                d.files,
+            ),
+            (
+                cfg.progress_files_finalized.clone(),
+                inner.progress_files_finalized.clone(),
+                d.files_finalized,
+            ),
+            (
+                cfg.progress_bytes_finalized.clone(),
+                inner.progress_bytes_finalized.clone(),
+                d.bytes_finalized,
+            ),
+        ]
+    };
+    let mirror = |d: Done| {
+        for (real, mine, base) in pairs(d) {
+            if let (Some(real), Some(mine)) = (real, mine) {
+                real.store(base + mine.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        }
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let base = *done;
+    let ticker = {
+        let stop = stop.clone();
+        let pairs = pairs(base);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                for (real, mine, base) in &pairs {
+                    if let (Some(real), Some(mine)) = (real, mine) {
+                        real.store(base + mine.load(Ordering::Relaxed), Ordering::Relaxed);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        })
+    };
+    let r = f(&inner);
+    stop.store(true, Ordering::Relaxed);
+    let _ = ticker.join();
+    mirror(base);
+    let get = |c: &C| c.as_ref().map_or(0, |a| a.load(Ordering::Relaxed));
+    done.bytes += get(&inner.progress_bytes);
+    done.files += get(&inner.progress_files);
+    done.files_finalized += get(&inner.progress_files_finalized);
+    done.bytes_finalized += get(&inner.progress_bytes_finalized);
+    r
+}
+
+/// Folds the per-job results of a split list into one.
+fn merge_results(parts: Vec<TransferResult>) -> TransferResult {
+    let jobs = parts.len();
+    let mut it = parts.into_iter();
+    let mut out = it.next().expect("at least one job");
+    let mut ack: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&out.commit_ack_body).unwrap_or_default();
+    for p in it {
+        out.shards_sent += p.shards_sent;
+        out.bytes_sent += p.bytes_sent;
+        let other: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&p.commit_ack_body).unwrap_or_default();
+        for k in [
+            "files",
+            "bytes",
+            "resent",
+            "skipped_files",
+            "skipped_bytes",
+            "files_sent",
+        ] {
+            let sum = ack.get(k).and_then(|v| v.as_u64()).unwrap_or(0)
+                + other.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            ack.insert(k.into(), sum.into());
+        }
+        let lanes = ack
+            .get("max_lanes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .max(other.get("max_lanes").and_then(|v| v.as_u64()).unwrap_or(0));
+        ack.insert("max_lanes".into(), lanes.into());
+    }
+    ack.insert("jobs".into(), jobs.into());
+    out.commit_ack_body = serde_json::Value::Object(ack).to_string();
+    out
+}
+
+/// A file-list upload. Destinations below `dest_root` form one job; each other directory a
+/// destination names (an absolute path outside the root) is a job of its own, run in sequence
+/// under this one call: progress aggregates, a cancel stops the rest, and a failure names the
+/// first failing path.
 pub fn upload_list_in(
     pool: &Pool,
     cfg: &TransferConfig,
@@ -841,15 +1057,38 @@ pub fn upload_list_in(
     dest_root: &str,
     entries: &[FileListEntry],
 ) -> Result<TransferResult> {
-    let root = if dest_root == "/" {
-        "/"
-    } else {
-        dest_root.trim_end_matches('/')
-    };
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
-    for e in entries {
-        files.push((relative_list_path(root, &e.dest)?, e.src.clone().into()));
+    let mut groups = split_list(dest_root, entries)?;
+    if groups.len() == 1 {
+        let (root, files) = groups.remove(0);
+        let first = first_dest(&root, &files);
+        return upload_list_group_in(pool, cfg, job_id, &root, files).map_err(|e| named(e, &first));
     }
+    let cancel = cfg.cancel.clone();
+    let mut done = Done::default();
+    let mut results = Vec::new();
+    for (k, (root, files)) in groups.into_iter().enumerate() {
+        if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(anyhow!("transfer_cancelled"));
+        }
+        let first = first_dest(&root, &files);
+        let id = group_job_id(job_id, k);
+        let r = run_aggregated(cfg, &mut done, |c| {
+            upload_list_group_in(pool, c, id, &root, files)
+        })
+        .map_err(|e| named(e, &first))?;
+        results.push(r);
+    }
+    Ok(merge_results(results))
+}
+
+/// One job of a file list: `files` are `(path relative to root, source)`.
+fn upload_list_group_in(
+    pool: &Pool,
+    cfg: &TransferConfig,
+    job_id: [u8; 16],
+    root: &str,
+    mut files: Vec<(String, PathBuf)>,
+) -> Result<TransferResult> {
     // Exactly manifest::walk's order (depth-first preorder: component comparison).
     files.sort_by(|a, b| a.0.split('/').cmp(b.0.split('/')));
     let mut all: Vec<Entry> = Vec::new();
@@ -932,7 +1171,7 @@ pub fn upload_list(
 
 #[cfg(test)]
 mod list_destination_tests {
-    use super::{relative_list_path, upload_list_first_unsupported};
+    use super::{group_job_id, relative_list_path, split_list};
     use ps5upload_core::transfer::FileListEntry;
 
     #[test]
@@ -958,26 +1197,53 @@ mod list_destination_tests {
         assert!(relative_list_path("/data/games", "../other/file.bin").is_err());
     }
 
+    fn e(src: &str, dest: &str) -> FileListEntry {
+        FileListEntry {
+            src: src.into(),
+            dest: dest.into(),
+        }
+    }
+
     #[test]
-    fn a_mixed_list_with_one_outside_path_names_it() {
-        let entries = [
-            FileListEntry {
-                src: "a".into(),
-                dest: "Title/a".into(),
-            },
-            FileListEntry {
-                src: "b".into(),
-                dest: "/data/other/b".into(),
-            },
-        ];
-        assert_eq!(
-            upload_list_first_unsupported("/data/games", &entries).as_deref(),
-            Some("/data/other/b")
-        );
-        assert_eq!(
-            upload_list_first_unsupported("/data/games", &entries[..1]),
-            None
-        );
+    fn a_list_splits_into_the_root_then_one_job_per_other_directory() {
+        let groups = split_list(
+            "/data/games/",
+            &[
+                e("a", "Title/a"),
+                e("b", "/data/other/b"),
+                e("c", "/data/games/Title/c"),
+                e("d", "/data/other/d"),
+                e("f", "/data/third/x/f"),
+            ],
+        )
+        .unwrap();
+        let roots: Vec<&str> = groups.iter().map(|g| g.0.as_str()).collect();
+        assert_eq!(roots, ["/data/games", "/data/other", "/data/third/x"]);
+        let names = |i: usize| groups[i].1.iter().map(|f| f.0.as_str()).collect::<Vec<_>>();
+        assert_eq!(names(0), ["Title/a", "Title/c"]);
+        assert_eq!(names(1), ["b", "d"]);
+        assert_eq!(names(2), ["f"]);
+    }
+
+    #[test]
+    fn a_list_wholly_outside_the_root_has_no_empty_first_job() {
+        let groups = split_list("/data/games", &[e("b", "/data/other/b")]).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "/data/other");
+    }
+
+    #[test]
+    fn a_hostile_destination_is_still_refused() {
+        assert!(split_list("/data/games", &[e("b", "/data/../etc/b")]).is_err());
+        assert!(split_list("/data/games", &[e("b", "../other/b")]).is_err());
+    }
+
+    #[test]
+    fn group_job_ids_are_stable_and_distinct() {
+        let base = [7u8; 16];
+        assert_eq!(group_job_id(base, 0), base);
+        assert_ne!(group_job_id(base, 1), group_job_id(base, 2));
+        assert_eq!(group_job_id(base, 1), group_job_id(base, 1));
     }
 }
 

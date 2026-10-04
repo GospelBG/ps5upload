@@ -339,3 +339,103 @@ pub fn build_game_folder(root: &Path) -> Vec<(String, Vec<u8>)> {
     }
     expected
 }
+
+// ─── a host that accepts absolute roots ────────────────────────────────────────
+
+/// A job host that, unlike `FolderHost`, accepts an absolute `JobOpen.root` (the console does:
+/// its write policy, not the path shape, decides). The root is mapped under `share/`
+/// (`/data/other` becomes `share/data/other`) and recorded, so a test can see how many jobs
+/// a file list became and under which roots. A root starting with `/forbidden` is refused.
+pub struct MappedHost {
+    pub inner: FolderHost,
+    pub roots: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ava1::router::JobHost for MappedHost {
+    fn accept(&self, link: ava1::router::JobLink, mut first: ava1::conn::Frame, peer: [u8; 32]) {
+        if first.ty == <gen::JobOpen as ava1::wire::FrameMessage>::TYPE {
+            if let Ok(mut open) = first.decode::<gen::JobOpen>() {
+                self.roots.lock().unwrap().push(open.root.clone());
+                if open.root.starts_with("/forbidden") {
+                    tokio::spawn(async move {
+                        let _ = link
+                            .control
+                            .send(&gen::JobOpenAck {
+                                job_id: open.job_id,
+                                status: gen::ERR_PATH,
+                                credit: 0,
+                                staged: 0,
+                                workers: 0,
+                                message: Some("the write policy refuses this root".into()),
+                            })
+                            .await;
+                    });
+                    return;
+                }
+                open.root = open.root.trim_start_matches('/').to_string();
+                first.body = open.to_bytes().unwrap();
+            }
+        }
+        self.inner.accept(link, first, peer);
+    }
+}
+
+/// A console on a [`MappedHost`], optionally behind a rate-limited proxy.
+pub struct AbsConsole {
+    pub console: Console,
+    pub roots: Arc<std::sync::Mutex<Vec<String>>>,
+    pub proxy: Option<Arc<ChaosProxy>>,
+}
+
+pub async fn abs_console(slow: bool) -> AbsConsole {
+    let dir = tempdir();
+    let ava = dir.path().join("ava");
+    let me = Identity::load_or_create(&ava.join("identity")).unwrap();
+    let mut peers = PeerStore::in_memory();
+    peers.add(me.public(), "engine").unwrap();
+    let roots = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let host = MappedHost {
+        inner: FolderHost {
+            root: dir.path().join("share"),
+            jobs_dir: dir.path().join("hjobs"),
+        },
+        roots: roots.clone(),
+    };
+    let ctx = ServerCtx::new(
+        Identity::generate().unwrap(),
+        "host",
+        peers,
+        node_info_rpc(),
+    )
+    .with_jobs(Arc::new(host));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(server::serve(l, Arc::new(ctx)));
+    let (via, proxy) = if slow {
+        let p = Arc::new(
+            ChaosProxy::start(
+                addr.parse().unwrap(),
+                ChaosConfig {
+                    bytes_per_sec: Some(512 << 10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        (p.addr.to_string(), Some(p))
+    } else {
+        (addr.clone(), None)
+    };
+    let pool = Arc::new(Pool::new(ava).with_addr(via));
+    AbsConsole {
+        console: Console {
+            share: dir.path().join("share"),
+            dir,
+            addr,
+            pool,
+        },
+        roots,
+        proxy,
+    }
+}
