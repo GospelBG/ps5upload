@@ -3,10 +3,8 @@
 //! affect the payload's transfer/install pipelines.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
 use crate::mgmt::{self, m};
 
 /// Read up to `max_bytes` of currently-buffered kernel log. Empty
@@ -351,19 +349,9 @@ pub fn pkg_direct_mount(
         "mount_point": mount_point.unwrap_or(""),
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::PkgDirectMount, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected PKG_DIRECT_MOUNT: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::PkgDirectMountAck {
-        bail!("expected PKG_DIRECT_MOUNT_ACK, got {ft:?}");
-    }
+    // A failed mount is an error status whose cause is the failure body (code, mount_point):
+    // `call_legacy_ok` gives it back as the `{"ok":false,...}` this function reports on.
+    let resp = mgmt::call_legacy_ok(addr, m::FS_MOUNT_PKG, "PKG_DIRECT_MOUNT", &body)?;
     let parsed: PkgDirectMountResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(
@@ -459,19 +447,7 @@ pub fn lwfs_mount(
         "title_id": title_id.unwrap_or(""),
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::LwfsMount, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected LWFS_MOUNT: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::LwfsMountAck {
-        bail!("expected LWFS_MOUNT_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_legacy_ok(addr, m::FS_MOUNT_LWFS, "LWFS_MOUNT", &body)?;
     let parsed: LwfsMountResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(

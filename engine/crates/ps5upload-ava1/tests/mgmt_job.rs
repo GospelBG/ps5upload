@@ -61,6 +61,8 @@ struct Script {
     run_refused: Option<u16>,
     /// `job.run` takes this long to answer (the job is not listed until it does).
     run_delay_ms: u64,
+    /// The console does not advertise CAP_MGMT (an older helper): the transport sends nothing.
+    no_cap: bool,
 }
 
 #[derive(Default)]
@@ -190,6 +192,7 @@ async fn console(
     let me = Identity::load_or_create(&ava.join("identity")).unwrap();
     let mut peers = PeerStore::in_memory();
     peers.add(me.public(), "engine").unwrap();
+    let no_cap = script.no_cap;
     let state = Arc::new(Mutex::new(Console {
         script,
         ..Console::default()
@@ -205,6 +208,7 @@ async fn console(
         root: base.join("share"),
         jobs_dir: base.join("jobs"),
     }));
+    let ctx = if no_cap { ctx } else { ctx.with_mgmt() };
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap().to_string();
     tokio::spawn(server::serve(l, Arc::new(ctx)));
@@ -577,7 +581,7 @@ async fn an_old_helper_without_job_run_falls_back_to_ftx2_and_busy_is_a_refusal(
     let (t, _p, c, _st) = console(
         "old",
         Script {
-            run_refused: Some(gen::ERR_UNKNOWN_METHOD),
+            no_cap: true,
             ..Script::default()
         },
     )
@@ -585,7 +589,25 @@ async fn an_old_helper_without_job_run_falls_back_to_ftx2_and_busy_is_a_refusal(
     let r = run_op(&t, &c, ops::DELETE, r#"{"path":"/data/x"}"#, 0, "", T)
         .await
         .unwrap();
-    assert!(r.is_none(), "Ok(None) sends the caller to the FTX2 frame");
+    assert!(
+        r.is_none(),
+        "no CAP_MGMT: Ok(None) sends the caller to the FTX2 frame, nothing sent"
+    );
+    // a helper that advertises CAP_MGMT but predates job.run answers ERR_UNKNOWN_METHOD: FTX2 serves it
+    let (t, _p, c, _st) = console(
+        "old-job-run",
+        Script {
+            run_refused: Some(gen::ERR_UNKNOWN_METHOD),
+            ..Script::default()
+        },
+    )
+    .await;
+    assert!(
+        run_op(&t, &c, ops::DELETE, r#"{"path":"/data/x"}"#, 0, "", T)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let (t, _p, c, _st) = console(
         "busy",
         Script {

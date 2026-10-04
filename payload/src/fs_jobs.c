@@ -14,6 +14,7 @@
 #include "ava1_gen.h"
 #include "ava1_op.h"
 #include "blake3.h"
+#include "path_policy.h"
 
 #define MAX_DEPTH 64
 
@@ -289,6 +290,8 @@ static int chmod_rf_in(const char *path, unsigned mode, int depth, const fsj_hoo
         failed(h, path, "mount");
         return -1;
     }
+    /* A link that leads into the trust store is not chmod'ed (chmod follows it). */
+    if (S_ISLNK(st.st_mode) && path_in_protected(path)) return 0;
     /* chmod first, then descend: a partial failure still updated the top. */
     if (chmod(path, (mode_t)mode) != 0) {
         failed(h, path, "chmod");
@@ -497,7 +500,9 @@ int fsj_copy_atomic(const char *src, const char *dst, const fsj_hooks_t *h) {
 
 static int may_write(const char *p) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
-    return cfg->may_write && cfg->may_write(p);
+    /* Review S2: a root that IS the AVA1 trust store, is below it, or is an ANCESTOR of it (/data/ps5upload,
+     * /data, /) is refused for every walking/destructive op: the walk would reach identity and peers. */
+    return cfg->may_write && cfg->may_write(p) && !path_tree_op_refused(p);
 }
 
 /* "/a/b/c" -> "/a/b"; "/c" -> "/". */
@@ -679,7 +684,7 @@ static int open_for_read(ava1_op_ctx_t *c, const char *args, const char *tag, ch
         *status = AVA1_ERR_PATH;
         return -1;
     }
-    if (path[0] != '/' || !cfg->may_read || !cfg->may_read(path, unsafe != 0)) {
+    if (path[0] != '/' || !cfg->may_read || !cfg->may_read(path, unsafe != 0) || path_tree_op_refused(path)) {
         ava1_op_message(c, "%s_bad_path", tag);
         *status = AVA1_ERR_PATH;
         return -1;

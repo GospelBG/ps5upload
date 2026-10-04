@@ -67,11 +67,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use ftx2_proto::FrameType;
 use ps5upload_core::{
     app_lifecycle::{app_lifecycle, AppAction},
     cleanup::{cleanup_path, CleanupResult},
-    connection::Connection,
     diagnostics::appdb_query,
     diagnostics::{klog_read, net_interfaces},
     download::{
@@ -4104,12 +4102,11 @@ async fn ps5_game_meta(
                     application_category_type,
                 )
             };
-        // icon0.png probe — read the first byte to confirm it exists.
-        // Avoids pulling the full image just to know whether to set
-        // `has_icon`. Errors (path denied, not found) treated as "no icon".
+        // icon0.png probe — `fs.stat` confirms a non-empty regular file without pulling
+        // the image. Errors (path denied, not found) treated as "no icon".
         let icon_path = format!("{}/sce_sys/icon0.png", path.trim_end_matches('/'));
-        let has_icon = fs_read(&addr, &icon_path, 0, 1)
-            .map(|b| !b.is_empty())
+        let has_icon = ps5upload_core::fs_ops::fs_stat(&addr, &icon_path)
+            .map(|s| s.kind == "file" && s.size > 0)
             .unwrap_or(false);
         Ok(GameMetaResponse {
             title,
@@ -4830,14 +4827,12 @@ async fn ps5_status(
     Query(q): Query<AddrQuery>,
 ) -> impl IntoResponse {
     let addr = mgmt_addr_or_default(q.addr, &state.default_ps5_addr);
+    // `node.status` through the management seam: the typed AVA1 NodeStatus is rebuilt into the
+    // legacy JSON (`ucred_elevated` a bool, `prior_instance` only when present). The FTX2
+    // transaction fields (runtime_port, shutdown, takeover_requested, active_transactions,
+    // last_tx_seq, recovered_transactions) no longer exist; nothing reads them.
     let result = tokio::task::spawn_blocking(move || {
-        let mut c = Connection::connect(&addr)?;
-        c.send_frame(FrameType::Status, b"")?;
-        let (hdr, body) = c.recv_frame()?;
-        let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-        if ft != FrameType::StatusAck {
-            anyhow::bail!("expected STATUS_ACK, got {ft:?}");
-        }
+        let body = ps5upload_core::mgmt::call(&addr, ps5upload_core::mgmt::m::NODE_STATUS, b"")?;
         let json: serde_json::Value = serde_json::from_slice(&body)?;
         Ok::<_, anyhow::Error>(json)
     })

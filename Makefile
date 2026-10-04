@@ -922,6 +922,12 @@ test-payload: payload
 		$(PAYLOAD_DIR)/tests/ftp_lifecycle_selftest.c
 	@/tmp/ps5upload-ftp-lifecycle-selftest
 	@echo "✓ FTP stop/start drains sessions without stale listeners or fd reuse"
+	@echo "Running FTP trust-store self-test (host build)..."
+	@cc -O2 -Wall -Wextra -Werror -pthread -I$(PAYLOAD_DIR)/include \
+		-o /tmp/ps5upload-ftp-trust-selftest \
+		$(PAYLOAD_DIR)/tests/ftp_trust_store_selftest.c
+	@/tmp/ps5upload-ftp-trust-selftest
+	@echo "✓ FTP cannot reach the AVA1 trust store directly or through an ancestor"
 	@echo "Running timed initializer serialization self-test (host build)..."
 	@cc -O2 -Wall -Wextra -Werror -pthread -I$(PAYLOAD_DIR)/include \
 		-o /tmp/ps5upload-timed-init-selftest \

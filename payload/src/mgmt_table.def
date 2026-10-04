@@ -3,6 +3,7 @@
  *   MGMT_H0(method, ftx2_frame, ftx2_ack, flags, handler, runner)   handler(state, fd, trace_id)
  *   MGMT_HS(method, ftx2_frame, ftx2_ack, flags, handler, runner)   handle_status_frame(state, fd, hdr, scratch, cap)
  *   MGMT_H1(method, ftx2_frame, ftx2_ack, flags, handler, runner)   handler(state, fd, trace_id, body, len)
+ *   MGMT_N(method, ftx2_frame, ftx2_ack, flags, run)                a native runner (mgmt_run_fn): no FTX2 handler behind it
  *
  * `method` is the AVA1_METHOD_* name (it names the generated wrapper, so use the bare
  * constant), `flags` is 0 or MGMT_SONY (the handler reaches register.c, profile.c,
@@ -16,7 +17,6 @@
  * every entry on one line.
  */
 MGMT_H0(AVA1_METHOD_FS_VOLUMES, FTX2_FRAME_FS_LIST_VOLUMES, FTX2_FRAME_FS_LIST_VOLUMES_ACK, 0, handle_fs_list_volumes, mgmt_call_text)
-MGMT_H1(AVA1_METHOD_FS_MKDIR, FTX2_FRAME_FS_MKDIR, FTX2_FRAME_FS_MKDIR_ACK, 0, handle_fs_mkdir, mgmt_call_fs_mkdir)
 MGMT_H1(AVA1_METHOD_APP_LAUNCH, FTX2_FRAME_APP_LAUNCH, FTX2_FRAME_APP_LAUNCH_ACK, MGMT_SONY, handle_app_launch, mgmt_call_text)
 MGMT_H1(AVA1_METHOD_APP_LIST, FTX2_FRAME_APP_LIST_REGISTERED, FTX2_FRAME_APP_LIST_REGISTERED_ACK, MGMT_SONY, handle_app_list_registered, mgmt_call_paged)
 MGMT_H0(AVA1_METHOD_PROC_PROCESS_LIST, FTX2_FRAME_PROCESS_LIST, FTX2_FRAME_PROCESS_LIST_ACK, 0, handle_process_list, mgmt_call_text)
@@ -133,3 +133,16 @@ MGMT_H0(AVA1_METHOD_RP_READINESS, FTX2_FRAME_REMOTEPLAY_READINESS, FTX2_FRAME_RE
 MGMT_H1(AVA1_METHOD_RP_ENABLE, FTX2_FRAME_REMOTEPLAY_ENABLE, FTX2_FRAME_REMOTEPLAY_ENABLE, MGMT_SONY, mgmt_w_remoteplay_enable, mgmt_call_text_keep)
 MGMT_H0(AVA1_METHOD_RP_DEVICES, FTX2_FRAME_REMOTEPLAY_DEVICES, FTX2_FRAME_REMOTEPLAY_DEVICES, MGMT_SONY, handle_remoteplay_devices, mgmt_call_text_keep)
 /* ---- end Task 7 ---- */
+/* ---- P3 Task 4: node.shutdown, native fs.* and mounts (log.*, net.* and node.cleanup are routed in the Task 9 and Task 5 blocks) ---- */
+MGMT_H0(AVA1_METHOD_NODE_SHUTDOWN, FTX2_FRAME_SHUTDOWN, FTX2_FRAME_SHUTDOWN_ACK, 0, handle_shutdown, mgmt_call_empty)
+MGMT_N(AVA1_METHOD_FS_LIST, FTX2_FRAME_FS_LIST_DIR, FTX2_FRAME_FS_LIST_DIR_ACK, 0, mgmt_run_fs_list)
+MGMT_N(AVA1_METHOD_FS_STAT, FTX2_FRAME_FS_LIST_DIR, FTX2_FRAME_FS_LIST_DIR_ACK, 0, mgmt_run_fs_stat)
+MGMT_N(AVA1_METHOD_FS_MKDIR, FTX2_FRAME_FS_MKDIR, FTX2_FRAME_FS_MKDIR_ACK, 0, mgmt_run_fs_mkdir)
+MGMT_N(AVA1_METHOD_FS_RENAME, FTX2_FRAME_FS_MOVE, FTX2_FRAME_FS_MOVE_ACK, 0, mgmt_run_fs_rename)
+MGMT_N(AVA1_METHOD_FS_CHMOD, FTX2_FRAME_FS_CHMOD, FTX2_FRAME_FS_CHMOD_ACK, 0, mgmt_run_fs_chmod)
+MGMT_N(AVA1_METHOD_FS_READ, FTX2_FRAME_FS_READ, FTX2_FRAME_FS_READ_ACK, 0, mgmt_run_fs_read)
+MGMT_N(AVA1_METHOD_FS_WRITE, FTX2_FRAME_FS_WRITE_BYTES, FTX2_FRAME_FS_WRITE_BYTES_ACK, 0, mgmt_run_fs_write)
+MGMT_H1(AVA1_METHOD_FS_MOUNT, FTX2_FRAME_FS_MOUNT, FTX2_FRAME_FS_MOUNT_ACK, 0, handle_fs_mount, mgmt_call_text)
+MGMT_H1(AVA1_METHOD_FS_UNMOUNT, FTX2_FRAME_FS_UNMOUNT, FTX2_FRAME_FS_UNMOUNT_ACK, 0, handle_fs_unmount, mgmt_call_text)
+MGMT_H1(AVA1_METHOD_FS_MOUNT_PKG, FTX2_FRAME_PKG_DIRECT_MOUNT, FTX2_FRAME_PKG_DIRECT_MOUNT_ACK, 0, handle_pkg_direct_mount, mgmt_call_text_keep)
+MGMT_H1(AVA1_METHOD_FS_MOUNT_LWFS, FTX2_FRAME_LWFS_MOUNT, FTX2_FRAME_LWFS_MOUNT_ACK, 0, handle_lwfs_mount, mgmt_call_text_keep)

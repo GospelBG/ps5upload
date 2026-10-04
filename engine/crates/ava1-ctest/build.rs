@@ -96,6 +96,9 @@ fn main() {
             ava1.join("platform_posix.c"),
             ava1.join("gen/ava1_gen.c"),
             p.join("src/mgmt_rpc.c"),
+            p.join("src/mgmt_fs.c"),
+            p.join("src/path_policy.c"),
+            here.join("csrc/test_shim_fs.c"),
             p.join("src/fs_jobs.c"),
             p.join("src/net_probe.c"),
             here.join("csrc/sizes.c"),
@@ -190,6 +193,22 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         p.join("include/mgmt_rpc.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("src/mgmt_fs.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("src/path_policy.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("include/cross_device.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("include/mgmt_fs.h").display()
     );
     println!(
         "cargo:rerun-if-changed={}",

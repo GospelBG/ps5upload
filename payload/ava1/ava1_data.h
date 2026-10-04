@@ -19,6 +19,10 @@ typedef struct {
     int (*may_write)(const char *abs);    /* 1 = allowed */
     int (*may_read)(const char *abs, int unsafe_read);
     int (*same_device)(const char *a, const char *b); /* 1 same, 0 crosses, -1 unknown */
+    /* Review S2: 1 = `abs` (a symlink met while walking a download/copy source) leads to something the data
+     * plane must never read: the trust store, or an ancestor of it. The walk skips such an entry and the open
+     * refuses it. May be NULL. */
+    int (*refuse_link)(const char *abs);
     uint32_t fsync_delay_us;              /* tests: a slow disk */
     int crash_at;                         /* tests: AVA1_CRASH_* (Task 13) */
     uint32_t park_ms;                     /* a parked job is freed after this; 0 = AVA1_PARK_MS */

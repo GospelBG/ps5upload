@@ -1,6 +1,7 @@
 //! The payload's AVA1 C, built for the host (see build.rs). Test-only.
 #![cfg(unix)]
 
+pub mod mgmt_fs;
 use ava1::frame::Header;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
@@ -661,7 +662,16 @@ fn start_data_raw(a: &DataArgs, port: u16) -> u16 {
     rc as u16
 }
 
+/// Serialises the tests that install the shim's process-wide tables, policies and counters
+/// (test_shim.c / test_shim_fs.c): hold the guard for the whole test.
+static SHIM_LOCK: Mutex<()> = Mutex::new(());
+
 impl CServer {
+    /// The shared guard for shim-global state; take it before installing anything.
+    pub fn lock_for_shim_tests() -> MutexGuard<'static, ()> {
+        SHIM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn start(
         secret: [u8; 32],
         peers_path: &Path,
@@ -1236,6 +1246,20 @@ pub fn c_set_same_device(v: i32) {
 /// What the C data layer's `may_read` hook answers for the next download JobOpen
 /// (test_shim.c's `t_allow_read`): false refuses the open with AVA1_ERR_PATH. The
 /// refusal test restores it; a test that starts a server should set it true first.
+/// Names the trust-store directory the data layer must never follow a link into (None: off).
+pub fn c_set_protected(dir: Option<&std::path::Path>) {
+    extern "C" {
+        fn ava1_test_set_protected(dir: *const c_char);
+    }
+    match dir {
+        Some(d) => {
+            let c = CString::new(d.to_str().unwrap()).unwrap();
+            unsafe { ava1_test_set_protected(c.as_ptr()) }
+        }
+        None => unsafe { ava1_test_set_protected(std::ptr::null()) },
+    }
+}
+
 pub fn c_set_read_allowed(v: bool) {
     unsafe { ffi::ava1_test_set_allow_read(v as c_int) };
 }
