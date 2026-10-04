@@ -14,7 +14,7 @@ The CHANGELOG keeps its FTX2 entries: they describe releases that shipped FTX2.
 - [ ] `tests/README.md` — "full FTX2 stack", `PS5_ADDR` default `:9113`, `--ps5-addr` description
 - [ ] `tests/lab/README.md` — `:9113`/`:9114`, `ftx2_control.py`, `ftx2_probe.py`
 - [ ] `bench/README.md` — `run-ftx2-upload.mjs`, `check-ftx2-baseline.mjs`, `ftx2-upload-main.json` baselines, `--ps5-addr=…:9113`
-- [ ] `FAQ.md` — `FTX2_ZIP_RAM_THRESHOLD_MB` and `FTX2_ARCHIVE_STAGE_MB` environment variables (rename to `PS5UPLOAD_*` and accept the old names for one release)
+- [x] `FAQ.md` — `FTX2_ZIP_RAM_THRESHOLD_MB` and `FTX2_ARCHIVE_STAGE_MB` environment variables (P3 Task 17: renamed to `PS5UPLOAD_ZIP_RAM_THRESHOLD_MB` / `PS5UPLOAD_ARCHIVE_STAGE_MB`; the engine still reads the old names once per process with a deprecation line, and both settings are accepted but change nothing now that archives stream)
 - [ ] `MGMT_METHODS.md` — every row `hw-verified` (or `n/a` for a retired frame) on both consoles
 - [x] In-app strings (`client/src/i18n/locales/*.ts`) that mention FTX2, ports 9113/9114 or "transfer port" (Task 20; pinned by `client/src/i18n/noLegacyPorts.test.ts`)
 
@@ -125,12 +125,7 @@ kept.
 - [x] The Upload screen shows the transfer's `bottleneck` (Task 20: `screens/Upload/Bottleneck.tsx`; see
       "Client contract" below for the fields it reads).
 - [x] PS5 → PS5 UI wiring (Task 20: "From another PS5" on the Upload screen, `screens/Upload/Ps5ToPs5.tsx`).
-- [ ] `PS5UPLOAD_TRANSFER`: the default today is `auto` (probe the console, use AVA1 when it
-      advertises `CAP_DATA_PLANE`, FTX2 otherwise). At the cutover `route.rs` and the variable are
-      deleted along with the FTX2 branch of every call site above. To verify which protocol a run used,
-      read the engine's startup line `transfer mode=<auto|ava1|ftx2> (<default|env PS5UPLOAD_TRANSFER=…>)
-      ava_dir=…` (`ps5upload-engine/src/lib.rs:9631`) and each transfer's `protocol=` line; the
-      benchmark harness refuses an ambiguous `PS5UPLOAD_TRANSFER`.
+- [x] `PS5UPLOAD_TRANSFER` (P3 Task 17): `route.rs`, the variable and the `Mode` seam are deleted and every engine call site is AVA1 only. A console with no AVA1 listener or an older helper fails with `helper_not_ava1`; one that has not accepted this app fails with `not_paired`. The startup line is now `ava1: dir=<ava_dir> identity=<key prefix> paired=<n>`; each transfer still logs `protocol=ava1`. The benchmark harness calls each protocol directly and no longer cross-checks the variable.
 - [ ] The payload's FTX2 journal directories (`/data/ps5upload/tx`, `/data/ps5upload/spool`) are
       removed by the cutover payload on first start.
 - [ ] Engine tests that stub or assert FTX2 (list in section 1) are replaced by their AVA1
