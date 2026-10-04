@@ -16,7 +16,7 @@ The CHANGELOG keeps its FTX2 entries: they describe releases that shipped FTX2.
 - [ ] `bench/README.md` — `run-ftx2-upload.mjs`, `check-ftx2-baseline.mjs`, `ftx2-upload-main.json` baselines, `--ps5-addr=…:9113`
 - [ ] `FAQ.md` — `FTX2_ZIP_RAM_THRESHOLD_MB` and `FTX2_ARCHIVE_STAGE_MB` environment variables (rename to `PS5UPLOAD_*` and accept the old names for one release)
 - [ ] `MGMT_METHODS.md` — every row `hw-verified` (or `n/a` for a retired frame) on both consoles
-- [ ] In-app strings (`client/src/i18n/locales/*.ts`) that mention FTX2, ports 9113/9114 or "transfer port"
+- [x] In-app strings (`client/src/i18n/locales/*.ts`) that mention FTX2, ports 9113/9114 or "transfer port" (Task 20; pinned by `client/src/i18n/noLegacyPorts.test.ts`)
 
 Release gate: the engine's `auto` mode must not ship before the Task 28 hardware pass.
 
@@ -117,10 +117,9 @@ kept.
 - [ ] The engine never removes `<data dir>/ava/jobs/*` or `<data dir>/ava/send/*` (`SPEC.md` §14.3
       says a node removes a job directory 7 days after its last write; only the console does so, in
       `payload/src/ava1_glue.c:192`). `ava1::journal::gc` exists and has no caller in the engine.
-- [ ] The Upload screen shows the transfer's `bottleneck` (the engine already carries it in
-      `commit_ack` and `Progress`; no file in `client/src` reads it).
-- [ ] PS5 → PS5 UI wiring (the relay and `/api/transfer/ps5-to-ps5` exist and the relay is tested; the
-      screen does not offer it).
+- [x] The Upload screen shows the transfer's `bottleneck` (Task 20: `screens/Upload/Bottleneck.tsx`; see
+      "Client contract" below for the fields it reads).
+- [x] PS5 → PS5 UI wiring (Task 20: "From another PS5" on the Upload screen, `screens/Upload/Ps5ToPs5.tsx`).
 - [ ] `PS5UPLOAD_TRANSFER`: the default today is `auto` (probe the console, use AVA1 when it
       advertises `CAP_DATA_PLANE`, FTX2 otherwise). At the cutover `route.rs` and the variable are
       deleted along with the FTX2 branch of every call site above. To verify which protocol a run used,
@@ -226,3 +225,42 @@ The Phat's usb0 numbers are far below the Pro's for both protocols and its AVA1 
 third of FTX2's there; that is unexplained and is a reason to re-run the Phat before the release.
 FTX2 resume failed in every Phat run (the harness did not wait for the helper's ports after a
 restart; fixed in `a67ea278`, re-run pending on the Phat).
+
+# Client contract (Task 20)
+
+The client reads these, all optional, so an engine that does not send a field shows nothing for it.
+
+**Job snapshot** (`GET /api/jobs/{id}`, SSE `job`), fields on a `running` job unless noted:
+
+| field | type | meaning |
+|-------|------|---------|
+| `phase` | `"skipping"` | 7z/RAR resume: the decoder is discarding data the console already has. Absent otherwise. |
+| `skip_done_bytes`, `skip_total_bytes` | u64 | Progress of the skipping phase (decoded vs to skip). |
+| `bottleneck` | string | AVA1's words: `network`, `source`, `console drive`, `console workers`, `console memory`, `none`. A finished job carries the same word in `commit_ack.bottleneck` (already sent today). |
+| `settling` | bool | Files are still settling on the console after the job finished (the engine sees `unswept` > 0 in `job.status`): the client shows "Finishing on the console…". Send it on the job while it settles; absent or `false` shows nothing. |
+
+**Console status tokens** the status pill and the banners key on, read as substrings of the error
+text of `GET /api/ps5/status` (the one probe; `payload_check`):
+
+| token | state | UI |
+|-------|-------|----|
+| (a good `node.status` reply) | `connected` | green dot |
+| `ava1_not_paired`, `not_paired` | `needs_pairing` | "Pair…" banner and the pairing dialog |
+| `helper_old` | `helper_old` | "This PS5 is running an older helper. Update it." with the one-click send |
+| `legacy_helper_wedged` | `helper_old` (wedged) | the same banner without the button: "restart the console, then update" |
+| `helper_not_ava1`, anything else | `down` | the existing Send helper flow |
+
+A console in `needs_pairing` or `helper_old` is a live helper: it does not count as down, so
+the auto-redeploy loop never fires on it.
+
+**Pairing routes** (loopback-guarded like every engine route): `GET /api/ava1/pairing?addr=` starts
+or re-reads the handshake and answers `{state: "code", code: "004821", console_name}` (`code` is
+the six digits both screens show, zero-padded), `{state: "accepted"}` (already trusted),
+`{state: "closed"}` (the console's pairing window is shut) or a 502 with `error`.
+`POST /api/ava1/pairing/confirm` `{addr}` answers `accepted` or `closed`. The handshake whose code
+is on screen is held in `ps5upload_ava1::Pool` until confirmed, so asking twice shows one code.
+Tests: `engine/crates/ava1-ctest/tests/pairing.rs` (the C server).
+
+**Addresses.** The client sends the bare console host (`consoleAddr`); the engine owns the port and
+ignores any port a caller sends. While the FTX2 path still exists, `resolve_connect_targets` gives a
+bare host the default FTX2 port.

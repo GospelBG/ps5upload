@@ -117,7 +117,8 @@ export function humanizePs5Error(
   }
 
   // ─── PS5 unreachable at connect time ───────────────────────────────
-  if (/connect to .+:9114/i.test(raw)) {
+  // :9120 is the helper's single AVA1 port; :9114/:9113 still appear in older engine messages.
+  if (/connect to .+:(9114|9120)/i.test(raw)) {
     return te("err_connect_mgmt");
   }
   if (/connect to .+:9113/i.test(raw)) {

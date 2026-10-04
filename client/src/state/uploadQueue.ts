@@ -1,3 +1,4 @@
+import { consoleAddr } from "../lib/addr";
 import { create } from "zustand";
 
 import { pkgMkdirChain } from "../lib/pkgStorage";
@@ -41,6 +42,7 @@ import {
   type RateSample,
 } from "../lib/rollingRate";
 import { archiveFormat, type SourceKind } from "./upload";
+import { jobLiveFromSnapshot, type JobLive } from "../lib/jobLive";
 import {
   runPkgInstall,
   installSampleFeed,
@@ -88,7 +90,6 @@ import {
   type InstallRequest,
   type InstallResult,
 } from "./consoleQueueBridge";
-import { PS5_PAYLOAD_PORT } from "./connection";
 import { trStatic } from "../lib/trStatic";
 import { ensurePayloadCurrent } from "../lib/ensurePayloadCurrent";
 import { effectiveUploadStreams } from "../lib/uploadStreams";
@@ -242,6 +243,10 @@ export interface QueueItem {
    *  phase and on pre-P3 payloads that don't emit APPLY_PROGRESS. */
   filesFinalized: number;
   filesFinalizingTotal: number;
+  /** Transient live notes (skipping phase, bottleneck, "finishing on the
+   *  console") forwarded from the job snapshot while running; only set when
+   *  the engine sent them. Not persisted meaningfully: stale on reload. */
+  live?: JobLive;
   /** Mount path the runner produced when `mountAfterUpload` is true and
    *  the image upload + mount succeeded. Surfaced to the row so users
    *  see where the image landed without flipping to the Volumes tab. */
@@ -683,6 +688,8 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     installPhase: QueueItem["installPhase"];
     installedTitle: string | null;
     installNote?: string | null;
+    /** The finished transfer's bottleneck note, when the engine reported one. */
+    live?: JobLive;
   }> => {
     if (item.sourceKind === "install") return runInstallItem(item);
     const isFolder =
@@ -1137,6 +1144,12 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         return {
           bytesSent: finalBytes,
           bytesPerSec: averageRate(finalBytes, elapsedMs),
+          // The finished transfer's bottleneck (commit ack); a stale skipping/settling
+          // note from the last running tick must not outlive the job.
+          live: jobLiveFromSnapshot({
+            bottleneck: snap.bottleneck,
+            commit_ack: snap.commit_ack,
+          }),
           mountedAt,
           mountWarnings,
           registeredAs,
@@ -1176,6 +1189,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           // OR outside the finalize phase).
           filesFinalized: snap.files_finalized ?? 0,
           filesFinalizingTotal: snap.files_finalizing_total ?? 0,
+          live: jobLiveFromSnapshot(snap),
         }),
       }));
       await sleep(POLL_INTERVAL_MS);
@@ -1279,6 +1293,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             installPhase,
             installedTitle,
             installNote,
+            live,
           } =
             await runOne(next, isLive);
           // Always flip to "done" once runOne returns success — the
@@ -1302,6 +1317,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
               installPhase,
               installedTitle,
               installNote: installNote ?? null,
+              live,
               recovering: false,
               recoverAttempt: 0,
               completedAt: Date.now(),
@@ -1343,6 +1359,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             set((s) => ({
               items: patchItem(s.items, next.id, {
                 status: "failed",
+                live: undefined,
                 bytesPerSec: 0,
                 recovering: false,
                 recoverAttempt: 0,
@@ -1577,7 +1594,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         sourcePath: installKey(input.request),
         displayName: input.displayName,
         resolvedDest: "",
-        addr: `${bare}:${PS5_PAYLOAD_PORT}`,
+        addr: consoleAddr(bare),
         strategy: "overwrite",
         reconcileMode: "fast",
         excludes: [],

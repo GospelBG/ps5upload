@@ -69,7 +69,8 @@ describe("effectiveUploadStreams", () => {
           ucredElevated: true,
           priorInstance: null,
           maxTransferStreams: 1,
-          transferAlive: null,
+          session: null,
+          helperWedged: false,
         },
         "192.168.86.100": {
           payloadStatus: "up",
@@ -78,7 +79,8 @@ describe("effectiveUploadStreams", () => {
           ucredElevated: true,
           priorInstance: null,
           maxTransferStreams: 4,
-          transferAlive: null,
+          session: null,
+          helperWedged: false,
         },
       },
     });

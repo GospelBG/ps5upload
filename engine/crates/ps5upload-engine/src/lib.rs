@@ -9875,6 +9875,11 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         .route("/api/ps5/pkg/metadata", get(ps5_pkg_metadata))
         .route("/api/ps5/list-dir", get(ps5_list_dir))
         .route("/api/ava1/identity", get(ava1_api::identity_handler))
+        .route("/api/ava1/pairing", get(ava1_api::pairing_handler))
+        .route(
+            "/api/ava1/pairing/confirm",
+            post(ava1_api::pairing_confirm_handler),
+        )
         .route("/api/game/inspect", post(inspect::inspect_handler))
         .route(
             "/api/game/inspect/image",

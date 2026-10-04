@@ -446,7 +446,7 @@ describe("rest mode after upload", () => {
     expect(itemsByStatus("done")).toHaveLength(1);
     // Standby targets the mgmt addr of the drained host.
     expect(mockedStandby).toHaveBeenCalledTimes(1);
-    expect(mockedStandby).toHaveBeenCalledWith("192.168.1.10:9114");
+    expect(mockedStandby).toHaveBeenCalledWith("192.168.1.10");
   });
 
   it("sleeps EACH console that drains, independently", async () => {
@@ -457,7 +457,7 @@ describe("rest mode after upload", () => {
     await vi.advanceTimersByTimeAsync(5000);
     await p;
     const called = mockedStandby.mock.calls.map((c) => c[0]).sort();
-    expect(called).toEqual(["192.168.1.10:9114", "192.168.1.20:9114"]);
+    expect(called).toEqual(["192.168.1.10", "192.168.1.20"]);
   });
 
   it("does NOT sleep a console that was Stopped mid-drain", async () => {

@@ -5,6 +5,11 @@
 // TCP send) stay in-process.
 
 import { trStatic } from "../lib/trStatic";
+import {
+  classifySession,
+  reportIfNotPaired,
+  type SessionState,
+} from "../lib/consoleSession";
 import { Channel } from "@tauri-apps/api/core";
 import { getEngineUrl } from "../state/engine";
 // Logging wrapper: every command leaves a trace breadcrumb + logs failures at
@@ -4132,6 +4137,22 @@ export interface JobSnapshot {
    *  Second progress dimension alongside file count; useful when file
    *  sizes vary wildly. */
   bytes_finalized?: number;
+  /** The sending phase when it is not plain sending: `"skipping"` while a 7z/RAR
+   *  resume discards data the console already has. Absent otherwise (and on engines
+   *  that do not report it). Contract: protocol/ava1/CUTOVER.md. */
+  phase?: string;
+  /** Skipping progress: bytes decoded so far and bytes to skip in all. */
+  skip_done_bytes?: number;
+  skip_total_bytes?: number;
+  /** What limits the transfer (AVA1's words: "network", "source", "console drive",
+   *  "console workers", "console memory", "none"). Live on a running job when the
+   *  engine reports it; a finished job carries it in `commit_ack`. */
+  bottleneck?: string;
+  /** True while files are still settling on the console after the job finished
+   *  ("Finishing on the console"). Absent until the engine sends it. */
+  settling?: boolean;
+  /** The commit ack of a finished job (AVA1: protocol, files, bytes, bottleneck, ...). */
+  commit_ack?: { bottleneck?: string } & Record<string, unknown>;
   /** Files actually sent (Done only). */
   files_sent?: number;
   shards_sent?: number;
@@ -4265,6 +4286,12 @@ export async function jobStatus(jobId: string): Promise<JobSnapshot> {
       `job_status returned unexpected shape (missing/invalid status): ${JSON.stringify(raw).slice(0, 200)}`,
     );
   }
+  if (status === "failed") {
+    // A transfer that died because the console has not accepted this app opens the pairing dialog.
+    reportIfNotPaired(
+      (raw as { error_reason?: unknown }).error_reason ?? raw.error,
+    );
+  }
   return raw as unknown as JobSnapshot;
 }
 
@@ -4388,7 +4415,7 @@ export async function portProbe(
 }
 
 /**
- * Check whether the PS5 runtime (:9113) is currently serving. Returns a
+ * Check whether the PS5 runtime (AVA1, :9120) is currently serving. Returns a
  * lightly-parsed shape — the full command's return covers more details
  * but these are the fields the status UI actually renders.
  *
@@ -4506,6 +4533,9 @@ export async function payloadCheck(ip: string): Promise<{
    *  Defaults to true when absent so an older engine degrades to the old
    *  interpretation rather than claiming a console outage it can't see. */
   engineReachable: boolean;
+  /** The ONE status verdict (connected / needs_pairing / helper_old / down),
+   *  classified from the same reply. See lib/consoleSession.ts. */
+  session: SessionState;
   /** Raw error string from the engine when reachable=false. Lets the
    *  Connection screen's wait-for-boot banner surface what actually
    *  went wrong (TCP connect refused, STATUS_ACK timeout, etc.)
@@ -4525,10 +4555,12 @@ export async function payloadCheck(ip: string): Promise<{
       max_transfer_streams?: number;
     };
   }>("payload_check", { ip });
+  const error = resp?.reachable ? null : (resp?.error ?? null);
   return {
     reachable: !!resp?.reachable,
     loaded: !!resp?.loaded,
     engineReachable: resp?.engine !== false,
+    session: classifySession({ reachable: !!resp?.reachable, error }),
     payloadVersion: resp?.status?.version ?? null,
     ps5Kernel: resp?.status?.ps5_kernel ?? null,
     ucredElevated:
@@ -4544,7 +4576,7 @@ export async function payloadCheck(ip: string): Promise<{
       resp.status.max_transfer_streams > 0
         ? resp.status.max_transfer_streams
         : null,
-    error: resp?.reachable ? null : (resp?.error ?? null),
+    error,
   };
 }
 

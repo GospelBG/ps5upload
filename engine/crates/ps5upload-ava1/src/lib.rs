@@ -24,7 +24,7 @@ pub mod source;
 pub mod upload;
 pub mod zip_source;
 
-pub use pool::{pool, Pool, JOURNAL_GC_EVERY, JOURNAL_MAX_AGE_S};
+pub use pool::{pool, Pairing, Pool, JOURNAL_GC_EVERY, JOURNAL_MAX_AGE_S};
 pub use upload::{PostCommitError, PostCommitKind};
 
 /// Runs a future from blocking code (C15): a runtime handle's `block_on` when the

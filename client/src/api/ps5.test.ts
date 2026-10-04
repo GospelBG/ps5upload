@@ -64,7 +64,7 @@ describe("searchPS5", () => {
     expect(result.scanned).toBe(257);
     expect(result.truncated).toBe(false);
     expect(mockedInvoke).toHaveBeenCalledWith("ps5_list_dir", {
-      addr: "192.168.1.2:9114",
+      addr: "192.168.1.2",
       path: "/data",
       offset: 256,
       limit: 256,

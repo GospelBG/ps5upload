@@ -41,6 +41,11 @@ describe("humanizePs5Error", () => {
         /management service/i,
       );
     });
+    it("maps the helper's single port (:9120) refused → reachability hint", () => {
+      expect(humanizePs5Error("connect to 192.168.1.5:9120: refused")).toMatch(
+        /Can't reach your PS5/i,
+      );
+    });
     it("maps transfer-port refused → transfer hint", () => {
       expect(
         humanizePs5Error("connect to 192.168.1.5:9113: refused"),

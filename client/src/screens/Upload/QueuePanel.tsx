@@ -48,6 +48,7 @@ import {
 } from "../../state/uploadQueue";
 import { isRemotePath } from "../../lib/remotePath";
 import { useTransferStore } from "../../state/transfer";
+import { BottleneckLine, JobLiveNotes } from "./Bottleneck";
 
 /** One console's slice of the queue, in first-seen order. */
 interface ConsoleGroup {
@@ -989,6 +990,9 @@ export function QueueRow({
             value={pct / 100}
             label={tr("queue_title", undefined, "Queue")}
           />
+          <div className="mt-1">
+            <JobLiveNotes live={item.live} />
+          </div>
           {isFinalizing && (
             // Always-visible explainer under the bar. The pill itself
             // ("Finalizing on PS5") is short enough to fit on the
@@ -1009,6 +1013,9 @@ export function QueueRow({
 
       {item.status === "done" && !isInstall && (
         <DoneStats bytesSent={item.bytesSent} bytesPerSec={item.bytesPerSec} />
+      )}
+      {item.status === "done" && !isInstall && item.live?.bottleneck && (
+        <BottleneckLine cause={item.live.bottleneck} />
       )}
 
       {item.status === "done" && item.installNote && (

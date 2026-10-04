@@ -31,8 +31,8 @@ check_updates: "Frissítések keresése",
 language: "Nyelv",
 // Forrás
 // Cél
-// Az előző feltöltési-mód union (payload / ftp / mix / ftx2) egyetlen
-// FTX2-motor útvonallá olvad össze, a felhasználók felé "Payload" néven.
+// Az előző feltöltési-mód union (payload / ftp / mix / a régi protokollnév) egyetlen
+// motor-útvonallá olvad össze, a felhasználók felé "Payload" néven.
 // A régi kulcsok maradnak a konfig-visszafelé-kompatibilitás miatt —
 // mind a négy ugyanarra a címkére mutat most.
 // Várólisták
@@ -358,7 +358,7 @@ logs_filter_all: "Összes",
 status_engine: "Motor",
 status_engine_tooltip: "ps5upload-engine — az app háttérrendszere ({url})",
 status_payload: "segédprogram",
-status_payload_tooltip: "PS5Upload segédprogram a :9113-on",
+status_payload_tooltip: "PS5Upload segédprogram a :9120-on",
 status_kernel_ok: "kernel OK",
 status_no_active_transfers: "Nincs aktív átvitel",
 status_ps5: "PS5",
@@ -428,8 +428,7 @@ about_credits_text: "A licencfeltételekért lásd a LICENSE fájlt.",
 // renderelve a screens/About/index.tsx-ben, amit az i18n extraktor nem
 // jár be, így ezeket itt kézzel deklaráljuk).
 about_feat_fast_transfers_title: "Gyors átvitel",
-about_feat_fast_transfers_body:
-  "FTX2 bináris protokoll BLAKE3 shard-ellenőrzéssel + kis fájlok csomagolási optimalizációval. A LAN-od maximumon kihasználja.",
+about_feat_fast_transfers_body: "AVA1 átviteli protokoll BLAKE3-ellenőrzéssel, titkosított munkamenetekkel, folytatható feladatokkal és kis fájlok csomagolásával. A LAN-od maximumon kihasználja.",
 about_feat_native_mount_title: "Natív képcsatolás",
 about_feat_native_mount_body:
   "Csatolja a .exfat és .ffpkg képeket a /mnt/ps5upload/ alá MDIOCATTACH + nmount segítségével — harmadik féltől származó segédprogram nélkül.",
@@ -3729,6 +3728,42 @@ cheats_your_version: "A te verziód",
 notifications_mark_all_read: "Összes megjelölése olvasottként",
 notifications_mark_read: "Megjelölés olvasottként",
 notifications_mark_unread: "Megjelölés olvasatlanként",
+
+// AVA1 cutover (P3 Task 20): pairing dialog, session status, skipping/bottleneck, PS5 to PS5.
+pairing_title: "Párosítás a PS5-tel",
+pairing_intro: "{name} párosítást kér ezzel az alkalmazással. Ellenőrizd, hogy az alábbi kód megegyezik-e a PS5-ön láthatóval, majd erősítsd meg.",
+pairing_code_label: "Párosítási kód",
+pairing_codes_differ: "A kódok eltérnek",
+pairing_confirm: "A kódok egyeznek, párosítás",
+pairing_closed_title: "A PS5 nem fogad új párosítást",
+pairing_closed_body: "A párosítási ablak zárva van. Egy már párosított eszközön nyisd meg a párosítást ehhez a konzolhoz. Ha még egy eszköz sincs párosítva, indítsd újra a segédprogramot a konzolon az ablak újranyitásához. Aztán próbáld újra.",
+pairing_retry: "Próbáld újra",
+pairing_error: "A párosítás sikertelen: {error}",
+pairing_waiting: "Kapcsolódás a PS5-höz…",
+session_needs_pairing: "Ez a PS5 még nem fogadta el ezt az alkalmazást. A folytatáshoz párosítsd őket.",
+session_pair_button: "Párosítás…",
+helper_old_banner: "Ezen a PS5-ön régebbi segédprogram fut. Frissítsd.",
+helper_old_wedged: "A régi segédprogram nem lépett ki a kérésre. Indítsd újra a konzolt, majd frissítsd a segédprogramot.",
+helper_old_update: "Segédprogram frissítése",
+status_ps5_needs_pairing: "Párosítás szükséges",
+status_ps5_helper_old: "Régebbi segédprogram, frissítsd",
+upload_phase_skipping: "A konzolon már meglévő adatok átugrása: {done} / {total}",
+upload_bottleneck_label: "Korlátozó tényező: {cause}",
+bottleneck_network: "hálózat",
+bottleneck_source: "forrás (archívum kicsomagolása)",
+bottleneck_disk: "konzol meghajtója",
+bottleneck_workers: "konzol munkaszálai",
+bottleneck_memory: "konzol memóriája",
+upload_phase_settling: "Befejezés a konzolon…",
+ps5src_title: "Másik PS5-ről",
+ps5src_need_two: "Adj hozzá egy második konzolt a listához, hogy konzolok között másolhass.",
+ps5src_hint: "Fájlt vagy mappát másol egy másik konzolról erre a hálózaton át. Az adatok átmennek ezen a számítógépen; semmi sem marad rajta.",
+ps5src_from_console: "Forráskonzol",
+ps5src_from_path: "Útvonal a forráskonzolon",
+ps5src_dest_path: "Célútvonal ezen a konzolon",
+ps5src_start: "Másolás erre a PS5-re",
+ps5src_need_source_path: "Add meg a forrás útvonalát, / jellel kezdve",
+ps5src_need_dest_path: "Add meg a cél útvonalát, / jellel kezdve",
 };
 
 export default hu;

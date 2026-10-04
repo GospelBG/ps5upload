@@ -2,7 +2,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::ConnectInfo;
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -147,8 +147,100 @@ pub async fn identity_handler(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Res
     }
 }
 
+/// The pairing dialog's view of a console, as the JSON the client keys on:
+/// `state` is `none` (nothing in progress), `code` (compare `code` with the console's
+/// screen; `console_name` is what the console calls itself), `accepted` (paired) or
+/// `closed` (the console's pairing window is shut). A transport failure is a 502.
+fn pairing_body(
+    r: Result<ps5upload_ava1::Pairing, ava1::Ava1Error>,
+) -> (StatusCode, serde_json::Value) {
+    use ps5upload_ava1::Pairing;
+    match r {
+        Ok(Pairing::Paired) => (StatusCode::OK, serde_json::json!({ "state": "accepted" })),
+        Ok(Pairing::Closed) => (StatusCode::OK, serde_json::json!({ "state": "closed" })),
+        Ok(Pairing::Code { code, peer_name }) => (
+            StatusCode::OK,
+            // Zero-padded: the console shows six digits, and 012345 is not 12345.
+            serde_json::json!({ "state": "code", "code": format!("{code:06}"), "console_name": peer_name }),
+        ),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({ "state": "none", "error": e.to_string() }),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct PairingQuery {
+    addr: Option<String>,
+}
+
+/// `GET /api/ava1/pairing?addr=` — starts (or re-reads) the pairing handshake with the
+/// console and reports the code to compare. The handshake is held until confirmed.
+pub async fn pairing_handler(
+    State(state): State<crate::AppState>,
+    Query(q): Query<PairingQuery>,
+) -> Response {
+    let addr = q.addr.unwrap_or_else(|| state.default_ps5_addr.clone());
+    let (code, body) = pairing_body(ps5upload_ava1::pool().pairing_status(&addr).await);
+    (code, Json(body)).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct PairingConfirm {
+    addr: Option<String>,
+}
+
+/// `POST /api/ava1/pairing/confirm` `{addr}` — the user saw matching codes. A refusal by the
+/// console, or a handshake that is gone (the console's window timed out), is `closed`:
+/// the dialog then explains how to reopen the window.
+pub async fn pairing_confirm_handler(
+    State(state): State<crate::AppState>,
+    Json(req): Json<PairingConfirm>,
+) -> Response {
+    let addr = req.addr.unwrap_or_else(|| state.default_ps5_addr.clone());
+    let r = ps5upload_ava1::pool()
+        .confirm_pairing(&addr)
+        .await
+        .map(|()| ps5upload_ava1::Pairing::Paired);
+    let r = match r {
+        Err(ava1::Ava1Error::NotPaired) => Ok(ps5upload_ava1::Pairing::Closed),
+        Err(ava1::Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CLOSED => {
+            Ok(ps5upload_ava1::Pairing::Closed)
+        }
+        other => other,
+    };
+    let (code, body) = pairing_body(r);
+    (code, Json(body)).into_response()
+}
+
 #[cfg(test)]
 mod tests {
+    use ps5upload_ava1::Pairing;
+
+    #[test]
+    fn the_pairing_body_names_the_state_and_pads_the_code() {
+        let (st, b) = super::pairing_body(Ok(Pairing::Code {
+            code: 4821,
+            peer_name: "PS5-Pro".into(),
+        }));
+        assert_eq!(st, axum::http::StatusCode::OK);
+        assert_eq!(b["state"], "code");
+        assert_eq!(b["code"], "004821");
+        assert_eq!(b["console_name"], "PS5-Pro");
+        assert_eq!(
+            super::pairing_body(Ok(Pairing::Paired)).1["state"],
+            "accepted"
+        );
+        assert_eq!(
+            super::pairing_body(Ok(Pairing::Closed)).1["state"],
+            "closed"
+        );
+        let (st, b) = super::pairing_body(Err(ava1::Ava1Error::Timeout));
+        assert_eq!(st, axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(b["state"], "none");
+        assert!(b["error"].is_string());
+    }
     #[test]
     fn the_helper_is_stamped_with_the_given_key_and_sent_regardless() {
         let mut elf = vec![0x11u8; 4096];

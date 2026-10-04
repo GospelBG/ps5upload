@@ -6,8 +6,8 @@ import {
   mgmtAddr,
   portOf,
   PS5_LOADER_PORT,
-  PS5_MGMT_PORT,
-  PS5_TRANSFER_PORT,
+  PS5_AVA1_PORT,
+  consoleAddr,
   transferAddr,
   withPort,
 } from "./addr";
@@ -18,11 +18,29 @@ describe("port constants", () => {
     // silently break every send-payload call site.
     expect(PS5_LOADER_PORT).toBe(9021);
   });
-  it("keeps our payload transfer port at 9113", () => {
-    expect(PS5_TRANSFER_PORT).toBe(9113);
+  it("keeps the helper's single AVA1 port at 9120", () => {
+    expect(PS5_AVA1_PORT).toBe(9120);
   });
-  it("keeps our payload mgmt port at 9114", () => {
-    expect(PS5_MGMT_PORT).toBe(9114);
+});
+
+describe("consoleAddr", () => {
+  it("consoleAddr_strips_any_port", () => {
+    for (const shape of [
+      "192.168.1.50",
+      "192.168.1.50:9113",
+      "192.168.1.50:9114",
+      "192.168.1.50:9120",
+      "192.168.1.50:9113:9114",
+    ]) {
+      expect(consoleAddr(shape)).toBe("192.168.1.50");
+    }
+    expect(consoleAddr("ps5.local:9120")).toBe("ps5.local");
+    expect(consoleAddr("[fe80::1]:9120")).toBe("[fe80::1]:9120");
+    expect(consoleAddr("")).toBe("");
+  });
+  it("makes the old mgmt and transfer helpers aliases of it", () => {
+    expect(mgmtAddr("10.0.0.2:9113")).toBe("10.0.0.2");
+    expect(transferAddr("10.0.0.2")).toBe("10.0.0.2");
   });
 });
 
@@ -61,15 +79,11 @@ describe("withPort", () => {
   });
 });
 
-describe("named port helpers", () => {
-  it("mgmtAddr targets :9114 from any input shape", () => {
-    expect(mgmtAddr("192.168.1.50")).toBe("192.168.1.50:9114");
-    expect(mgmtAddr("192.168.1.50:9113")).toBe("192.168.1.50:9114");
-    expect(mgmtAddr("192.168.1.50:9114")).toBe("192.168.1.50:9114");
-  });
-  it("transferAddr targets :9113", () => {
-    expect(transferAddr("192.168.1.50")).toBe("192.168.1.50:9113");
-    expect(transferAddr("192.168.1.50:9114")).toBe("192.168.1.50:9113");
+describe("named address helpers", () => {
+  it("mgmtAddr and transferAddr are the bare host from any input shape", () => {
+    expect(mgmtAddr("192.168.1.50")).toBe("192.168.1.50");
+    expect(mgmtAddr("192.168.1.50:9113")).toBe("192.168.1.50");
+    expect(transferAddr("192.168.1.50:9114")).toBe("192.168.1.50");
   });
   it("loaderAddr targets :9021", () => {
     expect(loaderAddr("192.168.1.50")).toBe("192.168.1.50:9021");
@@ -108,15 +122,14 @@ describe("IPv6 addressing", () => {
   });
   it("brackets an IPv6 literal when composing host:port", () => {
     expect(withPort("fe80::1", 9114)).toBe("[fe80::1]:9114");
-    expect(mgmtAddr("2001:db8::5")).toBe("[2001:db8::5]:9114");
-    expect(transferAddr("fe80::1")).toBe("[fe80::1]:9113");
     expect(loaderAddr("fe80::1")).toBe("[fe80::1]:9021");
   });
-  it("re-brackets a bracketed IPv6 when swapping the port", () => {
-    expect(mgmtAddr("[fe80::1]:9113")).toBe("[fe80::1]:9114");
+  it("keeps an IPv6 console splittable for the engine (bracketed, port ignored)", () => {
+    expect(consoleAddr("fe80::1")).toBe("[fe80::1]:9120");
+    expect(consoleAddr("[fe80::1]:9113")).toBe("[fe80::1]:9120");
   });
-  it("leaves IPv4 unbracketed", () => {
-    expect(mgmtAddr("192.168.1.50")).toBe("192.168.1.50:9114");
+  it("leaves IPv4 unbracketed and portless", () => {
+    expect(mgmtAddr("192.168.1.50")).toBe("192.168.1.50");
   });
   it("portOf reads a bracketed IPv6 port and null for a bare literal", () => {
     expect(portOf("[fe80::1]:9114")).toBe(9114);
