@@ -103,7 +103,7 @@ key, and the shared plaintext is unchanged.
 
 ## 7. The second counter at `keys.rs:438`
 
-It is in `#[cfg(test)]` (`noise_xx_matches_the_vector`): the test replays the Noise
+It is in `#[cfg(test)]` (`the_published_noise_vector_reproduces`): the test replays the Noise
 transport vector messages 3..5 with a local `n_i/n_r`. It is not production code and not an
 AEAD nonce under a live key (production never uses Noise transport messages after the split;
 the post-handshake keys are the derived `control_key`s, which differ from the raw split keys).
