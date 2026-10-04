@@ -27,8 +27,10 @@ typedef struct {
     int (*read_allowed)(const char *path, int unsafe_read);
     /* One successful command (the node's command_count). May be NULL. */
     void (*count)(void);
-    /* Device id of a path (xdev_dev_fn, cross_device.h); NULL = stat(2). The rename guard. */
+    /* Device id of the rename guard's destination directory (xdev_dev_fn, cross_device.h); NULL = stat(2). */
     int (*dev_of)(const char *path, unsigned long long *out);
+    /* Device id of the rename's SOURCE: its own device, a link not followed; NULL = lstat(2). */
+    int (*src_dev_of)(const char *path, unsigned long long *out);
 } mgmt_fs_policy_t;
 
 /* Installs the policy (copied). Until it is called every path is refused. */

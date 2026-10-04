@@ -12,6 +12,7 @@
 #include "cross_device.h"
 #include "mgmt_fs.h"
 #include "mgmt_rpc.h"
+#include "path_policy.h"
 
 #define FRAME_ERROR 3u
 
@@ -20,10 +21,18 @@ static uint32_t g_counted, g_shutdowns, g_unsafe_seen;
 static int g_fake_dev; /* 1: a path containing "/mnt2/" is on another device */
 static uint32_t g_klog_avail, g_syslog_len;
 
-static int mine(const char *path) {
+static int g_allow_dev; /* the xdev symlink test renames into /dev: the guard must refuse before any rename */
+
+/* The pure string rule of this test's "allowed roots": the temp root (and /dev when asked). */
+static int lexical_mine(const char *path) {
     size_t n = strlen(g_root);
-    return g_root[0] && strncmp(path, g_root, n) == 0 && (path[n] == '/' || path[n] == '\0') && !strstr(path, "/../");
+    if (path[0] != '/' || strstr(path, "/../") || strstr(path, "/./")) return 0;
+    if (g_allow_dev && strncmp(path, "/dev/", 5) == 0) return 1;
+    return g_root[0] && strncmp(path, g_root, n) == 0 && (path[n] == '/' || path[n] == '\0');
 }
+
+/* The REAL symlink-safe resolution (payload/src/path_policy.c, what runtime.c's is_path_allowed runs). */
+static int mine(const char *path) { return path_resolve_allowed(path, lexical_mine); }
 
 static int t_write_allowed(const char *path) { return mine(path); }
 
@@ -38,12 +47,17 @@ static int t_read_allowed(const char *path, int unsafe_read) {
 
 static void t_count(void) { __atomic_add_fetch(&g_counted, 1, __ATOMIC_SEQ_CST); }
 
+/* With fake_dev set both lookups are injected; otherwise p.dev_of/src_dev_of are NULL (the real stat/lstat). */
 static int t_dev_of(const char *path, unsigned long long *out) {
     if (g_fake_dev) {
         *out = strstr(path, "/mnt2") ? 2u : 1u;
         return 0;
     }
     return xdev_stat_dev(path, out);
+}
+static int t_src_dev_of(const char *path, unsigned long long *out) {
+    if (g_fake_dev) return t_dev_of(path, out);
+    return xdev_lstat_dev(path, out);
 }
 
 static int send_frame(uint16_t type, const void *body, uint64_t len) {
@@ -170,22 +184,33 @@ int ava1_test_mgmtfs_install(const char *root) {
     mgmt_fs_policy_t p;
     memset(&p, 0, sizeof p);
     snprintf(g_root, sizeof g_root, "%s", root);
+    {
+        char prot[700];
+        /* the trust store of this test console: <root>/d/ava (an ancestor, <root>/d, exists to be refused too) */
+        snprintf(prot, sizeof prot, "%s/d/ava", root);
+        path_policy_set_protected(prot);
+    }
     p.write_allowed = t_write_allowed;
     p.read_allowed = t_read_allowed;
     p.count = t_count;
     p.dev_of = t_dev_of;
+    p.src_dev_of = t_src_dev_of;
     mgmt_fs_set_policy(&p);
     g_counted = g_shutdowns = g_unsafe_seen = 0;
     g_fake_dev = 0;
+    g_allow_dev = 0;
     g_klog_avail = g_syslog_len = 0;
     return mgmt_rpc_install(k_table, sizeof k_table / sizeof k_table[0], NULL, NULL, NULL);
 }
 
 void ava1_test_mgmtfs_uninstall(void) {
+    path_policy_set_protected(NULL);
     g_counted = g_shutdowns = g_unsafe_seen = 0;
     mgmt_fs_set_policy(NULL);
     (void)mgmt_rpc_install(NULL, 0, NULL, NULL, NULL);
 }
+
+void ava1_test_mgmtfs_allow_dev(int on) { g_allow_dev = on; }
 
 void ava1_test_mgmtfs_set(int fake_dev, uint32_t klog_avail, uint32_t syslog_len) {
     g_fake_dev = fake_dev;
@@ -198,3 +223,6 @@ void ava1_test_mgmtfs_stats(uint32_t *counted, uint32_t *shutdowns, uint32_t *un
     *shutdowns = __atomic_load_n(&g_shutdowns, __ATOMIC_SEQ_CST);
     *unsafe_seen = __atomic_load_n(&g_unsafe_seen, __ATOMIC_SEQ_CST);
 }
+
+int ava1_test_path_in_protected(const char *p) { return path_in_protected(p); }
+int ava1_test_path_contains_protected(const char *p) { return path_contains_protected(p); }

@@ -20,8 +20,11 @@ use ava1_ctest::*;
 const SECRET: [u8; 32] = [0x43; 32];
 const OK: u16 = gen::STATUS_OK;
 
-/// The installed table and policy are process-wide: one test at a time.
-static ONE: Mutex<()> = Mutex::new(());
+/// The installed table, policy and stub counters are process-wide (test_shim_fs.c): every test holds
+/// the shared shim guard for its whole run, so the suite passes in parallel mode.
+fn one() -> MutexGuard<'static, ()> {
+    CServer::lock_for_shim_tests()
+}
 
 struct Rig {
     _one: MutexGuard<'static, ()>,
@@ -42,7 +45,7 @@ fn fast() -> Timing {
 // The process-wide lock is held for the whole test on purpose (the installed table is global).
 #[allow(clippy::await_holding_lock)]
 async fn rig(tag: &str) -> Rig {
-    let one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let one = one();
     let base = std::env::temp_dir().join(format!("ava1-mfs-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let root = base.join("root");
@@ -856,7 +859,7 @@ mod transport {
     pub fn rig(tag: &str, install: bool) -> T {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| std::env::set_var("PS5UPLOAD_TRANSFER", "auto"));
-        let one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let one = one();
         let base = std::env::temp_dir().join(format!("ava1-mfst-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("root");
@@ -1074,4 +1077,374 @@ mod transport {
         assert!(out.is_none());
         assert_eq!(mgmt_fs::stats(), (0, 0, 0));
     }
+}
+
+// ---- review round 1: kernel-panic class, policy, tmp-file hygiene ----
+
+fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+/// A REAL symlink and the REAL lstat-based device lookup (no injection): the link lives on the
+/// temp root's device and points at /dev/null, which is on another. Renaming it into /dev (the
+/// link's TARGET's device) must be refused before any rename(2): a stat()-based guard compares
+/// /dev with /dev, says "same", and moves the link across devices (the kernel panic).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlink_source_is_judged_by_its_own_device() {
+    let r = rig("xdevlink").await;
+    let dev_of = |p: &Path| std::fs::metadata(p).unwrap().dev();
+    if dev_of(&r.root) == dev_of(Path::new("/dev")) {
+        eprintln!("skipped: the temp root and /dev share a device on this host");
+        return;
+    }
+    mgmt_fs::allow_dev(true);
+    symlink("/dev/null", r.path("lnk"));
+    let (st, b) = r
+        .rpc(
+            gen::METHOD_FS_RENAME,
+            &gen::FsRename {
+                from: r.p("lnk"),
+                to: "/dev/ava1-should-never-exist".into(),
+                overwrite: 1,
+            },
+        )
+        .await;
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_CROSS_DEVICE, "fs_move_cross_mount")
+    );
+    assert!(
+        std::fs::symlink_metadata(r.path("lnk")).is_ok(),
+        "the link did not move"
+    );
+    assert!(!Path::new("/dev/ava1-should-never-exist").exists());
+    // a link moved inside its own directory is fine (same device as itself)
+    let (st, _) = r
+        .rpc(gen::METHOD_FS_RENAME, &rename(&r, "lnk", "lnk2", 1))
+        .await;
+    assert_eq!(st, OK);
+    assert!(std::fs::symlink_metadata(r.path("lnk2"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn the_guard_header_judges_a_source_link_by_lstat() {
+    let src = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../payload/include/cross_device.h"),
+    )
+    .unwrap();
+    assert!(
+        src.contains("xdev_lstat_dev"),
+        "the lstat device lookup exists"
+    );
+    // Every caller that renames a user-chosen source passes the lstat lookup for it.
+    for f in ["src/runtime.c", "src/ftp_server.c", "src/mgmt_fs.c"] {
+        let c = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../payload")
+                .join(f),
+        )
+        .unwrap();
+        assert!(
+            c.contains("xdev_rename_crosses_l("),
+            "{f} uses the two-lookup guard"
+        );
+        assert!(
+            !c.contains("xdev_rename_crosses("),
+            "{f} still uses the one-lookup (stat) guard"
+        );
+    }
+    let sh = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../payload/src/shell_builtin.c"),
+    )
+    .unwrap();
+    assert!(sh.contains("mv_same_dev = (lstat(argv[i]"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nonexistent_leaf_under_a_symlinked_parent_is_refused_by_the_real_policy() {
+    let r = rig("symparent").await;
+    let outside = r.root.parent().unwrap().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, r.path("link"));
+    // fs.write
+    let (st, b) = r.write("link/new", 0, 0, b"x", None).await;
+    assert_eq!((st, cause(&b).as_str()), (gen::ERR_PATH, "path_unsafe"));
+    assert!(!outside.join("new").exists());
+    // fs.mkdir, with and without parents (the missing parents are created below the link too)
+    for rel in ["link/sub", "link/a/b/c"] {
+        let (st, _) = r
+            .rpc(
+                gen::METHOD_FS_MKDIR,
+                &gen::FsMkdir {
+                    path: r.p(rel),
+                    mode: 0o755,
+                    parents: 1,
+                },
+            )
+            .await;
+        assert_eq!(st, gen::ERR_PATH, "{rel}");
+    }
+    assert_eq!(
+        std::fs::read_dir(&outside).unwrap().count(),
+        0,
+        "nothing was created outside"
+    );
+    // fs.rename's destination
+    std::fs::write(r.path("src"), b"1").unwrap();
+    let (st, b) = r
+        .rpc(gen::METHOD_FS_RENAME, &rename(&r, "src", "link/dst", 1))
+        .await;
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PATH, "fs_move_path_not_allowed")
+    );
+    assert!(r.path("src").exists() && !outside.join("dst").exists());
+    // a dangling symlink leaf is refused too: creating through it would write where it points
+    symlink(outside.join("target-not-there"), r.path("dangling"));
+    let (st, _) = r.write("dangling", 0, 0, b"x", None).await;
+    assert_eq!(st, gen::ERR_PATH);
+    assert!(!outside.join("target-not-there").exists());
+    // the policy still accepts the honest cases: a missing leaf in a real directory, and a deeper one
+    let (st, _) = r.write("ok-leaf", 0, 0, b"x", None).await;
+    assert_eq!(st, OK);
+    let (st, _) = r
+        .rpc(
+            gen::METHOD_FS_MKDIR,
+            &gen::FsMkdir {
+                path: r.p("real/a/b"),
+                mode: 0o755,
+                parents: 1,
+            },
+        )
+        .await;
+    assert_eq!(st, OK);
+    // and a symlink INSIDE the root that stays inside is fine
+    symlink(r.path("real"), r.path("inlink"));
+    let (st, _) = r.write("inlink/file", 0, 0, b"x", None).await;
+    assert_eq!(st, OK);
+    assert!(r.path("real/file").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_planted_tmp_symlink_is_never_followed() {
+    let r = rig("tmplink").await;
+    let outside = r.root.parent().unwrap().join("victim");
+    std::fs::write(&outside, b"precious").unwrap();
+    // single-call write: the planted link at the tmp name is removed, not written through
+    symlink(&outside, r.path("f.ps5upload.tmp"));
+    let (st, _) = r.write("f", 0, 0, b"mine", None).await;
+    assert_eq!(st, OK);
+    assert_eq!(std::fs::read(&outside).unwrap(), b"precious");
+    assert_eq!(std::fs::read(r.path("f")).unwrap(), b"mine");
+    // first chunk: same
+    symlink(&outside, r.path("g.ps5upload.tmp"));
+    let (st, _) = r.write("g", 0, AT, b"aa", None).await;
+    assert_eq!(st, OK);
+    assert_eq!(std::fs::read(&outside).unwrap(), b"precious");
+    // a link planted BETWEEN chunks: the next chunk is refused, the target untouched
+    std::fs::remove_file(r.path("g.ps5upload.tmp")).unwrap();
+    symlink(&outside, r.path("g.ps5upload.tmp"));
+    let (st, b) = r.write("g", 2, AT | COMMIT, b"bb", None).await;
+    assert_eq!((st, cause(&b).as_str()), (gen::ERR_IO, "open_failed"));
+    assert_eq!(std::fs::read(&outside).unwrap(), b"precious");
+    assert!(!r.path("g").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fifo_cannot_block_a_worker() {
+    let r = rig("fifo").await;
+    let mk = |p: PathBuf| {
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&p)
+            .status()
+            .unwrap()
+            .success());
+    };
+    // fs.read of a FIFO: opened non-blocking, then refused as not a regular file
+    mk(r.path("pipe"));
+    let (st, b) = tokio::time::timeout(Duration::from_secs(5), r.read("pipe", 0, 10, 0))
+        .await
+        .expect("fs.read of a FIFO must not block");
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_IO, "fs_read_not_regular_file")
+    );
+    // a FIFO at the tmp name: a later chunk is refused without blocking
+    mk(r.path("w.ps5upload.tmp"));
+    let (st, _) = tokio::time::timeout(Duration::from_secs(5), r.write("w", 5, AT, b"x", None))
+        .await
+        .expect("fs.write onto a FIFO tmp must not block");
+    assert_eq!(st, gen::ERR_IO);
+    // the single-call write replaces it with a regular file
+    let (st, _) = r.write("w", 0, 0, b"ok", None).await;
+    assert_eq!(st, OK);
+    assert_eq!(std::fs::read(r.path("w")).unwrap(), b"ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chunk_past_zero_without_a_tmp_file_is_refused_not_made_sparse() {
+    let r = rig("nosparse").await;
+    let (st, b) = r.write("s", 4096, AT, b"tail", None).await;
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PROTOCOL, "fs_write_no_tmp_file")
+    );
+    assert!(!r.path("s.ps5upload.tmp").exists() && !r.path("s").exists());
+    let (st, _) = r.write("s", 4096, AT | COMMIT, b"", None).await;
+    assert_eq!(
+        st,
+        gen::ERR_PROTOCOL,
+        "a commit with no tmp file is refused too"
+    );
+}
+
+// ---- review S2: the trust store (<root>/d/ava stands for /data/ps5upload/ava) is untouchable ----
+
+fn trust_store(r: &Rig) {
+    std::fs::create_dir_all(r.path("d/ava")).unwrap();
+    std::fs::write(r.path("d/ava/peers"), b"trusted").unwrap();
+    std::fs::write(r.path("d/ava/identity"), b"secret").unwrap();
+}
+
+/// review S2: write, read, rename (into and out of), mkdir, chmod and stat-free probes under the
+/// directory are all refused through fs.* over AVA1, and nothing changed on disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn s2_the_trust_store_refuses_every_fs_method() {
+    let r = rig("s2fs").await;
+    trust_store(&r);
+    std::fs::write(r.path("src"), b"mine").unwrap();
+    // write: over the peers file, and a new file
+    for rel in ["d/ava/peers", "d/ava/new", "d/ava/identity"] {
+        let (st, _) = r.write(rel, 0, 0, b"evil", None).await;
+        assert_eq!(st, gen::ERR_PATH, "write {rel}");
+        let (st, _) = r.write(rel, 0, AT, b"evil", None).await;
+        assert_eq!(st, gen::ERR_PATH, "chunk {rel}");
+    }
+    assert_eq!(std::fs::read(r.path("d/ava/peers")).unwrap(), b"trusted");
+    assert!(!r.path("d/ava/new").exists() && !r.path("d/ava/peers.ps5upload.tmp").exists());
+    // read
+    let (st, b) = r.read("d/ava/identity", 0, 100, 0).await;
+    assert_eq!(
+        (st, cause(&b).as_str()),
+        (gen::ERR_PATH, "fs_read_path_not_allowed")
+    );
+    let (st, _) = r.read("d/ava/identity", 0, 100, gen::FSR_UNSAFE).await;
+    assert_eq!(st, gen::ERR_PATH);
+    // rename into, and out of
+    let (st, _) = r
+        .rpc(gen::METHOD_FS_RENAME, &rename(&r, "src", "d/ava/peers", 1))
+        .await;
+    assert_eq!(st, gen::ERR_PATH);
+    let (st, _) = r
+        .rpc(
+            gen::METHOD_FS_RENAME,
+            &rename(&r, "d/ava/peers", "stolen", 1),
+        )
+        .await;
+    assert_eq!(st, gen::ERR_PATH);
+    assert_eq!(std::fs::read(r.path("d/ava/peers")).unwrap(), b"trusted");
+    // rename of an ANCESTOR (takes the store with it)
+    let (st, _) = r
+        .rpc(gen::METHOD_FS_RENAME, &rename(&r, "d", "d2", 1))
+        .await;
+    assert_eq!(st, gen::ERR_PATH);
+    assert!(r.path("d/ava").exists());
+    // mkdir under it, with parents
+    for rel in ["d/ava/sub", "d/ava/x/y/z"] {
+        let (st, _) = r
+            .rpc(
+                gen::METHOD_FS_MKDIR,
+                &gen::FsMkdir {
+                    path: r.p(rel),
+                    mode: 0o755,
+                    parents: 1,
+                },
+            )
+            .await;
+        assert_eq!(st, gen::ERR_PATH, "mkdir {rel}");
+    }
+    // chmod
+    let (st, _) = r
+        .rpc(
+            gen::METHOD_FS_CHMOD,
+            &gen::FsChmod {
+                path: r.p("d/ava/peers"),
+                mode: 0o777,
+            },
+        )
+        .await;
+    assert_eq!(st, gen::ERR_PATH);
+    // its siblings are still ordinary
+    let (st, _) = r.write("d/other", 0, 0, b"fine", None).await;
+    assert_eq!(st, OK);
+}
+
+/// review S2: every spelling of the path: `//`, `.`, `..`, a symlink to it, a symlink into it,
+/// a case variant; and a symlink that points at it from outside.
+#[tokio::test(flavor = "multi_thread")]
+async fn s2_the_trust_store_is_found_through_every_spelling() {
+    let r = rig("s2spell").await;
+    trust_store(&r);
+    let root = r.root.display().to_string();
+    symlink(r.path("d/ava"), r.path("tolink"));
+    symlink(r.path("d"), r.path("todir"));
+    let spellings = [
+        format!("{root}/d/ava/peers"),
+        format!("{root}//d//ava//peers"),
+        format!("{root}/d/./ava/peers"),
+        format!("{root}/d/x/../ava/peers"),
+        format!("{root}/D/AVA/Peers"),
+        format!("{root}/d/Ava/peers"),
+        format!("{root}/tolink/peers"),
+        format!("{root}/tolink/brand-new"),
+        format!("{root}/todir/ava/peers"),
+        format!("{root}/todir/ava/brand-new"),
+        format!("{root}/d/ava"),
+    ];
+    for p in &spellings {
+        assert!(mgmt_fs::in_protected(p), "{p} must be protected");
+        let (st, _) = r
+            .rpc(
+                gen::METHOD_FS_WRITE,
+                &FsWrite {
+                    path: p.clone(),
+                    offset: 0,
+                    flags: 0,
+                    data: b"evil".to_vec(),
+                    mode: None,
+                },
+            )
+            .await;
+        // the lexical `.`/`..` forms and everything else: refused (ERR_PATH), never written
+        assert_eq!(st, gen::ERR_PATH, "write {p}");
+    }
+    assert_eq!(std::fs::read(r.path("d/ava/peers")).unwrap(), b"trusted");
+    assert!(!r.path("d/ava/brand-new").exists());
+    // ancestors and delete-style questions (a destructive op on a source path asks `contains`)
+    for p in [
+        format!("{root}/d"),
+        format!("{root}/d/"),
+        format!("{root}/d/ava"),
+        format!("{root}/todir"),
+    ] {
+        assert!(mgmt_fs::contains_protected(&p), "{p} contains the store");
+    }
+    for p in [
+        format!("{root}/other"),
+        format!("{root}/d/ava2"),
+        format!("{root}/dd"),
+    ] {
+        assert!(
+            !mgmt_fs::in_protected(&p) && !mgmt_fs::contains_protected(&p),
+            "{p} is unrelated"
+        );
+    }
+    // a link planted elsewhere that points at it is refused to rename/write through too
+    symlink(r.path("d/ava/peers"), r.path("plant"));
+    let (st, _) = r.write("plant", 0, 0, b"evil", None).await;
+    assert_eq!(st, gen::ERR_PATH);
+    assert_eq!(std::fs::read(r.path("d/ava/peers")).unwrap(), b"trusted");
 }

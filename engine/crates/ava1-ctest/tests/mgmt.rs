@@ -39,6 +39,18 @@ async fn rig(tag: &str) -> (CServer, Session) {
 
 /// `install = false`: the server starts with no management table (no CAP_MGMT).
 async fn rig_with(tag: &str, install: bool) -> (CServer, Session) {
+    // The stub table and counters are process-wide: hold the shared shim guard for the whole test
+    // (the test's thread owns it until the thread ends), so the suite passes in parallel mode.
+    thread_local! {
+        static SHIM: std::cell::RefCell<Option<std::sync::MutexGuard<'static, ()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    SHIM.with(|g| {
+        let mut g = g.borrow_mut();
+        if g.is_none() {
+            *g = Some(CServer::lock_for_shim_tests());
+        }
+    });
     if install {
         assert_eq!(mgmt::install(), 0);
     } else {

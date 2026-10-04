@@ -94,7 +94,9 @@ pub fn use_ava1_mgmt_in(pool: &Pool, console: &str) -> bool {
     route_in(pool, console, ava1::gen::CAP_MGMT)
 }
 
-/// The shared rule. `Ftx2`: never. `Ava1`: always (failures surface). `Auto`: true only when a
+/// The shared rule. `Ftx2`: never. `Ava1` (forced with `PS5UPLOAD_TRANSFER=ava1`): always, WITHOUT
+/// checking `CAP_MGMT` or probing: a console without management methods then answers
+/// `ERR_UNKNOWN_METHOD`, which surfaces as the error it is (failures surface). `Auto`: true only when a
 /// session can be established and the node advertises `cap`. A failed session attempt is cached
 /// for `NEGATIVE_TTL`; a node that answered but lacks `cap` is not (the live session is cached
 /// by the pool, so asking again costs nothing).

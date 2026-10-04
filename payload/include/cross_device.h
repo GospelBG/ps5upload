@@ -88,22 +88,38 @@ static inline void xdev_parent_dir(const char *path, char *buf,
 
 /* Would rename(from, to) cross a device boundary?
  *
- * Compares the source file against the destination's PARENT DIRECTORY,
- * not the destination itself — the destination usually does not exist
- * yet, which is the whole point of a rename. */
-static inline xdev_result_t xdev_rename_crosses(const char *from,
-                                                const char *to,
-                                                xdev_dev_fn dev_fn) {
-    if (!from || !to || !dev_fn) return XDEV_UNKNOWN;
+ * Compares the source against the destination's PARENT DIRECTORY, not the
+ * destination itself — the destination usually does not exist yet, which is
+ * the whole point of a rename.
+ *
+ * The SOURCE is judged by its own device (`from_dev`, lstat: a symbolic link
+ * is the thing rename() moves, and it lives on its directory's device). A
+ * stat() here would judge the link by its TARGET: a link on device A pointing
+ * at a file on device B, renamed into a directory on B, would read as B == B
+ * and rename() would move the link across devices — the kernel panic. The
+ * destination directory is followed (`dir_dev`, stat), as rename() resolves it. */
+static inline xdev_result_t xdev_rename_crosses_l(const char *from,
+                                                  const char *to,
+                                                  xdev_dev_fn from_dev,
+                                                  xdev_dev_fn dir_dev) {
+    if (!from || !to || !from_dev || !dir_dev) return XDEV_UNKNOWN;
 
     unsigned long long dev_from = 0, dev_to = 0;
-    if (dev_fn(from, &dev_from) != 0) return XDEV_UNKNOWN;
+    if (from_dev(from, &dev_from) != 0) return XDEV_UNKNOWN;
 
     char to_dir[512];
     xdev_parent_dir(to, to_dir, sizeof(to_dir));
-    if (dev_fn(to_dir, &dev_to) != 0) return XDEV_UNKNOWN;
+    if (dir_dev(to_dir, &dev_to) != 0) return XDEV_UNKNOWN;
 
     return dev_from == dev_to ? XDEV_SAME : XDEV_CROSSES;
+}
+
+/* One lookup for both ends (the selftest's fake mount table). Real callers use
+ * xdev_rename_crosses_l with xdev_lstat_dev for the source. */
+static inline xdev_result_t xdev_rename_crosses(const char *from,
+                                                const char *to,
+                                                xdev_dev_fn dev_fn) {
+    return xdev_rename_crosses_l(from, to, dev_fn, dev_fn);
 }
 
 /* The real device lookup, for payload callers. */
@@ -111,6 +127,16 @@ static inline int xdev_stat_dev(const char *path, unsigned long long *out) {
     struct stat st;
     if (!path || !out) return -1;
     if (stat(path, &st) != 0) return -1;
+    *out = (unsigned long long)st.st_dev;
+    return 0;
+}
+
+/* The same without following a final symbolic link: the device of the link
+ * itself. This is the lookup for a rename's SOURCE. */
+static inline int xdev_lstat_dev(const char *path, unsigned long long *out) {
+    struct stat st;
+    if (!path || !out) return -1;
+    if (lstat(path, &st) != 0) return -1;
     *out = (unsigned long long)st.st_dev;
     return 0;
 }

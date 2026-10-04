@@ -9,6 +9,9 @@ use std::path::Path;
 extern "C" {
     fn ava1_test_mgmtfs_install(root: *const c_char) -> c_int;
     fn ava1_test_mgmtfs_uninstall();
+    fn ava1_test_mgmtfs_allow_dev(on: c_int);
+    fn ava1_test_path_in_protected(p: *const c_char) -> c_int;
+    fn ava1_test_path_contains_protected(p: *const c_char) -> c_int;
     fn ava1_test_mgmtfs_set(fake_dev: c_int, klog_avail: u32, syslog_len: u32);
     fn ava1_test_mgmtfs_stats(counted: *mut u32, shutdowns: *mut u32, unsafe_seen: *mut u32);
 }
@@ -34,4 +37,22 @@ pub fn stats() -> (u32, u32, u32) {
     let (mut a, mut b, mut c) = (0, 0, 0);
     unsafe { ava1_test_mgmtfs_stats(&mut a, &mut b, &mut c) };
     (a, b, c)
+}
+
+/// Lets the path policy accept `/dev/...` too (the symlink-source rename test).
+pub fn allow_dev(on: bool) {
+    unsafe { ava1_test_mgmtfs_allow_dev(on as c_int) }
+}
+
+/// `path_in_protected` (the trust-store check every policy runs): the path is the protected
+/// directory (`<root>/d/ava`) or below it.
+pub fn in_protected(p: &str) -> bool {
+    let c = CString::new(p).unwrap();
+    unsafe { ava1_test_path_in_protected(c.as_ptr()) != 0 }
+}
+
+/// `path_contains_protected`: the path is the protected directory or one of its ancestors.
+pub fn contains_protected(p: &str) -> bool {
+    let c = CString::new(p).unwrap();
+    unsafe { ava1_test_path_contains_protected(c.as_ptr()) != 0 }
 }

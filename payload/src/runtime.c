@@ -63,6 +63,8 @@
 #include "blake3.h"
 #include "mgmt_rpc.h"
 #include "mgmt_fs.h"
+#include "path_policy.h"
+#include "cross_device.h"
 
 /* PS5 SDK's `<fcntl.h>` hides `posix_fadvise` and its POSIX_FADV_* constants
  * behind `__POSIX_VISIBLE >= 200112`, but defining `_POSIX_C_SOURCE` to unlock
@@ -5458,6 +5460,7 @@ static int cleanup_path_allowed(const char *path) {
      * Component-scoped (matches is_path_allowed's semantics) so
      * legitimate test-folder names like `My..Tests` aren't rejected. */
     if (path_has_dotdot_component(path)) return 0;
+    if (path_in_protected(path) || path_contains_protected(path)) return 0; /* the AVA1 trust store */
 
     /* Case A: /data/ps5upload/tests[/...] */
     {
@@ -6507,40 +6510,9 @@ static int is_path_lexically_allowed(const char *p) {
 }
 
 int is_path_allowed(const char *p) {
-    if (!is_path_lexically_allowed(p)) return 0;
-    /* (2.9.0) Symlink-escape guard. The lexical check above confirms
-     * the path STARTS with an allowed root, but if any component
-     * along the path is a symlink that resolves OUTSIDE the allowlist
-     * (e.g. /mnt/ps5upload/usermount/evil → /system_ex), the
-     * subsequent open()/unlink()/etc. follows the symlink and
-     * operates on the forbidden target. Realistic when a user mounts
-     * a .ffpkg from an untrusted source — the image is the
-     * attacker's data and UFS supports symlinks. Same CWE-59 class
-     * as CVE-2007-2374.
-     *
-     * realpath() resolves all symlinks and collapses any embedded
-     * dotdots. If the canonical form fails the lexical check, the
-     * path was escaping via a symlink — refuse.
-     *
-     * realpath fails (returns NULL) when any component along the
-     * path doesn't exist yet — common for FS_WRITE / mkdir paths
-     * that are about to create the target. For those there's no
-     * symlink to follow yet, so accept based on the lexical decision
-     * we already passed. The first time a real file appears at this
-     * path, subsequent calls go through the realpath check above
-     * and reject any symlink the writer planted. */
-    char resolved[PATH_MAX];
-    if (realpath(p, resolved) == NULL) {
-        return 1;
-    }
-    if (!is_path_lexically_allowed(resolved)) {
-        fprintf(stderr,
-                "[payload2] is_path_allowed REJECTED: %s resolves to %s "
-                "(symlink escape)\n",
-                p, resolved);
-        return 0;
-    }
-    return 1;
+    /* The lexical rule on the path and on its canonical form (symlink-escape guard, CWE-59), with
+     * the deepest existing ancestor resolved for a path that does not exist yet: see path_policy.h. */
+    return path_resolve_allowed(p, is_path_lexically_allowed);
 }
 
 /* Recursively remove `path`. Descends directories, unlinks regular files
@@ -7515,7 +7487,8 @@ static int handle_fs_delete(runtime_state_t *state, int client_fd,
     if (!state) return -1;
     path[0] = '\0';
     if (request_body) extract_json_string_field(request_body, "path", path, sizeof(path));
-    if (!is_path_allowed(path)) {
+    /* Deleting a directory that contains the AVA1 trust store deletes the store. */
+    if (!is_path_allowed(path) || path_contains_protected(path)) {
         return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
                           "fs_delete_path_not_allowed", 26);
     }
@@ -7602,34 +7575,18 @@ static int handle_fs_move(runtime_state_t *state, int client_fd,
         extract_json_string_field(request_body, "from", from, sizeof(from));
         extract_json_string_field(request_body, "to", to, sizeof(to));
     }
-    if (!is_path_allowed(from) || !is_path_allowed(to)) {
+    if (!is_path_allowed(from) || !is_path_allowed(to) || path_contains_protected(from)) {
         return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
                           "fs_move_path_not_allowed", 24);
     }
-    /* Cross-device guard — see the header comment. Compare st_dev of the source
-     * and of the destination's parent directory; if they differ, refuse the
-     * rename (it would panic) and report cross-mount. stat() on USB is safe
-     * (FS_COPY stats the same paths). If either stat fails we fall through to
-     * rename(), but only when devices can't be compared — a missing source/dest
-     * there fails with a normal errno, not the cross-device panic. */
-    {
-        struct stat sf, sdp;
-        char to_dir[512];
-        const char *slash = strrchr(to, '/');
-        if (slash && slash != to) {
-            size_t dlen = (size_t)(slash - to);
-            if (dlen >= sizeof(to_dir)) dlen = sizeof(to_dir) - 1;
-            memcpy(to_dir, to, dlen);
-            to_dir[dlen] = '\0';
-        } else {
-            to_dir[0] = '/';
-            to_dir[1] = '\0';
-        }
-        if (stat(from, &sf) == 0 && stat(to_dir, &sdp) == 0 &&
-            sf.st_dev != sdp.st_dev) {
-            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
-                              "fs_move_cross_mount", 19);
-        }
+    /* Cross-device guard — see the header comment. The SOURCE is judged by its own device (lstat:
+     * a symlink is what rename() moves, and stat() would judge it by its target, so a link on one
+     * device pointing at another could pass), the destination by its parent directory. If a device
+     * cannot be read (missing source or directory) rename() fails with a plain errno, not the
+     * cross-device panic. */
+    if (xdev_rename_crosses_l(from, to, xdev_lstat_dev, xdev_stat_dev) == XDEV_CROSSES) {
+        return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                          "fs_move_cross_mount", 19);
     }
     if (rename(from, to) != 0) {
         if (errno == EXDEV) {

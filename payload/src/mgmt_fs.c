@@ -14,6 +14,7 @@
 #include "ava1_gen.h"
 #include "ava1_wire.h"
 #include "cross_device.h"
+#include "path_policy.h"
 
 #define FS_PATH_MAX 1024u
 /* fs.list: entries per call (FTX2's ceiling) and the room an entry list may take in a reply. */
@@ -262,14 +263,18 @@ int mgmt_run_fs_rename(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx) {
     struct stat st;
     int rc;
     xdev_dev_fn dev = P.dev_of ? P.dev_of : xdev_stat_dev;
+    xdev_dev_fn src_dev = P.src_dev_of ? P.src_dev_of : xdev_lstat_dev;
     if (ava1_fs_rename_decode(req, n, &q) != 0) return mgmt_reply_error(cx, AVA1_ERR_PROTOCOL, "bad FsRename request");
     if ((rc = take_path(cx, q.from, q.from_len, from, "fs_move_path_not_allowed")) != AVA1_STATUS_OK) return rc;
     if ((rc = take_path(cx, q.to, q.to_len, to, "fs_move_path_not_allowed")) != AVA1_STATUS_OK) return rc;
     if (!write_ok(from) || !write_ok(to)) return mgmt_reply_error(cx, AVA1_ERR_PATH, "fs_move_path_not_allowed");
+    /* Moving a directory that CONTAINS the trust store moves the store with it. */
+    if (path_contains_protected(from)) return mgmt_reply_error(cx, AVA1_ERR_PATH, "fs_move_path_not_allowed");
     /* NEVER rename(2) across devices: on this kernel it does not fail with EXDEV, it panics the
-     * console. Compare the source's device with the destination's parent before any rename; a
+     * console. Compare the source's OWN device (lstat: a link is judged by where it lives, not by
+     * its target) with the destination's parent before any rename; a
      * path whose device cannot be read (missing source or directory) fails below with a plain errno. */
-    if (xdev_rename_crosses(from, to, dev) == XDEV_CROSSES) return mgmt_reply_error(cx, AVA1_ERR_CROSS_DEVICE, "fs_move_cross_mount");
+    if (xdev_rename_crosses_l(from, to, src_dev, dev) == XDEV_CROSSES) return mgmt_reply_error(cx, AVA1_ERR_CROSS_DEVICE, "fs_move_cross_mount");
     if (!q.overwrite && lstat(to, &st) == 0) return mgmt_reply_error(cx, AVA1_ERR_EXISTS, "fs_move_exists");
     if (rename(from, to) != 0) {
         if (errno == EXDEV) return mgmt_reply_error(cx, AVA1_ERR_CROSS_DEVICE, "fs_move_cross_mount");
@@ -313,7 +318,7 @@ int mgmt_run_fs_read(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx) {
     /* The reply is `data + 7` bytes; a longer ask is a short read (eof = 0), never an error. */
     want = q.len > AVA1_FS_READ_MAX ? AVA1_FS_READ_MAX : q.len;
     if (want + 7 > cx->cap) want = cx->cap > 7 ? cx->cap - 7 : 0;
-    fd = open(path, O_RDONLY);
+    fd = open(path, O_RDONLY | O_NONBLOCK); /* a FIFO must not block a worker; fstat below refuses it */
     if (fd < 0) {
         int e = errno;
         /* The FTX2 handler said stat_failed for a missing file and open_failed for the rest. */
@@ -402,12 +407,28 @@ int mgmt_run_fs_write(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx) {
      * written for a refusal) and again at commit (it may have appeared while chunks were sent). */
     if (whole && (f & AVA1_FSW_CREATE) && lstat(path, &st) == 0) return mgmt_reply_error(cx, AVA1_ERR_EXISTS, "exists");
     mode = (mode_t)(q.has_mode ? (q.mode & 07777) : FS_DEFAULT_FILE_MODE);
-    /* The first chunk (offset 0) and the single-call write truncate an abandoned tmp file, so a retry
-     * starts clean; a later chunk adds to what is there (creating it empty if it is not). */
-    oflags = O_WRONLY | O_CREAT;
-    if (whole || (at_off && q.offset == 0)) oflags |= O_TRUNC;
+    /* The tmp file is ours alone, opened so that nothing planted there can redirect the write:
+     * O_NOFOLLOW (a symlink at the tmp name is an error, never followed) and O_NONBLOCK (a FIFO
+     * cannot block a worker; fstat below refuses anything but a regular file). The single-call write
+     * and the first chunk (offset 0) remove whatever sits at the tmp name and create it fresh with
+     * O_EXCL, so a retry starts clean and a pre-planted file or link is never opened. A later chunk
+     * must find the tmp file its first chunk made: with none it is refused, not made as a sparse file. */
+    oflags = O_WRONLY | O_NOFOLLOW | O_NONBLOCK;
+    if (whole || (at_off && q.offset == 0)) {
+        if (unlink(tmp) != 0 && errno != ENOENT) return mgmt_reply_error(cx, AVA1_ERR_IO, "open_failed");
+        oflags |= O_CREAT | O_EXCL;
+    } else if (append) {
+        oflags |= O_CREAT; /* an append writer's first chunk has no offset to say so */
+    }
     fd = open(tmp, oflags, FS_DEFAULT_FILE_MODE);
-    if (fd < 0) return mgmt_reply_error(cx, AVA1_ERR_IO, "open_failed");
+    if (fd < 0) {
+        if (errno == ENOENT) return mgmt_reply_error(cx, AVA1_ERR_PROTOCOL, "fs_write_no_tmp_file");
+        return mgmt_reply_error(cx, AVA1_ERR_IO, "open_failed");
+    }
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return mgmt_reply_error(cx, AVA1_ERR_IO, "open_failed");
+    }
     if (append) {
         if (lseek(fd, 0, SEEK_END) < 0) {
             close(fd);

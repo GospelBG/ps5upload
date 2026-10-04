@@ -45,7 +45,7 @@ static int may_read(const char *p, int unsafe_read) {
 /* 1 same device, 0 crosses (refuse: a cross-device rename panics this kernel), -1 unknown. */
 static int same_device(const char *from, const char *to_dir) {
     unsigned long long a, b;
-    if (xdev_stat_dev(from, &a) != 0 || xdev_stat_dev(to_dir, &b) != 0) return -1;
+    if (xdev_lstat_dev(from, &a) != 0 || xdev_stat_dev(to_dir, &b) != 0) return -1;
     return a == b ? 1 : 0;
 }
 

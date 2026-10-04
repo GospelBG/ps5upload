@@ -1335,7 +1335,7 @@ int handle_shell_builtin(const char *cmd_in, char **out_text,
                     mv_dpar[0] = '/';
                     mv_dpar[1] = '\0';
                 }
-                mv_same_dev = (stat(argv[i], &mv_sf) == 0 &&
+                mv_same_dev = (lstat(argv[i], &mv_sf) == 0 && /* the link itself, not its target */
                                stat(mv_dpar, &mv_dd) == 0 &&
                                mv_sf.st_dev == mv_dd.st_dev);
             }

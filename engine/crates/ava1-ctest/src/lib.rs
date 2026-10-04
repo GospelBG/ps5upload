@@ -629,7 +629,16 @@ fn start_data_raw(a: &DataArgs, port: u16) -> u16 {
     rc as u16
 }
 
+/// Serialises the tests that install the shim's process-wide tables, policies and counters
+/// (test_shim.c / test_shim_fs.c): hold the guard for the whole test.
+static SHIM_LOCK: Mutex<()> = Mutex::new(());
+
 impl CServer {
+    /// The shared guard for shim-global state; take it before installing anything.
+    pub fn lock_for_shim_tests() -> MutexGuard<'static, ()> {
+        SHIM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn start(
         secret: [u8; 32],
         peers_path: &Path,
