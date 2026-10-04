@@ -56,7 +56,8 @@ pub fn is_priority(method: u16) -> bool {
 }
 
 /// Methods that change nothing, so a call lost with its session may be sent again on the
-/// next session. Everything else is never repeated: it may already have run.
+/// next session. Everything else is never repeated: it may already have run. `net.speedtest`
+/// changes nothing but takes seconds of link time, so it is not resent either (review 005 section 3).
 fn is_read_only(method: u16) -> bool {
     matches!(
         method,
@@ -71,7 +72,6 @@ fn is_read_only(method: u16) -> bool {
             | gen::METHOD_LOG_SYSLOG
             | gen::METHOD_NET_INTERFACES
             | gen::METHOD_NET_REACH
-            | gen::METHOD_NET_SPEEDTEST
             | gen::METHOD_HW_INFO
             | gen::METHOD_HW_TEMPS
             | gen::METHOD_HW_POWER
@@ -744,6 +744,13 @@ fn map_transport_error(label: &str, e: Ava1Error) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_lost_speedtest_is_not_resent_but_a_read_is() {
+        assert!(!is_read_only(gen::METHOD_NET_SPEEDTEST));
+        assert!(is_read_only(gen::METHOD_NET_REACH));
+        assert!(is_read_only(gen::METHOD_JOB_STATUS));
+    }
+
     use super::*;
 
     #[test]
