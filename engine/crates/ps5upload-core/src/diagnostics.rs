@@ -253,19 +253,7 @@ pub struct AppDbList {
 
 /// Query app.db for the title_id ↔ app_id ↔ name mapping.
 pub fn appdb_query(addr: &str) -> Result<AppDbList> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppDbQuery, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APPDB_QUERY: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppDbQueryAck {
-        bail!("expected APPDB_QUERY_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::APP_DB_QUERY, &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -300,19 +288,13 @@ pub fn appinfo_query(addr: &str, title_id: &str, keys: Option<&str>) -> Result<A
         "title_id": title_id,
         "keys": keys.unwrap_or(""),
     });
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppInfoQuery, body.to_string().as_bytes())?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APPINFO_QUERY: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppInfoQueryAck {
-        bail!("expected APPINFO_QUERY_ACK, got {ft:?}");
-    }
+    // `{"ok":false,"error":..}` is a reply the caller decodes (AppInfoRows.error): see call_legacy_body.
+    let resp = mgmt::call_legacy_body(
+        addr,
+        m::APP_INFO_QUERY,
+        "APPINFO_QUERY",
+        body.to_string().as_bytes(),
+    )?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -336,19 +318,13 @@ pub fn appinfo_set(addr: &str, title_id: &str, key: &str, val: &str) -> Result<A
         "key": key,
         "val": val,
     });
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppInfoSet, body.to_string().as_bytes())?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APPINFO_SET: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppInfoSetAck {
-        bail!("expected APPINFO_SET_ACK, got {ft:?}");
-    }
+    // A refused edit is `{"ok":false,"err":..}`, a result the caller reports (AppInfoSetResult.err).
+    let resp = mgmt::call_legacy_body(
+        addr,
+        m::APP_INFO_SET,
+        "APPINFO_SET",
+        body.to_string().as_bytes(),
+    )?;
     Ok(serde_json::from_slice(&resp)?)
 }
 

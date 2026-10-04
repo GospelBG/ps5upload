@@ -245,7 +245,10 @@ async fn c_mgmt_error_frame_becomes_status_and_cause() {
         .unwrap();
     assert_eq!(
         (r.status, r.body.as_slice()),
-        (gen::ERR_INTERNAL, &b"launch_failed"[..])
+        (
+            gen::ERR_INTERNAL,
+            &br#"{"ok":false,"err":"launch_failed"}"#[..]
+        )
     );
     // a missing argument is the peer's
     let r = s.rpc(LAUNCH, &text("{}")).await.unwrap();

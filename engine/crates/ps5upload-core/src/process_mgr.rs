@@ -14,10 +14,9 @@
 //! payload's (elevated) ucred.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 /// One process row. Every field defaults so the payload's trailing
 /// `{"truncated":true}` sentinel object (which carries no pid) parses
@@ -86,19 +85,7 @@ pub struct ProcessKillAck {
 
 /// Enumerate running processes (detailed). Read-only.
 pub fn process_list(addr: &str) -> Result<ProcessListResult> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::ProcessList, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected PROCESS_LIST: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::ProcessListAck {
-        bail!("expected PROCESS_LIST_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::PROC_PROCESS_LIST, &[])?;
     let raw: RawProcessList = serde_json::from_slice(&resp)?;
     // Split the truncation sentinel (pid == 0) from real rows.
     let truncated = raw.procs.iter().any(|p| p.truncated);
@@ -113,19 +100,9 @@ pub fn process_list(addr: &str) -> Result<ProcessListResult> {
 /// is responsible for confirming before killing a "system" process.
 pub fn process_kill(addr: &str, pid: i32) -> Result<ProcessKillAck> {
     let body = serde_json::to_vec(&serde_json::json!({ "pid": pid }))?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::ProcessKill, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected PROCESS_KILL: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::ProcessKillAck {
-        bail!("expected PROCESS_KILL_ACK, got {ft:?}");
-    }
+    // A refused kill is `{"ok":false,"pid":..,"err":"kill_failed","errno":..,"reason":..}`; over AVA1 it
+    // is the error's cause and `call_legacy_body` returns it, so errno and reason still reach the user.
+    let resp = mgmt::call_legacy_body(addr, m::PROC_KILL, "PROCESS_KILL", &body)?;
     let ack: ProcessKillAck = serde_json::from_slice(&resp)?;
     if !ack.ok {
         // Prefer the specific reason (strerror) over the generic err code so

@@ -23,6 +23,9 @@ use ps5upload_core::mgmt::{
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
 
+#[path = "mgmt_paged.rs"]
+mod paged;
+
 use crate::mgmt_convert as conv;
 use crate::pool::{host_of, pool, Pool};
 use crate::route::{mode, use_ava1_in, Mode};
@@ -73,14 +76,40 @@ fn is_read_only(method: u16) -> bool {
             | gen::METHOD_HW_TEMPS
             | gen::METHOD_HW_POWER
             | gen::METHOD_HW_STORAGE
+            | gen::METHOD_APP_LIST
+            | gen::METHOD_APP_INFO_QUERY
+            | gen::METHOD_APP_DB_QUERY
+            | gen::METHOD_PROC_FOCUS
+            | gen::METHOD_PROC_LIST
+            | gen::METHOD_PROC_PROCESS_LIST
+            | gen::METHOD_PROC_MODULES
+            | gen::METHOD_SAVES_LIST
+            | gen::METHOD_SHOTS_LIST
+            | gen::METHOD_VIDEOS_LIST
+            | gen::METHOD_INDEX_STATUS
+            | gen::METHOD_INDEX_SEARCH
     )
 }
+
+/// The Sony-lock methods that can run for seconds (register / unregister may take 10 s or more,
+/// launch is patient). The payload serialises them under `sony_api_lock`, so more than
+/// [`SONY_LONG`] of them in flight would only park workers that other calls need.
+pub fn is_sony_long(method: u16) -> bool {
+    matches!(
+        method,
+        gen::METHOD_APP_REGISTER | gen::METHOD_APP_UNREGISTER | gen::METHOD_APP_LAUNCH
+    )
+}
+
+/// Slots of the general pool the long Sony-lock methods may hold at once.
+pub const SONY_LONG: usize = 2;
 
 /// The per-console in-flight gate: [`GENERAL`] slots for everyone, [`RESERVED`] more for
 /// the priority methods. The total never exceeds the payload's eight.
 pub struct MgmtGate {
     general: Semaphore,
     reserved: Semaphore,
+    sony_long: Semaphore,
 }
 
 impl Default for MgmtGate {
@@ -88,8 +117,16 @@ impl Default for MgmtGate {
         Self {
             general: Semaphore::new(GENERAL),
             reserved: Semaphore::new(RESERVED),
+            sony_long: Semaphore::new(SONY_LONG),
         }
     }
+}
+
+/// What a call holds while it is in flight: its slot, and for the long Sony-lock methods
+/// one of the [`SONY_LONG`] sub-slots as well.
+pub struct CallPermit<'a> {
+    _sony: Option<SemaphorePermit<'a>>,
+    _slot: SemaphorePermit<'a>,
 }
 
 impl MgmtGate {
@@ -104,6 +141,25 @@ impl MgmtGate {
             biased;
             p = self.general.acquire() => p.expect("gate is never closed"),
             p = self.reserved.acquire() => p.expect("gate is never closed"),
+        }
+    }
+
+    /// The permit for `method`: the sub-limit first (long Sony-lock methods only), then the slot.
+    /// Priority methods never take the sub-limit, so it cannot delay a cancel.
+    pub async fn acquire_for(&self, method: u16) -> CallPermit<'_> {
+        let sony = if is_sony_long(method) {
+            Some(
+                self.sony_long
+                    .acquire()
+                    .await
+                    .expect("gate is never closed"),
+            )
+        } else {
+            None
+        };
+        CallPermit {
+            _sony: sony,
+            _slot: self.acquire(is_priority(method)).await,
         }
     }
 
@@ -221,7 +277,7 @@ impl AvaTransport {
         loop {
             let attempt = tokio::time::timeout(timeout, async {
                 let session = self.pool().session(console).await?;
-                let _permit = gate.acquire(is_priority(method)).await;
+                let _permit = gate.acquire_for(method).await;
                 session.rpc(method, body).await
             })
             .await;
@@ -250,6 +306,24 @@ impl AvaTransport {
         }
     }
 
+    /// One `MgmtText` call: the reply's body and its `more` flag (a paged reply is not the whole answer).
+    async fn text_page(
+        &self,
+        console: &str,
+        method: Method,
+        label: &str,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<MgmtText> {
+        let req = MgmtText {
+            body: body.to_vec(),
+            more: None,
+        }
+        .to_bytes()?;
+        let reply = self.rpc(console, method.id, label, &req, timeout).await?;
+        Ok(MgmtText::decode(&reply)?)
+    }
+
     async fn text(
         &self,
         console: &str,
@@ -258,13 +332,9 @@ impl AvaTransport {
         body: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>> {
-        let req = MgmtText {
-            body: body.to_vec(),
-            more: None,
-        }
-        .to_bytes()?;
-        let reply = self.rpc(console, method.id, label, &req, timeout).await?;
-        let t = MgmtText::decode(&reply)?;
+        let t = self
+            .text_page(console, method, label, body, timeout)
+            .await?;
         // A paged reply is not the whole answer. The two log tails are clamped reads whose
         // `more` only says older text exists, which the legacy handlers never reported.
         let tail = matches!(method.id, gen::METHOD_LOG_KLOG | gen::METHOD_LOG_SYSLOG);
@@ -396,6 +466,13 @@ impl AvaTransport {
                 };
                 self.run_job_async(console, op, label, body, &call).await
             }
+            gen::METHOD_APP_LIST
+            | gen::METHOD_SAVES_LIST
+            | gen::METHOD_SHOTS_LIST
+            | gen::METHOD_VIDEOS_LIST => self
+                .paged_text(console, method, label, body, timeout)
+                .await
+                .map(Some),
             _ => self
                 .text(console, method, label, body, timeout)
                 .await

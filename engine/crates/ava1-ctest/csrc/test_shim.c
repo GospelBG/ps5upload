@@ -132,7 +132,7 @@ static int stub_launch(void *st, int fd, uint64_t t, const char *b, uint64_t l) 
     usleep(20 * 1000);
     g_stub_sony_in--;
     pthread_mutex_unlock(&g_stub_sony);
-    if (strstr(b, "NOPE")) return stub_send_frame(61, "{\"ok\":false,\"err\":\"launch_failed\"}", 33);
+    if (strstr(b, "NOPE")) return stub_send_frame(61, "{\"ok\":false,\"err\":\"launch_failed\"}", 34);
     if (!strstr(b, "title_id")) return stub_send_frame(STUB_FRAME_ERROR, "launch_title_id_missing", 23);
     return stub_send_frame(61, NULL, 0);
 }

@@ -10,6 +10,7 @@ use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
 use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -56,19 +57,9 @@ pub fn app_lifecycle(addr: &str, action: AppAction, app_id: u32) -> Result<AppLi
         "app_id": app_id,
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppLifecycle, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APP_LIFECYCLE: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppLifecycleAck {
-        bail!("expected APP_LIFECYCLE_ACK, got {ft:?}");
-    }
+    // A refused action is `{"ok":false,"action":..,"code":..}`; over AVA1 it travels as the error's cause
+    // and `call_legacy_body` returns it, so the Sony return code below still reaches the user.
+    let resp = mgmt::call_legacy_body(addr, m::APP_LIFECYCLE, "APP_LIFECYCLE", &body)?;
     let parsed: AppLifecycleAck = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         // Include the Sony return code. Without it every failure reads
