@@ -109,7 +109,7 @@ ADB ?= $(ANDROID_HOME)/platform-tools/adb
 .PHONY: quality quality-full quality-hardware ci ci-full
 .PHONY: clean clean-payload clean-engine clean-client
 .PHONY: verify info install-hooks
-.PHONY: test-ava1 ava1-fuzz-c
+.PHONY: test-ava1 ava1-fuzz-c check-no-ftx2
 .PHONY: run-engine run-client dev start _check-tauri-system-deps
 .PHONY: install-engine uninstall-engine
 .PHONY: dist dist-win dist-win-arm dist-mac dist-mac-x64 dist-linux dist-linux-arm
@@ -517,7 +517,70 @@ _wait-payload-ready:
 	done; \
 	echo "ERROR: PS5 AVA1 port 9120 did not open within 30s"; exit 1
 
-validate: send-payload _wait-payload-ready
+#──────────────────────────────────────────────────────────────────────────────
+# check-no-ftx2: FTX2 and its ports (9113 transfer, 9114 management) must not
+# reappear in the guides, the client or the AVA1 engine crates.
+#
+# SCOPE IS TEMPORARY. FTX2 still lives in core, payload, lab, bench,
+# ftx2-proto and the old tests until it is deleted after the hardware pass, so
+# only the documentation, client/src and ps5upload-engine are checked now
+# (ps5upload-ava1 is exempt for now, see below). The scope widens to the whole repo at the FTX2 deletion
+# (P3 Task 18 Step 3 / Task 19), and the exceptions below shrink to
+# CHANGELOG.md alone.
+#
+# The pattern is case-insensitive "ftx2" or a bare port 9113/9114. Digits on
+# either side are excluded so the engine's own 19113 is not a match.
+#
+# Exceptions (each is a path excluded from the search):
+#   CHANGELOG.md                     history keeps FTX2 by design.
+#   Makefile                         names the legacy bench scripts and this pattern.
+#   bench/README.md                  (outside the scanned list now) names the legacy
+#                                    baseline scripts by file name until they go.
+#   payload/src/legacy_takeover.c    the migration shim: shuts an old helper down.
+#   .../src/legacy_helper.rs,
+#   .../src/legacy_helper_tests.rs,
+#   .../src/legacy_guard.rs          the old-helper banner strings and migration guard.
+#   .../src/lib.rs, .../src/ava1_only_tests.rs
+#                                    the migration/deprecation lines and the env-var
+#                                    fallback tests (the old FTX2_* names).
+#   client/src/lib/addr.ts,
+#   client/src/lib/humanizeError.ts  tolerate a stale host:9113 / host:9114 a user or an
+#                                    older engine message still carries.
+#   *.test.ts, *.test.tsx, */tests/*, ps5upload-engine/src/**/tests and in-file
+#   test modules use 9113/9114 as fixture addresses for that same tolerance
+#   (engine src files that only hold such fixtures or old-port strip logic:
+#   install/, pkg_install.rs, fakelibs_api.rs, fpkg_remote.rs, icon_cache.rs).
+#   ps5upload-ava1 (not scanned yet)  the whole crate still depends on ftx2-proto and compares itself to
+#                                    the FTX2 behaviour in comments until Task 18/19.
+CHECK_NO_FTX2_PATTERN := ftx2|(^|[^0-9])911[34]([^0-9]|$$)
+CHECK_NO_FTX2_SCOPE := README.md CONTRIBUTING.md TESTING.md FAQ.md \
+	engine/README.md tests/README.md tests/lab/README.md \
+	client/src engine/crates/ps5upload-engine
+CHECK_NO_FTX2_EXCEPT := \
+	':!CHANGELOG.md' \
+	':!payload/src/legacy_takeover.c' \
+	':!engine/crates/ps5upload-engine/src/legacy_helper.rs' \
+	':!engine/crates/ps5upload-engine/src/legacy_helper_tests.rs' \
+	':!engine/crates/ps5upload-engine/src/legacy_guard.rs' \
+	':!engine/crates/ps5upload-engine/src/lib.rs' \
+	':!engine/crates/ps5upload-engine/src/ava1_only_tests.rs' \
+	':!engine/crates/ps5upload-engine/src/install' \
+	':!engine/crates/ps5upload-engine/src/pkg_install.rs' \
+	':!engine/crates/ps5upload-engine/src/fakelibs_api.rs' \
+	':!engine/crates/ps5upload-engine/src/fpkg_remote.rs' \
+	':!engine/crates/ps5upload-engine/src/icon_cache.rs' \
+	':!engine/crates/ps5upload-engine/tests' \
+	':!engine/crates/ps5upload-engine/static' \
+	':!client/src/lib/addr.ts' \
+	':!client/src/lib/humanizeError.ts' \
+	':!client/src/**/*.test.ts' ':!client/src/**/*.test.tsx'
+
+check-no-ftx2:
+	@if git grep -n -i -E '$(CHECK_NO_FTX2_PATTERN)' -- $(CHECK_NO_FTX2_SCOPE) $(CHECK_NO_FTX2_EXCEPT); then \
+		echo "ERROR: FTX2 or port 9113/9114 found above (see the check-no-ftx2 notes in the Makefile)"; exit 1; \
+	else echo "✓ check-no-ftx2: clean"; fi
+
+validate: check-no-ftx2 send-payload _wait-payload-ready
 	@echo ""
 	@echo "── Running smoke suite ────────────────────────────────"
 	@npm run --silent smoke:hardware
