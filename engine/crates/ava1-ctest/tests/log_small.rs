@@ -301,14 +301,18 @@ fn a_torn_log_tail_resends_only_the_files_whose_record_is_unreadable() {
             .unwrap()
             .set_len(len - 5)
             .unwrap(); // the last record is cut mid-way
-        std::fs::remove_file(t.join("dest/d/39")).unwrap(); // and its file never landed
+        // The workers append records in whatever order they win the pack lock, so the cut
+        // record is not necessarily file 39's. Every file is lost with the page cache: the
+        // intact records rebuild theirs from the log, and only the torn record's file is resent.
+        for i in 0..40 {
+            std::fs::remove_file(t.join(format!("dest/d/{i}"))).unwrap();
+        }
     });
     assert_eq!(
         done.len(),
         39,
         "only the torn record's file is resent: {done:?}"
     );
-    assert!(!done.contains(&40));
     assert_eq!(r.wait(15_000), 0, "{}", r.events());
     all_there(&t, 40);
 }
