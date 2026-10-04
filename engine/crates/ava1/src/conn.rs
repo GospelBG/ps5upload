@@ -582,4 +582,107 @@ mod tests {
         );
         assert_eq!(r2.ctr(), NONCE_CEILING);
     }
+
+    // ---- negative frame vectors (review 006 #4, checklist A): truncated, oversized, misordered ----
+
+    /// Three sealed frames on one lane, as wire bytes, with each frame's length.
+    async fn three_frames(key: [u8; 32]) -> (Vec<u8>, Vec<usize>) {
+        let mut w = FrameWriter::new(Vec::new());
+        w.set_key(key);
+        let mut lens = Vec::new();
+        let mut last = 0;
+        for body in [&b"first frame"[..], b"second frame!", b"third"] {
+            w.send(0x20, 1, body).await.unwrap();
+            let total = w.w.len();
+            lens.push(total - last);
+            last = total;
+        }
+        (w.into_inner(), lens)
+    }
+
+    async fn read_all(wire: &[u8], key: [u8; 32]) -> (Vec<Vec<u8>>, Ava1Error) {
+        let mut r = FrameReader::new(wire);
+        r.set_key(key);
+        let mut got = Vec::new();
+        loop {
+            match r.recv().await {
+                Ok(f) => got.push(f.body),
+                Err(e) => return (got, e),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_cut_at_any_byte_ends_the_stream_cleanly() {
+        let key = [0x31u8; 32];
+        let (wire, lens) = three_frames(key).await;
+        for cut in 0..wire.len() {
+            let (got, err) = read_all(&wire[..cut], key).await;
+            // Whole frames before the cut open; the cut one is `Closed`, never a panic or a
+            // frame with the wrong bytes.
+            let whole = lens
+                .iter()
+                .scan(0, |at, n| {
+                    *at += n;
+                    Some(*at)
+                })
+                .filter(|end| *end <= cut)
+                .count();
+            assert_eq!(got.len(), whole, "cut at {cut}");
+            assert!(matches!(err, Ava1Error::Closed), "cut at {cut}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn misordered_dropped_and_duplicated_frames_do_not_open() {
+        let key = [0x32u8; 32];
+        let (wire, lens) = three_frames(key).await;
+        let f = |i: usize| -> &[u8] {
+            let start: usize = lens[..i].iter().sum();
+            &wire[start..start + lens[i]]
+        };
+        let cases: [(&str, Vec<u8>, usize); 4] = [
+            ("swapped 1 and 2", [f(1), f(0), f(2)].concat(), 0),
+            ("the first frame dropped", [f(1), f(2)].concat(), 0),
+            ("a middle frame dropped", [f(0), f(2)].concat(), 1),
+            ("a frame sent twice", [f(0), f(0), f(1)].concat(), 1),
+        ];
+        for (what, bytes, opened) in cases {
+            let (got, err) = read_all(&bytes, key).await;
+            assert_eq!(got.len(), opened, "{what}");
+            assert!(matches!(err, Ava1Error::BadTag), "{what}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_reader_cap_is_refused_before_it_is_read() {
+        let key = [0x33u8; 32];
+        let mut w = FrameWriter::new(Vec::new());
+        w.set_key(key);
+        w.send(0x20, 1, &[7u8; 5000]).await.unwrap();
+        let wire = w.into_inner();
+        let mut r = FrameReader::new(&wire[..]);
+        r.set_key(key);
+        r.set_max_body(1000);
+        let e = r.recv().await.unwrap_err();
+        assert!(
+            matches!(e, Ava1Error::Header(HeaderError::TooLong(_))),
+            "{e:?}"
+        );
+        assert_eq!(r.ctr(), 0, "the refused frame spent no nonce");
+        // And a header that claims more than the protocol allows never gets a body read.
+        let mut h = Header {
+            ty: 0x20,
+            flags: FLAG_SEALED,
+            channel: 1,
+            body_len: 100,
+        }
+        .encode();
+        h[8..12].copy_from_slice(&(MAX_BODY + 1).to_le_bytes());
+        let crc = crate::crc32c::crc32c(&h[..12]);
+        h[12..16].copy_from_slice(&crc.to_le_bytes());
+        let mut r = FrameReader::new(&h[..]);
+        r.set_key(key);
+        assert!(r.recv().await.is_err());
+    }
 }

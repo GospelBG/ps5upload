@@ -412,7 +412,7 @@ write small state files). The core wrapper `fs_write_bytes` chunks transparently
 Other filesystem methods, as built (`payload/src/mgmt_fs.c`, host-tested): `fs.list` pages by `offset`/`limit`
 (`limit` 0 = 256, at most 256; `more` = entries remain; names that are not valid UTF-8 are listed with `?` for
 their high bytes; `total_scanned` counts what the walk passed). `fs.stat` takes any absolute path without a `..`
-component (the policy of `fs.list`, not of `fs.read`), follows a link (`kind` is `link` only for a dangling
+component (the policy of `fs.list`, not of `fs.read`; see "Scope of `fs.stat` and `fs.list`" below), follows a link (`kind` is `link` only for a dangling
 one), and answers `ERR_IO` with `fs_stat_failed_errno_<n>` for an absent path. `fs.mkdir` honours `mode`
 (applied to the new directory despite the umask; intermediate directories get 0777) and `parents` (0: a missing
 parent is `fs_mkdir_failed`); an existing directory succeeds, an existing non-directory is `ERR_EXISTS`.
@@ -423,6 +423,17 @@ read filled the whole ask; `log.syslog` returns the newest `RPC_TEXT_MAX` bytes 
 when older text was cut. A handler whose failure carries data the caller reads (`net.reach`, `fs.mount_pkg`,
 `fs.mount_lwfs`) answers an error status whose cause is the whole `{"ok":false,...}` body (up to 1 KiB), which
 the engine's `call_legacy_ok` hands back as the reply it parses.
+
+Scope of `fs.stat` and `fs.list` (review 006, checklist D; decided: not narrowed). Both answer for any
+absolute, `..`-free path, as the FTX2 handlers did, because the product needs it: the Volumes and file
+browsers list `/`, `/mnt/*`, `/user` and `/system_data`, and existence probes (installed titles, SMP
+overlays, backport libraries) ask about paths outside every writable root. What a paired peer learns is
+metadata only: names, kind, size, mtime, mode, device. Never contents (`fs.read` and the data plane keep
+their own read policy), and the trust store's contents are refused by the read and write policies (S2), so no key
+material or peer list is reachable (its name and size are visible, like any other file's). A peer that is paired can already upload, delete, rename, launch and
+read through `fs.read`'s allowlist, so metadata of the rest adds no capability. Narrowing these two
+would break the browsers for no gain; the decision is to revisit it only if a read-only or guest pairing
+tier is ever added (then `fs.list`/`fs.stat` would take the read policy).
 
 Typed bodies decoded by the adapters: `NodeStatus.ucred_elevated` is a `u8` on the wire; the engine
 adapter restores the JSON boolean the client reads (`true`/`false`) and rebuilds the legacy
@@ -438,6 +449,11 @@ count (FTX2's reply had both); the adapter reconstructs `path` from the request 
 A server accepts at most 64 connections, 12 from one source address, and 16
 sessions (2 of them unconfirmed, §5); past any of these it sends
 `Error(ERR_BUSY)` and closes. The accept loop never stops on an accept error.
+
+Job admission is bounded as well: a receiver has at most 32 jobs open (the console's job table;
+the engine's host counts per session). A `JobOpen` past it is answered `JobOpenAck{ERR_BUSY}`
+and a `Resume` `JobMap{ERR_BUSY}`; the session and the admitted jobs are untouched and the
+sender retries (review 006, checklist T).
 
 One session per device: when a client completes a handshake (message 3 proves its
 key) while that key still has a session, the older session ends at once — its

@@ -611,6 +611,32 @@ int ava1_test_conn_nonce_ceiling(const uint8_t key[32]) {
     return rc;
 }
 
+/* Review 006 #4: the C reader over `wire` (small frames; the pipe is the socketpair's buffer) keyed with
+ * `key`, counter 0: how many frames open before the first error, and that error (AVA1_E_CLOSED at a clean
+ * end or a cut frame). The wire is written whole, then the write end closes. */
+int ava1_test_conn_read_all(const uint8_t key[32], const uint8_t *wire, size_t len, uint32_t *opened) {
+    int sv[2], rc;
+    ava1_conn_t c;
+    uint8_t type, flags, buf[512];
+    uint32_t ch;
+    size_t n;
+    *opened = 0;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -100;
+    if (len && write(sv[1], wire, len) != (ssize_t)len) {
+        close(sv[0]);
+        close(sv[1]);
+        return -101;
+    }
+    close(sv[1]);
+    ava1_conn_init(&c, sv[0]);
+    memcpy(c.recv_key, key, 32);
+    c.keyed = 1;
+    while ((rc = ava1_conn_recv(&c, &type, &flags, &ch, buf, sizeof buf, &n)) == 0) (*opened)++;
+    ava1_conn_destroy(&c);
+    close(sv[0]);
+    return rc;
+}
+
 /* The generated per-struct records helpers (SPEC.md §3), which nothing else on the host
  * executes: count the items in `blob`, read each with _next, re-append them with _append
  * (which is also what drives ava1_w_len_begin/_len_end). 0 = ok, -1 = bad blob,

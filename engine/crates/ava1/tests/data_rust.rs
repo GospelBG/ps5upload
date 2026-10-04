@@ -1224,3 +1224,121 @@ async fn a_slow_disk_batch_is_not_a_stall() {
         .expect("a slow disk was not cut");
     assert_eq!(files, 2);
 }
+
+/// Review 006 #4 (checklist T): job admission is bounded. A paired peer that opens more jobs
+/// than the host admits at once is refused `ERR_BUSY` for the extra ones; the session and the
+/// admitted jobs go on, and a slot freed by a finished job admits the next open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flood_of_job_opens_is_bounded_with_err_busy() {
+    let d = common::temp_dir("rr-admission");
+    let host = Arc::new(CreditHost {
+        root: d.join("share"),
+        jobs: d.join("hjobs"),
+        credit: 1 << 20,
+    });
+    let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(host)).await;
+    let s = connect(&addr.to_string(), id, peers, "client", common::fast())
+        .await
+        .unwrap();
+    let cap = ava1::server::MAX_JOBS_PER_SESSION;
+    let mut links = Vec::new();
+    for n in 0..cap {
+        let job = [n as u8 + 1; 16];
+        let mut link = s.job(job);
+        link.control
+            .send(&JobOpen {
+                job_id: job,
+                kind: gen::JOB_UPLOAD,
+                policy: 0,
+                flags: 0,
+                root: format!("in{n}"),
+                src: None,
+                credit: None,
+            })
+            .await
+            .unwrap();
+        let ack: JobOpenAck = next_control(&mut link).await.decode().unwrap();
+        assert_eq!(ack.status, 0, "job {n} is within the cap");
+        links.push(link);
+    }
+    // One more is refused, not queued: BUSY, and the session stays.
+    let over = [0xee; 16];
+    let mut extra = s.job(over);
+    extra
+        .control
+        .send(&JobOpen {
+            job_id: over,
+            kind: gen::JOB_UPLOAD,
+            policy: 0,
+            flags: 0,
+            root: "over".into(),
+            src: None,
+            credit: None,
+        })
+        .await
+        .unwrap();
+    let ack: JobOpenAck = next_control(&mut extra).await.decode().unwrap();
+    assert_eq!(ack.status, gen::ERR_BUSY);
+    assert!(!s.is_closed());
+    // An admitted job still works: finishing one (an empty manifest) frees a slot for the next
+    // open, which the host admits once the finished job has unregistered.
+    let first = [1u8; 16];
+    let m = Manifest::default();
+    let l0 = &mut links[0];
+    for p in m.pages(first) {
+        l0.control.send(&p).await.unwrap();
+    }
+    l0.control
+        .send(&ManifestEnd {
+            job_id: first,
+            files: 0,
+            bytes: 0,
+            manifest_hash: m.hash(),
+        })
+        .await
+        .unwrap();
+    loop {
+        let f = next_control(l0).await;
+        if f.ty == JobDone::TYPE {
+            break;
+        }
+    }
+    drop(extra);
+    let mut again = s.job(over);
+    again
+        .control
+        .send(&JobOpen {
+            job_id: over,
+            kind: gen::JOB_UPLOAD,
+            policy: 0,
+            flags: 0,
+            root: "over".into(),
+            src: None,
+            credit: None,
+        })
+        .await
+        .unwrap();
+    let mut ack: JobOpenAck = next_control(&mut again).await.decode().unwrap();
+    // The finished job unregisters a moment after its JobDone: BUSY until then.
+    for _ in 0..40 {
+        if ack.status == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        again
+            .control
+            .send(&JobOpen {
+                job_id: over,
+                kind: gen::JOB_UPLOAD,
+                policy: 0,
+                flags: 0,
+                root: "over".into(),
+                src: None,
+                credit: None,
+            })
+            .await
+            .unwrap();
+        ack = next_control(&mut again).await.decode().unwrap();
+    }
+    assert_eq!(ack.status, 0, "a freed slot admits the next open");
+}
