@@ -75,7 +75,53 @@ enum Probe {
     Done,
 }
 
+/// Governor switches. `Default` is the production behaviour; the pins are for benchmarking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GovernorOptions {
+    /// Hold the lane count (1..=MAX_LANES) instead of probing.
+    pub pin_lanes: Option<u8>,
+    /// Hold the chunk size in bytes (a whole number of MiB, MIN_CHUNK..=MAX_CHUNK).
+    pub pin_chunk: Option<u32>,
+}
+
+impl Default for GovernorOptions {
+    fn default() -> Self {
+        Self {
+            pin_lanes: None,
+            pin_chunk: None,
+        }
+    }
+}
+
+impl GovernorOptions {
+    /// `PS5UPLOAD_AVA1_LANES=n` and `PS5UPLOAD_AVA1_CHUNK=m` (MiB) pin the governor.
+    /// Benchmarking only: a pinned governor ignores what the link says. Values out of
+    /// range are ignored.
+    pub fn from_env() -> Self {
+        let get = |k: &str| std::env::var(k).ok();
+        Self::from_vars(
+            get("PS5UPLOAD_AVA1_LANES").as_deref(),
+            get("PS5UPLOAD_AVA1_CHUNK").as_deref(),
+        )
+    }
+
+    pub fn from_vars(lanes: Option<&str>, chunk_mib: Option<&str>) -> Self {
+        let pin_lanes = lanes
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .filter(|n| (1..=MAX_LANES).contains(n));
+        let pin_chunk = chunk_mib
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|m| (1..=(MAX_CHUNK >> 20)).contains(m))
+            .map(|m| m << 20);
+        Self {
+            pin_lanes,
+            pin_chunk,
+        }
+    }
+}
+
 pub struct Governor {
+    opts: GovernorOptions,
     lanes: u8,
     chunk: u32,
     bundle: u32,
@@ -111,9 +157,14 @@ pub fn inflight_cap(chunk: u32, lane_rate: f64) -> u64 {
 
 impl Governor {
     pub fn new() -> Self {
+        Self::with_options(GovernorOptions::default())
+    }
+
+    pub fn with_options(opts: GovernorOptions) -> Self {
         Self {
-            lanes: START_LANES,
-            chunk: START_CHUNK,
+            opts,
+            lanes: opts.pin_lanes.unwrap_or(START_LANES),
+            chunk: opts.pin_chunk.unwrap_or(START_CHUNK),
             bundle: START_BUNDLE,
             step: LaneStep::Steady,
             stable: 0,
@@ -198,7 +249,11 @@ impl Governor {
                     before,
                     wait: wait - 1,
                 },
-                LaneStep::Steady if bottleneck == BN_NETWORK && self.lanes < MAX_LANES => {
+                LaneStep::Steady
+                    if bottleneck == BN_NETWORK
+                        && self.lanes < MAX_LANES
+                        && self.opts.pin_lanes.is_none() =>
+                {
                     self.lanes += 1;
                     LaneStep::Trying {
                         before: rate,
@@ -210,6 +265,13 @@ impl Governor {
         }
         let half_second = ((lane_rate * 0.5) as u32) & !((1 << 20) - 1);
         self.chunk = self.chunk.min(half_second.max(MIN_CHUNK));
+        // Pins win over everything the link says (benchmarking).
+        if let Some(n) = self.opts.pin_lanes {
+            self.lanes = n;
+        }
+        if let Some(c) = self.opts.pin_chunk {
+            self.chunk = c;
+        }
         self.bundle = ((lane_rate * 0.25) as u32).clamp(MIN_BUNDLE, MAX_BUNDLE);
 
         // Mixing check.
@@ -450,5 +512,57 @@ mod tests {
             ..Default::default()
         });
         assert!(matches!(g.probe, Probe::Done), "the probe never runs twice");
+    }
+
+    // ---- review 003 §4: the benchmark pins ----
+
+    #[test]
+    fn pinned_lanes_and_chunk_are_honoured_through_everything() {
+        let opts = GovernorOptions {
+            pin_lanes: Some(4),
+            pin_chunk: Some(8 << 20),
+        };
+        let mut g = Governor::with_options(opts);
+        let first = g.tick(&Sample::default());
+        assert_eq!((first.lanes, first.chunk), (4, 8 << 20));
+        for i in 0..80 {
+            // A slow, stalling, starved link must not move a pin.
+            let d = g.tick(&Sample {
+                secs: 1.0,
+                bytes_acked: 1_000_000,
+                lanes: 4,
+                stalls: u32::from(i % 7 == 0),
+                credit_starved: i % 3 == 0,
+                ..Default::default()
+            });
+            assert_eq!((d.lanes, d.chunk), (4, 8 << 20), "tick {i}");
+        }
+        let d = net(&mut Governor::with_options(opts), 100e6, 110e6, 50);
+        assert_eq!((d.lanes, d.chunk), (4, 8 << 20));
+    }
+
+    #[test]
+    fn a_lane_pin_alone_leaves_the_chunk_to_the_governor() {
+        let mut g = Governor::with_options(GovernorOptions {
+            pin_lanes: Some(3),
+            ..Default::default()
+        });
+        let d = net(&mut g, 100e6, 300e6, 40);
+        assert_eq!(d.lanes, 3);
+        assert!(d.chunk >= MIN_CHUNK);
+    }
+
+    #[test]
+    fn the_env_knobs_parse_and_ignore_nonsense() {
+        let o = GovernorOptions::from_vars(Some("6"), Some("4"));
+        assert_eq!((o.pin_lanes, o.pin_chunk), (Some(6), Some(4 << 20)));
+        let o = GovernorOptions::from_vars(Some("0"), Some("16"));
+        assert_eq!((o.pin_lanes, o.pin_chunk), (None, None));
+        let o = GovernorOptions::from_vars(Some("9"), Some("0"));
+        assert_eq!((o.pin_lanes, o.pin_chunk), (None, None));
+        let o = GovernorOptions::from_vars(Some(" 2 "), Some("15"));
+        assert_eq!((o.pin_lanes, o.pin_chunk), (Some(2), Some(15 << 20)));
+        let o = GovernorOptions::from_vars(Some("x"), Some(""));
+        assert_eq!(o, GovernorOptions::default());
     }
 }

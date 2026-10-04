@@ -19,7 +19,7 @@ use crate::gen::{
     self, Bundle, BundleRecord, Chunk, Credit, Durable, FileRetry, FileRoot, JobDone, JobMap,
     JobOpen, JobOpenAck, ManifestEnd, Received, Status,
 };
-use crate::governor::{self, Class, Governor, Mode, Sample};
+use crate::governor::{self, Class, Governor, GovernorOptions, Mode, Sample};
 use crate::manifest::Manifest;
 use crate::ranges::{from_runs, Need, RangeSet};
 use crate::router::{ConnTx, Inbound, JobLink, LaneTx};
@@ -1120,8 +1120,10 @@ pub async fn run_upload(
         bytes_budget: Arc::new(Semaphore::new(READ_AHEAD_KIB as usize)),
         stall: Mutex::new(None),
     });
-    let mut gov = Governor::new();
+    // `PS5UPLOAD_AVA1_LANES` / `_CHUNK` pin the governor (benchmarking only).
+    let mut gov = Governor::with_options(GovernorOptions::from_env());
     let first = gov.tick(&Sample::default());
+    sh.chunk.store(first.chunk, Ordering::Relaxed);
     sh.sched.lock().unwrap().decision = Some(first);
     let small_q = Arc::new(Mutex::new(small));
     let large_q = Arc::new(Mutex::new(large));

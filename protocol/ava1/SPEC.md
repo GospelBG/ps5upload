@@ -822,6 +822,9 @@ numbers they are fed, so both are tested against models rather than sockets.
 - Chunk: 1–15 MiB in whole groups; halved on a stall, doubled after 10 stable ticks; never more
   than half a second of one lane's throughput (min 1 MiB). 15 MiB, not 16: the frame cap (§2)
   counts the header and the MAC, which a 16 MiB body would not fit under.
+- Benchmark pins (sender-local, never on the wire): `PS5UPLOAD_AVA1_LANES=n` holds the lane count
+  at n (1-8) and `PS5UPLOAD_AVA1_CHUNK=m` holds the chunk at m MiB (1-15); a pinned value ignores
+  stalls and the link. Out-of-range values are ignored. For measurement only.
 - Bundle target: a quarter second of one lane's throughput, clamped to 256 KiB–15 MiB. It moves
   with that rate; the effect is that it grows while the network is the limit and shrinks when
   the rate falls (a receiver whose workers wait shows up as a receiver-reported bottleneck, §16.9
