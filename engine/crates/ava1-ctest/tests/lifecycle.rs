@@ -370,8 +370,14 @@ fn waiting_for_a_held_port_gives_up_after_the_bound() {
     let rc = unsafe { takeover_wait_port_free(port as c_int, 400, 20) };
     let took = t.elapsed();
     assert_eq!(rc, -1, "the port is answered: the wait must say so");
-    assert!(took >= Duration::from_millis(400), "gave up early: {took:?}");
-    assert!(took < Duration::from_millis(1500), "waited far past the bound: {took:?}");
+    assert!(
+        took >= Duration::from_millis(400),
+        "gave up early: {took:?}"
+    );
+    assert!(
+        took < Duration::from_millis(1500),
+        "waited far past the bound: {took:?}"
+    );
     drop(l);
 }
 
@@ -387,13 +393,20 @@ fn waiting_for_a_port_returns_the_moment_it_frees() {
     let rc = unsafe { takeover_wait_port_free(port as c_int, 5000, 20) };
     h.join().unwrap();
     assert_eq!(rc, 0);
-    assert!(t.elapsed() < Duration::from_millis(2000), "{:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_millis(2000),
+        "{:?}",
+        t.elapsed()
+    );
 }
 
 #[test]
 fn waiting_for_a_free_port_does_not_wait() {
     let port = free_port();
     let t = Instant::now();
-    assert_eq!(unsafe { takeover_wait_port_free(port as c_int, 5000, 20) }, 0);
+    assert_eq!(
+        unsafe { takeover_wait_port_free(port as c_int, 5000, 20) },
+        0
+    );
     assert!(t.elapsed() < Duration::from_millis(500));
 }

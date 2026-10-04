@@ -400,7 +400,11 @@ fn gc_never_removes_a_job_directory_that_holds_a_log_until_a_long_ceiling() {
     // not on one boot's wall clock (a clock moved forward would age every log at once): it takes three
     // boots that each saw it past the ceiling (final review: console)
     for strike in 1..=2 {
-        assert_eq!(jobs_gc(&jobs, 20 * 86_400, 86_400), 0, "strike {strike}: the clock alone must not take a log");
+        assert_eq!(
+            jobs_gc(&jobs, 20 * 86_400, 86_400),
+            0,
+            "strike {strike}: the clock alone must not take a log"
+        );
         assert!(job_dir(&jobs, &[7; 16]).exists());
     }
     let removed = jobs_gc(&jobs, 20 * 86_400, 86_400);
@@ -440,7 +444,10 @@ fn gc_does_nothing_when_the_clock_is_implausible_or_behind_a_jobs_own_stamp() {
     std::fs::create_dir_all(&old).unwrap();
     // Thirty days old: an ordinary collection.
     let thirty = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
-    std::fs::File::open(&old).unwrap().set_modified(thirty).unwrap();
+    std::fs::File::open(&old)
+        .unwrap()
+        .set_modified(thirty)
+        .unwrap();
     // Before 2024 (the console's clock reset to its epoch): the age of everything is nonsense.
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -452,7 +459,10 @@ fn gc_does_nothing_when_the_clock_is_implausible_or_behind_a_jobs_own_stamp() {
     let fresh = jobs.join("efefefefefefefefefefefefefefefef");
     std::fs::create_dir_all(&fresh).unwrap();
     assert_eq!(jobs_gc(&jobs, -2 * 86_400, 86_400), 0);
-    assert!(old.exists(), "a clock behind a job's own stamp took a directory");
+    assert!(
+        old.exists(),
+        "a clock behind a job's own stamp took a directory"
+    );
     // A sane clock collects the old directory as before.
     assert_eq!(jobs_gc(&jobs, 0, 86_400), 1);
     assert!(!old.exists() && fresh.exists());
@@ -620,7 +630,10 @@ fn start_time_recovery_alone_restores_lost_files_without_any_jobopen() {
     // The start's recovery pass runs on the recovery thread now (the listeners no longer wait for it).
     let t0 = std::time::Instant::now();
     while packs(&t.join("jobs"), 7) > 0 {
-        assert!(t0.elapsed().as_secs() < 20, "the start-time pass never recovered the log");
+        assert!(
+            t0.elapsed().as_secs() < 20,
+            "the start-time pass never recovered the log"
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     all_there(&t, 30);

@@ -205,8 +205,14 @@ fn the_watchdog_waits_while_a_sony_call_runs_up_to_the_ceiling() {
     assert_eq!(unsafe { ava1_exit_decide(8000, 1, 8000, 60000) }, WAIT);
     assert_eq!(unsafe { ava1_exit_decide(59999, 1, 8000, 60000) }, WAIT);
     // The hard ceiling: after it the process goes, and the caller logs loudly that it was forced.
-    assert_eq!(unsafe { ava1_exit_decide(60000, 1, 8000, 60000) }, EXIT_FORCED);
-    assert_eq!(unsafe { ava1_exit_decide(90000, 1, 8000, 60000) }, EXIT_FORCED);
+    assert_eq!(
+        unsafe { ava1_exit_decide(60000, 1, 8000, 60000) },
+        EXIT_FORCED
+    );
+    assert_eq!(
+        unsafe { ava1_exit_decide(90000, 1, 8000, 60000) },
+        EXIT_FORCED
+    );
 }
 
 #[test]

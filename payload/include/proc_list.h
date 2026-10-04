@@ -2,6 +2,7 @@
 #define PS5UPLOAD2_PROC_LIST_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Layout offsets inside FreeBSD's kinfo_proc as exposed via
  * sysctl(KERN_PROC_PROC). Same offsets shellui_rpc.c uses. */
