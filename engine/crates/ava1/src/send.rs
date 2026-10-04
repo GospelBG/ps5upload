@@ -87,6 +87,14 @@ pub struct Progress {
     pub skipped_files: AtomicU64,
     pub skipped_bytes: AtomicU64,
     pub skip_recorded: AtomicBool,
+    /// Sequential sources (7z/RAR resume): 1 while the decoder discards data the receiver
+    /// already holds (`skip_done_bytes` of `skip_total_bytes`), else 0.
+    pub phase: AtomicU8,
+    pub skip_done_bytes: AtomicU64,
+    pub skip_total_bytes: AtomicU64,
+    /// Files are still settling on the receiver after the job's last byte (it reports
+    /// unswept files); false until the receiver says so.
+    pub settling: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
