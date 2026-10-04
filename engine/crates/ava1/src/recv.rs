@@ -110,6 +110,19 @@ pub trait Sink: Send + Sync {
     }
 }
 
+/// The root of a file of at most one group, as the sink now holds it. A zero-length file is the
+/// empty root with nothing to read back: no sink is asked to read a file that has no bytes (a
+/// zip sink cannot, and a local one would look for a part file that never existed).
+fn one_group_root(sink: &dyn Sink, id: u32, size: u64) -> Option<[u8; 32]> {
+    if size == 0 {
+        return Some(*blake3::hash(&[]).as_bytes());
+    }
+    let mut buf = vec![0u8; size as usize];
+    sink.read_at(id, 0, &mut buf)
+        .ok()
+        .map(|_| *blake3::hash(&buf).as_bytes())
+}
+
 /// Whether a `LocalSink` takes the durable-by-log path unless told otherwise. The environment decides
 /// (`PS5UPLOAD_AVA1_LOG_SMALL=1` / `0`); with no setting it is on everywhere but macOS, where a plain
 /// fsync never reaches the drive (one `F_FULLFSYNC` per batch already covers the files) so the log
@@ -1576,12 +1589,22 @@ async fn run_loop(
                             id = r.file_id
                         )));
                     }
-                    eprintln!("DBGROOT {} size {}", r.file_id, e.size);
                     last_progress = Instant::now();
-                    large
-                        .entry(r.file_id)
-                        .or_insert_with(|| new_large(&dir, &m, r.file_id))
-                        .root = Some(r.root);
+                    if e.size == 0 {
+                        // A zero-length file is complete when created (up front, above); its root
+                        // is the empty root and there is nothing to read back or commit.
+                        if r.root != *blake3::hash(&[]).as_bytes() {
+                            return Err(SendError::Protocol(format!(
+                                "file {} is empty but its root is not the empty root",
+                                r.file_id
+                            )));
+                        }
+                    } else {
+                        large
+                            .entry(r.file_id)
+                            .or_insert_with(|| new_large(&dir, &m, r.file_id))
+                            .root = Some(r.root);
+                    }
                 }
                 JobCancel::TYPE => {
                     return Err(SendError::Refused {
@@ -2163,16 +2186,11 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
             };
             cvs.map(|c| verify::root_from_cvs(&c))
         } else {
-            let mut buf = vec![0u8; l.size as usize];
             let s2 = sink.clone();
-            let id = l.id;
-            let (buf, n) = tokio::task::spawn_blocking(move || {
-                let n = s2.read_at(id, 0, &mut buf);
-                (buf, n)
-            })
-            .await
-            .map_err(proto)?;
-            n.ok().map(|_| *blake3::hash(&buf).as_bytes())
+            let (id, size) = (l.id, l.size);
+            tokio::task::spawn_blocking(move || one_group_root(s2.as_ref(), id, size))
+                .await
+                .map_err(proto)?
         };
         if actual != Some(root) {
             let rec = Record::Reset(l.id);
@@ -2447,6 +2465,39 @@ mod tests {
             }));
         }
         (sink, groups, st)
+    }
+
+    #[test]
+    fn an_empty_file_verifies_as_the_empty_root_without_a_read_back() {
+        struct NoRead;
+        impl Sink for NoRead {
+            fn prepare(&self, _: &Manifest) -> io::Result<()> {
+                Ok(())
+            }
+            fn write_at(&self, _: u32, _: u64, _: &[u8]) -> io::Result<()> {
+                Ok(())
+            }
+            fn write_whole(&self, _: u32, _: &[u8]) -> io::Result<()> {
+                Ok(())
+            }
+            fn sync(&self, _: &[u32]) -> io::Result<()> {
+                Ok(())
+            }
+            fn read_at(&self, _: u32, _: u64, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::Unsupported))
+            }
+            fn commit(&self, _: u32) -> io::Result<()> {
+                Ok(())
+            }
+            fn finish(&self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            one_group_root(&NoRead, 3, 0),
+            Some(*blake3::hash(&[]).as_bytes())
+        );
+        assert_eq!(one_group_root(&NoRead, 3, 10), None);
     }
 
     #[test]
