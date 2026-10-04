@@ -564,7 +564,7 @@ struct BusyHost {
 }
 
 impl ava1::router::JobHost for BusyHost {
-    fn accept(&self, mut link: ava1::router::JobLink, first: ava1::conn::Frame, peer: [u8; 32]) {
+    fn accept(&self, link: ava1::router::JobLink, first: ava1::conn::Frame, peer: [u8; 32]) {
         use std::sync::atomic::Ordering::SeqCst;
         if first.ty == gen::JobOpen::TYPE {
             self.seen.fetch_add(1, SeqCst);
