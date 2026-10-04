@@ -42,6 +42,7 @@ import {
   type RateSample,
 } from "../lib/rollingRate";
 import { archiveFormat, type SourceKind } from "./upload";
+import { rarPasswordProblem } from "../lib/rarPassword";
 import { jobLiveFromSnapshot, type JobLive } from "../lib/jobLive";
 import {
   runPkgInstall,
@@ -357,6 +358,10 @@ interface QueueState {
   retryFailed: () => void;
   /** Retry one failed row. Returns false when the row is missing/not failed. */
   retryItem: (id: string) => boolean;
+  /** Retry one archive row that failed for a missing or wrong password, with the password
+   *  the person just typed. The password lives on the in-memory item only (the save redacts
+   *  it) and is never logged. False when the password is empty or the row is not a failed one. */
+  retryWithPassword: (id: string, password: string) => boolean;
   /** Re-drive one console's uploads that FAILED on a recoverable
    *  (connection-class) error, then restart that console's drain loop.
    *  This is the "slept past the in-loop recovery budget" case: a standby
@@ -1846,6 +1851,21 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         ),
       }));
       scheduleSave();
+      return true;
+    },
+
+    retryWithPassword(id, password) {
+      if (!password) return false;
+      const item = get().items.find((candidate) => candidate.id === id);
+      if (!item || item.status !== "failed") return false;
+      if (!rarPasswordProblem(item.errorReason, item.error)) return false;
+      set((s) => ({
+        items: s.items.map((candidate) =>
+          candidate.id === id ? { ...candidate, rarPassword: password } : candidate,
+        ),
+      }));
+      if (!get().retryItem(id)) return false;
+      void get().startHost(hostOf(item.addr));
       return true;
     },
 

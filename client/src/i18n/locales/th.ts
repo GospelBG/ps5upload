@@ -3427,6 +3427,9 @@ ps5src_dest_path: "พาธปลายทางบนเครื่องน�
 ps5src_start: "คัดลอกมายัง PS5 เครื่องนี้",
 ps5src_need_source_path: "ใส่พาธต้นทางที่ขึ้นต้นด้วย /",
 ps5src_need_dest_path: "ใส่พาธปลายทางที่ขึ้นต้นด้วย /",
+queue_rar_password_required: "ไฟล์บีบอัดนี้ต้องใช้รหัสผ่าน",
+queue_rar_password_wrong: "รหัสผ่านไม่ถูกต้อง ลองอีกครั้ง",
+queue_rar_password_retry: "ลองใหม่ด้วยรหัสผ่าน",
 };
 
 export default th;

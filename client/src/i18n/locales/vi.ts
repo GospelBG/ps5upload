@@ -3402,6 +3402,9 @@ ps5src_dest_path: "Đường dẫn đích trên máy này",
 ps5src_start: "Sao chép sang PS5 này",
 ps5src_need_source_path: "Nhập đường dẫn nguồn, bắt đầu bằng /",
 ps5src_need_dest_path: "Nhập đường dẫn đích, bắt đầu bằng /",
+queue_rar_password_required: "Tệp lưu trữ này cần mật khẩu.",
+queue_rar_password_wrong: "Mật khẩu đó sai. Hãy thử lại.",
+queue_rar_password_retry: "Thử lại với mật khẩu",
 };
 
 export default vi;

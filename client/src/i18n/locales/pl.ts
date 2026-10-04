@@ -3695,6 +3695,9 @@ ps5src_dest_path: "Ścieżka docelowa na tej konsoli",
 ps5src_start: "Kopiuj na tę PS5",
 ps5src_need_source_path: "Wpisz ścieżkę źródłową, zaczynając od /",
 ps5src_need_dest_path: "Wpisz ścieżkę docelową, zaczynając od /",
+queue_rar_password_required: "To archiwum wymaga hasła.",
+queue_rar_password_wrong: "Hasło było nieprawidłowe. Spróbuj ponownie.",
+queue_rar_password_retry: "Ponów z hasłem",
 };
 
 export default pl;

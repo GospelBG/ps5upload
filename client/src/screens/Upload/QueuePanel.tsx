@@ -49,6 +49,8 @@ import {
 import { isRemotePath } from "../../lib/remotePath";
 import { useTransferStore } from "../../state/transfer";
 import { BottleneckLine, JobLiveNotes } from "./Bottleneck";
+import { RarPasswordPrompt } from "./RarPasswordPrompt";
+import { rarPasswordProblem } from "../../lib/rarPassword";
 
 /** One console's slice of the queue, in first-seen order. */
 interface ConsoleGroup {
@@ -1031,6 +1033,17 @@ export function QueueRow({
           detail={item.errorDetail}
         />
       )}
+
+      {item.status === "failed" &&
+        !isInstall &&
+        rarPasswordProblem(item.errorReason, item.error) && (
+          <RarPasswordPrompt
+            problem={rarPasswordProblem(item.errorReason, item.error)!}
+            onSubmit={(pw) =>
+              useUploadQueueStore.getState().retryWithPassword(item.id, pw)
+            }
+          />
+        )}
 
       {item.status === "failed" && isInstall && (
         <div className="mt-2 flex flex-wrap gap-2">

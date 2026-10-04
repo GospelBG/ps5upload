@@ -3764,6 +3764,9 @@ ps5src_dest_path: "Célútvonal ezen a konzolon",
 ps5src_start: "Másolás erre a PS5-re",
 ps5src_need_source_path: "Add meg a forrás útvonalát, / jellel kezdve",
 ps5src_need_dest_path: "Add meg a cél útvonalát, / jellel kezdve",
+queue_rar_password_required: "Ehhez az archívumhoz jelszó kell.",
+queue_rar_password_wrong: "Rossz volt a jelszó. Próbáld újra.",
+queue_rar_password_retry: "Újra jelszóval",
 };
 
 export default hu;

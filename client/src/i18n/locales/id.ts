@@ -3409,6 +3409,9 @@ ps5src_dest_path: "Path tujuan di konsol ini",
 ps5src_start: "Salin ke PS5 ini",
 ps5src_need_source_path: "Masukkan path sumber, diawali /",
 ps5src_need_dest_path: "Masukkan path tujuan, diawali /",
+queue_rar_password_required: "Arsip ini memerlukan kata sandi.",
+queue_rar_password_wrong: "Kata sandi itu salah. Coba lagi.",
+queue_rar_password_retry: "Coba lagi dengan kata sandi",
 };
 
 export default id;

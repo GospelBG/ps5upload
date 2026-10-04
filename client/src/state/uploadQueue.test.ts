@@ -629,6 +629,33 @@ describe("queue recovery and persistence visibility", () => {
     expect(useUploadQueueStore.getState().retryItem(pending.id)).toBe(false);
   });
 
+  it("retries a password-failed archive with the typed password, in memory only", async () => {
+    addItem("192.168.1.10:9113", "game.rar");
+    const [it0] = useUploadQueueStore.getState().items;
+    useUploadQueueStore.setState({
+      items: [
+        {
+          ...it0,
+          sourceKind: "archive",
+          status: "failed",
+          error: "rar_password_required",
+          errorReason: "ava1_rar_password_required",
+        },
+      ],
+    });
+    expect(
+      useUploadQueueStore.getState().retryWithPassword(it0.id, "s3cret"),
+    ).toBe(true);
+    const [r] = useUploadQueueStore.getState().items;
+    expect(r).toMatchObject({ status: "pending", error: null, rarPassword: "s3cret" });
+    // The password reaches the live item, never the saved document.
+    await vi.advanceTimersByTimeAsync(400);
+    const saved = JSON.stringify(mockedQueueSave.mock.calls[mockedQueueSave.mock.calls.length - 1] ?? []);
+    expect(saved).not.toContain("s3cret");
+    // An empty password retries nothing; a row that did not fail for a password is refused.
+    expect(useUploadQueueStore.getState().retryWithPassword(it0.id, "")).toBe(false);
+  });
+
   it("surfaces a failed save and clears the warning after a successful save", async () => {
     mockedQueueSave.mockRejectedValueOnce(new Error("disk full"));
     addItem("192.168.1.10:9113", "first.bin");

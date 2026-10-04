@@ -3400,6 +3400,9 @@ ps5src_dest_path: "এই কনসোলে গন্তব্য পাথ",
 ps5src_start: "এই PS5-এ কপি করুন",
 ps5src_need_source_path: "/ দিয়ে শুরু হওয়া উৎস পাথ লিখুন",
 ps5src_need_dest_path: "/ দিয়ে শুরু হওয়া গন্তব্য পাথ লিখুন",
+queue_rar_password_required: "এই আর্কাইভের জন্য পাসওয়ার্ড দরকার।",
+queue_rar_password_wrong: "ওই পাসওয়ার্ড ভুল ছিল। আবার চেষ্টা করুন।",
+queue_rar_password_retry: "পাসওয়ার্ড দিয়ে আবার চেষ্টা করুন",
 };
 
 export default bn;

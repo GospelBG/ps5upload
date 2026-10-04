@@ -3407,6 +3407,9 @@ ps5src_dest_path: "Bu konsoldaki hedef yol",
 ps5src_start: "Bu PS5’e kopyala",
 ps5src_need_source_path: "Kaynak yolunu girin, / ile başlamalı",
 ps5src_need_dest_path: "Hedef yolunu girin, / ile başlamalı",
+queue_rar_password_required: "Bu arşiv için parola gerekiyor.",
+queue_rar_password_wrong: "Bu parola yanlıştı. Tekrar deneyin.",
+queue_rar_password_retry: "Parolayla yeniden dene",
 };
 
 export default tr;

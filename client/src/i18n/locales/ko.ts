@@ -3438,6 +3438,9 @@ ps5src_dest_path: "이 본체의 대상 경로",
 ps5src_start: "이 PS5로 복사",
 ps5src_need_source_path: "/로 시작하는 원본 경로를 입력하세요",
 ps5src_need_dest_path: "/로 시작하는 대상 경로를 입력하세요",
+queue_rar_password_required: "이 압축 파일에는 비밀번호가 필요합니다.",
+queue_rar_password_wrong: "비밀번호가 틀렸습니다. 다시 시도하세요.",
+queue_rar_password_retry: "비밀번호로 다시 시도",
 };
 
 export default ko;

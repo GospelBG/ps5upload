@@ -3353,6 +3353,9 @@ ps5src_dest_path: "这台主机上的目标路径",
 ps5src_start: "复制到这台 PS5",
 ps5src_need_source_path: "请输入以 / 开头的源路径",
 ps5src_need_dest_path: "请输入以 / 开头的目标路径",
+queue_rar_password_required: "此压缩包需要密码。",
+queue_rar_password_wrong: "密码错误，请重试。",
+queue_rar_password_retry: "使用密码重试",
 };
 
 export default zh_CN;

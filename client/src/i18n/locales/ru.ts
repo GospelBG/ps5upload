@@ -3347,6 +3347,9 @@ ps5src_dest_path: "Путь назначения на этой консоли",
 ps5src_start: "Копировать на эту PS5",
 ps5src_need_source_path: "Введите исходный путь, начиная с /",
 ps5src_need_dest_path: "Введите путь назначения, начиная с /",
+queue_rar_password_required: "Для этого архива нужен пароль.",
+queue_rar_password_wrong: "Неверный пароль. Попробуйте ещё раз.",
+queue_rar_password_retry: "Повторить с паролем",
 };
 
 export default ru;

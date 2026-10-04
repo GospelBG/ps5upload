@@ -3437,6 +3437,9 @@ ps5src_dest_path: "इस कंसोल पर गंतव्य पाथ",
 ps5src_start: "इस PS5 पर कॉपी करें",
 ps5src_need_source_path: "/ से शुरू होने वाला स्रोत पाथ दर्ज करें",
 ps5src_need_dest_path: "/ से शुरू होने वाला गंतव्य पाथ दर्ज करें",
+queue_rar_password_required: "इस आर्काइव के लिए पासवर्ड चाहिए।",
+queue_rar_password_wrong: "वह पासवर्ड गलत था। दोबारा कोशिश करें।",
+queue_rar_password_retry: "पासवर्ड के साथ दोबारा कोशिश करें",
 };
 
 export default hi;

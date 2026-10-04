@@ -3442,6 +3442,9 @@ ps5src_dest_path: "この本体上のコピー先パス",
 ps5src_start: "この PS5 にコピー",
 ps5src_need_source_path: "コピー元のパスを / から始めて入力してください",
 ps5src_need_dest_path: "コピー先のパスを / から始めて入力してください",
+queue_rar_password_required: "このアーカイブにはパスワードが必要です。",
+queue_rar_password_wrong: "パスワードが違います。もう一度お試しください。",
+queue_rar_password_retry: "パスワードで再試行",
 };
 
 export default ja;

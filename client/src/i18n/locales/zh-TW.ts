@@ -3348,6 +3348,9 @@ ps5src_dest_path: "這台主機上的目的路徑",
 ps5src_start: "複製到這台 PS5",
 ps5src_need_source_path: "請輸入以 / 開頭的來源路徑",
 ps5src_need_dest_path: "請輸入以 / 開頭的目的路徑",
+queue_rar_password_required: "此壓縮檔需要密碼。",
+queue_rar_password_wrong: "密碼錯誤，請重試。",
+queue_rar_password_retry: "使用密碼重試",
 };
 
 export default zh_TW;

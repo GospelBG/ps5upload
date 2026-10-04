@@ -3765,6 +3765,9 @@ ps5src_dest_path: "Destination path on this console",
 ps5src_start: "Copy to this PS5",
 ps5src_need_source_path: "Enter the source path, starting with /",
 ps5src_need_dest_path: "Enter the destination path, starting with /",
+queue_rar_password_required: "This archive needs a password.",
+queue_rar_password_wrong: "That password was wrong. Try again.",
+queue_rar_password_retry: "Retry with password",
 };
 
 export default en;

@@ -3400,6 +3400,9 @@ ps5src_dest_path: "مسار الوجهة على هذه الوحدة",
 ps5src_start: "نسخ إلى جهاز PS5 هذا",
 ps5src_need_source_path: "أدخل مسار المصدر بادئًا بـ /",
 ps5src_need_dest_path: "أدخل مسار الوجهة بادئًا بـ /",
+queue_rar_password_required: "يحتاج هذا الأرشيف إلى كلمة مرور.",
+queue_rar_password_wrong: "كلمة المرور خاطئة. حاول مرة أخرى.",
+queue_rar_password_retry: "إعادة المحاولة بكلمة المرور",
 };
 
 export default ar;

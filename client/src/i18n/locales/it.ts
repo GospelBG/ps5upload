@@ -3347,6 +3347,9 @@ ps5src_dest_path: "Percorso di destinazione su questa console",
 ps5src_start: "Copia su questa PS5",
 ps5src_need_source_path: "Inserisci il percorso di origine, che inizia con /",
 ps5src_need_dest_path: "Inserisci il percorso di destinazione, che inizia con /",
+queue_rar_password_required: "Questo archivio richiede una password.",
+queue_rar_password_wrong: "La password era errata. Riprova.",
+queue_rar_password_retry: "Riprova con la password",
 };
 
 export default it;
