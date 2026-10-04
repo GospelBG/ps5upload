@@ -8,11 +8,13 @@
 #define MIB (1024u * 1024u)
 #define DEFAULT_POOL_BUDGET (96u * MIB)
 
-static const size_t CLASS_CAP[AVA1_FRAME_CLASSES] = { 1u * MIB, 4u * MIB, 8u * MIB, 16u * MIB };
-/* A chunk of N MiB arrives as a body of N MiB plus its message header: the buffer is a little
- * larger than the class so that body still belongs to class N rather than the next one up
- * (which would hold twice the memory the admit budget counted). */
-#define CLASS_SLACK (64u * 1024u)
+static const size_t CLASS_CAP[AVA1_FRAME_CLASSES] = { 1u * MIB, 4u * MIB, 8u * MIB, 15u * MIB, 16u * MIB };
+/* A chunk of N MiB arrives as a body of N MiB plus its message header and MAC (tens of bytes):
+ * a body from the class size up to this much beyond it is pooled in a class-sized buffer
+ * with this much slack. Any other length (a 2 MiB chunk, a bundle) is allocated exactly, so
+ * a frame never holds meaningfully more memory than the credit window counted for it: the
+ * most a pooled frame can add is CLASS_SLACK, under 0.4% of a 1 MiB frame. */
+#define CLASS_SLACK 4096u
 
 typedef struct idle_node {
     struct idle_node *next;
@@ -24,16 +26,16 @@ static struct {
     size_t n[AVA1_FRAME_CLASSES];
     uint64_t budget; /* 0 = default */
     uint64_t idle_bytes;
-    size_t outstanding;
-} P = { PTHREAD_MUTEX_INITIALIZER, { 0 }, { 0 }, 0, 0, 0 };
+    size_t outstanding;      /* buffers handed out and not yet freed, pooled or exact */
+    uint64_t out_bytes, peak; /* their allocation sizes, and the high-water mark */
+} P = { PTHREAD_MUTEX_INITIALIZER, { 0 }, { 0 }, 0, 0, 0, 0, 0 };
 
 static uint64_t budget_locked(void) { return P.budget ? P.budget : DEFAULT_POOL_BUDGET; }
 
 static int class_of_len(size_t len) {
     int i;
-    if (len <= CLASS_CAP[0] / 2) return -1;
     for (i = 0; i < AVA1_FRAME_CLASSES; i++)
-        if (len <= CLASS_CAP[i] + CLASS_SLACK) return i;
+        if (len >= CLASS_CAP[i] && len <= CLASS_CAP[i] + CLASS_SLACK) return i;
     return -1;
 }
 
@@ -44,39 +46,45 @@ static int class_of_cap(size_t cap) {
     return -1;
 }
 
-size_t ava1_frame_class(size_t len) {
+size_t ava1_frame_cap(size_t len) {
     int i = class_of_len(len);
-    return i < 0 ? 0 : CLASS_CAP[i];
+    return i < 0 ? (len ? len : 1) : CLASS_CAP[i];
+}
+
+static uint64_t alloc_size(size_t cap) { return class_of_cap(cap) < 0 ? cap : (uint64_t)cap + CLASS_SLACK; }
+
+static void take_locked(size_t cap) {
+    P.outstanding++;
+    P.out_bytes += alloc_size(cap);
+    if (P.out_bytes > P.peak) P.peak = P.out_bytes;
+}
+
+static void give_locked(size_t cap) {
+    if (P.outstanding) P.outstanding--;
+    P.out_bytes -= alloc_size(cap) <= P.out_bytes ? alloc_size(cap) : P.out_bytes;
 }
 
 void *ava1_frame_alloc(size_t len, size_t *cap) {
-    int i = class_of_len(len);
+    size_t c = ava1_frame_cap(len);
+    int i = class_of_cap(c);
     void *p = NULL;
-    if (i < 0) {
-        p = malloc(len ? len : 1);
-        if (cap) *cap = 0;
-        if (p) {
-            pthread_mutex_lock(&P.mu);
-            P.outstanding++;
-            pthread_mutex_unlock(&P.mu);
+    if (i >= 0) {
+        pthread_mutex_lock(&P.mu);
+        if (P.head[i]) {
+            idle_node_t *n = P.head[i];
+            P.head[i] = n->next;
+            P.n[i]--;
+            P.idle_bytes -= CLASS_CAP[i];
+            p = n;
         }
-        return p;
+        pthread_mutex_unlock(&P.mu);
     }
-    pthread_mutex_lock(&P.mu);
-    if (P.head[i]) {
-        idle_node_t *n = P.head[i];
-        P.head[i] = n->next;
-        P.n[i]--;
-        P.idle_bytes -= CLASS_CAP[i];
-        p = n;
-    }
-    pthread_mutex_unlock(&P.mu);
-    if (!p) p = malloc(CLASS_CAP[i] + CLASS_SLACK);
+    if (!p) p = malloc(alloc_size(c));
     if (!p) return NULL;
     pthread_mutex_lock(&P.mu);
-    P.outstanding++;
+    take_locked(c);
     pthread_mutex_unlock(&P.mu);
-    if (cap) *cap = CLASS_CAP[i];
+    if (cap) *cap = c;
     return p;
 }
 
@@ -88,7 +96,7 @@ int ava1_frame_free(void *p, size_t cap) {
     i = class_of_cap(cap);
     if (i < 0) {
         pthread_mutex_lock(&P.mu);
-        if (P.outstanding) P.outstanding--;
+        give_locked(cap);
         pthread_mutex_unlock(&P.mu);
         free(p);
         return 0;
@@ -100,7 +108,7 @@ int ava1_frame_free(void *p, size_t cap) {
             return -1; /* a double free: the buffer is already idle in the pool */
         }
     }
-    if (P.outstanding) P.outstanding--;
+    give_locked(cap);
     b = budget_locked();
     if (P.n[i] < b / CLASS_CAP[i] && P.idle_bytes + CLASS_CAP[i] <= b) {
         n = p;
@@ -145,6 +153,28 @@ size_t ava1_frame_pool_idle(int cls) {
     n = P.n[cls];
     pthread_mutex_unlock(&P.mu);
     return n;
+}
+
+uint64_t ava1_frame_pool_outstanding_bytes(void) {
+    uint64_t n;
+    pthread_mutex_lock(&P.mu);
+    n = P.out_bytes;
+    pthread_mutex_unlock(&P.mu);
+    return n;
+}
+
+uint64_t ava1_frame_pool_peak_bytes(void) {
+    uint64_t n;
+    pthread_mutex_lock(&P.mu);
+    n = P.peak;
+    pthread_mutex_unlock(&P.mu);
+    return n;
+}
+
+void ava1_frame_pool_reset_peak(void) {
+    pthread_mutex_lock(&P.mu);
+    P.peak = P.out_bytes;
+    pthread_mutex_unlock(&P.mu);
 }
 
 size_t ava1_frame_pool_outstanding(void) {

@@ -274,6 +274,9 @@ impl Governor {
                     && bottleneck == BN_NETWORK
                     && self.lanes < PREFER_LANES_UNTIL
                     && !self.lanes_capped
+                    // A lane pin means lanes are not ours to grow: treat them as capped,
+                    // or the chunk would sit at 4 MiB for the whole job.
+                    && self.opts.pin_lanes.is_none()
                 {
                     // Lanes first: a bigger frame lengthens every decrypt stall on the
                     // console, so hold at 4 MiB (never shrinking what is already larger).
@@ -764,6 +767,17 @@ mod tests {
         }
         let d = net(&mut Governor::with_options(opts), 100e6, 110e6, 50);
         assert_eq!((d.lanes, d.chunk), (4, 8 << 20));
+    }
+
+    #[test]
+    fn a_lane_pin_below_four_lanes_does_not_hold_the_chunk_at_four_mib() {
+        let mut g = Governor::with_options(GovernorOptions {
+            pin_lanes: Some(2),
+            ..Default::default()
+        });
+        let d = run_stable(&mut g, 2, 60);
+        assert_eq!(d.lanes, 2);
+        assert!(d.chunk > 4 << 20, "chunk {}", d.chunk);
     }
 
     #[test]

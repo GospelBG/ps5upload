@@ -252,14 +252,11 @@ where the time went. Rows to fill (not measured yet; the consoles were reserved)
 
 Landed in code, all host-tested, none yet measured on a console: 4 MiB socket buffers on every lane
 (both ends, effective sizes logged once: the engine on stderr, the console in its log), a frame-buffer
-pool on the console (1/4/8/16 MiB classes, idle memory capped at the admit budget), a single copy per
+pool on the console (1/4/8/15/16 MiB classes for class-sized chunks, every other size allocated exactly, so live frame memory is the credit window's byte count; idle pool memory capped at the admit budget), a single copy per
 sent frame on the engine (the in-flight frame is shared with the writer, which seals into one
 buffer), the lanes-first governor policy (default on, to A/B), and `dead_after` 12 s with the ping
 at 2 s.
 
 Deferred: decrypt off the lane reader thread (03 section 2) waits for the matrix above; the
-`open_us_per_mib` receiver hint (03 section 5) is optional and also waits; the pool rounds a frame up
-to its class (a 5 MiB frame holds an 8 MiB buffer; a chunk of 1, 4, 8 or 15 MiB fits its class, so the
-governor's usual sizes waste little, but 2, 3 and 5-7 MiB chunks waste up to 2x of in-flight memory
-against the admit budget) until the matrix says whether finer classes are worth it.
+`open_us_per_mib` receiver hint (03 section 5) is optional and also waits.
 

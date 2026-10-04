@@ -1321,7 +1321,7 @@ static int data_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
     pthread_mutex_unlock(&D.mu);
     if (!body) return 0;
     if (len < 16 || (type != AVA1_TYPE_CHUNK && type != AVA1_TYPE_BUNDLE) || !(j = ava1_job_find(body))) {
-        (void)ava1_frame_free(body, ava1_frame_class(len));
+        (void)ava1_frame_free(body, ava1_frame_cap(len));
         return 0; /* a frame for a job that is gone: its credit died with it */
     }
     f = calloc(1, sizeof *f);
@@ -1337,7 +1337,7 @@ static int data_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
         j->in_oom = 1;
         pthread_cond_broadcast(&j->ccv);
         pthread_mutex_unlock(&j->cmu);
-        (void)ava1_frame_free(body, ava1_frame_class(len));
+        (void)ava1_frame_free(body, ava1_frame_cap(len));
         ava1_job_put_nowait(j);
         return 0;
     }
@@ -1350,7 +1350,7 @@ static int data_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
     pthread_mutex_unlock(&j->cmu);
     if (!take) {
         free(f);
-        (void)ava1_frame_free(body, ava1_frame_class(len));
+        (void)ava1_frame_free(body, ava1_frame_cap(len));
         ava1_job_put_nowait(j);
         if (!over) return 0;
         post_error(sid, lane, AVA1_ERR_CREDIT, "the frame exceeds the credit granted");
@@ -1362,7 +1362,7 @@ static int data_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
     f->seq = seq;
     f->len = len;
     f->body = body;
-    f->cap = ava1_frame_class(len);
+    f->cap = ava1_frame_cap(len);
     pthread_mutex_lock(&j->cmu);
     if (j->held_tail) j->held_tail->next = f;
     else j->held_head = f;

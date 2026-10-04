@@ -777,9 +777,9 @@ static void serve_loop(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane,
              * admitted against credit, read into its own heap buffer and handed over. */
             const ava1_data_hooks_t *dh = S.cfg.data;
             if (!dh || !dh->admit || !dh->on_lane || dh->admit(sid, lane, blen) != 0) break;
-            heap = ava1_frame_alloc(blen, NULL); /* pooled: released with ava1_frame_free(heap, ava1_frame_class(blen)) */
+            heap = ava1_frame_alloc(blen, NULL); /* pooled: released with ava1_frame_free(heap, ava1_frame_cap(blen)) */
             if (!heap || ava1_conn_recv_body(&k->io, heap, blen) != 0) {
-                (void)ava1_frame_free(heap, ava1_frame_class(blen));
+                (void)ava1_frame_free(heap, ava1_frame_cap(blen));
                 dh->on_lane(sid, lane, h.type, h.channel, NULL, blen);
                 break;
             }
