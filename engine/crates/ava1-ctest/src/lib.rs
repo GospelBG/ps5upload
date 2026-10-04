@@ -360,6 +360,7 @@ pub mod ffi {
         pub fn ava1_test_unswept_global_add(d: i64);
         pub fn ava1_test_jobs_gc(jobs: *const c_char, age_s: i64, max_age_s: i64) -> c_int;
         pub fn ava1_test_recv_restart_noopen() -> c_int;
+        pub fn ava1_test_data_stop_only();
         pub fn ava1_test_reap_and_drop();
         pub fn ava1_test_apply_unswept() -> u32;
         pub fn ava1_test_apply_segments() -> u32;
@@ -1866,6 +1867,13 @@ impl CRecv {
     /// The fast path: `Resume{manifest_hash}`.
     pub fn resume(&self, hash: [u8; 32]) {
         assert_eq!(unsafe { ffi::ava1_test_recv_resume(hash.as_ptr()) }, 0);
+    }
+
+    /// Stops the data layer and nothing else; how long that took.
+    pub fn stop_data_timed(&self) -> std::time::Duration {
+        let t = std::time::Instant::now();
+        unsafe { ffi::ava1_test_data_stop_only() };
+        t.elapsed()
     }
 
     /// A helper restart with no JobOpen after it: only the start-time recovery runs.

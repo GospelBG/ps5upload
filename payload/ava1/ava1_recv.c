@@ -383,7 +383,7 @@ uint32_t ava1_recv_recover_pass(const char *jobs_dir, uint32_t max) {
     if (dp) closedir(dp);
     qsort(names, n, sizeof *names, name_cmp);
     start = n ? cursor % n : 0;
-    for (k = 0; k < n && settled < max && tried < 2u * max; k++) {
+    for (k = 0; k < n && settled < max && tried < 2u * max && ava1_data_running(); k++) {
         uint32_t at = (start + k) % n;
         uint8_t id[16], buf[AVA1_MAX_PATH + 256];
         char dir[sizeof ((ava1_job_t *)0)->dir];

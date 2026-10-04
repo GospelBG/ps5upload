@@ -116,6 +116,8 @@ void ava1_unswept_add(int64_t delta) {
 }
 uint64_t ava1_unswept_total(void) { return __atomic_load_n(&g_unswept_total, __ATOMIC_RELAXED); }
 
+int ava1_data_running(void) { return __atomic_load_n(&D.running, __ATOMIC_RELAXED); }
+
 unsigned ava1_house_ticks;
 
 static void *house_main(void *arg) {

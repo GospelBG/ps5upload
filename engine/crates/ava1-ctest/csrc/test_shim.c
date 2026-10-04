@@ -1958,6 +1958,13 @@ int ava1_test_probe_open(uint8_t byte, const char *root) {
     ava1_job_put(j);
     return 0;
 }
+/* The data layer stops (the job dropped first), and nothing starts it again. */
+void ava1_test_data_stop_only(void) {
+    if (g_job) ava1_job_put(g_job);
+    g_job = NULL;
+    ava1_data_stop();
+}
+
 /* A helper restart where no JobOpen follows: only the start-time recovery runs. 0, or the start's error. */
 int ava1_test_recv_restart_noopen(void) {
     if (g_job) ava1_job_put(g_job);

@@ -867,3 +867,38 @@ fn a_job_in_a_sticky_sweep_error_does_not_count_against_the_others() {
     settled(&job, 20);
     assert_eq!(job.unswept_total(), 0);
 }
+
+#[test]
+fn stopping_the_data_layer_during_a_slow_recovery_pass_returns_promptly() {
+    let t = tmp("stop-recovery");
+    let jobs = t.join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    crashed_dir(&t, 1);
+    let opts = LogOpts {
+        recover_every_ms: 100,
+        job_byte: 9,
+        ..slow()
+    };
+    let r = CRecv::open_opts(&jobs, &t.join("dest9"), 0, gen::POLICY_REPLACE, 0, opts);
+    // every sweep of the recovery fails, so its drain keeps retrying with backoff (~1.5 s in all)
+    r.fail_sweeps(1_000_000);
+    std::fs::rename(
+        job_dir(&t.join("jobs1"), &[1; 16]),
+        job_dir(&jobs, &[1; 16]),
+    )
+    .unwrap();
+    let t0 = std::time::Instant::now();
+    while sweep_failures_left() == 1_000_000 {
+        assert!(
+            t0.elapsed().as_secs() < 10,
+            "housekeeping never began the pass"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let took = r.stop_data_timed(); // data_stop joins the recovery thread
+    assert!(
+        took < std::time::Duration::from_millis(450),
+        "the stop waited {took:?} behind the recovery pass"
+    );
+    drop(r);
+}

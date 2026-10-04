@@ -17,7 +17,7 @@ use ava1::peers::PeerStore;
 use ava1::recv::Sink;
 use ava1::server::{self, RpcHandler, ServerCtx};
 use ava1::session::RpcReply;
-use ava1::wire::Message;
+use ava1::wire::{FrameMessage, Message};
 use ava1_chaos::{ChaosConfig, ChaosProxy};
 use ps5upload_ava1::copy::{console_copy_in, op_cancel, op_snapshot, record_status};
 use ps5upload_ava1::download::{self, Counters, ZipCompression, ZipSink};
@@ -1119,4 +1119,93 @@ async fn zip_entries_of_several_groups_download_intact() {
         .collect();
     assert_eq!(got.len(), 3);
     assert!(got == want, "multi-group zip entries differ");
+}
+
+/// A host that answers the first `busy` JobOpens `ERR_BUSY` and serves the rest like `FolderHost`.
+struct BusyHost {
+    inner: FolderHost,
+    busy: std::sync::atomic::AtomicU32,
+    seen: std::sync::atomic::AtomicU32,
+}
+
+impl ava1::router::JobHost for BusyHost {
+    fn accept(&self, mut link: ava1::router::JobLink, first: ava1::conn::Frame, peer: [u8; 32]) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if first.ty == gen::JobOpen::TYPE {
+            self.seen.fetch_add(1, SeqCst);
+            let left = self.busy.load(SeqCst);
+            if left > 0 {
+                self.busy.store(left - 1, SeqCst);
+                if let Ok(open) = first.decode::<gen::JobOpen>() {
+                    tokio::spawn(async move {
+                        let _ = link
+                            .control
+                            .send(&gen::JobOpenAck {
+                                job_id: open.job_id,
+                                status: gen::ERR_BUSY,
+                                credit: 0,
+                                staged: 0,
+                                workers: 0,
+                                message: Some("too many jobs; try again".into()),
+                            })
+                            .await;
+                    });
+                    return;
+                }
+            }
+        }
+        self.inner.accept(link, first, peer)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_download_open_is_retried_and_a_console_that_stays_busy_fails_clearly() {
+    for (busy, tries, id) in [(2u32, 12u32, 0x31u8), (u32::MAX, 2, 0x32)] {
+        let d = temp(&format!("dl-busy-{id}"));
+        let src = d.join("share/src");
+        std::fs::create_dir_all(&src).unwrap();
+        tree(&src, 12, |_| 2048);
+        let key = Identity::load_or_create(&d.join("ava").join("identity"))
+            .unwrap()
+            .public();
+        let mut peers = PeerStore::in_memory();
+        peers.add(key, "engine").unwrap();
+        let h = Arc::new(BusyHost {
+            inner: FolderHost {
+                root: d.join("share"),
+                jobs_dir: d.join("hjobs"),
+            },
+            busy: busy.into(),
+            seen: 0.into(),
+        });
+        let ctx = ServerCtx::new(Identity::generate().unwrap(), "host", peers, node_info())
+            .with_jobs(h.clone());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(server::serve(l, Arc::new(ctx)));
+        let pool = Arc::new(
+            Pool::new(d.join("ava"))
+                .with_addr(addr)
+                .with_busy_tries(tries),
+        );
+        let dest = d.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let r = local(pool, "src", DownloadKind::Folder, &dest, counters(), id).await;
+        if busy == 2 {
+            r.expect("the download completes after two BUSY answers");
+            assert_eq!(h.seen.load(Ordering::SeqCst), 3);
+            assert_eq!(files_of(&src), files_of(&dest.join("src")));
+        } else {
+            let e = r.unwrap_err();
+            let f = e
+                .downcast_ref::<UploadFailure>()
+                .unwrap_or_else(|| panic!("{e:#}"));
+            assert_eq!(f.reason, "ava1_busy", "{f:?}");
+            assert_eq!(
+                h.seen.load(Ordering::SeqCst),
+                3,
+                "the first try and two retries"
+            );
+        }
+    }
 }

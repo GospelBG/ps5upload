@@ -948,7 +948,7 @@ Beside the per-job `UNSWEPT_MAX` there is a cap across jobs (512 MiB); it gates 
 and the bytes of a job in a sticky sweep error, or of a recovery pass, do not count against the others. Recovery runs on a
 thread of its own (the reaper is never held up), takes a bounded number of directories per pass and moves on from one it
 cannot settle, so a stuck directory never starves the rest; while it holds a job id a `JobOpen` for it is answered
-`BUSY` (the sender retries and then resumes). A log nobody could recover is garbage-collected a week after the normal
+`BUSY` (the sender retries with a bounded jittered backoff, honouring cancel, and then resumes; the engine does this for uploads, downloads and relays, and fails with reason `ava1_busy` once the bound, 12 tries by default, is spent). A log nobody could recover is garbage-collected a week after the normal
 age, with a log line.
 
 ## 16. Governor

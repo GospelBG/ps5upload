@@ -1752,7 +1752,15 @@ int ava1_pack_drain(ava1_job_t *j) {
         if (n < 0) {
             if (n == -EINTR || is_stopping(j)) return EINTR;
             if (++fails >= SWEEP_FAIL_MAX) return -n;
-            ava1_platform_sleep_ms(50u << (fails - 1));
+            { /* the backoff, in slices a data-layer stop can cut (recovery drains run on a background thread) */
+                uint32_t ms = 50u << (fails - 1);
+                while (ms && ava1_data_running()) {
+                    uint32_t step = ms < 20u ? ms : 20u;
+                    ava1_platform_sleep_ms(step);
+                    ms -= step;
+                }
+                if (!ava1_data_running()) return EINTR;
+            }
             continue;
         }
         pthread_mutex_lock(&j->mu);

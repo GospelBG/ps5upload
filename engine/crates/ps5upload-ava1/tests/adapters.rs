@@ -15,7 +15,7 @@ use ava1::peers::PeerStore;
 use ava1::server::{self, ServerCtx};
 use ava1::session::RpcReply;
 use ava1::source::LocalSource;
-use ava1::wire::Message;
+use ava1::wire::{FrameMessage, Message};
 use ava1_chaos::{ChaosConfig, ChaosProxy};
 use ps5upload_ava1::route;
 use ps5upload_ava1::upload;
@@ -553,4 +553,150 @@ async fn a_console_that_wants_a_user_code_ends_an_upload_as_not_paired() {
     let (reason, took) = failure_of(pool, src).await;
     assert_eq!(reason, "ava1_not_paired");
     assert!(took < Duration::from_secs(20), "{took:?}");
+}
+
+/// A host that answers the first `busy` JobOpens `ERR_BUSY` (a console whose recovery pass holds the job id)
+/// and serves the rest like `FolderHost`.
+struct BusyHost {
+    inner: FolderHost,
+    busy: std::sync::atomic::AtomicU32,
+    seen: std::sync::atomic::AtomicU32,
+}
+
+impl ava1::router::JobHost for BusyHost {
+    fn accept(&self, mut link: ava1::router::JobLink, first: ava1::conn::Frame, peer: [u8; 32]) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if first.ty == gen::JobOpen::TYPE {
+            self.seen.fetch_add(1, SeqCst);
+            let left = self.busy.load(SeqCst);
+            if left > 0 {
+                self.busy.store(left - 1, SeqCst);
+                if let Ok(open) = first.decode::<gen::JobOpen>() {
+                    tokio::spawn(async move {
+                        let _ = link
+                            .control
+                            .send(&gen::JobOpenAck {
+                                job_id: open.job_id,
+                                status: gen::ERR_BUSY,
+                                credit: 0,
+                                staged: 0,
+                                workers: 0,
+                                message: Some(
+                                    "the console is finishing this job's files; try again".into(),
+                                ),
+                            })
+                            .await;
+                    });
+                    return;
+                }
+            }
+        }
+        self.inner.accept(link, first, peer)
+    }
+}
+
+async fn busy_host(dir: &Path, busy: u32) -> (Arc<BusyHost>, Pool) {
+    let ava = dir.join("ava");
+    let me = Identity::load_or_create(&ava.join("identity")).unwrap();
+    let mut peers = PeerStore::in_memory();
+    peers.add(me.public(), "engine").unwrap();
+    let h = Arc::new(BusyHost {
+        inner: FolderHost {
+            root: dir.join("share"),
+            jobs_dir: dir.join("hjobs"),
+        },
+        busy: busy.into(),
+        seen: 0.into(),
+    });
+    let ctx = ServerCtx::new(
+        Identity::generate().unwrap(),
+        "host",
+        peers,
+        node_info_rpc(),
+    )
+    .with_jobs(h.clone());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(server::serve(l, Arc::new(ctx)));
+    (h, Pool::new(ava).with_addr(addr))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_job_open_is_retried_until_the_console_accepts() {
+    // the console answers BUSY twice (recovery holds the job), then OK: the upload completes
+    let d = temp_dir("busy-then-ok");
+    let src = d.join("src");
+    tree(&src, 40, |_| 4096);
+    let (h, pool) = busy_host(&d, 2).await;
+    let c = cfg();
+    let r = within(
+        60,
+        tokio::task::spawn_blocking(move || {
+            upload::upload_dir_in(&pool, &c, [0x21; 16], "out", &src)
+        }),
+    )
+    .await
+    .unwrap();
+    r.expect("the upload completes after the BUSY answers");
+    assert_eq!(
+        h.seen.load(Ordering::SeqCst),
+        3,
+        "two BUSY answers, then the real open"
+    );
+    same_tree(&d.join("src"), &d.join("share/out"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_console_that_stays_busy_fails_the_upload_after_the_bound_with_a_clear_reason() {
+    let d = temp_dir("busy-forever");
+    let src = d.join("src");
+    tree(&src, 4, |_| 1024);
+    let (h, pool) = busy_host(&d, u32::MAX).await;
+    let pool = pool.with_busy_tries(3);
+    let c = cfg();
+    let e = within(
+        60,
+        tokio::task::spawn_blocking(move || {
+            upload::upload_dir_in(&pool, &c, [0x22; 16], "out", &src)
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    let f = e
+        .downcast_ref::<upload::UploadFailure>()
+        .unwrap_or_else(|| panic!("not a classified failure: {e:#}"));
+    assert_eq!(f.reason, "ava1_busy", "{f:?}");
+    assert!(f.detail.contains("busy"), "{}", f.detail);
+    assert_eq!(
+        h.seen.load(Ordering::SeqCst),
+        4,
+        "the first try and three retries, then it gave up"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_ends_the_busy_wait() {
+    let d = temp_dir("busy-cancel");
+    let src = d.join("src");
+    tree(&src, 4, |_| 1024);
+    let (_h, pool) = busy_host(&d, u32::MAX).await;
+    let c = cfg();
+    let cancel = c.cancel.clone().unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(600));
+        cancel.store(true, Ordering::Relaxed);
+    });
+    let t = std::time::Instant::now();
+    let e = within(
+        60,
+        tokio::task::spawn_blocking(move || {
+            upload::upload_dir_in(&pool, &c, [0x23; 16], "out", &src)
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(e.to_string().contains("cancel"), "{e:#}");
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
 }
