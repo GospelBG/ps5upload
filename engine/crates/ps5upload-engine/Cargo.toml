@@ -33,7 +33,6 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # Cache keys and ETags for the on-disk artwork cache (icon_cache.rs).
 # Already a workspace dependency via ps5upload-core; not a new build cost.
 blake3.workspace = true
-ftx2-proto = { path = "../ftx2-proto" }
 mime_guess = { version = "2", optional = true }
 smb2 = "0.23"
 ps5upload-core = { path = "../ps5upload-core" }

@@ -1,4 +1,4 @@
-//! ps5upload-engine — local HTTP service that drives FTX2 transfers.
+//! ps5upload-engine — local HTTP service that drives AVA1 transfers.
 //!
 //! This is a library crate so the engine can be consumed two ways: the
 //! desktop sidecar binary (`src/main.rs`) calls `run_cli()`, while the
@@ -12,10 +12,7 @@
 //! `/pkg-host/*` accepts off-loopback peers (so the PS5 can fetch fakepkg
 //! bytes during install). Everything else 403s any non-loopback source,
 //! except the IPs in PS5UPLOAD_ALLOW_IP (comma-separated, for remote clients).
-//! Historical note: this was `9114` through 2.1.x, but `9114` is also the
-//! PS5-payload management port. The two live on different machines so
-//! no real collision — but the shared number confused users and logs.
-//! PS5 address defaults to 192.168.137.2:9113 (set PS5_ADDR to override).
+//! PS5 address defaults to 192.168.137.2 (set PS5_ADDR to override).
 //!
 //! API
 //! ───
@@ -429,6 +426,11 @@ pub(crate) fn console_addr(addr: &str) -> String {
 
 fn console_addr_or_default(addr: Option<String>, default_addr: &str) -> String {
     console_addr(addr.as_deref().unwrap_or(default_addr))
+}
+
+/// The engine's one startup line about the transport.
+fn ava1_startup_line(dir: &str, identity: &str, paired: usize) -> String {
+    format!("ava1: dir={dir} identity={identity} paired={paired}")
 }
 
 /// A renamed environment variable: the new name wins; the old name is still read, and the first
@@ -2623,8 +2625,8 @@ async fn ps5_fs_op_status(
 ) -> impl IntoResponse {
     let addr = console_addr_or_default(q.addr, &state.default_ps5_addr);
     let op_id = q.op_id;
-    // An op this engine runs over AVA1 answers from its own registry, with the same
-    // field names the FTX2 branch emits; any other id falls through to the console.
+    // An op this engine runs over AVA1 answers from its own registry; any other id falls
+    // through to the console.
     if let Some(snap) = ps5upload_ava1::copy::op_snapshot(op_id) {
         return (
             StatusCode::OK,
@@ -5010,7 +5012,7 @@ async fn ps5_status(
 ) -> impl IntoResponse {
     let addr = console_addr_or_default(q.addr, &state.default_ps5_addr);
     // `node.status` through the management seam: the typed AVA1 NodeStatus is rebuilt into the
-    // legacy JSON (`ucred_elevated` a bool, `prior_instance` only when present). The FTX2
+    // legacy JSON (`ucred_elevated` a bool, `prior_instance` only when present). The old
     // transaction fields (runtime_port, shutdown, takeover_requested, active_transactions,
     // last_tx_seq, recovered_transactions) no longer exist; nothing reads them.
     let result = tokio::task::spawn_blocking(move || {
@@ -8178,8 +8180,7 @@ async fn transfer_file_list_handler(
 
 #[derive(Deserialize)]
 struct TransferDownloadReq {
-    /// Transfer-port addr (`ip:9113`); we'll route to mgmt via
-    /// `mgmt_addr_for` since downloads use FS_LIST_DIR + FS_READ.
+    /// The console (a `:port` suffix from an older client is ignored).
     addr: Option<String>,
     /// Path on the PS5 to download. For `kind: "folder"` this is the
     /// root of the tree; for `kind: "file"` it's the file itself.
@@ -8214,13 +8215,11 @@ enum Ava1DownloadTarget {
     Zip(std::path::PathBuf, ps5upload_ava1::download::ZipCompression),
 }
 
-/// Starts a console -> computer download over AVA1 and answers `ACCEPTED` with the job id,
-/// exactly like the FTX2 code in the two handlers it is called from (which stays
-/// byte-identical below their call). Three differences, all deliberate:
-/// - no FTX2 enumeration: the console's own manifest is the source of truth and the
-///   mgmt port is never touched, so the initial `Running` has an empty per-file list
-///   (bytes and total are correct; the list returns when the manifest feeds the UI) and
-///   no skipped-entry report;
+/// Starts a console -> computer download over AVA1 and answers `ACCEPTED` with the job id.
+/// Three things to know:
+/// - nothing is enumerated here: the console's own manifest is the source of truth, so the
+///   initial `Running` has an empty per-file list (bytes and total are correct; the list
+///   returns when the manifest feeds the UI) and there is no skipped-entry report;
 /// - the total is unknown until the manifest arrives, so the ticker reads
 ///   `dynamic_total_bytes`, which the transfer fills in (a zero total is never published
 ///   as if it were real);
@@ -8342,7 +8341,7 @@ fn start_ava1_download(
                         completed_at_ms,
                         elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
                         tx_id_hex: id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                        // The FTX2 field name; for AVA1 it carries files (as uploads do).
+                        // For AVA1 `shards_sent` carries files (as uploads do).
                         shards_sent: files,
                         bytes_sent: bytes,
                         dest: dest_display,
@@ -9168,7 +9167,7 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
     fpkg_remote::register();
     // Every management call (hardware, filesystem, apps, ...) goes through one transport
     // seam in the core crate; this registers the AVA1 implementation over the shared pool.
-    // A console without AVA1 management keeps the FTX2 path inside the seam.
+    // A console it cannot serve is a `helper_not_ava1` error, never another protocol.
     ps5upload_ava1::mgmt::install();
     // Renamed variables: the old name is read once with a deprecation line. Archives stream
     // (nothing is staged or held back to inflate), so both settings are accepted and reported
@@ -9180,29 +9179,17 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
     }
     // SPEC.md §14.3: expire old AVA1 job directories at start and then daily.
     ava1_api::spawn_journal_gc();
-    // AVA1 cutover (Task 23, controller A4): one line at startup naming the
-    // resolved transfer mode, its source (the environment or the default), and
-    // the ava data dir when the mode can use AVA1. The benchmark phase compares
-    // AVA1 against FTX2 and a mis-set PS5UPLOAD_TRANSFER would silently measure
-    // the wrong protocol; this is how a bug report proves the mode. The
-    // per-transfer `protocol=` line (C8) stays per transfer.
-    let transfer_mode = ps5upload_ava1::route::mode();
-    let mode_name = match transfer_mode {
-        ps5upload_ava1::route::Mode::Auto => "auto",
-        ps5upload_ava1::route::Mode::Ava1 => "ava1",
-        ps5upload_ava1::route::Mode::Ftx2 => "ftx2",
-    };
-    let mode_source = match std::env::var("PS5UPLOAD_TRANSFER") {
-        Ok(v) if v.trim().is_empty() => "default".to_string(),
-        Ok(v) => format!("env PS5UPLOAD_TRANSFER={v}"),
-        Err(_) => "default".to_string(),
-    };
-    let ava_dir = if transfer_mode == ps5upload_ava1::route::Mode::Ftx2 {
-        String::new()
-    } else {
-        format!(" ava_dir={}", ps5upload_ava1::pool().ava_dir().display())
-    };
-    crate::log_info!("transfer mode={mode_name} ({mode_source}){ava_dir}");
+    // One line at startup: where the AVA1 state lives, which key this engine is, and how many
+    // consoles trust it. The per-transfer `protocol=` line stays per transfer.
+    let ava = ps5upload_ava1::pool();
+    crate::log_info!(
+        "{}",
+        ava1_startup_line(
+            &ava.ava_dir().display().to_string(),
+            &ava.identity_prefix(),
+            ava.paired_count()
+        )
+    );
     if cfg.parent_watch {
         spawn_parent_watcher();
     }
@@ -9762,7 +9749,7 @@ pub async fn run_cli() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(19113);
-    let ps5_addr = std::env::var("PS5_ADDR").unwrap_or_else(|_| "192.168.137.2:9113".to_string());
+    let ps5_addr = std::env::var("PS5_ADDR").unwrap_or_else(|_| "192.168.137.2".to_string());
     // Extra IPs allowed past the loopback guard (e.g. remote desktop
     // clients reaching a self-hosted engine). Comma-separated; unparseable
     // entries are dropped, unset → empty.

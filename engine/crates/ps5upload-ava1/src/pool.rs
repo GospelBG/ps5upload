@@ -291,6 +291,24 @@ impl Pool {
         self.me.is_ok()
     }
 
+    /// The first eight hex digits of this engine's public key, for the startup line (`none`
+    /// when there is no identity).
+    pub fn identity_prefix(&self) -> String {
+        match &self.me {
+            Ok(me) => ava1::hex::encode(&me.public())[..8].to_string(),
+            Err(_) => "none".to_string(),
+        }
+    }
+
+    /// How many consoles have accepted this engine (its paired peers).
+    pub fn paired_count(&self) -> usize {
+        self.peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .list()
+            .len()
+    }
+
     /// The address `session()` connects to: the per-pool override first (A1: the
     /// engine's pools never carry one), then the console's own address.
     fn addr_for(&self, console: &str) -> String {
@@ -602,6 +620,22 @@ pub fn pool() -> &'static Pool {
             Pool::unavailable()
         }
     })
+}
+
+#[cfg(test)]
+mod identity_summary_tests {
+    use super::*;
+
+    #[test]
+    fn the_startup_summary_names_the_key_and_the_paired_count() {
+        let d = std::env::temp_dir().join(format!("p5a-summary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let p = Pool::new(d.join("ava"));
+        assert_eq!(p.identity_prefix().len(), 8);
+        assert_eq!(p.paired_count(), 0);
+        assert_eq!(Pool::unavailable().identity_prefix(), "none");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 #[cfg(test)]

@@ -32,11 +32,6 @@ fn temp(tag: &str) -> PathBuf {
     d
 }
 
-fn force_auto() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| std::env::set_var("PS5UPLOAD_TRANSFER", "auto"));
-}
-
 type Seen = Arc<Mutex<Vec<(u16, String)>>>;
 
 /// What the scripted console answers.
@@ -66,7 +61,6 @@ fn answer(r: &Reply) -> RpcReply {
 
 /// A loopback console running `handler`, and a transport over its own pool.
 async fn console(tag: &str, handler: RpcHandler) -> (Arc<AvaTransport>, String) {
-    force_auto();
     let base = temp(tag);
     let ava = base.join("ava");
     std::fs::create_dir_all(&ava).unwrap();

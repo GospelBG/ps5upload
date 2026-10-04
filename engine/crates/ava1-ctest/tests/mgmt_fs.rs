@@ -780,8 +780,6 @@ mod transport {
 
     /// `install`: the server's management table is installed (CAP_MGMT is advertised).
     pub fn rig(tag: &str, install: bool) -> T {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| std::env::set_var("PS5UPLOAD_TRANSFER", "auto"));
         let one = one();
         let base = std::env::temp_dir().join(format!("ava1-mfst-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);

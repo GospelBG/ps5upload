@@ -291,6 +291,19 @@ async fn fs_copy_with_no_ava1_listener_is_helper_not_ava1() {
     assert!(text.contains("helper_not_ava1"), "{text}");
 }
 
+/// The same for a management call: no fallback to a second protocol.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_management_call_with_no_ava1_listener_is_helper_not_ava1() {
+    let r = tokio::task::spawn_blocking(|| {
+        ps5upload_ava1::mgmt::install();
+        ps5upload_core::volumes::list_volumes("127.0.0.1")
+    })
+    .await
+    .unwrap();
+    let e = format!("{:#}", r.unwrap_err());
+    assert!(e.contains("helper_not_ava1"), "{e}");
+}
+
 /// A console that has not accepted this app fails with `not_paired` (the pairing dialog's
 /// trigger), as a job failure and as a management refusal.
 #[test]
@@ -384,4 +397,85 @@ fn console_addr_is_the_host_only() {
     assert_eq!(console_addr("[::1]"), "[::1]");
     assert_eq!(console_addr("fe80::1"), "fe80::1");
     assert_eq!(console_addr_or_default(None, "10.0.0.1:9113"), "10.0.0.1");
+}
+
+#[test]
+fn the_startup_line_names_the_directory_the_key_and_the_paired_count() {
+    assert_eq!(
+        ava1_startup_line("/home/u/.ps5upload/ava", "1a2b3c4d", 2),
+        "ava1: dir=/home/u/.ps5upload/ava identity=1a2b3c4d paired=2"
+    );
+}
+
+/// No retired-protocol symbol survives in this crate (the one named exception is the
+/// migration shim that shuts an older helper down; it is deleted a release later).
+#[test]
+fn engine_has_no_ftx2_symbol() {
+    let needle = ["ft", "x2"].concat();
+    let allowed = [
+        "legacy_helper.rs",
+        "legacy_helper_tests.rs",
+        // this file names the retired variables to prove they are renamed
+        "ava1_only_tests.rs",
+    ];
+    let mut hits = Vec::new();
+    let mut stack = vec![engine_src_dir()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                if allowed.contains(&name.as_str()) {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&p).unwrap().to_lowercase();
+                for (i, line) in text.lines().enumerate() {
+                    if line.contains(&needle) {
+                        hits.push(format!("{}:{}: {}", p.display(), i + 1, line.trim()));
+                    }
+                }
+            }
+        }
+    }
+    let manifest = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+    )
+    .unwrap()
+    .to_lowercase();
+    if manifest.contains(&needle) {
+        hits.push("Cargo.toml depends on the retired protocol crate".to_string());
+    }
+    assert!(
+        hits.is_empty(),
+        "retired-protocol symbols:\n{}",
+        hits.join("\n")
+    );
+}
+
+/// The routing seam is gone: nothing in the engine decides between protocols.
+#[test]
+fn engine_has_no_routing_seam() {
+    let mut stack = vec![engine_src_dir()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs")
+                && p.file_name().is_some_and(|n| n != "ava1_only_tests.rs")
+            {
+                let text = std::fs::read_to_string(&p).unwrap();
+                for banned in [
+                    "route::use_ava1",
+                    "route::mode",
+                    "PS5UPLOAD_TRANSFER",
+                    "mgmt_addr_for",
+                ] {
+                    assert!(!text.contains(banned), "{} mentions {banned}", p.display());
+                }
+            }
+        }
+    }
 }

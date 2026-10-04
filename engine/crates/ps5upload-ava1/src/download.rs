@@ -2,7 +2,7 @@
 //! (`to_local`) and a folder or file streamed straight into a `.zip` (`to_zip`).
 //! Blocking, like the upload adapters: call from `spawn_blocking` or a plain thread.
 //!
-//! Route selection (`route::use_ava1`), the terminal-versus-retryable split, the
+//! The console check (`console::require_ava1`), the terminal-versus-retryable split, the
 //! `error_reason` words and the retry/backoff loop are the upload adapters' own
 //! (`upload.rs`): a download differs only in which side holds the sink.
 

@@ -28,7 +28,6 @@ mod paged;
 
 use crate::mgmt_convert as conv;
 use crate::pool::{host_of, pool, Pool};
-use crate::route::{mode, use_ava1_mgmt_in, Mode};
 
 /// In-flight calls the payload allows per session (`RPC_WORKERS`, SPEC.md section 7.4).
 pub const IN_FLIGHT: usize = ava1::server::RPC_WORKERS;
@@ -272,11 +271,22 @@ impl AvaTransport {
             .clone()
     }
 
-    /// Whether this console is served over AVA1 for management: it advertises `CAP_MGMT`
-    /// (the node says so in its `ServerInfo`; nothing is sent to find out). An older AVA1
-    /// helper that has transfers but no management methods goes to FTX2.
-    pub(crate) fn serves(&self, console: &str) -> bool {
-        use_ava1_mgmt_in(self.pool(), console)
+    /// Whether this console can be used for management at all: a paired AVA1 session exists (or
+    /// opens now) and its node advertises `CAP_MGMT` (the node says so in its `ServerInfo`;
+    /// nothing is sent to find out). Anything else is the error the person can act on
+    /// (`helper_not_ava1`: nothing listening or an older helper; `not_paired`).
+    pub(crate) fn ensure(&self, console: &str, label: &str) -> Result<()> {
+        use crate::console::{require_in, HELPER_NOT_AVA1, NOT_PAIRED};
+        require_in(self.pool(), console, gen::CAP_MGMT).map_err(|f| match f.reason.as_str() {
+            HELPER_NOT_AVA1 => mgmt::helper_not_ava1(label),
+            NOT_PAIRED => MgmtError {
+                label: label.to_string(),
+                status: gen::ERR_NOT_PAIRED,
+                cause: NOT_PAIRED.into(),
+            }
+            .into(),
+            _ => anyhow::anyhow!("management call {label} failed: {}", f.detail),
+        })
     }
 
     /// One RPC: gate permit, `ERR_BUSY` retries, one resend on a lost session for
@@ -386,7 +396,7 @@ impl AvaTransport {
         Ok(t.body)
     }
 
-    /// The whole call. `Ok(None)` sends the caller to FTX2.
+    /// The whole call. `Ok(None)` is a helper that cannot serve it (`helper_not_ava1`).
     async fn run(
         &self,
         console: &str,
@@ -399,7 +409,6 @@ impl AvaTransport {
         // The two methods that run as job.run ops: see run_job (a CAP_MGMT helper without job.run).
         if matches!(method.id, gen::METHOD_NODE_CLEANUP | gen::METHOD_SDK_SCAN)
             && is_unknown_method(&r)
-            && mode() == Mode::Auto
         {
             // Still a CAP_MGMT helper: ask for the plain method (Task 7 serves sdk.scan as one too).
             let plain = self.text(console, method, label, body, timeout).await;
@@ -443,7 +452,7 @@ impl AvaTransport {
                 json(conv::fs_stat_reply(&gen::FsStat::decode(&r)?))
             }
             gen::METHOD_NODE_SHUTDOWN => {
-                // An empty reply; the FTX2 ack was `{}`.
+                // An empty reply; the legacy ack was `{}`.
                 self.rpc(console, id, label, &[], timeout).await?;
                 Ok(Some(b"{}".to_vec()))
             }
@@ -634,9 +643,7 @@ impl MgmtTransport for AvaTransport {
         timeout: Duration,
     ) -> Result<Option<Vec<u8>>> {
         run_blocking(|| {
-            if !self.serves(addr) {
-                return Ok(None);
-            }
+            self.ensure(addr, label)?;
             crate::block_on(self.run(addr, method, label, body, timeout))
         })
     }
@@ -650,14 +657,11 @@ impl MgmtTransport for AvaTransport {
         call: &JobCall<'_>,
     ) -> Result<Option<Vec<u8>>> {
         run_blocking(|| {
-            if !self.serves(addr) {
-                return Ok(None);
-            }
+            self.ensure(addr, label)?;
             let r = crate::block_on(self.run_job_async(addr, op, label, body, call));
-            if is_unknown_method(&r) && mode() == Mode::Auto {
-                // Routing is by CAP_MGMT (review M1) and nothing is probed for methods. The one exception: a
-                // helper that advertises CAP_MGMT but predates `job.run` (the Task 2-4 payloads) answers
-                // ERR_UNKNOWN_METHOD to it, and FTX2 serves the operation.
+            if is_unknown_method(&r) {
+                // A helper that advertises CAP_MGMT but predates `job.run` (the Task 2-4 payloads)
+                // answers ERR_UNKNOWN_METHOD: it is too old, and the person re-sends the helper.
                 return Ok(None);
             }
             r
@@ -666,18 +670,14 @@ impl MgmtTransport for AvaTransport {
 
     fn job_progress(&self, addr: &str, op_id: u64) -> Result<Option<Option<JobProgress>>> {
         run_blocking(|| {
-            if !self.serves(addr) {
-                return Ok(None);
-            }
+            self.ensure(addr, "JOB_STATUS")?;
             crate::block_on(self.job_progress_async(addr, op_id)).map(Some)
         })
     }
 
     fn job_cancel(&self, addr: &str, op_id: u64) -> Result<Option<bool>> {
         run_blocking(|| {
-            if !self.serves(addr) {
-                return Ok(None);
-            }
+            self.ensure(addr, "JOB_CANCEL")?;
             crate::block_on(self.job_cancel_async(addr, op_id)).map(Some)
         })
     }

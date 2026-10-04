@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ava1::gen;
@@ -17,7 +17,7 @@ use ava1::session::RpcReply;
 use ava1::source::LocalSource;
 use ava1::wire::Message;
 use ava1_chaos::{ChaosConfig, ChaosProxy};
-use ps5upload_ava1::route;
+use ps5upload_ava1::console;
 use ps5upload_ava1::upload;
 use ps5upload_ava1::{block_on, Pool, PostCommitError, PostCommitKind};
 use ps5upload_core::transfer::{FileListEntry, TransferConfig};
@@ -316,31 +316,8 @@ async fn post_commit_failure_is_not_a_resend() {
     );
 }
 
-/// This test owns PS5UPLOAD_TRANSFER — the only test in this file that mutates the
-/// environment (the brief's carve-out; noted so nobody adds a second). Every test
-/// that *reads* the routing mode takes `ENV_LOCK`, so the parallel run cannot see the
-/// variable mid-mutation.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-#[test]
-fn routing_mode_comes_from_the_environment() {
-    let _g = ENV_LOCK.lock().unwrap();
-    std::env::set_var("PS5UPLOAD_TRANSFER", "ftx2");
-    assert!(matches!(route::mode(), route::Mode::Ftx2));
-    assert!(!route::use_ava1("192.0.2.1"));
-    std::env::set_var("PS5UPLOAD_TRANSFER", "AVA1");
-    assert!(matches!(route::mode(), route::Mode::Ava1));
-    // Ava1: true unconditionally, without any probe (the pool never connects).
-    let d = temp_dir("route");
-    let p = Pool::new(d.join("ava")).with_addr("127.0.0.1:1");
-    assert!(route::use_ava1_in(&p, "console"));
-    assert_eq!(p.attempts(), 0, "Ava1 mode must not probe");
-    std::env::remove_var("PS5UPLOAD_TRANSFER");
-    assert!(matches!(route::mode(), route::Mode::Auto));
-}
-
 #[tokio::test(flavor = "multi_thread")]
-async fn a_console_that_wants_a_user_code_is_not_routed_to() {
+async fn a_console_that_wants_a_user_code_is_not_paired() {
     let d = temp_dir("pair");
     std::fs::create_dir_all(&d).unwrap();
     // A second server whose peer store does NOT know the engine's key and whose
@@ -359,24 +336,18 @@ async fn a_console_that_wants_a_user_code_is_not_routed_to() {
         pool.session(&addr).await.is_err(),
         "the console refused the stranger"
     );
-    // Auto: the probe fails, the failure is cached, and the second call makes no
-    // further connection attempt (A4: the hit path is pinned by counting, not by
-    // sleeping). `use_ava1` is blocking (C15), so it runs on a blocking thread; the
-    // lock keeps test 5's env mutation out of these calls.
+    // The readiness check says what the person has to do, and a refused pairing is not a
+    // transfer's to settle: `not_paired`, the pairing dialog's trigger.
     let (pool, addr) = (Arc::new(pool), addr.clone());
-    let (a1, a2, attempts) = tokio::task::spawn_blocking(move || {
-        let _g = ENV_LOCK.lock().unwrap();
-        let a1 = route::use_ava1_in(&pool, &addr);
-        let a2 = route::use_ava1_in(&pool, &addr);
-        (a1, a2, pool.attempts())
+    let failure = tokio::task::spawn_blocking(move || {
+        console::require_in(&pool, &addr, ava1::gen::CAP_DATA_PLANE).unwrap_err()
     })
     .await
     .unwrap();
-    assert!(!a1, "Auto does not route to it");
-    assert!(!a2, "the second call is cached");
+    assert_eq!(failure.reason, "not_paired");
     assert_eq!(
-        attempts, 2,
-        "the cached failure probed again: the 30 s negative cache did not hit"
+        failure.detail,
+        "This PS5 has not accepted this app yet. Pair it from the Connection screen."
     );
 }
 

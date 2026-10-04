@@ -953,13 +953,14 @@ It depends on the format.
   same game as a `.rar` or `.7z` needs none.
 
 If your temp drive is small and the game is large, prefer `.rar` or
-`.7z`. You can also raise the in-memory limit with the
-`FTX2_ZIP_RAM_THRESHOLD_MB` environment variable, at the cost of more RAM.
+`.7z`. The in-memory limit can be raised with the `PS5UPLOAD_ZIP_RAM_THRESHOLD_MB`
+environment variable, at the cost of more RAM (the old `FTX2_ZIP_RAM_THRESHOLD_MB`
+name still works for one release and logs a deprecation line).
 
 This changed in a recent version. Older builds extracted a `.rar` in full
 first, which meant a 180 GB game needed 180 GB free on top of the archive.
-If you set `FTX2_ARCHIVE_STAGE_MB` to work around that, you can remove it —
-it no longer does anything.
+If you set `PS5UPLOAD_ARCHIVE_STAGE_MB` (or its old `FTX2_ARCHIVE_STAGE_MB` name)
+to work around that, you can remove it — it no longer does anything.
 
 **Q: Which archive formats work on which system?**
 

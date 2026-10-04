@@ -14,15 +14,9 @@ use ava1::Ava1Error;
 use crate::pool::{pool, Pool};
 use crate::upload::{terminal_connection_reason, UploadFailure};
 
-/// `error_reason` for a console with no AVA1 listener or an older helper.
-pub const HELPER_NOT_AVA1: &str = "helper_not_ava1";
-/// The text shown with [`HELPER_NOT_AVA1`].
-pub const HELPER_NOT_AVA1_MESSAGE: &str = "The PS5 helper is not running or is an old version. Send the helper again from the Connection screen.";
-/// `error_reason` for a console that has not accepted this app.
-pub const NOT_PAIRED: &str = "not_paired";
-/// The text shown with [`NOT_PAIRED`].
-pub const NOT_PAIRED_MESSAGE: &str =
-    "This PS5 has not accepted this app yet. Pair it from the Connection screen.";
+pub use ps5upload_core::mgmt::{
+    HELPER_NOT_AVA1, HELPER_NOT_AVA1_MESSAGE, NOT_PAIRED, NOT_PAIRED_MESSAGE,
+};
 
 /// How long one session attempt may take (nominal constant: an unreachable console must not
 /// stall a job start for longer than this).

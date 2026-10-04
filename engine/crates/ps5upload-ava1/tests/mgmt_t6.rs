@@ -63,7 +63,6 @@ fn text_of(req: &[u8]) -> String {
 }
 
 async fn console(tag: &str, handler: RpcHandler) -> (Arc<AvaTransport>, String) {
-    force_auto();
     let base = temp(tag);
     let ava = base.join("ava");
     std::fs::create_dir_all(&ava).unwrap();
@@ -82,15 +81,6 @@ async fn console(tag: &str, handler: RpcHandler) -> (Arc<AvaTransport>, String) 
     let pool: &'static Pool = Box::leak(Box::new(Pool::new(ava).with_addr(addr)));
     let t = AvaTransport::with_pool(pool).with_busy_delays([Duration::from_millis(5); 3]);
     (Arc::new(t), format!("{tag}-t6:9114"))
-}
-
-fn force_auto() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| std::env::set_var("PS5UPLOAD_TRANSFER", "auto"));
-    assert_eq!(
-        ps5upload_ava1::route::mode(),
-        ps5upload_ava1::route::Mode::Auto
-    );
 }
 
 async fn call(
