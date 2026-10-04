@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
 
 import { Button } from "../../components";
@@ -10,14 +11,19 @@ export interface PairingPanelProps {
   view: PairingView | null;
   busy: boolean;
   error: string | null;
-  onConfirm: () => void;
+  /** The six digits the user typed from the console's screen. */
+  onConfirm: (code: string) => void;
   onRetry: () => void;
   onCancel: () => void;
+  /** "Forget the old one and pair this one" (a different PS5 answered at the address). */
+  onForget?: () => void;
 }
 
 /** The body and buttons of the pairing dialog, separate from the store so it renders (and
- *  tests) without one. Three situations: a code to compare, a closed pairing window, and a
- *  console that could not be reached. */
+ *  tests) without one. Passkey entry: the console shows a six-digit code on its own screen
+ *  and the user types it here; the app never displays a code. Situations: a code to enter
+ *  (or re-enter after a wrong one), a closed pairing window, a different console at a
+ *  pinned address, and a console that could not be reached. */
 export function PairingPanel({
   view,
   busy,
@@ -25,32 +31,67 @@ export function PairingPanel({
   onConfirm,
   onRetry,
   onCancel,
+  onForget,
 }: PairingPanelProps) {
   const tr = useTr();
+  const [digits, setDigits] = useState("");
+  const wrong = view?.state === "wrong_code";
+  useEffect(() => {
+    // A refused code is cleared so the next attempt starts from an empty field.
+    if (wrong) setDigits("");
+  }, [wrong, busy]);
+  const ready = digits.length === 6;
+  const submit = () => {
+    if (ready && !busy) onConfirm(digits);
+  };
 
-  if (view?.state === "code") {
+  if (view?.state === "code" || view?.state === "wrong_code") {
     const name = view.consoleName || "PS5";
+    const label = tr(
+      "pairing_enter_label",
+      undefined,
+      "Enter the code shown on your PS5",
+    );
     return (
       <>
         <div className="flex flex-col gap-3 p-4 text-sm">
           <p>
             {tr(
-              "pairing_intro",
+              "pairing_enter_intro",
               { name },
-              `${name} is asking to pair with this app. Check that the code below is the same one shown on your PS5, then confirm.`,
+              `${name} is asking to pair with this app. Enter the code shown on your PS5.`,
             )}
           </p>
-          <div className="text-center">
-            <div className="text-xs text-[var(--color-muted)]">
-              {tr("pairing_code_label", undefined, "Pairing code")}
-            </div>
-            <div
-              className="font-mono text-3xl font-semibold tracking-[0.3em] tabular-nums"
-              data-testid="pairing-code"
-            >
-              {view.code}
-            </div>
-          </div>
+          <label className="flex flex-col items-center gap-1">
+            <span className="text-xs text-[var(--color-muted)]">{label}</span>
+            <input
+              className="w-48 rounded-md border border-[var(--color-border)] bg-transparent px-3 py-2 text-center font-mono text-2xl font-semibold tracking-[0.3em] tabular-nums"
+              data-testid="pairing-code-input"
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              autoComplete="one-time-code"
+              maxLength={6}
+              autoFocus
+              aria-label={label}
+              value={digits}
+              onChange={(e) =>
+                setDigits(e.target.value.replace(/\D/g, "").slice(0, 6))
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submit();
+              }}
+            />
+          </label>
+          {wrong && (
+            <p className="text-xs text-[var(--color-bad)]" role="alert">
+              {tr(
+                "pairing_wrong_code",
+                undefined,
+                "That code didn't match. Check the code on your PS5 and try again.",
+              )}
+            </p>
+          )}
           {error && (
             <p className="text-xs text-[var(--color-bad)]" role="alert">
               {tr("pairing_error", { error }, `Pairing failed: ${error}`)}
@@ -59,10 +100,55 @@ export function PairingPanel({
         </div>
         <div className="flex items-center justify-end gap-2 border-t border-[var(--color-border)] px-4 py-3">
           <Button variant="ghost" onClick={onCancel}>
-            {tr("pairing_codes_differ", undefined, "Codes differ")}
+            {tr("close", undefined, "Close")}
           </Button>
-          <Button variant="primary" loading={busy} onClick={onConfirm}>
-            {tr("pairing_confirm", undefined, "Codes match, pair")}
+          <Button
+            variant="primary"
+            loading={busy}
+            disabled={!ready}
+            onClick={submit}
+          >
+            {tr("pairing_enter_submit", undefined, "Pair")}
+          </Button>
+        </div>
+      </>
+    );
+  }
+
+  if (view?.state === "wrong_console") {
+    return (
+      <>
+        <div className="flex flex-col gap-2 p-4 text-sm">
+          <p className="font-medium">
+            {tr(
+              "pairing_wrong_console_title",
+              undefined,
+              "A different PS5 answered at this address",
+            )}
+          </p>
+          <p className="text-[var(--color-muted)]">
+            {tr(
+              "pairing_wrong_console_body",
+              undefined,
+              "This app remembers another PS5 at this address, for example after the address changed hands. If you replaced or swapped consoles, forget the old one and pair this one.",
+            )}
+          </p>
+          {error && (
+            <p className="text-xs text-[var(--color-bad)]" role="alert">
+              {tr("pairing_error", { error }, `Pairing failed: ${error}`)}
+            </p>
+          )}
+        </div>
+        <div className="flex items-center justify-end gap-2 border-t border-[var(--color-border)] px-4 py-3">
+          <Button variant="ghost" onClick={onCancel}>
+            {tr("close", undefined, "Close")}
+          </Button>
+          <Button variant="primary" loading={busy} onClick={onForget}>
+            {tr(
+              "pairing_forget_and_pair",
+              undefined,
+              "Forget the old one and pair this one",
+            )}
           </Button>
         </div>
       </>
@@ -139,6 +225,7 @@ export function PairingDialog() {
   const busy = usePairingStore((s) => s.busy);
   const error = usePairingStore((s) => s.error);
   const confirm = usePairingStore((s) => s.confirm);
+  const forgetAndPair = usePairingStore((s) => s.forgetAndPair);
   const retry = usePairingStore((s) => s.retry);
   const dismiss = usePairingStore((s) => s.dismiss);
   return (
@@ -153,7 +240,8 @@ export function PairingDialog() {
         view={view}
         busy={busy}
         error={error}
-        onConfirm={() => void confirm()}
+        onConfirm={(code) => void confirm(code)}
+        onForget={() => void forgetAndPair()}
         onRetry={() => void retry()}
         onCancel={dismiss}
       />

@@ -35,6 +35,7 @@ pub const ERR_CANCELLED: u16 = 15;
 pub const ERR_CROSS_DEVICE: u16 = 16;
 pub const ERR_CREDIT: u16 = 17;
 pub const ERR_STALLED: u16 = 18;
+pub const ERR_PAIRING_CODE: u16 = 19;
 pub const JOB_UPLOAD: u8 = 1;
 pub const JOB_DOWNLOAD: u8 = 2;
 pub const JOB_COPY: u8 = 3;
@@ -334,19 +335,22 @@ impl FrameMessage for Welcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PairConfirm {
+    pub code: u32,
 }
 
 impl Message for PairConfirm {
     const NAME: &'static str = "PairConfirm";
 
     fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.code);
         w.u16(0);
         Ok(())
     }
 
     fn decode(b: &[u8]) -> Result<Self, DecodeError> {
         let mut r = Reader::new(b);
-        let m = Self::default();
+        let mut m = Self::default();
+        m.code = r.u32()?;
         let ext_n = r.u16()?;
         for _ in 0..ext_n {
             let tag = r.u16()?;
@@ -3110,7 +3114,7 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "Hs2" => Hs2 { noise: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
         "Hs3" => Hs3 { noise: { let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }, }.to_bytes().ok(),
         "Welcome" => Welcome { knows_you: rng.next_u64() as u8, nonce_s: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, launch_proof: if rng.below(2) == 1 { Some({ let mut a = [0u8; 16]; rng.fill(&mut a); a }) } else { None }, }.to_bytes().ok(),
-        "PairConfirm" => PairConfirm { }.to_bytes().ok(),
+        "PairConfirm" => PairConfirm { code: rng.next_u64() as u32, }.to_bytes().ok(),
         "PairResult" => PairResult { accepted: rng.next_u64() as u8, }.to_bytes().ok(),
         "Join" => Join { session_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, lane_id: rng.next_u64() as u16, client_nonce: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, tag: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, }.to_bytes().ok(),
         "JoinAck" => JoinAck { lane_id: rng.next_u64() as u16, server_nonce: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, tag: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, }.to_bytes().ok(),

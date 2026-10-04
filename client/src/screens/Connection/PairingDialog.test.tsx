@@ -19,15 +19,33 @@ const panel = (over: Partial<Parameters<typeof PairingPanel>[0]>) =>
     />,
   );
 
-describe("pairing_dialog_shows_the_code_and_confirms", () => {
-  it("shows the six digits, the console's name and a confirm button", () => {
+describe("pairing_dialog_takes_the_code_from_the_console_screen", () => {
+  it("asks for the six digits the console shows and never displays a code", () => {
     const html = panel({
-      view: { state: "code", code: "004821", consoleName: "PS5-Pro" },
+      view: { state: "code", consoleName: "PS5-Pro" },
     });
-    expect(html).toContain("004821");
+    expect(html).toContain("Enter the code shown on your PS5");
     expect(html).toContain("PS5-Pro is asking to pair");
-    expect(html).toContain("Codes match, pair");
-    expect(html).toContain("Codes differ");
+    expect(html).toContain('data-testid="pairing-code-input"');
+    expect(html).toContain('maxLength="6"');
+    expect(html).toContain('inputMode="numeric"');
+    expect(html).not.toContain("Codes match");
+    expect(html).not.toContain("didn&#x27;t match");
+  });
+
+  it("says a wrong code did not match and lets the user try again", () => {
+    const html = panel({
+      view: { state: "wrong_code", consoleName: "PS5-Pro" },
+    });
+    expect(html).toContain("That code didn&#x27;t match");
+    expect(html).toContain('data-testid="pairing-code-input"');
+  });
+
+  it("explains a different console at the pinned address and offers to forget the old one", () => {
+    const html = panel({ view: { state: "wrong_console" } });
+    expect(html).toContain("A different PS5 answered at this address");
+    expect(html).toContain("Forget the old one and pair this one");
+    expect(html).not.toContain("pairing-code-input");
   });
 
   it("explains how to reopen a closed pairing window and offers a retry", () => {
@@ -36,7 +54,7 @@ describe("pairing_dialog_shows_the_code_and_confirms", () => {
     expect(html).toContain("already paired");
     expect(html).toContain("restart the helper");
     expect(html).toContain("Try again");
-    expect(html).not.toContain("Codes match");
+    expect(html).not.toContain("pairing-code-input");
   });
 
   it("says when the console could not be reached", () => {

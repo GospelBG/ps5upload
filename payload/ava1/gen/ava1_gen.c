@@ -2720,7 +2720,7 @@ int ava1_welcome_decode(const uint8_t *buf, size_t len, ava1_welcome_t *m) {
 }
 
 int ava1_pair_confirm_encode(const ava1_pair_confirm_t *m, ava1_w_t *w) {
-    (void)m;
+    ava1_w_u32(w, m->code);
     ava1_w_u16(w, 0);
     return w->err;
 }
@@ -2730,6 +2730,7 @@ int ava1_pair_confirm_decode(const uint8_t *buf, size_t len, ava1_pair_confirm_t
     uint16_t ext_n, i;
     memset(m, 0, sizeof(*m));
     ava1_r_init(&r, buf, len);
+    m->code = ava1_r_u32(&r);
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {
         uint32_t vlen;

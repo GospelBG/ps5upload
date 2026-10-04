@@ -1,14 +1,17 @@
 // The pairing dialog's state. The dialog opens when any call comes back `not_paired`
 // (via `reportIfNotPaired`, wired in lib/invokeLogged and the upload poll) or when the user
 // presses Pair… on the status pill. The engine holds the handshake whose code is on screen;
-// this store only reads it and relays the user's "the codes match".
+// this store relays the six digits the user types from the console's screen (passkey entry:
+// the console checks them, the app never shows a code).
 //
 // The app's own launches never reach it: a helper this app sent pairs with no code.
 
 import { create } from "zustand";
 
 import {
+  pairingCancel,
   pairingConfirm,
+  pairingForget,
   pairingStatus,
   type PairingView,
 } from "../api/ava1";
@@ -36,7 +39,10 @@ interface PairingState {
   openFor: (host?: string) => Promise<void>;
   /** Asks again (after the user opened the pairing window on the console). */
   retry: () => Promise<void>;
-  confirm: () => Promise<void>;
+  /** Sends the six digits the user typed. */
+  confirm: (code: string) => Promise<void>;
+  /** "Forget the old one and pair this one": clears the pinned key, then pairs afresh. */
+  forgetAndPair: () => Promise<void>;
   /** Closes the dialog. */
   close: () => void;
   /** Closes it because the user said no: automatic opens for this console go quiet. */
@@ -90,18 +96,19 @@ export const usePairingStore = create<PairingState>((set, get) => {
       if (host) await load(host);
     },
 
-    async confirm() {
+    async confirm(code) {
       const { host, view } = get();
-      if (!host || view?.state !== "code") return;
+      if (!host || (view?.state !== "code" && view?.state !== "wrong_code"))
+        return;
       set({ busy: true, error: null });
       try {
-        const next = await pairingConfirm(host);
+        const next = await pairingConfirm(host, code);
         if (next.state === "accepted") {
           set({ busy: false, open: false, view: next, paired: hostOf(host) });
         } else if (next.state === "none") {
           set({ busy: false, error: UNKNOWN_STATE });
         } else {
-          // `closed`: the console's window shut before we confirmed.
+          // `wrong_code` (type again) or `closed` (five wrong codes, or the window shut).
           set({ busy: false, view: next });
         }
       } catch (e) {
@@ -112,12 +119,29 @@ export const usePairingStore = create<PairingState>((set, get) => {
       }
     },
 
+    async forgetAndPair() {
+      const { host } = get();
+      if (!host) return;
+      set({ busy: true, error: null });
+      try {
+        await pairingForget(host);
+      } catch (e) {
+        set({ busy: false, error: e instanceof Error ? e.message : String(e) });
+        return;
+      }
+      await load(host);
+    },
+
     close() {
       set({ open: false, view: null, error: null, busy: false });
     },
 
     dismiss() {
-      const key = hostOf(get().host) || "_";
+      const host = get().host;
+      // The engine's pending handshake holds one of the console's two unconfirmed places;
+      // dismissing the dialog hands it back (best effort: it also expires on its own).
+      if (host) void pairingCancel(host);
+      const key = hostOf(host) || "_";
       set((s) => ({
         open: false,
         view: null,

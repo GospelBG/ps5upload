@@ -39,6 +39,7 @@
 #define AVA1_ERR_CROSS_DEVICE 16ULL
 #define AVA1_ERR_CREDIT 17ULL
 #define AVA1_ERR_STALLED 18ULL
+#define AVA1_ERR_PAIRING_CODE 19ULL
 #define AVA1_JOB_UPLOAD 1ULL
 #define AVA1_JOB_DOWNLOAD 2ULL
 #define AVA1_JOB_COPY 3ULL
@@ -853,7 +854,7 @@ int ava1_welcome_encode(const ava1_welcome_t *m, ava1_w_t *w);
 int ava1_welcome_decode(const uint8_t *buf, size_t len, ava1_welcome_t *m);
 
 typedef struct {
-    uint8_t unused_;
+    uint32_t code;
 } ava1_pair_confirm_t;
 
 int ava1_pair_confirm_encode(const ava1_pair_confirm_t *m, ava1_w_t *w);

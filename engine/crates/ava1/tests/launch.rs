@@ -127,7 +127,7 @@ async fn a_key_only_stamp_pairs_as_before() {
         "the client still compares a code once"
     );
     // ... and the server needs no confirmation of its own: it trusts its launcher.
-    s.confirm_pairing().await.unwrap();
+    s.confirm_trusted().unwrap();
     s.node_info().await.unwrap();
 }
 

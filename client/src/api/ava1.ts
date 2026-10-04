@@ -6,26 +6,36 @@
 import { getEngineUrl } from "../state/engine";
 import { consoleAddr } from "../lib/addr";
 
-/** What the pairing dialog needs to know (engine `GET /api/ava1/pairing`).
- *  `code` is the six digits both screens show; `none` means no pairing is in progress. */
+/** What the pairing dialog needs to know (engine `GET /api/ava1/pairing`). Passkey entry:
+ *  the console shows a six-digit code on its own screen and the user types it into the app,
+ *  so no code is ever sent to the app. `wrong_code`: what was typed was not the console's
+ *  (type it again; a console-side refusal also shows a new code). `wrong_console`: another
+ *  PS5 answers at the address this app pinned. `none`: no pairing is in progress. */
 export type PairingView =
   | { state: "none" }
   | { state: "accepted" }
   | { state: "closed" }
-  | { state: "code"; code: string; consoleName: string };
+  | { state: "wrong_console" }
+  | { state: "code"; consoleName: string }
+  | { state: "wrong_code"; consoleName: string };
 
 interface PairingWire {
   state?: string;
-  code?: string;
   console_name?: string;
   error?: string;
 }
 
 function toView(w: PairingWire): PairingView {
-  if (w.state === "code" && typeof w.code === "string") {
-    return { state: "code", code: w.code, consoleName: w.console_name ?? "" };
+  if (w.state === "code" || w.state === "wrong_code") {
+    return { state: w.state, consoleName: w.console_name ?? "" };
   }
-  if (w.state === "accepted" || w.state === "closed") return { state: w.state };
+  if (
+    w.state === "accepted" ||
+    w.state === "closed" ||
+    w.state === "wrong_console"
+  ) {
+    return { state: w.state };
+  }
   return { state: "none" };
 }
 
@@ -47,16 +57,43 @@ export async function pairingStatus(host: string): Promise<PairingView> {
   return toView(await readWire(res));
 }
 
-/** The user saw matching codes. Resolves `accepted`, or `closed` when the console's
- *  pairing window shut before the confirm arrived. */
-export async function pairingConfirm(host: string): Promise<PairingView> {
+/** The user typed the code the console shows (six digits, a string: leading zeros count).
+ *  Resolves `accepted`; `wrong_code` when it was not the console's (the console shows a new
+ *  code, or the same one for a typo); `closed` when five wrong codes shut its window. */
+export async function pairingConfirm(
+  host: string,
+  code: string,
+): Promise<PairingView> {
   const res = await fetch(`${getEngineUrl()}/api/ava1/pairing/confirm`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ addr: consoleAddr(host) }),
+    body: JSON.stringify({ addr: consoleAddr(host), code }),
     signal: AbortSignal.timeout(15_000),
   });
   return toView(await readWire(res));
+}
+
+/** The dialog was dismissed: the engine closes the pending handshake, which would
+ *  otherwise hold one of the console's two unconfirmed places for a minute. */
+export async function pairingCancel(host: string): Promise<void> {
+  await fetch(`${getEngineUrl()}/api/ava1/pairing/cancel`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ addr: consoleAddr(host) }),
+    signal: AbortSignal.timeout(5_000),
+  }).catch(() => undefined);
+}
+
+/** "Forget the old console": removes the key pinned for this address so a different PS5
+ *  there can be paired. */
+export async function pairingForget(host: string): Promise<void> {
+  const res = await fetch(`${getEngineUrl()}/api/ava1/pairing/forget`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ addr: consoleAddr(host) }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  await readWire(res);
 }
 
 /** Copy `src` on console `from` to `dest` on console `to` through this engine. Returns the

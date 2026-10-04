@@ -244,7 +244,7 @@ async fn pairing_with_the_c_server() {
     );
     assert!(matches!(s.open_lane().await, Err(Ava1Error::NotPaired)));
     assert!(srv.pairing_open());
-    s.confirm_pairing().await.unwrap();
+    s.confirm_pairing(s.pairing_code().unwrap()).await.unwrap();
     assert!(
         !srv.pairing_open(),
         "a successful pairing closes the window"
@@ -856,7 +856,7 @@ async fn the_c_server_with_an_unreadable_peers_file_pairs_no_one_and_leaves_it_a
     // Even with the window forced open, nothing is accepted or written.
     srv.open_pairing(60);
     let mut s = stranger(&srv).await.unwrap();
-    assert!(s.confirm_pairing().await.is_err());
+    assert!(s.confirm_pairing(s.pairing_code().unwrap()).await.is_err());
     assert!(path.is_dir(), "left alone");
     assert!(!d.join("peers.tmp").exists());
 }
@@ -868,7 +868,7 @@ async fn the_c_server_reports_a_pairing_it_cannot_store() {
     // so the window opens), but the pairing cannot be written.
     let srv = CServer::start_with(SECRET, &d.join("gone").join("peers"), opts(60));
     let mut s = stranger(&srv).await.unwrap();
-    assert!(s.confirm_pairing().await.is_err());
+    assert!(s.confirm_pairing(s.pairing_code().unwrap()).await.is_err());
     assert!(srv.logs() >= 1, "ava1_peers_save's failure is logged");
     // Nothing half-stored in memory either: the same device is still a stranger.
     assert!(srv.pairing_open());
@@ -1092,14 +1092,14 @@ async fn a_c_reader_kept_from_reading_past_dead_after_keeps_a_live_session() {
         .success());
     let mut a = stranger(&srv).await.unwrap();
     let a_confirm = tokio::spawn(async move {
-        let _ = a.confirm_pairing().await;
+        let _ = a.confirm_pairing(a.pairing_code().unwrap()).await;
         a
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
     // A paired device confirms as well (harmless: already paired), so its reader waits
     // for the same lock. It keeps pinging all the while.
     let (mut r, mut w) = raw_session(&srv.addr(), &me).await;
-    w.send_msg(1, &gen::PairConfirm {}).await.unwrap();
+    w.send_msg(1, &gen::PairConfirm { code: 0 }).await.unwrap();
     let release = {
         let fifo = fifo.clone();
         std::thread::spawn(move || {
@@ -1249,7 +1249,7 @@ async fn the_c_helper_stamped_with_a_key_only_pairs_as_before() {
         .await
         .unwrap();
     assert!(s.pairing_code().is_some());
-    s.confirm_pairing().await.unwrap();
+    s.confirm_trusted().unwrap();
     s.node_info().await.unwrap();
 }
 
@@ -1310,4 +1310,163 @@ async fn each_c_handshake_proves_afresh_and_an_old_proof_does_not_replay() {
         p1,
         "the first proof fails on the second handshake"
     );
+}
+
+// ---- passkey entry (SPEC.md §4.6, §5.5): the C console checks the code the user typed ----
+
+struct Rogue {
+    r: RawR,
+    w: RawW,
+    code: u32,
+    key: [u8; 32],
+}
+
+/// A LAN host with a throwaway key, welcomed with knows_you = 0.
+async fn rogue(addr: &str) -> Rogue {
+    let me = Identity::generate().unwrap();
+    let (rh, wh) = TcpStream::connect(addr).await.unwrap().into_split();
+    let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+    let est = ava1::handshake::client(&mut r, &mut w, &me, "rogue", |_| false, 0)
+        .await
+        .unwrap();
+    assert!(est.pairing.is_some_and(|p| p.server_must_confirm));
+    Rogue {
+        r,
+        w,
+        code: est.code,
+        key: me.public(),
+    }
+}
+
+impl Rogue {
+    async fn confirm_raw(&mut self, body: &[u8]) -> bool {
+        self.w.send(5, 1, body).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match self.r.recv().await {
+                    Ok(f) if f.ty == gen::PairResult::TYPE => {
+                        return f.decode::<gen::PairResult>().unwrap().accepted != 0
+                    }
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+    async fn confirm(&mut self, code: u32) -> bool {
+        use ava1::wire::Message;
+        self.confirm_raw(&gen::PairConfirm { code }.to_bytes().unwrap())
+            .await
+    }
+}
+
+fn stored(d: &std::path::Path, key: &[u8; 32]) -> bool {
+    std::fs::read_to_string(d.join("peers"))
+        .map(|t| t.contains(&ava1::hex::encode(key)))
+        .unwrap_or(false)
+}
+
+fn wrong(c: u32) -> u32 {
+    (c + 1) % 1_000_000
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_refuses_a_pairconfirm_without_the_code() {
+    let d = dir("pk-nocode");
+    let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);
+    let mut g = rogue(&srv.addr()).await;
+    assert!(!g.confirm_raw(&[0, 0]).await, "the old empty PairConfirm");
+    assert!(!stored(&d, &g.key));
+    assert!(srv.pairing_open(), "one failure leaves the window open");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_refuses_a_wrong_code_and_stores_nothing() {
+    let d = dir("pk-wrong");
+    let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);
+    let mut g = rogue(&srv.addr()).await;
+    let bad = wrong(g.code);
+    assert!(!g.confirm(bad).await);
+    assert!(!stored(&d, &g.key));
+    assert!(srv.logs() >= 1, "each failure is logged");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_pairs_the_right_code() {
+    let d = dir("pk-right");
+    let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);
+    let mut g = rogue(&srv.addr()).await;
+    let ok = g.code;
+    assert!(g.confirm(ok).await);
+    assert!(stored(&d, &g.key));
+    assert!(!srv.pairing_open());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_server_shows_the_code_it_checks() {
+    // The code on the console's screen is the one it compares against: a client that
+    // reads it off the notification (not off its own transcript) pairs.
+    let d = dir("pk-screen");
+    let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);
+    let mut g = rogue(&srv.addr()).await;
+    let t = Instant::now();
+    while srv.pair_requests().0 == 0 && t.elapsed() < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let on_screen = srv.pair_requests().1;
+    assert_eq!(on_screen, g.code);
+    assert!(g.confirm(on_screen).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn five_wrong_codes_close_the_c_servers_window() {
+    let d = dir("pk-five");
+    let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);
+    for i in 0..5 {
+        assert!(srv.pairing_open(), "still open before failure {i}");
+        let mut g = rogue(&srv.addr()).await;
+        let bad = wrong(g.code);
+        assert!(!g.confirm(bad).await);
+        drop(g);
+        // The refused session's place is given back before the next knock.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(!srv.pairing_open(), "the window closed");
+    let r = stranger(&srv).await;
+    assert!(is_pairing_closed(&r), "{:?}", r.err());
+    // Reopened (a paired device's pairing.open), the counter starts again.
+    srv.open_pairing(60);
+    let mut g = rogue(&srv.addr()).await;
+    let ok = g.code;
+    assert!(g.confirm(ok).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_c_session_gets_one_attempt() {
+    let d = dir("pk-once");
+    let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);
+    let mut g = rogue(&srv.addr()).await;
+    let bad = wrong(g.code);
+    assert!(!g.confirm(bad).await);
+    let ok = g.code;
+    assert!(!g.confirm(ok).await, "the session ended with the refusal");
+    assert!(!stored(&d, &g.key));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_with_a_mismatched_code_is_refused_by_the_c_server_path() {
+    // A man in the middle, or a typo: the app's own code is not the one typed.
+    let d = dir("pk-mitm");
+    let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);
+    let mut s = stranger(&srv).await.unwrap();
+    let mine = s.pairing_code().unwrap();
+    let r = s.confirm_pairing(wrong(mine)).await;
+    assert!(
+        matches!(&r, Err(Ava1Error::Refused { code, .. }) if *code == gen::ERR_PAIRING_CODE),
+        "{r:?}"
+    );
+    assert!(srv.pairing_open());
+    s.confirm_pairing(mine).await.unwrap();
 }

@@ -91,6 +91,16 @@ before the console reveals nonce_s, so each active attempt is a single 1-in-10�
 and the code. The three fields are required (a node that omits one is refused, since
 an optional field could be stripped); a trusted reconnect carries them too.
 
+Passkey entry. The code is a secret that never crosses the network: the console shows
+it on its own screen (a notification) and the user types it into the app, which sends it
+in `PairConfirm` (§5.5). Threat model: a host on the LAN can complete the Noise handshake
+with a throwaway key and be welcomed, and it can derive the code from its own transcript,
+but it cannot read the console's screen, so it cannot send the console's code; a man in
+the middle has a different h on each leg, so the code the console shows is the code of
+the console's leg, which the man in the middle cannot learn either. Comparing two
+displayed codes is not enough: nothing would then stop a host that skips the comparison
+from pairing, so the console itself checks the typed code (§5.5).
+
 ## 5. Handshake and pairing
 1. Client → `Hs1{noise}` (unsealed): Noise message 1, payload `HelloInfo`
    (version range, caps 0).
@@ -116,12 +126,25 @@ an optional field could be stripped); a trusted reconnect carries them too.
    pair_commit of message 2 before it shows any code or trusts anything else in the
    Welcome; a mismatch, or a ServerInfo or Welcome without its field, closes the
    connection (after a best-effort `Error(ERR_PROTOCOL)`).
-5. Pairing: while either side does not know the other, both show the pairing
-   code (§4.6). After the user confirms, a client whose server sent knows_you = 0
-   sends `PairConfirm` (channel = request id); the server answers
-   `PairResult{accepted}` on the same channel, accepting only while its pairing
-   window is open and its owner approves, then stores the client's key; a key
-   that cannot be stored is not accepted. Until accepted, RPCs answer
+5. Pairing (§5.5, passkey entry): while either side does not know the other, the
+   console shows the pairing code (§4.6) on its screen and the user types it into
+   the app. A client whose server sent knows_you = 0 sends `PairConfirm{code}`
+   (channel = request id), `code` being the typed number (a required field: a
+   `PairConfirm` without it does not decode and is refused like a wrong code). The
+   client first compares the typed code with its own derivation and does not send a
+   code that differs (a typo, or a man in the middle: the session stays, the user
+   types again). The server compares the code, in constant time, with the one it
+   derived for this session, and answers `PairResult{accepted}` on the same channel,
+   accepting only while its pairing window is open and the code is equal (and its
+   owner, where there is a hook, does not veto), then stores the client's key; a key
+   that cannot be stored is not accepted. A session gets one attempt: a wrong or
+   missing code is refused (`accepted = 0`) and the session ends. Each such failure is
+   logged and counted; after 5 since the window was last opened (by `pairing.open`
+   or at start) the window closes and stays shut until a paired device reopens it
+   or the node restarts, and a refusal makes the next welcome show a new
+   notification at once. A client that cannot be told apart from a paired one (a
+   trusted reconnect, §5.1, or a launch proof, §5.2) never sends `PairConfirm` and
+   needs no code. `ERR_PAIRING_CODE` (19) is the local refusal of a mismatched code. Until accepted, RPCs answer
    `ERR_NOT_PAIRED` and lanes are refused. A client sends nothing but
    `PairConfirm` (no RPC, no Join) while either side is unconfirmed: until the
    user has compared the codes, the server is unverified. A data-plane frame (§11–§16) on a
@@ -285,6 +308,7 @@ normative table; the second column names the constant in the generated code.
 | 16 | `ERR_CROSS_DEVICE` | a staged or part-file rename whose two sides are on different devices (`st_dev`); never attempted, because a cross-device `rename` panics the console's kernel |
 | 17 | `ERR_CREDIT` | a lane frame larger than the credit the receiver granted (§12.4) |
 | 18 | `ERR_STALLED` | the receiver ended a job whose sender sent no file data for the progress deadline while heartbeating (§12.8) |
+| 19 | `ERR_PAIRING_CODE` | a client-side refusal: the code typed in the app is not the one this session derived (§5.5) |
 
 7.3 Management methods (the console operations FTX2 carried on :9114). Numbers are assigned by
 block; the tracked list, one row per FTX2 frame with its payload handler and engine caller, is

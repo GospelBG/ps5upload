@@ -3399,10 +3399,13 @@ notifications_mark_unread: "ทำเครื่องหมายว่าย�
 
 // AVA1 cutover (P3 Task 20): pairing dialog, session status, skipping/bottleneck, PS5 to PS5.
 pairing_title: "จับคู่กับ PS5 ของคุณ",
-pairing_intro: "{name} ขอจับคู่กับแอปนี้ ตรวจสอบว่ารหัสด้านล่างตรงกับรหัสที่แสดงบน PS5 ของคุณ แล้วกดยืนยัน",
-pairing_code_label: "รหัสจับคู่",
-pairing_codes_differ: "รหัสไม่ตรงกัน",
-pairing_confirm: "รหัสตรงกัน จับคู่",
+pairing_enter_intro: "{name} ต้องการจับคู่กับแอปนี้ ป้อนรหัสที่แสดงบน PS5 ของคุณ",
+pairing_enter_label: "ป้อนรหัสที่แสดงบน PS5 ของคุณ",
+pairing_enter_submit: "จับคู่",
+pairing_wrong_code: "รหัสไม่ตรงกัน ตรวจสอบรหัสบน PS5 แล้วลองอีกครั้ง",
+pairing_wrong_console_title: "มี PS5 เครื่องอื่นตอบที่ที่อยู่นี้",
+pairing_wrong_console_body: "แอปจำ PS5 เครื่องอื่นที่ที่อยู่นี้ไว้ เช่น หลังจากที่อยู่ถูกเปลี่ยนมือ หากคุณเปลี่ยนเครื่อง ให้ลืมเครื่องเก่าแล้วจับคู่เครื่องนี้",
+pairing_forget_and_pair: "ลืมเครื่องเก่าและจับคู่เครื่องนี้",
 pairing_closed_title: "PS5 ไม่รับการจับคู่ใหม่",
 pairing_closed_body: "หน้าต่างจับคู่ปิดอยู่ ให้เปิดการจับคู่สำหรับเครื่องนี้จากอุปกรณ์ที่จับคู่ไว้แล้ว หากยังไม่มีอุปกรณ์ใดจับคู่ ให้รีสตาร์ตตัวช่วยบนเครื่องเพื่อเปิดหน้าต่างอีกครั้ง จากนั้นลองใหม่",
 pairing_retry: "ลองอีกครั้ง",

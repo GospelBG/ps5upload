@@ -35,6 +35,7 @@
 #define MAX_CONNS_PER_IP 12u
 #define MAX_UNPAIRED 2u
 #define PAIR_CONFIRM_MS 60000u
+#define MAX_PAIR_FAILURES 5u /* wrong codes, then the window closes (SPEC.md 5.5) */
 #define NOTIFY_EVERY_MS 10000u
 #define THREAD_STACK (256u * 1024u)
 #define MGMT_STACK (512u * 1024u) /* = AVA1_MGMT_STACK; the thread test pins both */
@@ -62,6 +63,7 @@ typedef struct {
     uint8_t c2s[32];
     uint8_t s2c[32];
     int paired;
+    uint32_t pair_code; /* the code this session derived (SPEC.md 4.6): what PairConfirm must carry */
     int unpaired_hold;  /* reserved slot whose client is about to be welcomed unpaired */
     uint64_t since_ms;  /* when the session was welcomed */
     uint8_t peer_key[32];
@@ -94,6 +96,7 @@ static struct {
     int peers_ok; /* 0: the peers file could not be read; never write it */
     uint64_t last_notify_ms;
     int notified;
+    unsigned pair_fails; /* wrong or missing codes since the window was last opened */
     struct {
         uint32_t ip;
         int n;
@@ -499,7 +502,39 @@ static int send_status(ava1_conn_t *c, uint32_t ch, uint16_t status, const uint8
     return rc;
 }
 
-static int pair_confirm(ava1_conn_t *c, int idx, uint32_t ch) {
+/* Constant-time equality of two codes: no early exit on the first differing byte. */
+static int code_eq(uint32_t a, uint32_t b) {
+    uint32_t d = a ^ b;
+    d |= d >> 16;
+    d |= d >> 8;
+    d |= d >> 4;
+    d |= d >> 2;
+    d |= d >> 1;
+    return (int)(~d & 1u);
+}
+
+/* SPEC.md 5.5, passkey entry: the code the user typed (read off this console's screen)
+ * must equal the one this session derived. A missing, malformed or wrong code is refused
+ * and logged, counts toward MAX_PAIR_FAILURES (at which the window closes), and ends the
+ * session: one attempt each. Caller holds mu. Returns 1 when the code is right. */
+static int pair_code_ok_locked(const sess_t *s, const uint8_t *body, size_t len) {
+    ava1_pair_confirm_t m;
+    int right = ava1_pair_confirm_decode(body, len, &m) == 0 && code_eq(m.code, s->pair_code);
+    if (!right) {
+        S.pair_fails++;
+        slog("ava1: pairing refused: wrong or missing code from %s (%u of %u)", s->peer_name, S.pair_fails,
+             MAX_PAIR_FAILURES);
+        /* The next attempt shows a new code: the rate limit must not swallow it. */
+        S.notified = 0;
+        if (S.pair_fails >= MAX_PAIR_FAILURES) {
+            S.pairing_until_ms = 0;
+            slog("ava1: too many wrong pairing codes: the window is closed");
+        }
+    }
+    return right;
+}
+
+static int pair_confirm(ava1_conn_t *c, int idx, uint32_t ch, const uint8_t *body, size_t len) {
     ava1_pair_result_t r;
     uint8_t b[16];
     ava1_w_t w;
@@ -511,7 +546,7 @@ static int pair_confirm(ava1_conn_t *c, int idx, uint32_t ch) {
         sess_t *s = &S.sessions[idx];
         if (s->paired) {
             accepted = 1;
-        } else if (next && S.peers_ok && now_ms() < S.pairing_until_ms) {
+        } else if (next && S.peers_ok && now_ms() < S.pairing_until_ms && pair_code_ok_locked(s, body, len)) {
             *next = S.peers;
             ava1_peers_put(next, s->peer_key, s->peer_name, (uint64_t)time(NULL));
             attempt = 1;
@@ -686,7 +721,7 @@ static int handle_frame(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane
         return 0;
     case AVA1_TYPE_PAIR_CONFIRM:
         if (lane != 0) break;
-        return pair_confirm(&k->io, idx, ch);
+        return pair_confirm(&k->io, idx, ch, body, len);
     case AVA1_TYPE_RPC_REQUEST:
         if (lane != 0) break;
         return do_rpc(k, idx, sid, ch, body, len);
@@ -917,6 +952,9 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
         goto out;
     sess_fill(idx, k, sid, c2s, s2c, known, ns.rs, peer_name);
     filled = 1;
+    pthread_mutex_lock(&mu);
+    S.sessions[idx].pair_code = pair_code;
+    pthread_mutex_unlock(&mu);
     if (!known) {
         /* Only a device that was welcomed is shown, and a stranger reconnecting in a loop
          * must not flood the screen. */
@@ -1158,6 +1196,7 @@ int ava1_server_start(const ava1_server_cfg_t *cfg) {
     memset(S.ips, 0, sizeof S.ips);
     S.notified = 0;
     S.last_notify_ms = 0;
+    S.pair_fails = 0;
     S.peers_ok = ava1_peers_load(&S.peers, cfg->peers_path) == 0;
     if (!S.peers_ok) {
         /* Unknown is not empty: run for nobody rather than open pairing to anyone or
@@ -1200,6 +1239,7 @@ uint16_t ava1_server_port(void) { return S.port; }
 
 void ava1_server_open_pairing(uint32_t seconds) {
     pthread_mutex_lock(&mu);
+    S.pair_fails = 0;
     S.pairing_until_ms = now_ms() + (uint64_t)seconds * 1000u;
     pthread_mutex_unlock(&mu);
 }

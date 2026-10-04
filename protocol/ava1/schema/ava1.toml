@@ -95,6 +95,9 @@ ext = [{ tag = 1, name = "launch_proof", ty = "b16" }]
 [[message]]
 name = "PairConfirm"
 type = 0x05
+# code: the six digits the user read off the console's screen and typed into the app
+# (SPEC.md §4.6, §5.5, passkey entry). Required: a PairConfirm without it does not decode.
+fields = [{ name = "code", ty = "u32" }]
 
 [[message]]
 name = "PairResult"
@@ -287,6 +290,10 @@ value = 17
 name = "ERR_STALLED"   # a receiver ended a job whose sender kept the link alive but sent no data
 ty = "u16"
 value = 18
+[[const]]
+name = "ERR_PAIRING_CODE"   # the pairing code typed in the app is not the console's (SPEC.md §5.5)
+ty = "u16"
+value = 19
 # Job kinds, as seen by the node that receives JobOpen.
 [[const]]
 name = "JOB_UPLOAD"     # it receives the files

@@ -559,18 +559,18 @@ mod ava1_cmds {
             Timing::default(),
         )
         .await?;
-        if let Some(code) = s.pairing_code() {
+        if s.pairing_code().is_some() {
             print!(
-                "Pairing with {} — code {code:06}. Does the console show the same code? [y/N] ",
+                "Pairing with {}. Enter the 6-digit code shown on the console: ",
                 s.peer_name()
             );
             std::io::stdout().flush()?;
             let mut line = String::new();
             std::io::stdin().lock().read_line(&mut line)?;
-            if !line.trim().eq_ignore_ascii_case("y") {
-                bail!("pairing not confirmed");
-            }
-            s.confirm_pairing().await?;
+            let Ok(typed) = line.trim().parse::<u32>() else {
+                bail!("not a code");
+            };
+            s.confirm_pairing(typed).await?;
             println!("paired");
         }
         Ok(s)

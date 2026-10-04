@@ -114,7 +114,7 @@ async fn pairing_shows_the_same_code_and_persists_on_both_sides() {
             .status,
         gen::ERR_NOT_PAIRED
     );
-    s.confirm_pairing().await.unwrap();
+    s.confirm_pairing(s.pairing_code().unwrap()).await.unwrap();
     assert_eq!(s.node_info().await.unwrap().name, "console");
 
     let server_file = std::fs::read_to_string(dir.join("server-peers")).unwrap();
@@ -151,7 +151,7 @@ async fn a_server_that_declines_the_pairing_is_reported() {
     )
     .await
     .unwrap();
-    let r = s.confirm_pairing().await;
+    let r = s.confirm_pairing(s.pairing_code().unwrap()).await;
     assert!(matches!(r, Err(Ava1Error::Refused { .. })), "{r:?}");
 }
 

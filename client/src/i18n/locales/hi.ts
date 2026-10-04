@@ -3409,10 +3409,13 @@ notifications_mark_unread: "अनपढ़ा चिह्नित करे�
 
 // AVA1 cutover (P3 Task 20): pairing dialog, session status, skipping/bottleneck, PS5 to PS5.
 pairing_title: "अपने PS5 से पेयर करें",
-pairing_intro: "{name} इस ऐप से पेयर करने का अनुरोध कर रहा है। जाँचें कि नीचे का कोड वही है जो आपके PS5 पर दिख रहा है, फिर पुष्टि करें।",
-pairing_code_label: "पेयरिंग कोड",
-pairing_codes_differ: "कोड अलग हैं",
-pairing_confirm: "कोड मेल खाते हैं, पेयर करें",
+pairing_enter_intro: "{name} इस ऐप के साथ पेयर करना चाहता है। अपने PS5 पर दिखा कोड दर्ज करें।",
+pairing_enter_label: "अपने PS5 पर दिखा कोड दर्ज करें",
+pairing_enter_submit: "पेयर करें",
+pairing_wrong_code: "कोड मेल नहीं खाया। अपने PS5 का कोड देखकर फिर कोशिश करें।",
+pairing_wrong_console_title: "इस पते पर कोई दूसरा PS5 जवाब दे रहा है",
+pairing_wrong_console_body: "यह ऐप इस पते पर किसी दूसरे PS5 को याद रखता है, जैसे पता बदलने के बाद। अगर आपने कंसोल बदला है, तो पुराने को भूल जाएँ और इसे पेयर करें।",
+pairing_forget_and_pair: "पुराने को भूलें और इसे पेयर करें",
 pairing_closed_title: "PS5 नई पेयरिंग स्वीकार नहीं कर रहा",
 pairing_closed_body: "इसकी पेयरिंग विंडो बंद है। पहले से पेयर किए गए डिवाइस पर इस कंसोल के लिए पेयरिंग खोलें। अगर अभी कोई डिवाइस पेयर नहीं है, तो विंडो दोबारा खोलने के लिए कंसोल पर सहायक को पुनः आरंभ करें। फिर दोबारा कोशिश करें।",
 pairing_retry: "दोबारा कोशिश करें",

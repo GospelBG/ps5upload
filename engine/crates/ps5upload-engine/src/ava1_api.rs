@@ -148,9 +148,12 @@ pub async fn identity_handler(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Res
 }
 
 /// The pairing dialog's view of a console, as the JSON the client keys on:
-/// `state` is `none` (nothing in progress), `code` (compare `code` with the console's
-/// screen; `console_name` is what the console calls itself), `accepted` (paired) or
-/// `closed` (the console's pairing window is shut). A transport failure is a 502.
+/// `state` is `none` (nothing in progress), `code` (the user types the code the console's
+/// screen shows; `console_name` is what the console calls itself; the engine's own copy of
+/// the code is never sent: the code is the console's secret, SPEC.md §5.5), `wrong_code`
+/// (what was typed was not the console's; a new code is on its screen), `accepted` (paired),
+/// `closed` (the console's pairing window is shut) or `wrong_console` (a different console
+/// answers at this address than the one pinned). A transport failure is a 502.
 fn pairing_body(
     r: Result<ps5upload_ava1::Pairing, ava1::Ava1Error>,
 ) -> (StatusCode, serde_json::Value) {
@@ -158,10 +161,17 @@ fn pairing_body(
     match r {
         Ok(Pairing::Paired) => (StatusCode::OK, serde_json::json!({ "state": "accepted" })),
         Ok(Pairing::Closed) => (StatusCode::OK, serde_json::json!({ "state": "closed" })),
-        Ok(Pairing::Code { code, peer_name }) => (
+        Ok(Pairing::WrongConsole) => (
             StatusCode::OK,
-            // Zero-padded: the console shows six digits, and 012345 is not 12345.
-            serde_json::json!({ "state": "code", "code": format!("{code:06}"), "console_name": peer_name }),
+            serde_json::json!({ "state": "wrong_console" }),
+        ),
+        Ok(Pairing::WrongCode { peer_name }) => (
+            StatusCode::OK,
+            serde_json::json!({ "state": "wrong_code", "console_name": peer_name }),
+        ),
+        Ok(Pairing::Code { peer_name, .. }) => (
+            StatusCode::OK,
+            serde_json::json!({ "state": "code", "console_name": peer_name }),
         ),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
@@ -189,19 +199,71 @@ pub async fn pairing_handler(
 #[derive(serde::Deserialize)]
 pub struct PairingConfirm {
     addr: Option<String>,
+    /// The six digits typed from the console's screen: a string (leading zeros) or a number.
+    code: Option<serde_json::Value>,
 }
 
-/// `POST /api/ava1/pairing/confirm` `{addr}` — the user saw matching codes. A refusal by the
-/// console, or a handshake that is gone (the console's window timed out), is `closed`:
-/// the dialog then explains how to reopen the window.
+/// The typed code: exactly six decimal digits.
+fn typed_code(v: &Option<serde_json::Value>) -> Option<u32> {
+    let text = match v.as_ref()? {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Number(n) => format!("{:06}", n.as_u64()?),
+        _ => return None,
+    };
+    (text.len() == 6 && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
+}
+
+/// `POST /api/ava1/pairing/confirm` `{addr, code}` — the user typed the code the console
+/// shows (passkey entry, SPEC.md §5.5). The console checks it; a wrong one answers
+/// `wrong_code` with a new handshake pending, and five of them close the console's window
+/// (`closed`: the dialog then explains how to reopen it). A code that is not six digits is a 400.
 pub async fn pairing_confirm_handler(
     State(state): State<crate::AppState>,
     Json(req): Json<PairingConfirm>,
 ) -> Response {
-    let addr = req.addr.unwrap_or_else(|| state.default_ps5_addr.clone());
-    let r = ps5upload_ava1::pool().confirm_or_status(&addr).await;
+    let addr = req
+        .addr
+        .clone()
+        .unwrap_or_else(|| state.default_ps5_addr.clone());
+    let Some(typed) = typed_code(&req.code) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "state": "none", "error": "the code is the 6 digits shown on the PS5" })),
+        )
+            .into_response();
+    };
+    let r = ps5upload_ava1::pool().confirm_or_status(&addr, typed).await;
     let (code, body) = pairing_body(r);
     (code, Json(body)).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct PairingAddr {
+    addr: Option<String>,
+}
+
+/// `POST /api/ava1/pairing/cancel` `{addr}` — the dialog was dismissed: closes the pending
+/// handshake so it stops holding one of the console's two unconfirmed places.
+pub async fn pairing_cancel_handler(
+    State(state): State<crate::AppState>,
+    Json(req): Json<PairingAddr>,
+) -> Response {
+    let addr = req.addr.unwrap_or_else(|| state.default_ps5_addr.clone());
+    let had = ps5upload_ava1::pool().cancel_pairing(&addr).await;
+    Json(serde_json::json!({ "ok": true, "was_pending": had })).into_response()
+}
+
+/// `POST /api/ava1/pairing/forget` `{addr}` — "forget the old console": removes the key
+/// pinned for this address so a different PS5 there can be paired.
+pub async fn pairing_forget_handler(
+    State(state): State<crate::AppState>,
+    Json(req): Json<PairingAddr>,
+) -> Response {
+    let addr = req.addr.unwrap_or_else(|| state.default_ps5_addr.clone());
+    let had = ps5upload_ava1::pool().forget_console_key(&addr).await;
+    Json(serde_json::json!({ "ok": true, "was_pinned": had })).into_response()
 }
 
 #[cfg(test)]
@@ -216,7 +278,10 @@ mod tests {
         }));
         assert_eq!(st, axum::http::StatusCode::OK);
         assert_eq!(b["state"], "code");
-        assert_eq!(b["code"], "004821");
+        assert!(
+            b.get("code").is_none(),
+            "the code is on the console's screen only"
+        );
         assert_eq!(b["console_name"], "PS5-Pro");
         assert_eq!(
             super::pairing_body(Ok(Pairing::Paired)).1["state"],
@@ -226,6 +291,38 @@ mod tests {
             super::pairing_body(Ok(Pairing::Closed)).1["state"],
             "closed"
         );
+        assert_eq!(
+            super::pairing_body(Ok(Pairing::WrongConsole)).1["state"],
+            "wrong_console"
+        );
+        let w = super::pairing_body(Ok(Pairing::WrongCode {
+            peer_name: "PS5".into(),
+        }))
+        .1;
+        assert_eq!(
+            (w["state"].as_str(), w["console_name"].as_str()),
+            (Some("wrong_code"), Some("PS5"))
+        );
+    }
+
+    #[test]
+    fn the_typed_code_is_six_digits_with_leading_zeros() {
+        use serde_json::json;
+        let t = |v: serde_json::Value| super::typed_code(&Some(v));
+        assert_eq!(t(json!("004821")), Some(4821));
+        assert_eq!(t(json!(4821)), Some(4821));
+        assert_eq!(t(json!(" 123456 ")), Some(123456));
+        for bad in [
+            json!("12345"),
+            json!("1234567"),
+            json!("12a456"),
+            json!(null),
+            json!(-5),
+            json!(""),
+        ] {
+            assert_eq!(t(bad.clone()), None, "{bad}");
+        }
+        assert_eq!(super::typed_code(&None), None);
         let (st, b) = super::pairing_body(Err(ava1::Ava1Error::Timeout));
         assert_eq!(st, axum::http::StatusCode::BAD_GATEWAY);
         assert_eq!(b["state"], "none");

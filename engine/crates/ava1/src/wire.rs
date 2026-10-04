@@ -224,7 +224,10 @@ mod tests {
             body: vec![0xaa, 0xbb],
         };
         assert_eq!(r.to_bytes().unwrap(), hex("010002000000aabb0000"));
-        assert_eq!(PairConfirm {}.to_bytes().unwrap(), hex("0000"));
+        assert_eq!(
+            PairConfirm { code: 123456 }.to_bytes().unwrap(),
+            hex("40e201000000")
+        );
         let n = NodeInfo {
             version: "5".into(),
             platform: "ps5".into(),

@@ -343,13 +343,25 @@ impl Session {
         Ok(())
     }
 
-    /// Call after the user confirmed the codes match. Stores the other device's key.
-    pub async fn confirm_pairing(&mut self) -> Result<(), Ava1Error> {
+    /// Passkey entry (SPEC.md §5.5): `typed` is the code the user read off the console's
+    /// screen. A code that is not the one this side derived for the session is a man in
+    /// the middle (or a typo) and is refused here, before anything is sent: the console
+    /// is not told, so a typo costs it no attempt. Otherwise the code goes in
+    /// `PairConfirm`, and the console checks it against its own; only then is its key
+    /// stored. A server that already trusts us (the launch path) needs no code: use
+    /// `confirm_trusted`.
+    pub async fn confirm_pairing(&mut self, typed: u32) -> Result<(), Ava1Error> {
         let Some(p) = self.est.pairing else {
             return Ok(());
         };
         if p.server_must_confirm {
-            let r: PairResult = self.request(PairConfirm {}).await?.decode()?;
+            if typed != p.code {
+                return Err(Ava1Error::Refused {
+                    code: gen::ERR_PAIRING_CODE,
+                    message: "that code is not the one the console shows".into(),
+                });
+            }
+            let r: PairResult = self.request(PairConfirm { code: typed }).await?.decode()?;
             if r.accepted == 0 {
                 return Err(Ava1Error::Refused {
                     code: gen::ERR_PAIRING_CLOSED,
@@ -357,6 +369,20 @@ impl Session {
                 });
             }
         }
+        self.store_peer()
+    }
+
+    /// Records a console that already trusts us and showed no code (we launched it, or its
+    /// trust slot holds our key). Refused if the console wants a code.
+    pub fn confirm_trusted(&mut self) -> Result<(), Ava1Error> {
+        match self.est.pairing {
+            None => Ok(()),
+            Some(p) if p.server_must_confirm => Err(Ava1Error::NotPaired),
+            Some(_) => self.store_peer(),
+        }
+    }
+
+    fn store_peer(&mut self) -> Result<(), Ava1Error> {
         self.peers
             .lock()
             .unwrap()

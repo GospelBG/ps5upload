@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const api = vi.hoisted(() => ({
   pairingStatus: vi.fn(),
   pairingConfirm: vi.fn(),
+  pairingCancel: vi.fn(),
+  pairingForget: vi.fn(),
 }));
 vi.mock("../api/ava1", () => api);
 
@@ -12,22 +14,24 @@ import { usePairingStore } from "./pairing";
 beforeEach(() => {
   api.pairingStatus.mockReset();
   api.pairingConfirm.mockReset();
+  api.pairingCancel.mockReset();
+  api.pairingForget.mockReset();
   usePairingStore.getState().close();
   usePairingStore.setState({ quietUntil: {} });
 });
 
-const CODE = { state: "code", code: "004821", consoleName: "PS5-Pro" } as const;
+const CODE = { state: "code", consoleName: "PS5-Pro" } as const;
 
 describe("pairing store", () => {
-  it("shows the code the console shows, then confirms", async () => {
+  it("asks for the code the console shows, then sends what the user typed", async () => {
     api.pairingStatus.mockResolvedValue(CODE);
     api.pairingConfirm.mockResolvedValue({ state: "accepted" });
     await usePairingStore.getState().openFor("10.0.0.2");
     let s = usePairingStore.getState();
     expect(s.open && s.host).toBe("10.0.0.2");
     expect(s.view).toEqual(CODE);
-    await s.confirm();
-    expect(api.pairingConfirm).toHaveBeenCalledWith("10.0.0.2");
+    await s.confirm("004821");
+    expect(api.pairingConfirm).toHaveBeenCalledWith("10.0.0.2", "004821");
     s = usePairingStore.getState();
     expect(s.open).toBe(false);
     expect(s.paired).toBe("10.0.0.2");
@@ -46,10 +50,62 @@ describe("pairing store", () => {
     api.pairingStatus.mockResolvedValue(CODE);
     api.pairingConfirm.mockResolvedValue({ state: "closed" });
     await usePairingStore.getState().openFor("10.0.0.2");
-    await usePairingStore.getState().confirm();
+    await usePairingStore.getState().confirm("123456");
     const s = usePairingStore.getState();
     expect(s.open).toBe(true);
     expect(s.view).toEqual({ state: "closed" });
+  });
+
+  it("a wrong code shows the retry state and stays open", async () => {
+    api.pairingStatus.mockResolvedValue(CODE);
+    const WRONG = { state: "wrong_code", consoleName: "PS5-Pro" } as const;
+    api.pairingConfirm.mockResolvedValueOnce(WRONG);
+    await usePairingStore.getState().openFor("10.0.0.2");
+    await usePairingStore.getState().confirm("111111");
+    let s = usePairingStore.getState();
+    expect(s.open).toBe(true);
+    expect(s.view).toEqual(WRONG);
+    api.pairingConfirm.mockResolvedValueOnce({ state: "accepted" });
+    await s.confirm("222222");
+    s = usePairingStore.getState();
+    expect(s.open).toBe(false);
+    expect(s.paired).toBe("10.0.0.2");
+  });
+
+  it("dismissing the dialog closes the engine's pending handshake", async () => {
+    api.pairingStatus.mockResolvedValue(CODE);
+    await usePairingStore.getState().openFor("10.0.0.2");
+    usePairingStore.getState().dismiss();
+    expect(api.pairingCancel).toHaveBeenCalledWith("10.0.0.2");
+    expect(usePairingStore.getState().open).toBe(false);
+  });
+
+  it("a different console at the pinned address: forget, then pair afresh", async () => {
+    api.pairingStatus.mockResolvedValueOnce({ state: "wrong_console" });
+    await usePairingStore.getState().openFor("10.0.0.2");
+    expect(usePairingStore.getState().view).toEqual({ state: "wrong_console" });
+    api.pairingForget.mockResolvedValue(undefined);
+    api.pairingStatus.mockResolvedValueOnce(CODE);
+    await usePairingStore.getState().forgetAndPair();
+    expect(api.pairingForget).toHaveBeenCalledWith("10.0.0.2");
+    expect(usePairingStore.getState().view).toEqual(CODE);
+    expect(usePairingStore.getState().error).toBeNull();
+  });
+
+  it("a failed forget keeps the explanation and shows the error", async () => {
+    api.pairingStatus.mockResolvedValueOnce({ state: "wrong_console" });
+    await usePairingStore.getState().openFor("10.0.0.2");
+    api.pairingForget.mockRejectedValue(new Error("engine said no"));
+    await usePairingStore.getState().forgetAndPair();
+    const s = usePairingStore.getState();
+    expect(s.view).toEqual({ state: "wrong_console" });
+    expect(s.error).toBe("engine said no");
+  });
+
+  it("a wrong-console failure opens the dialog like a not-paired one", async () => {
+    api.pairingStatus.mockResolvedValue({ state: "wrong_console" });
+    expect(reportIfNotPaired("ava1_wrong_console", "10.0.0.2")).toBe(true);
+    await vi.waitFor(() => expect(usePairingStore.getState().open).toBe(true));
   });
 
   it("keeps the dialog open with the error when the console cannot be reached", async () => {

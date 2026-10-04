@@ -17,7 +17,14 @@ import { hostOf } from "./addr";
 
 export type SessionState = "connected" | "needs_pairing" | "helper_old" | "down";
 
-const NOT_PAIRED = ["ava1_not_paired", "not_paired", "devices are not paired"];
+// `ava1_wrong_console` (a different PS5 than the pinned one answers) is the same kind of
+// problem for the user: the pairing dialog explains it and offers to forget the old key.
+const NOT_PAIRED = [
+  "ava1_not_paired",
+  "not_paired",
+  "devices are not paired",
+  "ava1_wrong_console",
+];
 const HELPER_OLD = ["helper_old", "legacy_helper_wedged"];
 
 function text(e: unknown): string {

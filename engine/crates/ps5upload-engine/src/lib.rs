@@ -9244,6 +9244,14 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
             "/api/ava1/pairing/confirm",
             post(ava1_api::pairing_confirm_handler),
         )
+        .route(
+            "/api/ava1/pairing/cancel",
+            post(ava1_api::pairing_cancel_handler),
+        )
+        .route(
+            "/api/ava1/pairing/forget",
+            post(ava1_api::pairing_forget_handler),
+        )
         .route("/api/game/inspect", post(inspect::inspect_handler))
         .route(
             "/api/game/inspect/image",

@@ -356,12 +356,18 @@ text of `GET /api/ps5/status` (the one probe; `payload_check`):
 A console in `needs_pairing` or `helper_old` is a live helper: it does not count as down, so
 the auto-redeploy loop never fires on it.
 
-**Pairing routes** (loopback-guarded like every engine route): `GET /api/ava1/pairing?addr=` starts
-or re-reads the handshake and answers `{state: "code", code: "004821", console_name}` (`code` is
-the six digits both screens show, zero-padded), `{state: "accepted"}` (already trusted),
-`{state: "closed"}` (the console's pairing window is shut) or a 502 with `error`.
-`POST /api/ava1/pairing/confirm` `{addr}` answers `accepted` or `closed`. The handshake whose code
-is on screen is held in `ps5upload_ava1::Pool` until confirmed, so asking twice shows one code.
+**Pairing routes** (loopback-guarded like every engine route; passkey entry, SPEC.md §5.5):
+`GET /api/ava1/pairing?addr=` starts or re-reads the handshake and answers
+`{state: "code", console_name}` (the user types the six digits the console shows; the
+engine never sends its own copy), `{state: "accepted"}` (already trusted), `{state: "closed"}`
+(the console's pairing window is shut), `{state: "wrong_console"}` (a different console than
+the pinned one answers at this address) or a 502 with `error`.
+`POST /api/ava1/pairing/confirm` `{addr, code}` (six digits, a string) answers `accepted`,
+`wrong_code` (try again) or `closed`; a malformed code is a 400. `POST /api/ava1/pairing/cancel`
+`{addr}` closes the pending handshake (the dialog was dismissed); `POST /api/ava1/pairing/forget`
+`{addr}` removes the key pinned for that address ("forget the old console"). The handshake whose
+code is on screen is held in `ps5upload_ava1::Pool` until confirmed, so asking twice shows one
+code.
 Tests: `engine/crates/ava1-ctest/tests/pairing.rs` (the C server).
 
 **Addresses.** The client sends the bare console host (`consoleAddr`); the engine owns the port and

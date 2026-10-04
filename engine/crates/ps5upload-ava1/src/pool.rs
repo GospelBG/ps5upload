@@ -74,6 +74,9 @@ pub struct Pool {
     /// console caps connections per IP) or block on an unreachable console for every call.
     refusals: Mutex<HashMap<String, Refusal>>,
     refusal_ttl: Duration,
+    /// How long "this console is not paired" is remembered: longer than any status poll, so a
+    /// poll never opens a handshake (and a console pop-up) for a console known to need a code.
+    not_paired_ttl: Duration,
     /// How many times a `JobOpen` answered `ERR_BUSY` is retried before the transfer gives up.
     busy_tries: u32,
     /// Overrides the JobOpenAck timeout (tests).
@@ -90,14 +93,24 @@ struct Refusal {
 
 /// How long a failed session attempt is repeated without trying again.
 pub const REFUSAL_TTL: Duration = Duration::from_secs(5);
+/// How long a `ava1_not_paired` refusal is repeated: it outlasts the client's 10 s status poll.
+/// A pairing attempt (the dialog opening, a confirm, a dismissal) resets it.
+pub const NOT_PAIRED_TTL: Duration = Duration::from_secs(30);
 
 /// Where a console stands for the pairing dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pairing {
-    /// The console trusts this engine (or was launched by it): nothing to compare.
+    /// The console trusts this engine (or was launched by it): nothing to enter.
     Paired,
-    /// A person must compare `code` with the console's screen, then confirm.
+    /// A person must read the code off the console's screen and type it in the app (SPEC.md
+    /// §5.5). `code` is the engine's own derivation, kept for tests and debugging: it is
+    /// never shown.
     Code { code: u32, peer_name: String },
+    /// The code that was typed was not the console's. The handshake is pending (the same
+    /// code, or a new one after a console-side refusal): the user types again.
+    WrongCode { peer_name: String },
+    /// A different console answered at this address than the one this engine pinned.
+    WrongConsole,
     /// The console is not accepting new pairings (its window is closed).
     Closed,
 }
@@ -237,6 +250,7 @@ impl Pool {
             pending: Default::default(),
             refusals: Mutex::default(),
             refusal_ttl: REFUSAL_TTL,
+            not_paired_ttl: NOT_PAIRED_TTL,
             busy_tries: DEFAULT_BUSY_TRIES,
             open_ack_timeout: None,
         }
@@ -289,6 +303,7 @@ impl Pool {
             pending: Default::default(),
             refusals: Mutex::default(),
             refusal_ttl: REFUSAL_TTL,
+            not_paired_ttl: NOT_PAIRED_TTL,
             busy_tries: DEFAULT_BUSY_TRIES,
             open_ack_timeout: None,
         }
@@ -298,6 +313,12 @@ impl Pool {
     /// engine (A1).
     pub fn with_addr(mut self, addr: impl Into<String>) -> Pool {
         self.addr = Some(addr.into());
+        self
+    }
+
+    /// Test seam: how long a not-paired refusal is remembered.
+    pub fn with_not_paired_ttl(mut self, ttl: Duration) -> Pool {
+        self.not_paired_ttl = ttl;
         self
     }
 
@@ -313,7 +334,14 @@ impl Pool {
         let host = host_of(console);
         let mut m = self.refusals.lock().unwrap_or_else(|e| e.into_inner());
         match m.get(&host) {
-            Some(r) if r.at.elapsed() < self.refusal_ttl => {
+            Some(r)
+                if r.at.elapsed()
+                    < if r.reason == "ava1_not_paired" {
+                        self.not_paired_ttl
+                    } else {
+                        self.refusal_ttl
+                    } =>
+            {
                 Some((r.reason.clone(), r.detail.clone()))
             }
             Some(_) => {
@@ -459,6 +487,26 @@ impl Pool {
         }
     }
 
+    /// Removes the pin for `host` (see `forget_console_key`).
+    fn unpin(&self, host: &str) {
+        let p = self.dir.join("consoles");
+        let lines: Vec<String> = std::fs::read_to_string(&p)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.split_once(' ').map(|(h, _)| h) != Some(host))
+            .map(String::from)
+            .collect();
+        let tmp = self.dir.join("consoles.tmp");
+        let body = if lines.is_empty() {
+            String::new()
+        } else {
+            lines.join("\n") + "\n"
+        };
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(tmp, p);
+        }
+    }
+
     /// One handshake with the console, pairing not yet settled; and the key it was pinned to.
     async fn connect_raw(&self, console: &str) -> Result<(Session, Option<[u8; 32]>), Ava1Error> {
         let me = self
@@ -484,6 +532,8 @@ impl Pool {
     /// asking again shows the same code (the console's screen shows the one it made).
     pub async fn pairing_status(&self, console: &str) -> Result<Pairing, Ava1Error> {
         let host = host_of(console);
+        // The user is looking at the dialog: whatever the polls remembered is stale.
+        self.clear_refusal(console);
         let one_at_a_time = self
             .connecting
             .lock()
@@ -524,6 +574,7 @@ impl Pool {
                 Err(Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CLOSED => {
                     return Ok(Pairing::Closed)
                 }
+                Err(Ava1Error::WrongPeer) => return Ok(Pairing::WrongConsole),
                 Err(e) => return Err(e),
             }
         }
@@ -531,9 +582,12 @@ impl Pool {
         Ok(Pairing::Paired)
     }
 
-    /// The user confirmed that the codes match: stores the console's key (and tells it ours),
-    /// then opens the session every job will share.
-    pub async fn confirm_pairing(&self, console: &str) -> Result<(), Ava1Error> {
+    /// The user typed the code the console shows (passkey entry, SPEC.md §5.5): the app checks
+    /// it against its own derivation, the console against its own, and only then is the
+    /// console's key stored (and ours told to it). Then opens the session every job will
+    /// share. A typo is caught by the app and keeps the handshake (the console is not told);
+    /// a code the console refused uses the session up.
+    pub async fn confirm_pairing(&self, console: &str, typed: u32) -> Result<(), Ava1Error> {
         let host = host_of(console);
         let one_at_a_time = self
             .connecting
@@ -548,7 +602,18 @@ impl Pool {
             let Some(mut s) = taken.filter(|s| !s.is_closed()) else {
                 return Err(Ava1Error::NotPaired);
             };
-            s.confirm_pairing().await?;
+            if let Err(e) = s.confirm_pairing(typed).await {
+                // A code that is not even this app's own derivation (a typo, or a man in the
+                // middle) was never sent: the console still waits for the right one, so the
+                // handshake stays and the user types again. Anything else used the session up.
+                if matches!(&e, Ava1Error::Refused { code, .. } if *code == ava1::gen::ERR_PAIRING_CODE)
+                {
+                    self.pending.lock().await.insert(host, s);
+                } else {
+                    s.close().await;
+                }
+                return Err(e);
+            }
             if self.pinned(&host).is_none() {
                 self.pin(&host, s.peer_key());
             }
@@ -562,15 +627,93 @@ impl Pool {
     /// A confirm that never fails just because nothing is pending: a late or concurrent
     /// confirm (the handshake was already confirmed, or it timed out) answers with the
     /// console's current state (`Paired`, a fresh `Code`, or `Closed`) instead of an error.
-    pub async fn confirm_or_status(&self, console: &str) -> Result<Pairing, Ava1Error> {
-        match self.confirm_pairing(console).await {
+    /// A typo answers `WrongCode` on the same handshake (the console's code is still on its
+    /// screen); a code the console itself refused starts a new handshake and answers
+    /// `WrongCode` (a new code is on its screen), or `Closed` when five wrong codes shut its
+    /// window.
+    pub async fn confirm_or_status(&self, console: &str, typed: u32) -> Result<Pairing, Ava1Error> {
+        match self.confirm_pairing(console, typed).await {
             Ok(()) => Ok(Pairing::Paired),
             Err(Ava1Error::NotPaired) => self.pairing_status(console).await,
+            Err(Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CODE => {
+                let peer_name = match self.pending.lock().await.get(&host_of(console)) {
+                    Some(s) => s.peer_name().to_string(),
+                    None => String::new(),
+                };
+                Ok(Pairing::WrongCode { peer_name })
+            }
             Err(Ava1Error::Refused { code, .. }) if code == ava1::gen::ERR_PAIRING_CLOSED => {
-                Ok(Pairing::Closed)
+                match self.pairing_status(console).await? {
+                    Pairing::Code { peer_name, .. } => Ok(Pairing::WrongCode { peer_name }),
+                    other => Ok(other),
+                }
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// The dialog was dismissed: closes the pending handshake (it holds one of the console's
+    /// two unconfirmed places until its 60 s deadline) and remembers "not paired" so the
+    /// status poll does not open another. True when something was pending.
+    pub async fn cancel_pairing(&self, console: &str) -> bool {
+        let host = host_of(console);
+        let one_at_a_time = self
+            .connecting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(host.clone())
+            .or_default()
+            .clone();
+        let _connecting = one_at_a_time.lock().await;
+        let taken = self.pending.lock().await.remove(&host);
+        self.note_refusal(
+            console,
+            "ava1_not_paired",
+            "the devices are not paired yet (pairing was dismissed)",
+        );
+        match taken {
+            Some(s) => {
+                s.close().await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// "Forget this console's key": a different console answered at this address (a DHCP
+    /// swap, a replacement PS5), and the pin made the old one's key the only one accepted
+    /// here. Removes the pin, the old console's stored key, and every cached session,
+    /// pending handshake and remembered failure for the address; the next pairing pins
+    /// whichever console answers. True when a pin was removed.
+    pub async fn forget_console_key(&self, console: &str) -> bool {
+        let host = host_of(console);
+        let one_at_a_time = self
+            .connecting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(host.clone())
+            .or_default()
+            .clone();
+        let _connecting = one_at_a_time.lock().await;
+        let old = self.pinned(&host);
+        self.unpin(&host);
+        if let Some(key) = old {
+            let _ = self
+                .peers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+        }
+        if let Some(s) = self.pending.lock().await.remove(&host) {
+            s.close().await;
+        }
+        let cached = self.sessions.lock().await.remove(&host);
+        if let Some(c) = cached {
+            self.churn.forgot(&host);
+            drop(c);
+        }
+        self.clear_refusal(console);
+        old.is_some()
     }
 
     /// One live session for the console, connecting when there is none. C17: the lock
@@ -604,6 +747,17 @@ impl Pool {
         // C4: no identity is an `Io` error, not `NotPaired` — the latter's message
         // ("the devices are not paired yet") would misdescribe a missing identity
         // file; both fall back to FTX2 under Auto, so the honest error wins.
+        // A dialog is waiting on a code: a poll must not open another handshake (it would take
+        // one of the console's unconfirmed places and show another pop-up).
+        if self
+            .pending
+            .lock()
+            .await
+            .get(&host)
+            .is_some_and(|p| !p.is_closed())
+        {
+            return Err(Ava1Error::NotPaired);
+        }
         let (mut s, pin) = self.connect_raw(console).await?;
         if s.needs_user_pairing() {
             // A person must compare codes (SPEC.md §5), not a transfer.
@@ -611,7 +765,7 @@ impl Pool {
         }
         if s.pairing_code().is_some() {
             // The console already trusts us (it was launched by us): record its key.
-            s.confirm_pairing().await?;
+            s.confirm_trusted()?;
         }
         if pin.is_none() {
             self.pin(&host, s.peer_key());

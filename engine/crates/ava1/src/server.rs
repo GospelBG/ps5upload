@@ -1,7 +1,7 @@
 //! The server side: accept loop, control connections, pairing, RPC (SPEC.md §6–§8).
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,9 @@ pub const RPC_WORKERS: usize = 8;
 pub use crate::frame::{RPC_REPLY_MAX, RPC_REQUEST_MAX};
 /// The longest window `pairing.open` may ask for.
 pub const MAX_PAIRING_WINDOW_S: u16 = 600;
+/// Wrong pairing codes (SPEC.md §5.5) after which the window closes: it must be reopened
+/// from a paired device (or by restarting the node).
+pub const MAX_PAIR_FAILURES: u32 = 5;
 /// Connections one source address may hold (a session is 1 control + up to 8 lanes).
 pub const MAX_CONNS_PER_IP: usize = 12;
 /// Sessions that were welcomed during a pairing window but have not confirmed yet.
@@ -135,7 +138,9 @@ pub struct ServerCtx {
     notify: NotifyHook,
     last_notify: Mutex<Option<Instant>>,
     log: LogHook,
-    approve: PairHook,
+    /// An extra veto on top of the code check (never a substitute for it).
+    approve: Option<PairHook>,
+    pair_failures: AtomicU32,
     rpc: RpcHandler,
     /// Hosts data-plane jobs (SPEC.md §11); its presence advertises CAP_DATA_PLANE.
     jobs: Option<Arc<dyn JobHost>>,
@@ -162,7 +167,8 @@ impl ServerCtx {
             notify: Box::new(|_| {}),
             last_notify: Mutex::new(None),
             log: Box::new(|_| {}),
-            approve: Box::new(|_| true),
+            approve: None,
+            pair_failures: AtomicU32::new(0),
             rpc,
             jobs: None,
             mgmt: false,
@@ -233,13 +239,15 @@ impl ServerCtx {
         self
     }
 
-    /// Decides a PairConfirm (default: accept while the window is open).
+    /// An additional owner veto on a PairConfirm. The typed code is always checked first;
+    /// with no hook the code alone decides.
     pub fn with_approve(mut self, f: PairHook) -> Self {
-        self.approve = f;
+        self.approve = Some(f);
         self
     }
 
     pub fn open_pairing(&self, d: Duration) {
+        self.pair_failures.store(0, Ordering::SeqCst);
         *self.pairing_until.lock().unwrap() = Some(Instant::now() + d);
     }
 
@@ -274,6 +282,16 @@ impl ServerCtx {
             .is_some_and(|t| Instant::now() < t)
     }
 
+    /// Wrong codes seen since the window was last opened.
+    pub fn pair_failures(&self) -> u32 {
+        self.pair_failures.load(Ordering::SeqCst)
+    }
+
+    /// Whether `key` is a paired device.
+    pub fn knows(&self, key: &[u8; 32]) -> bool {
+        self.peers.lock().unwrap().contains(key)
+    }
+
     pub fn connections(&self) -> usize {
         self.conns.load(Ordering::SeqCst)
     }
@@ -302,12 +320,33 @@ impl ServerCtx {
         }
     }
 
-    /// Decides a PairConfirm. One window, one pairing: the window check, the store and
+    /// Decides a PairConfirm (SPEC.md §5.5, passkey entry): the code the user typed must
+    /// equal the one this side derived for this session, compared in constant time; a
+    /// missing or wrong code fails, is logged, and counts toward `MAX_PAIR_FAILURES`, at
+    /// which the window closes. One window, one pairing: the window check, the store and
     /// the closing of the window happen under one lock, so two devices confirming at the
-    /// same moment cannot both get in. The owner's approval (which may wait on a person)
-    /// is asked first, outside the lock, and the window checked again after it.
-    fn accept_pairing(&self, req: &PairRequest) -> bool {
-        if !self.pairing_open() || !(self.approve)(req) {
+    /// same moment cannot both get in. An owner hook (which may wait on a person) is asked
+    /// outside the lock, and the window checked again after it.
+    fn accept_pairing(&self, req: &PairRequest, typed: Option<u32>) -> bool {
+        if !self.pairing_open() {
+            return false;
+        }
+        let right = typed.is_some_and(|t| ct_eq_u32(t, req.code));
+        if !right {
+            let n = self.pair_failures.fetch_add(1, Ordering::SeqCst) + 1;
+            (self.log)(&format!(
+                "ava1: pairing refused: wrong or missing code from {} ({n} of {MAX_PAIR_FAILURES})",
+                req.peer_name
+            ));
+            // The next attempt shows a new code: it must not be swallowed by the rate limit.
+            *self.last_notify.lock().unwrap() = None;
+            if n >= MAX_PAIR_FAILURES {
+                self.close_pairing();
+                (self.log)("ava1: too many wrong pairing codes: the window is closed");
+            }
+            return false;
+        }
+        if self.approve.as_ref().is_some_and(|a| !a(req)) {
             return false;
         }
         let mut until = self.pairing_until.lock().unwrap();
@@ -340,6 +379,15 @@ impl ServerCtx {
         }
         (self.notify)(req);
     }
+}
+
+/// Constant-time equality of two codes: no early exit on the first differing byte.
+fn ct_eq_u32(a: u32, b: u32) -> bool {
+    a.to_le_bytes()
+        .iter()
+        .zip(b.to_le_bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// One connection's place in the global and per-address counts.
@@ -682,7 +730,13 @@ async fn control(
             }
             PairConfirm::TYPE => {
                 let already = entry.paired.load(Ordering::SeqCst);
-                let accepted = already || ctx.accept_pairing(&req);
+                // One attempt per session: whatever the outcome, a refusal ends it below.
+                let typed = if already {
+                    None
+                } else {
+                    f.decode::<PairConfirm>().ok().map(|c| c.code)
+                };
+                let accepted = already || ctx.accept_pairing(&req, typed);
                 entry.paired.store(accepted, Ordering::SeqCst);
                 if accepted && !already {
                     entry.unpaired.lock().unwrap().take();
