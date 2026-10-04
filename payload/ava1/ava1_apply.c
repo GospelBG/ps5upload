@@ -1066,16 +1066,67 @@ static int dirent_cmp(const void *a, const void *b) {
     return strcmp(((const ava1_dirent_t *)a)->dir, ((const ava1_dirent_t *)b)->dir);
 }
 
-int ava1_sync_dirset(ava1_job_t *j, ava1_dirent_t *d, uint32_t n, int hook_point) {
-    uint32_t i;
-    int rc = 0;
-    if (n) qsort(d, n, sizeof *d, dirent_cmp);
-    for (i = 0; i < n && !rc; i++) {
-        if (i && strcmp(d[i].dir, d[i - 1].dir) == 0) continue;
-        if (is_stopping(j)) rc = -1;
-        else if ((rc = sync_dir(d[i].dir)) == 0 && hook_point) HOOK(j, hook_point, d[i].id);
+/* A set of distinct directories to fsync, striped over the workers like the data fsyncs
+ * (review 003 §3.3 item 1: they used to run one after another on the job thread, ~3 ms each,
+ * tens of seconds in prepare and a good share of every batch on a game-sized tree). The
+ * directories are independent descriptors; each sync is the same call as before, so nothing
+ * about what is durable when changes. */
+typedef struct {
+    const ava1_dirent_t *d;
+    uint32_t n, stripes;
+    int hook, crash; /* the test hook point (0: none); crash after the first sync (tests) */
+    int err, cut;
+} dirset_t;
+
+static void dir_stripe(ava1_job_t *j, void *arg, uint32_t i) {
+    dirset_t *l = arg;
+    uint32_t k;
+    for (k = i; k < l->n; k += l->stripes) {
+        int e;
+        if (is_stopping(j) || __atomic_load_n(&l->cut, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&l->cut, 1, __ATOMIC_RELAXED);
+            return;
+        }
+        if ((e = sync_dir(l->d[k].dir)) != 0) {
+            __atomic_store_n(&l->err, e, __ATOMIC_RELAXED);
+            return;
+        }
+        if (l->hook) HOOK(j, l->hook, l->d[k].id);
+        if (l->crash) { /* tests: the power goes after one directory of the batch */
+            __atomic_store_n(&l->cut, 1, __ATOMIC_RELAXED);
+            ava1_apply_crash(j);
+            return;
+        }
     }
-    for (i = 0; i < n; i++) free(d[i].dir);
+}
+
+int ava1_sync_dirset(ava1_job_t *j, ava1_dirent_t *d, uint32_t n, int hook_point) {
+    uint32_t i, m = 0;
+    int rc = 0;
+    dirset_t l;
+    if (n) qsort(d, n, sizeof *d, dirent_cmp);
+    for (i = 0; i < n; i++) { /* distinct only, in place; the repeats' strings go now */
+        if (m && strcmp(d[i].dir, d[m - 1].dir) == 0) {
+            free(d[i].dir);
+            continue;
+        }
+        d[m++] = d[i];
+    }
+    memset(&l, 0, sizeof l);
+    l.d = d;
+    l.n = m;
+    l.hook = hook_point;
+    l.crash = hook_point == AVA1_HOOK_BATCH_DIR_SYNCED && ava1_data_cfg()->crash_at == AVA1_CRASH_MID_DIRS;
+    l.stripes = j->want_workers < m ? j->want_workers : m;
+    if (l.stripes >= 2 && m > 2) {
+        if (ava1_apply_parallel(j, dir_stripe, &l, l.stripes) != 0) rc = -1; /* stopping */
+    } else {
+        l.stripes = 1;
+        dir_stripe(j, &l, 0);
+    }
+    if (l.err) rc = l.err;
+    else if (!rc && (l.cut || (m && is_stopping(j)))) rc = -1;
+    for (i = 0; i < m; i++) free(d[i].dir);
     return rc;
 }
 
@@ -1223,6 +1274,10 @@ static void sync_batch(ava1_job_t *j) {
     }
     HOOK(j, AVA1_HOOK_BATCH_SYNCED, UINT32_MAX);
     u2 = mono_us();
+    if (cfg->crash_at == AVA1_CRASH_AFTER_DATA) {
+        ava1_apply_crash(j);
+        goto out;
+    }
     /* A new file's bytes are durable, its name only once its directory is synced. */
     if ((rc = sync_new_dirs(j, ids, n_small, newlf, nnew)) != 0) {
         if (rc > 0) ava1_apply_fail(j, AVA1_ERR_IO, "syncing a folder failed", rc, 0);

@@ -189,3 +189,136 @@ fn a_worker_commit_cut_between_rename_and_journal_loses_no_file() {
 fn a_worker_commit_cut_before_it_starts_loses_no_file() {
     worker_commit_crash("wcommit-before", 5); // AVA1_CRASH_BEFORE_COMMIT
 }
+
+fn small_dirs(ndirs: usize, per: usize) -> Manifest {
+    let mut entries = vec![];
+    for d in 0..ndirs {
+        entries.push(dir(&format!("d{d:02}")));
+        for i in 0..per {
+            entries.push(file(&format!("d{d:02}/f{i}"), 4));
+        }
+    }
+    Manifest { entries }
+}
+
+fn small_ids(ndirs: usize, per: usize) -> Vec<u32> {
+    (0..ndirs * (per + 1))
+        .filter(|i| i % (per + 1) != 0)
+        .map(|i| i as u32)
+        .collect()
+}
+
+fn body(id: u32) -> Vec<u8> {
+    format!("{id:04}").into_bytes()
+}
+
+#[test]
+fn a_batchs_directory_syncs_run_on_the_workers_not_the_job_thread() {
+    // Review 003 §3.3 item 1: sync_new_dirs fsynced every directory the batch touched serially
+    // on the job thread. They are striped over the workers like the data fsyncs.
+    let t = tmp("dirstripe");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let (nd, per) = (16usize, 2usize);
+    let m = small_dirs(nd, per);
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    job.hook_sleep(20);
+    job.hold_batches(true);
+    let ids = small_ids(nd, per);
+    for &id in &ids {
+        job.record(id, &body(id), *blake3::hash(&body(id)).as_bytes());
+    }
+    job.wait_pending(ids.len() as u32, 5000);
+    job.hold_batches(false);
+    assert_eq!(job.wait(15_000), 0, "{}", job.events());
+    let p = job.probe();
+    assert_eq!(p.batch_dir_syncs, nd as u64, "each directory once");
+    assert_eq!(
+        p.batch_dir_syncs_on_workers, p.batch_dir_syncs,
+        "ran on the job thread"
+    );
+    assert!(
+        p.batch_dir_sync_threads >= 2,
+        "all {} directory syncs ran on one thread",
+        p.batch_dir_syncs
+    );
+}
+
+#[test]
+fn prepares_directory_syncs_run_on_the_workers() {
+    // Review 003 §4 item 1: prepare fsynced each unique parent serially before the map was sent.
+    let t = tmp("prepstripe");
+    let mut entries = vec![];
+    for d in 0..24 {
+        entries.push(dir(&format!("p{d:02}")));
+        entries.push(dir(&format!("p{d:02}/c")));
+    }
+    let m = Manifest { entries };
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 0);
+    r.hook_sleep(20);
+    r.manifest(&m);
+    r.wait_event("map status=0", 15_000);
+    let (calls, on_workers, threads) = r.probe_prepare_dirs();
+    assert!(calls >= 24, "{calls} directory syncs in prepare");
+    assert_eq!(
+        on_workers, calls,
+        "prepare synced directories on its own thread"
+    );
+    assert!(threads >= 2, "one thread did every directory sync");
+}
+
+/// A crash with directories not (all) synced must journal and acknowledge nothing: the resumed
+/// job resends every file. (Crash 8: after the data fsync, before any directory. Crash 9: after
+/// the first directory, before the rest.)
+fn dir_crash(tag: &str, crash_at: i32) {
+    let t = tmp(tag);
+    let (nd, per) = (6usize, 3usize);
+    let m = small_dirs(nd, per);
+    let ids = small_ids(nd, per);
+    let r = CRecv::open(
+        &t.join("jobs"),
+        &t.join("dest"),
+        0,
+        gen::POLICY_REPLACE,
+        crash_at,
+    );
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    r.hold_batches(true);
+    for &id in &ids {
+        r.record(id, &body(id), *blake3::hash(&body(id)).as_bytes());
+    }
+    r.wait_pending(ids.len() as u32, 5000);
+    r.hold_batches(false);
+    r.wait_stopped(10_000);
+    let r = r.restart(0);
+    r.manifest(&m);
+    let ev = r.wait_event("map status=0", 5000);
+    assert!(
+        done_ids(&ev).is_empty(),
+        "crash {crash_at}: the journal named files whose directories were not synced: {ev}"
+    );
+    for &id in &ids {
+        r.record(id, &body(id), *blake3::hash(&body(id)).as_bytes());
+    }
+    assert_eq!(r.wait(15_000), 0, "{}", r.events());
+    for d in 0..nd {
+        for i in 0..per {
+            let id = (d * (per + 1) + 1 + i) as u32;
+            assert_eq!(
+                std::fs::read(t.join(format!("dest/d{d:02}/f{i}"))).unwrap(),
+                body(id)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_crash_after_the_data_sync_before_the_directories_journals_nothing() {
+    dir_crash("crash-data", 8);
+}
+
+#[test]
+fn a_crash_between_a_batchs_directory_syncs_journals_nothing() {
+    dir_crash("crash-middirs", 9);
+}

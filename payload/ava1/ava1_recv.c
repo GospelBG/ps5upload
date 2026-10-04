@@ -876,7 +876,7 @@ static uint16_t prepare(ava1_job_t *j, char *msg, size_t cap) {
                 status = AVA1_ERR_IO;
             }
         }
-        rc = ava1_sync_dirset(j, d, nd, 0); /* frees the strings */
+        rc = ava1_sync_dirset(j, d, nd, AVA1_HOOK_PREP_DIR_SYNCED); /* frees the strings */
         free(d);
         if (status != AVA1_STATUS_OK) return status;
         if (rc) {

@@ -1293,17 +1293,46 @@ static void dir_hook_note(ava1_job_t *j, int which) {
     pthread_mutex_unlock(&g_dir_mu);
     if (g_hook_sleep_ms) ava1_platform_sleep_ms(g_hook_sleep_ms);
 }
+typedef struct {
+    ava1_job_t *j;
+    int acquired, refs;
+} pre_watch_t;
+
+static void *pre_watcher(void *arg) {
+    pre_watch_t *w = arg;
+    pthread_mutex_lock(&w->j->mu);
+    __atomic_store_n(&w->acquired, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&w->j->mu);
+    if (__atomic_sub_fetch(&w->refs, 1, __ATOMIC_SEQ_CST) == 0) free(w);
+    return NULL;
+}
+
 static void t_hook(ava1_job_t *j, int point, uint32_t id) {
-    if (point == AVA1_HOOK_PREALLOC) {
-        /* Called right before the preallocation: the job mutex must NOT be held here. */
-        __atomic_add_fetch(&g_pre_calls, 1, __ATOMIC_SEQ_CST);
-        if (pthread_mutex_trylock(&j->mu) != 0) __atomic_add_fetch(&g_pre_held, 1, __ATOMIC_SEQ_CST);
-        else pthread_mutex_unlock(&j->mu);
-    }
     if (point == __atomic_load_n(&g_arm_point, __ATOMIC_SEQ_CST)) { /* fsync fault, armed for this point */
         ava1_fsync_test_errno = g_arm_errno;
         __atomic_store_n(&ava1_fsync_test_fail_n, g_arm_n, __ATOMIC_SEQ_CST);
         __atomic_store_n(&g_arm_point, -1, __ATOMIC_SEQ_CST);
+    }
+    if (point == AVA1_HOOK_PREALLOC) {
+        /* Called right before the preallocation. A watcher thread takes j->mu while this one
+         * waits 40 ms: if the mutex is held by this thread the watcher cannot get it in that
+         * time (another worker holding it briefly cannot take 40 ms). */
+        pre_watch_t *w = calloc(1, sizeof *w);
+        pthread_t th;
+        __atomic_add_fetch(&g_pre_calls, 1, __ATOMIC_SEQ_CST);
+        if (w) {
+            w->j = j;
+            w->refs = 2;
+            if (pthread_create(&th, NULL, pre_watcher, w) == 0) {
+                pthread_detach(th);
+                ava1_platform_sleep_ms(40);
+                if (!__atomic_load_n(&w->acquired, __ATOMIC_SEQ_CST))
+                    __atomic_add_fetch(&g_pre_held, 1, __ATOMIC_SEQ_CST);
+                if (__atomic_sub_fetch(&w->refs, 1, __ATOMIC_SEQ_CST) == 0) free(w);
+            } else {
+                free(w);
+            }
+        }
     }
     if (point == AVA1_HOOK_BATCH_DIR_SYNCED) dir_hook_note(j, 0);
     if (point == AVA1_HOOK_PREP_DIR_SYNCED) dir_hook_note(j, 1);

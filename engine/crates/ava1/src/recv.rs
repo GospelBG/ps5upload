@@ -191,6 +191,45 @@ fn flush_drive_cache(_f: &std::fs::File) -> io::Result<()> {
     Ok(())
 }
 
+/// fsyncs each directory (so the new names are durable). They are independent descriptors, so
+/// a game-sized tree's tens of directories go four at a time instead of one after another
+/// (review 003 §3.3 item 1, the engine's side of the console's striped directory syncs).
+#[cfg(unix)] // a directory cannot be opened for sync on Windows
+fn sync_dirs(dirs: &BTreeSet<PathBuf>) -> io::Result<()> {
+    const WAYS: usize = 4;
+    let list: Vec<&PathBuf> = dirs.iter().collect();
+    if list.len() <= 2 {
+        return list
+            .iter()
+            .try_for_each(|d| sys_fsync(&std::fs::File::open(d)?));
+    }
+    let mut first_err: Option<io::Error> = None;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..WAYS.min(list.len()))
+            .map(|k| {
+                let list = &list;
+                s.spawn(move || {
+                    list.iter()
+                        .skip(k)
+                        .step_by(WAYS)
+                        .try_for_each(|d| sys_fsync(&std::fs::File::open(d)?))
+                })
+            })
+            .collect();
+        for h in handles {
+            if let Err(e) = h.join().expect("a directory sync thread panicked") {
+                first_err.get_or_insert(e);
+            }
+        }
+    });
+    first_err.map_or(Ok(()), Err)
+}
+
+#[cfg(not(unix))]
+fn sync_dirs(_dirs: &BTreeSet<PathBuf>) -> io::Result<()> {
+    Ok(())
+}
+
 impl Sink for LocalSink {
     fn prepare(&self, m: &Manifest) -> io::Result<()> {
         let mut st = self.st.lock().unwrap();
@@ -240,13 +279,7 @@ impl Sink for LocalSink {
         if let Some(f) = files.last() {
             flush_drive_cache(f)?;
         }
-        #[cfg(unix)] // a directory cannot be opened for sync on Windows
-        for d in &dirs {
-            sys_fsync(&std::fs::File::open(d)?)?;
-        }
-        #[cfg(not(unix))]
-        let _ = dirs;
-        Ok(())
+        sync_dirs(&dirs)
     }
 
     fn read_at(&self, id: u32, off: u64, buf: &mut [u8]) -> io::Result<usize> {
@@ -1764,6 +1797,31 @@ fn subtract(set: &RangeSet, from: u64, to: u64) -> RangeSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_syncs_cover_every_directory_and_report_a_failure() {
+        let t = std::env::temp_dir().join(format!("ava1-syncdirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let dirs: BTreeSet<PathBuf> = (0..37)
+            .map(|i| {
+                let d = t.join(format!("d{i:02}"));
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            })
+            .collect();
+        sync_dirs(&dirs).unwrap();
+        let mut one_gone = dirs.clone();
+        one_gone.insert(t.join("missing"));
+        assert!(
+            sync_dirs(&one_gone).is_err(),
+            "a directory that cannot be opened is an error"
+        );
+        let two: BTreeSet<PathBuf> = dirs.iter().take(2).cloned().collect();
+        sync_dirs(&two).unwrap();
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
     use crate::conn::{FrameReader, FrameWriter};
     use crate::manifest::Entry;
     use crate::router::{ConnTx, Router};

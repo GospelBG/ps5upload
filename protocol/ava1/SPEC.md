@@ -753,11 +753,27 @@ final relative path inside the staging tree, so the file's own commit renames no
 outboard that is missing at commit time is a reset (`FileRetry` `RETRY_IO`), never a new empty
 file.
 
+A receiver opens and preallocates a new part file (so that ENOSPC is found first, and so that a
+sparse file cannot collapse the drive's write rate under dirty-buffer throttling) without
+holding the job's lock, and runs a commit on a worker rather than on the thread that batches
+fsyncs. Journal appends from several commits and a batch are serialised, so their records land in
+some order; each is independent, since a commit's record names one file and only follows that
+file's rename and directory fsync. A journal compaction waits until no commit is between its
+rename and its record.
+
 15.4 Sync batches: every 250 ms, or after `batch_max` small files (tuned 16–512, starting 256:
 halved when a batch takes over 1.5 s, doubled when under 0.5 s) or 64 MiB of large-file bytes.
-Data fsyncs run in parallel on the workers, then the new directories are fsynced, then the
-batch (`JnlBatch`) is appended and the durable ranges are reported. A stop in the middle of a
-sync journals and acknowledges nothing.
+Data fsyncs run in parallel on the workers, then the new directories are fsynced (also in
+parallel on the workers: each is an independent descriptor, and a directory is synced once per
+batch however many files it gained), then the batch (`JnlBatch`) is appended and the durable
+ranges are reported. A stop in the middle of a sync journals and acknowledges nothing.
+
+The directory-sync invariant (the journal never runs ahead of a name): a `JnlBatch` naming a
+file is appended only after every directory that gained an entry in that batch has returned from
+`fsync`, and a prepare's new directories are likewise all synced before the map is sent. The
+syncs are never deferred past the record; a crash with some of them still to do therefore leaves
+no record naming those files, and the resumed job resends them. A receiver may run the syncs in
+any order and on any threads, but not after the append.
 
 15.5 Staging and merge: a new destination is staged — the tree is written to `<root>.ava-part`,
 a sibling of the destination, while `<root>` itself is created as an empty lock folder; at the
