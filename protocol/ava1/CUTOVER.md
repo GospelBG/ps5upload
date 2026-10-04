@@ -170,8 +170,11 @@ kept.
       download fix `b1be8059`), and the Phat never ran part 2. Re-run the whole table on both, on all
       three drives each (Pro: `/data`, `/mnt/usb0`, `/mnt/ext1`; Phat: `/data`, `/mnt/usb0`,
       `/mnt/ext0`).
-- [ ] **The engine's `auto` mode must not ship before that pass is green.** Until then the default
-      stays FTX2 for any release that goes to users.
+- [ ] **No release from this branch until the §3 gates are green; the last FTX2 release remains the
+      shipped version until then** (review 007 #2, option a). AVA1 is the only transport in this branch
+      (there is no in-branch fallback or kill-switch), so the hardware pass below is a hard gate, not a
+      default to flip: users stay on the last FTX2 release, and nothing is published from here until every
+      box in this section is checked on one commit.
 - [ ] **The Pro outage of 2026-10-03 is investigated.** At about 09:10 the Pro stopped answering ping and
       every port shortly after an instrumented helper (extra stderr timing lines only) was sent;
       the last keep-awake acknowledgement was 09:10:50. Cause unknown: the console may have gone to
