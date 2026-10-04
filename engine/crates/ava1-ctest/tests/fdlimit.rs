@@ -176,4 +176,6 @@ async fn two_thousand_large_files_stay_within_the_fd_budget() {
         peak > 0 && peak <= 16,
         "large files held {peak} descriptors at once (budget 64, cap 16)"
     );
+    // 2 x 500 MiB of scratch: do not leave it behind
+    let _ = std::fs::remove_dir_all(&d);
 }
