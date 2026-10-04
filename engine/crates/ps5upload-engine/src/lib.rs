@@ -104,9 +104,9 @@ use ps5upload_core::{
         power_telemetry, system_control, PowerAction, PowerTelemetry, SystemControlAck,
     },
     transfer::{
-        inspect_7z, inspect_zip, sevenz_plan_preview, transfer_7z_resumable,
-        transfer_file_list_multistream, transfer_file_list_resumable, zip_plan_preview,
-        FileListEntry, TransferConfig, DEFAULT_RESUME_RETRIES, TX_FLAG_RESUME,
+        inspect_7z, inspect_zip, sevenz_plan_preview, transfer_file_list_multistream,
+        transfer_file_list_resumable, zip_plan_preview, FileListEntry, TransferConfig,
+        DEFAULT_RESUME_RETRIES, TX_FLAG_RESUME,
     },
     users::{user_list, UserList},
     volumes::{list_volumes, VolumeList},
@@ -7545,11 +7545,6 @@ async fn transfer_7z_handler(
         Ok(id) => id,
         Err(e) => return json_err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    let initial_flags = if caller_supplied_tx_id {
-        TX_FLAG_RESUME
-    } else {
-        0
-    };
 
     let plan_started = std::time::Instant::now();
     let (total_bytes, preview) = {
@@ -7657,12 +7652,10 @@ async fn transfer_7z_handler(
         cfg.progress_bytes_finalized = Some(Arc::clone(&progress_bytes_finalized));
         cfg.progress_live = Some(live_notes_for(job_id));
         apply_per_request_bandwidth(&mut cfg, req.bandwidth_cap_mbps);
-        // 1 fresh attempt + DEFAULT_RESUME_RETRIES resumes, matching the file
-        // and folder routes. The archive routes used to hard-code 2, so a
-        // mid-transfer stall on a console that recovers in ~10 s (a Wi-Fi
-        // blip, or the payload's serial accept loop still draining the dropped
-        // connection) burned both retries inside the first 1.5 s of backoff
-        // and surfaced as "transfer_zip gave up after 2 retries".
+        if fail_job_unless_console_ready(&jobs, &events_tx, job_id, started_at_ms, &addr) {
+            fail_guard.mark_succeeded();
+            return;
+        }
         if fail_job_if_capacity_insufficient(
             &jobs,
             &events_tx,
@@ -7676,37 +7669,27 @@ async fn transfer_7z_handler(
             fail_guard.mark_succeeded();
             return;
         }
-        let ftx2 = |reason: Option<&str>| {
-            let mut r = transfer_7z_resumable(
-                &cfg,
-                tx_id,
-                &req.dest_root,
-                std::path::Path::new(&req.archive_path),
-                DEFAULT_RESUME_RETRIES,
-                initial_flags,
-            )?;
-            r.commit_ack_body = tag_ack_body(&r.commit_ack_body, "ftx2", reason);
-            Ok::<_, anyhow::Error>(r)
-        };
-        let result = if ps5upload_ava1::route::use_ava1(&addr) {
-            match ps5upload_ava1::upload::upload_7z(
-                &cfg,
-                tx_id,
-                &req.dest_root,
-                std::path::Path::new(&req.archive_path),
-            ) {
-                Err(e)
-                    if e.downcast_ref::<ps5upload_ava1::upload::SevenzUnsupported>()
-                        .is_some() =>
-                {
-                    crate::log_info!("transfer_7z: AVA1 fallback to FTX2: {e}");
-                    ftx2(Some("7z_unsupported_by_ava1"))
-                }
-                other => other,
+        // Resume is by job_id (the sender reopens with JobOpen); retries live in the
+        // adapter's loop. An archive AVA1 cannot read (encryption, a feature the decoder lacks)
+        // is a failure with its own reason: there is no other transport to hand it to.
+        let result = ps5upload_ava1::upload::upload_7z(
+            &cfg,
+            tx_id,
+            &req.dest_root,
+            std::path::Path::new(&req.archive_path),
+        )
+        .map_err(|e| {
+            if e.downcast_ref::<ps5upload_ava1::upload::SevenzUnsupported>()
+                .is_some()
+            {
+                anyhow::Error::from(ps5upload_ava1::upload::UploadFailure {
+                    reason: "7z_unsupported".into(),
+                    detail: format!("{e}"),
+                })
+            } else {
+                e
             }
-        } else {
-            ftx2(Some("ava1_unavailable"))
-        };
+        });
         match result {
             Ok(r) => {
                 let completed_at_ms = now_ms();

@@ -58,3 +58,7 @@ russh-sftp = "3"
 # ps5upload-core gates it: the Android cross-compile stays pure Rust.
 [target.'cfg(not(target_os = "android"))'.dependencies]
 ureq = { version = "3", features = ["rustls"] }
+
+[dev-dependencies]
+# Writes the tiny archives the no-helper tests plan against (the decode side is ps5upload-core's).
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["compress"] }
