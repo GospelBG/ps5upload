@@ -29,7 +29,7 @@ typedef struct ava1_job ava1_job_t;
 typedef void (*ava1_emit_fn)(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len);
 
 /* A frame waiting for a job (Task 14): a lane frame held until the job's map is out, or a
- * control frame for the job's feeder thread. `body` is malloc'd and owned. */
+ * control frame for the job's feeder thread. `body` is owned: malloc'd, or a pool buffer when `cap` != 0. */
 typedef struct ava1_inframe {
     struct ava1_inframe *next;
     uint8_t type;
@@ -37,6 +37,7 @@ typedef struct ava1_inframe {
     uint32_t seq;
     size_t len;
     uint8_t *body;
+    size_t cap; /* 0: malloc'd; else the pool capacity ava1_frame_free takes (review 003 section 3) */
 } ava1_inframe_t;
 
 typedef struct {        /* one large file being assembled */
@@ -74,6 +75,7 @@ typedef struct ava1_work { /* a unit for the worker pool */
     uint8_t kind;          /* AVA1_W_CHUNK, AVA1_W_BUNDLE, AVA1_W_CALL */
     uint8_t *owned;        /* freed after apply; its size is returned as credit */
     size_t owned_len;
+    size_t owned_cap;      /* nonzero: a frame-pool buffer (ava1_frame_free) */
     uint32_t file_id;
     uint64_t offset;
     const uint8_t *data;
@@ -87,6 +89,7 @@ struct ava1_job {
     uint8_t id[16], owner[32], sid[16];
     int attached, refs, stopping, finished, prepared;
     uint64_t parked_at_ms;
+    int op_delivered;               /* an operation job: its terminal status was first delivered at parked_at_ms (the grace starts) */
     uint8_t kind, policy;
     uint32_t flags;
     int staged;

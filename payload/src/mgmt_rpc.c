@@ -265,8 +265,9 @@ static int legacy_call(mgmt_ctx_t *cx, mgmt_legacy_fn fn, const char *req, size_
                 mgmt_reply_error(cx, st, token);
             }
         } else {
-            /* the whole body (err, errno, reason, codes) when it fits a cause, else its token */
-            mgmt_reply_error(cx, st, c.len <= MGMT_CAUSE_MAX ? (const char *)c.buf : token);
+            /* the whole body (err, errno, reason, codes) when it fits a cause, else its token; a
+             * probe's refusal is a malformed request, whose token is the whole story */
+            mgmt_reply_error(cx, st, mode != LC_PROBE && c.len <= MGMT_CAUSE_MAX ? (const char *)c.buf : token);
         }
         free(c.buf);
         return st;
@@ -438,6 +439,19 @@ int mgmt_call_text_keep(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_leg
     rc = mgmt_reply_text(cx, (const char *)rep.body, rep.len, -1);
     mgmt_reply_free(&rep);
     return rc;
+}
+
+/* A method whose answer is empty (node.shutdown): the handler's body is dropped. */
+int mgmt_call_empty(const uint8_t *req, uint32_t n, mgmt_ctx_t *cx, mgmt_legacy_fn fn) {
+    mgmt_reply_t rep;
+    int rc;
+    (void)req;
+    (void)n;
+    rc = mgmt_legacy_call(cx, fn, "", 0, 4096, &rep);
+    if (rc != AVA1_STATUS_OK) return rc;
+    mgmt_reply_free(&rep);
+    cx->out_len = 0;
+    return AVA1_STATUS_OK;
 }
 
 /* A paged text method: the request body is {"offset":N,"limit":M} (both optional); the reply

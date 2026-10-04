@@ -40,8 +40,8 @@ struct Rig {
 }
 
 fn rig_lock() -> MutexGuard<'static, ()> {
-    static L: Mutex<()> = Mutex::new(());
-    L.lock().unwrap_or_else(|e| e.into_inner())
+    // one serialisation scheme for every shim-global test: the shared guard (src/lib.rs)
+    CServer::lock_for_shim_tests()
 }
 
 async fn rig(tag: &str) -> (Rig, Session) {

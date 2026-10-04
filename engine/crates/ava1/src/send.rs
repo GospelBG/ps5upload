@@ -19,7 +19,7 @@ use crate::gen::{
     self, Bundle, BundleRecord, Chunk, Credit, Durable, FileRetry, FileRoot, JobDone, JobMap,
     JobOpen, JobOpenAck, ManifestEnd, Received, Status,
 };
-use crate::governor::{self, Class, Governor, Mode, Sample};
+use crate::governor::{self, Class, Governor, GovernorOptions, JobSummary, Mode, Sample};
 use crate::manifest::Manifest;
 use crate::ranges::{from_runs, Need, RangeSet};
 use crate::router::{ConnTx, Inbound, JobLink, LaneTx};
@@ -87,10 +87,15 @@ pub struct Progress {
     pub skipped_files: AtomicU64,
     pub skipped_bytes: AtomicU64,
     pub skip_recorded: AtomicBool,
-    /// The receiver's JobDone said files are still being made durable in place (SPEC.md §15.7); true
-    /// while the sender waits for its Status to report `unswept` = 0 (bounded by `SETTLE_MAX`).
+    /// Sequential sources (7z/RAR resume): 1 while the decoder discards data the receiver
+    /// already holds (`skip_done_bytes` of `skip_total_bytes`), else 0.
+    pub phase: AtomicU8,
+    pub skip_done_bytes: AtomicU64,
+    pub skip_total_bytes: AtomicU64,
+    /// Files are still settling on the receiver after the job's last byte (it reports
+    /// unswept files); false until the receiver says so.
     pub settling: AtomicBool,
-    /// The receiver's last reported `unswept` count.
+    /// The receiver's last reported `unswept` count while the sender waits for it to settle.
     pub unswept: AtomicU32,
 }
 
@@ -891,7 +896,8 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
                     s.next_seq += 1;
                     let seq = s.next_seq;
                     let ty = f.ty;
-                    let body = (*f.body).clone();
+                    // Shared, not copied: the frame stays in `inflight` for a resend.
+                    let body = f.body.clone();
                     if f.class == Class::Bundle {
                         s.bundles_inflight += 1;
                     }
@@ -959,7 +965,7 @@ async fn lane_task(lane: LaneTx, sh: Arc<Shared>, cap_bps: Option<u64>, stop: Ar
             continue;
         };
         if let Some(bps) = cap_bps {
-            sent_bytes += body.len() as u64;
+            sent_bytes += body.len() as u64; // plaintext bytes, as before
             let due = Duration::from_secs_f64(sent_bytes as f64 / bps as f64);
             if let Some(wait) = due.checked_sub(started.elapsed()) {
                 tokio::time::sleep(wait).await;
@@ -1125,8 +1131,11 @@ pub async fn run_upload(
         bytes_budget: Arc::new(Semaphore::new(READ_AHEAD_KIB as usize)),
         stall: Mutex::new(None),
     });
-    let mut gov = Governor::new();
+    // `PS5UPLOAD_AVA1_LANES` / `_CHUNK` pin the governor (benchmarking only).
+    let mut gov = Governor::with_options(GovernorOptions::from_env());
     let first = gov.tick(&Sample::default());
+    sh.chunk.store(first.chunk, Ordering::Relaxed);
+    let mut summary = JobSummary::default();
     sh.sched.lock().unwrap().decision = Some(first);
     let small_q = Arc::new(Mutex::new(small));
     let large_q = Arc::new(Mutex::new(large));
@@ -1512,6 +1521,7 @@ pub async fn run_upload(
                     }
                 };
                 let d = gov.tick(&sample);
+                summary.observe(&sample, &d);
                 sh.chunk.store(d.chunk, Ordering::Relaxed);
                 sh.bundle.store(d.bundle, Ordering::Relaxed);
                 sh.sched.lock().unwrap().decision = Some(d);
@@ -1564,6 +1574,11 @@ pub async fn run_upload(
     }
     for h in readers {
         let _ = h.await;
+    }
+    if let Some(line) = summary.line() {
+        use std::io::Write;
+        // writeln!, not eprintln!: a dead parent's closed stderr must not panic the engine.
+        let _ = writeln!(std::io::stderr(), "{line}");
     }
     result
 }
@@ -2718,10 +2733,30 @@ mod tests {
         let lane_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let ls = lane_seen.clone();
         tokio::spawn(async move {
-            let mut peer = FrameReader::new(cbr);
-            peer.set_max_body(crate::frame::MAX_BODY);
-            let mut lane_peer = FrameReader::new(lbr);
-            lane_peer.set_max_body(crate::frame::MAX_BODY);
+            // `FrameReader::recv` is not cancel-safe (a cancelled read loses the bytes it
+            // already took, and the next frame starts mid-body: BadMagic). The select!
+            // below cancels whichever branch loses, so each reader runs in its own task and
+            // the branches wait on a channel, which is. Capacity 1 keeps the backpressure the
+            // full-outbox test relies on while the control read is held.
+            fn pump<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+                r: R,
+            ) -> mpsc::Receiver<Result<Frame, ()>> {
+                let (tx, rx) = mpsc::channel(1);
+                tokio::spawn(async move {
+                    let mut reader = FrameReader::new(r);
+                    reader.set_max_body(crate::frame::MAX_BODY);
+                    loop {
+                        let f = reader.recv().await.map_err(|_| ());
+                        let end = f.is_err();
+                        if tx.send(f).await.is_err() || end {
+                            return;
+                        }
+                    }
+                });
+                rx
+            }
+            let mut peer = pump(cbr);
+            let mut lane_peer = pump(lbr);
             let mut peer_w = FrameWriter::new(cbw);
             let cancel_seen = rcv.cancel_seen.clone();
             // The control-read hold (the full-outbox case) and the Status flood that
@@ -2735,7 +2770,7 @@ mod tests {
                 tokio::select! {
                     f = async {
                         (&mut control_hold).await;
-                        peer.recv().await
+                        peer.recv().await.unwrap_or(Err(()))
                     } => match f {
                         Ok(f) if f.ty == JobOpen::TYPE => {
                             let open: JobOpen = f.decode().unwrap();
@@ -2806,7 +2841,7 @@ mod tests {
                         }).await;
                         flood.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(1));
                     }
-                    f = lane_peer.recv() => match f {
+                    f = async { lane_peer.recv().await.unwrap_or(Err(())) } => match f {
                         Ok(f) if is_data_type(f.ty) => {
                             let n = ls.fetch_add(1, Ordering::Relaxed);
                             let payload = f.decode::<Chunk>().map(|c| c.data.len() as u64).unwrap_or(0);

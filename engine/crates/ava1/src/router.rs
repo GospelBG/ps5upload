@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use crate::conn::Frame;
+use crate::conn::{Frame, FrameBody};
 use crate::frame::FLAG_IGNORABLE;
 use crate::link::{Outbox, DELIVER_DEPTH};
 use crate::wire::FrameMessage;
@@ -57,7 +57,7 @@ impl ConnTx {
         ty: u8,
         flags: u8,
         channel: u32,
-        body: Vec<u8>,
+        body: impl Into<FrameBody>,
     ) -> Result<(), Ava1Error> {
         self.outbox.send_frame(ty, flags, channel, body).await
     }
@@ -70,7 +70,7 @@ impl ConnTx {
         ty: u8,
         flags: u8,
         channel: u32,
-        body: Vec<u8>,
+        body: impl Into<FrameBody>,
         taken: Arc<AtomicBool>,
     ) -> Result<(), Ava1Error> {
         self.outbox

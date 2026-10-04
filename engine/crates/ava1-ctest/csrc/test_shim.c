@@ -14,10 +14,12 @@
 #include <unistd.h>
 
 #include "ava1_apply.h"
+#include "ava1_stop.h"
 #include "ava1_copy.h"
 #include "ava1_recv.h"
 #include "ava1_conn.h"
 #include "ava1_data.h"
+#include "ava1_frame.h"
 #include "ava1_platform.h"
 
 #include "ava1_gen.h"
@@ -29,6 +31,7 @@
 #include "ava1_server.h"
 #include "ava1_thread.h"
 #include "mgmt_rpc.h"
+#include "path_policy.h"
 #include "ava1_op.h"
 #include "fs_jobs.h"
 #include "net_probe.h"
@@ -409,6 +412,16 @@ static int stack_probe(uint8_t *out, size_t cap, size_t *out_len) {
     return AVA1_STATUS_OK;
 }
 
+static void fire_payload_stop(void *arg) {
+    (void)arg;
+    (void)ava1_payload_stop(2000, 2000);
+}
+
+/* Off by default: only the Task 8 shutdown tests answer node.shutdown here (the shape of runtime.c's
+ * handle_node_shutdown); every other test reaches its installed management table. */
+static int g_intercept_shutdown;
+void ava1_test_intercept_shutdown(int on) { __atomic_store_n(&g_intercept_shutdown, on, __ATOMIC_SEQ_CST); }
+
 static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap,
                size_t *out_len) {
     ava1_node_info_t ni;
@@ -426,6 +439,11 @@ static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t 
     }
     if (method == 0x7703) { /* ava1_rpc_text into a 16-byte window: "%s" of the request body */
         return ava1_rpc_text(out, 16, out_len, "%.*s", (int)body_len, (const char *)body);
+    }
+    if (method == AVA1_METHOD_NODE_SHUTDOWN && __atomic_load_n(&g_intercept_shutdown, __ATOMIC_SEQ_CST)) {
+        if (ava1_shutdown_defer(300, fire_payload_stop, NULL) != 0) return AVA1_ERR_INTERNAL;
+        *out_len = 0; /* SPEC: node.shutdown answers an empty body (mgmt_call_empty) */
+        return AVA1_STATUS_OK;
     }
     if (method == 19) return stack_probe(out, cap, out_len); /* a 256 KiB-class method (the data plane's number) */
     if (method != AVA1_METHOD_NODE_INFO) return mgmt_rpc_dispatch(method, body, body_len, out, cap, out_len);
@@ -589,7 +607,7 @@ static int echo_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
         rc = echo_send(sid, AVA1_TYPE_RECEIVED, enc_received, &r) != 0 ||
              echo_send(sid, AVA1_TYPE_CREDIT, enc_credit, &cr) != 0;
     }
-    free(body);
+    (void)ava1_frame_free(body, ava1_frame_cap(len)); /* the server read it into a pool buffer */
     return rc;
 }
 
@@ -1516,6 +1534,14 @@ static int t_allow(const char *p) {
 /* The data layer's may_read hook (downloads): a test flips it through the FFI setter. */
 static int g_allow_read = 1;
 void ava1_test_set_allow_read(int v) { __atomic_store_n(&g_allow_read, v, __ATOMIC_SEQ_CST); }
+/* Review S2: the data layer's refuse_link hook, wired to the real shared policy when a test names a protected
+ * directory (NULL turns it off). */
+static int g_protect_links;
+void ava1_test_set_protected(const char *dir) {
+    path_policy_set_protected(dir);
+    __atomic_store_n(&g_protect_links, dir != NULL, __ATOMIC_SEQ_CST);
+}
+static int t_refuse_link(const char *p) { return __atomic_load_n(&g_protect_links, __ATOMIC_SEQ_CST) && path_tree_op_refused(p); }
 static int t_allow_read(const char *p, int u) {
     (void)p;
     (void)u;
@@ -1609,6 +1635,7 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
     snprintf(cfg.jobs_dir, sizeof cfg.jobs_dir, "%s", jobs_dir);
     cfg.may_write = t_allow;
     cfg.may_read = t_allow_read;
+    cfg.refuse_link = t_refuse_link;
     cfg.same_device = t_same_device;
     cfg.fsync_delay_us = fsync_delay_us;
     cfg.crash_at = crash_at;
@@ -1848,6 +1875,7 @@ int ava1_test_recv_open(const char *jobs_dir, const char *root, uint32_t flags, 
     snprintf(g_cfg.jobs_dir, sizeof g_cfg.jobs_dir, "%s", jobs_dir);
     g_cfg.may_write = t_allow;
     g_cfg.may_read = t_allow_read;
+    g_cfg.refuse_link = t_refuse_link;
     g_cfg.same_device = t_same_device;
     apply_opts(&g_cfg);
     snprintf(g_root, sizeof g_root, "%s", root);
@@ -1885,6 +1913,13 @@ int ava1_test_recv_end(uint32_t files, uint64_t bytes, const uint8_t hash[32]) {
 }
 
 int ava1_test_recv_resume(const uint8_t hash[32]) { return ava1_recv_resume(g_job, hash); }
+
+/* Holds job.run's reply until the operation it started has finished: the race where an op ends
+ * while its "running" reply is being built (it must stay listed for the next job.status). */
+static void wait_op_finished(ava1_job_t *j) {
+    for (int i = 0; i < 2000 && !__atomic_load_n(&j->finished, __ATOMIC_ACQUIRE); i++) usleep(1000);
+}
+void ava1_test_op_hold_reply_until_finished(int on) { ava1_op_test_pre_encode = on ? wait_op_finished : NULL; }
 
 int ava1_test_job_stopped(void) {
     int s;
@@ -2074,6 +2109,7 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "%s", jobs_dir);
     dc.may_write = t_allow;
     dc.may_read = t_allow_read;
+    dc.refuse_link = t_refuse_link;
     dc.same_device = t_same_device;
     dc.fsync_delay_us = fsync_delay_us;
     apply_opts(&dc);
@@ -2112,6 +2148,11 @@ void ava1_test_server_stop_data(void) {
     ava1_server_stop();
     ava1_data_stop();
 }
+
+#include "sony_api_lock.h"
+int ava1_test_payload_stop(int conn_ms, int sony_ms) { return ava1_payload_stop(conn_ms, sony_ms); }
+void ava1_test_sony_lock(void) { pthread_mutex_lock(&sony_api_lock); }
+void ava1_test_sony_unlock(void) { pthread_mutex_unlock(&sony_api_lock); }
 
 /* UINT32_MAX keeps a value. */
 void ava1_test_data_delays(uint32_t open_ms, uint32_t map_ms) {

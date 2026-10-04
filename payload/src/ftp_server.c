@@ -2,6 +2,7 @@
 
 #include "ftp_format.h"
 #include "cross_device.h"
+#include "path_policy.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -262,6 +263,16 @@ static void abs_path(struct ftp_session *s, const char *arg, char *out, size_t c
     } else {
         snprintf(out, cap, "%s%s", s->root, normalized);
     }
+    /* The AVA1 trust store (identity, paired peers) is not served over FTP, whatever the root is and
+     * however the path is spelled or linked: a path in or above it becomes a name that cannot exist. */
+    if (path_in_protected(out)) snprintf(out, cap, "%s", "/.ps5upload-denied");
+}
+
+/* Rename, delete and rmdir of the AVA1 trust store's directory OR OF AN ANCESTOR of it (moving or
+ * replacing /data/ps5upload moves or replaces ava/{identity,peers}) are refused. abs_path already
+ * turns paths inside the store into a name that cannot exist. */
+static int ftp_touches_trust_store(const char *path) {
+    return path_contains_protected(path) || path_in_protected(path);
 }
 
 static void handle_user(struct ftp_session *s, const char *arg) {
@@ -648,6 +659,10 @@ static void handle_rnfr(struct ftp_session *s, const char *arg) {
     }
     char path[512];
     abs_path(s, arg, path, sizeof(path));
+    if (ftp_touches_trust_store(path)) {
+        send_resp(s->ctrl_fd, 550, "Not permitted");
+        return;
+    }
     struct stat st;
     if (stat(path, &st) != 0) {
         send_resp(s->ctrl_fd, 550, "File not found");
@@ -673,13 +688,17 @@ static void handle_rnto(struct ftp_session *s, const char *arg) {
     }
     char path[512];
     abs_path(s, arg, path, sizeof(path));
+    if (ftp_touches_trust_store(path)) {
+        send_resp(s->ctrl_fd, 550, "Not permitted");
+        return;
+    }
     /* A cross-DEVICE rename() does not return EXDEV on this kernel — it
      * panics the console. An FTP client dragging a file from /mnt/usb0
      * to /data is an ordinary thing to do, so refuse it here rather than
      * let the kernel take the machine down. 553 tells the client the
      * name was disallowed; copy-then-delete is the safe alternative and
      * every client can do it. */
-    if (xdev_rename_crosses(s->rename_path, path, xdev_stat_dev)
+    if (xdev_rename_crosses_l(s->rename_path, path, xdev_lstat_dev, xdev_stat_dev)
         == XDEV_CROSSES) {
         s->rename_path[0] = '\0';
         send_resp(s->ctrl_fd, 553,
@@ -898,6 +917,10 @@ static void handle_dele(struct ftp_session *s, const char *arg) {
     }
     char path[512];
     abs_path(s, arg, path, sizeof(path));
+    if (ftp_touches_trust_store(path)) {
+        send_resp(s->ctrl_fd, 550, "Not permitted");
+        return;
+    }
     if (unlink(path) != 0) {
         send_resp(s->ctrl_fd, 550, "Failed to delete file");
         return;
@@ -917,6 +940,10 @@ static void handle_rmd(struct ftp_session *s, const char *arg) {
     }
     char path[512];
     abs_path(s, arg, path, sizeof(path));
+    if (ftp_touches_trust_store(path)) {
+        send_resp(s->ctrl_fd, 550, "Not permitted");
+        return;
+    }
     if (rmdir(path) != 0) {
         send_resp(s->ctrl_fd, 550, "Failed to remove directory");
         return;

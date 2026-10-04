@@ -64,6 +64,11 @@
 #include "smp_meta.h"
 #include "blake3.h"
 #include "mgmt_rpc.h"
+#include "mgmt_fs.h"
+#include "path_policy.h"
+#include "cross_device.h"
+#include "ava1_stop.h"
+#include "ava1_glue.h"
 
 /* PS5 SDK's `<fcntl.h>` hides `posix_fadvise` and its POSIX_FADV_* constants
  * behind `__POSIX_VISIBLE >= 200112`, but defining `_POSIX_C_SOURCE` to unlock
@@ -5459,6 +5464,7 @@ static int cleanup_path_allowed(const char *path) {
      * Component-scoped (matches is_path_allowed's semantics) so
      * legitimate test-folder names like `My..Tests` aren't rejected. */
     if (path_has_dotdot_component(path)) return 0;
+    if (path_in_protected(path) || path_contains_protected(path)) return 0; /* the AVA1 trust store */
 
     /* Case A: /data/ps5upload/tests[/...] */
     {
@@ -6508,40 +6514,9 @@ static int is_path_lexically_allowed(const char *p) {
 }
 
 int is_path_allowed(const char *p) {
-    if (!is_path_lexically_allowed(p)) return 0;
-    /* (2.9.0) Symlink-escape guard. The lexical check above confirms
-     * the path STARTS with an allowed root, but if any component
-     * along the path is a symlink that resolves OUTSIDE the allowlist
-     * (e.g. /mnt/ps5upload/usermount/evil → /system_ex), the
-     * subsequent open()/unlink()/etc. follows the symlink and
-     * operates on the forbidden target. Realistic when a user mounts
-     * a .ffpkg from an untrusted source — the image is the
-     * attacker's data and UFS supports symlinks. Same CWE-59 class
-     * as CVE-2007-2374.
-     *
-     * realpath() resolves all symlinks and collapses any embedded
-     * dotdots. If the canonical form fails the lexical check, the
-     * path was escaping via a symlink — refuse.
-     *
-     * realpath fails (returns NULL) when any component along the
-     * path doesn't exist yet — common for FS_WRITE / mkdir paths
-     * that are about to create the target. For those there's no
-     * symlink to follow yet, so accept based on the lexical decision
-     * we already passed. The first time a real file appears at this
-     * path, subsequent calls go through the realpath check above
-     * and reject any symlink the writer planted. */
-    char resolved[PATH_MAX];
-    if (realpath(p, resolved) == NULL) {
-        return 1;
-    }
-    if (!is_path_lexically_allowed(resolved)) {
-        fprintf(stderr,
-                "[payload2] is_path_allowed REJECTED: %s resolves to %s "
-                "(symlink escape)\n",
-                p, resolved);
-        return 0;
-    }
-    return 1;
+    /* The lexical rule on the path and on its canonical form (symlink-escape guard, CWE-59), with
+     * the deepest existing ancestor resolved for a path that does not exist yet: see path_policy.h. */
+    return path_resolve_allowed(p, is_path_lexically_allowed);
 }
 
 /* Recursively remove `path`. Descends directories, unlinks regular files
@@ -7098,7 +7073,7 @@ static int cp_rf_op(const char *src, const char *dst, int depth, int op_idx,
     }
 
     if (S_ISREG(st.st_mode)) {
-        int sfd = open(src, O_RDONLY);
+        int sfd = open(src, O_RDONLY | O_NOFOLLOW); /* lstat said regular: never read through a swapped-in link */
         if (sfd < 0) return -1;
         /* Open with 0777 (not source mode) so the destination is launch-
          * ready regardless of what the source file's mode bits looked
@@ -7112,7 +7087,9 @@ static int cp_rf_op(const char *src, const char *dst, int depth, int op_idx,
         /* O_EXCL is what turns a collision into an error. When merging we
          * want the opposite: land on top of the existing file, truncating
          * whatever was there. */
-        int dfd = open(dst, O_WRONLY | O_CREAT |
+        /* O_NOFOLLOW: a merge copy must not write THROUGH a link planted at dst (it would overwrite
+         * whatever the link points at, the AVA1 trust store included). */
+        int dfd = open(dst, O_WRONLY | O_CREAT | O_NOFOLLOW |
                             (overwrite ? O_TRUNC : O_EXCL), 0777);
         if (dfd < 0) { close(sfd); return -1; }
         (void)fchmod(dfd, 0777);
@@ -7341,7 +7318,8 @@ static int handle_fs_delete(runtime_state_t *state, int client_fd,
     if (!state) return -1;
     path[0] = '\0';
     if (request_body) extract_json_string_field(request_body, "path", path, sizeof(path));
-    if (!is_path_allowed(path)) {
+    /* Deleting a directory that contains the AVA1 trust store deletes the store. */
+    if (!is_path_allowed(path) || path_tree_op_refused(path)) {
         return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
                           "fs_delete_path_not_allowed", 26);
     }
@@ -7428,34 +7406,19 @@ static int handle_fs_move(runtime_state_t *state, int client_fd,
         extract_json_string_field(request_body, "from", from, sizeof(from));
         extract_json_string_field(request_body, "to", to, sizeof(to));
     }
-    if (!is_path_allowed(from) || !is_path_allowed(to)) {
+    if (!is_path_allowed(from) || !is_path_allowed(to) ||
+        path_tree_op_refused(from) || path_tree_op_refused(to)) {
         return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
                           "fs_move_path_not_allowed", 24);
     }
-    /* Cross-device guard — see the header comment. Compare st_dev of the source
-     * and of the destination's parent directory; if they differ, refuse the
-     * rename (it would panic) and report cross-mount. stat() on USB is safe
-     * (FS_COPY stats the same paths). If either stat fails we fall through to
-     * rename(), but only when devices can't be compared — a missing source/dest
-     * there fails with a normal errno, not the cross-device panic. */
-    {
-        struct stat sf, sdp;
-        char to_dir[512];
-        const char *slash = strrchr(to, '/');
-        if (slash && slash != to) {
-            size_t dlen = (size_t)(slash - to);
-            if (dlen >= sizeof(to_dir)) dlen = sizeof(to_dir) - 1;
-            memcpy(to_dir, to, dlen);
-            to_dir[dlen] = '\0';
-        } else {
-            to_dir[0] = '/';
-            to_dir[1] = '\0';
-        }
-        if (stat(from, &sf) == 0 && stat(to_dir, &sdp) == 0 &&
-            sf.st_dev != sdp.st_dev) {
-            return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
-                              "fs_move_cross_mount", 19);
-        }
+    /* Cross-device guard — see the header comment. The SOURCE is judged by its own device (lstat:
+     * a symlink is what rename() moves, and stat() would judge it by its target, so a link on one
+     * device pointing at another could pass), the destination by its parent directory. If a device
+     * cannot be read (missing source or directory) rename() fails with a plain errno, not the
+     * cross-device panic. */
+    if (xdev_rename_crosses_l(from, to, xdev_lstat_dev, xdev_stat_dev) == XDEV_CROSSES) {
+        return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
+                          "fs_move_cross_mount", 19);
     }
     if (rename(from, to) != 0) {
         if (errno == EXDEV) {
@@ -7486,7 +7449,7 @@ static int handle_fs_chmod(runtime_state_t *state, int client_fd,
         /* recursive is an unsigned field: 1 = recurse, 0 = top only. */
         recursive = extract_json_uint64_field(request_body, "recursive") != 0;
     }
-    if (!is_path_allowed(path)) {
+    if (!is_path_allowed(path) || path_tree_op_refused(path)) {
         return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
                           "fs_chmod_path_not_allowed", 25);
     }
@@ -7768,7 +7731,10 @@ static int handle_fs_copy(runtime_state_t *state, int client_fd,
         overwrite =
             (extract_json_uint64_field(request_body, "overwrite") != 0) ? 1 : 0;
     }
-    if (!is_path_allowed(from) || !is_path_allowed(to)) {
+    /* The AVA1 trust store: a copy FROM an ancestor (/data/ps5upload) carries identity+peers out, a copy ONTO
+     * one (overwrite) replaces them. cp_rf_op walks with no per-child check, so the roots are the gate. */
+    if (!is_path_allowed(from) || !is_path_allowed(to) ||
+        path_tree_op_refused(from) || path_tree_op_refused(to)) {
         return send_frame(client_fd, FTX2_FRAME_ERROR, 0, trace_id,
                           "fs_copy_path_not_allowed", 24);
     }
@@ -15774,6 +15740,24 @@ abort_done:
 
 __thread volatile unsigned int g_inflight_frame_type = 0;
 
+/* node.shutdown (the FTX2 SHUTDOWN frame's body, a handler of its own for the AVA1 table). */
+/* The native filesystem methods (mgmt_fs.c) take their policy from here: the same allowlist, the same
+ * read carve-outs and the same command counter the FTX2 handlers use. */
+static runtime_state_t *g_mgmt_fs_state;
+
+static int mgmt_fs_read_allowed(const char *path, int unsafe_read) {
+    return is_path_allowed(path) || is_profile_avatar_read_path(path) ||
+           (unsafe_read && is_safe_unsafe_read_path(path));
+}
+
+static void mgmt_fs_count(void) {
+    runtime_state_t *st = g_mgmt_fs_state;
+    if (!st) return;
+    pthread_mutex_lock(&st->state_mtx);
+    st->command_count += 1;
+    pthread_mutex_unlock(&st->state_mtx);
+}
+
 /* ---- P3 Task 7 table adapters ----
  * mgmt_table.def calls handlers as (state, fd, trace, body, len). These handlers take a different
  * shape (no length, or no state), so a one-line adapter gives them the table's. Each adapter only
@@ -15894,6 +15878,55 @@ static int mgmt_w_toast_send(runtime_state_t *st, int fd, uint64_t t, const char
 }
 
 /* The AVA1 management table (mgmt_table.def) and its thread environment. */
+/*
+ * Nudge the OTHER accept loop so it notices shutdown_requested. The transfer
+ * loop runs on the main thread, blocked in accept(); nothing wakes it but a
+ * connection. The host's own status polls would do it within seconds, and so
+ * does main closing the mgmt listener, but a loopback connect makes the exit
+ * prompt. Best effort: a process that has lost its network may not manage it.
+ */
+static void wake_other_listener(runtime_state_t *state, int failing_port) {
+    int other = (failing_port == state->mgmt_port) ? state->runtime_port
+                                                    : state->mgmt_port;
+    struct sockaddr_in sa;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)other);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    (void)connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    close(fd);
+}
+
+/* Asks this instance to exit: node.shutdown, the old shutdown frame, and the takeover flag file all
+ * land here. Marks open transactions interrupted (so they resume), sets the flag every loop
+ * checks, then nudges both accept loops: the transfer loop sits in accept() and nothing but a
+ * connection wakes it. Safe to call from any thread, more than once. */
+static void shutdown_common(runtime_state_t *state, const char *why) {
+    if (!state) return;
+    runtime_mark_active_transactions(state, "interrupted");
+    state->shutdown_requested = 1;
+    (void)runtime_append_tx_event(state, why ? why : "shutdown");
+    wake_other_listener(state, state->mgmt_port);
+    wake_other_listener(state, state->runtime_port);
+}
+
+void runtime_request_shutdown(runtime_state_t *state, const char *why) {
+    shutdown_common(state, why);
+}
+
+static void node_shutdown_fire(void *arg) { shutdown_common((runtime_state_t *)arg, "node_shutdown"); }
+
+/* node.shutdown (AVA1 method 5). The handler runs under the capture sink: its reply leaves only after
+ * it returns. So the exit is DEFERRED to a short thread (like power.control): the caller receives the
+ * acknowledgement first, then the instance stops (main.c runs ava1_payload_stop after the server loop). */
+static int handle_node_shutdown(runtime_state_t *state, int client_fd, uint64_t trace_id) {
+    int rc = send_frame(client_fd, FTX2_FRAME_SHUTDOWN_ACK, 0, trace_id, "{}", 2);
+    if (ava1_shutdown_defer(300, node_shutdown_fire, state) != 0) node_shutdown_fire(state);
+    return rc;
+}
+
 #include "mgmt_install.inc"
 
 static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
@@ -16068,10 +16101,11 @@ static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
     /* ── HELLO ── */
     if (hdr.frame_type == FTX2_FRAME_HELLO) {
         int len = snprintf(body, sizeof(body),
-                           "{\"version\":%u,\"instance_id\":%llu,\"runtime_port\":%d}",
+                           "{\"version\":%u,\"instance_id\":%llu,\"runtime_port\":%d,"
+                           "\"ava1_port\":%d,\"ava1\":\"%s\"}",
                            FTX2_VERSION,
                            (unsigned long long)state->instance_id,
-                           state->runtime_port);
+                           state->runtime_port, (int)AVA1_DEFAULT_PORT, ava1_payload_state());
         /* snprintf returns the length that *would* have been written
          * (excluding NUL). A return > sizeof(body) means truncation;
          * clamp so we don't ask send_frame to read past the buffer. */
@@ -16112,9 +16146,7 @@ static int handle_binary_frame_impl(runtime_state_t *state, int client_fd,
 
     /* ── SHUTDOWN ── */
     if (hdr.frame_type == FTX2_FRAME_SHUTDOWN) {
-        runtime_mark_active_transactions(state, "interrupted");
-        state->shutdown_requested = 1;
-        (void)runtime_append_tx_event(state, "shutdown");
+        runtime_request_shutdown(state, "shutdown");
         return send_frame(client_fd, FTX2_FRAME_SHUTDOWN_ACK, 0, hdr.trace_id, "{}", 2);
     }
 
@@ -16731,27 +16763,6 @@ static void *transfer_client_thread(void *arg) {
     return NULL;
 }
 
-
-/*
- * Nudge the OTHER accept loop so it notices shutdown_requested. The transfer
- * loop runs on the main thread, blocked in accept(); nothing wakes it but a
- * connection. The host's own status polls would do it within seconds, and so
- * does main closing the mgmt listener, but a loopback connect makes the exit
- * prompt. Best effort: a process that has lost its network may not manage it.
- */
-static void wake_other_listener(runtime_state_t *state, int failing_port) {
-    int other = (failing_port == state->mgmt_port) ? state->runtime_port
-                                                    : state->mgmt_port;
-    struct sockaddr_in sa;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t)other);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    (void)connect(fd, (struct sockaddr *)&sa, sizeof(sa));
-    close(fd);
-}
 
 /*
  * accept() failed on a listener. Decide how to carry on — never by giving up.

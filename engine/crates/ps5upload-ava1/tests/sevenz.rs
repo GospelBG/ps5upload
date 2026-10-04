@@ -470,7 +470,9 @@ async fn partial_upload(d: &Path, arc: &Path, job: [u8; 16], fin_bytes: u64) -> 
         ChaosProxy::start(
             addr.parse().unwrap(),
             ChaosConfig {
-                bytes_per_sec: Some(2 << 20),
+                // Per connection: two lanes move ~1 MiB/s, so the rest of the archive after the
+                // cut takes about two seconds and a loaded machine still cancels before the end.
+                bytes_per_sec: Some(512 << 10),
                 ..Default::default()
             },
         )

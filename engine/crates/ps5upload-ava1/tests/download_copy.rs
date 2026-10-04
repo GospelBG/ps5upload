@@ -20,7 +20,7 @@ use ava1::session::RpcReply;
 use ava1::wire::Message;
 use ava1_chaos::{ChaosConfig, ChaosProxy};
 use ps5upload_ava1::copy::{console_copy_in, op_cancel, op_snapshot, record_status};
-use ps5upload_ava1::download::{self, Counters, ZipSink};
+use ps5upload_ava1::download::{self, Counters, ZipCompression, ZipSink};
 use ps5upload_ava1::upload::UploadFailure;
 use ps5upload_ava1::Pool;
 use ps5upload_core::download::DownloadKind;
@@ -497,7 +497,7 @@ async fn a_download_survives_a_host_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_zip_download_restarts_a_fresh_archive_after_a_drop() {
+async fn a_deflate_zip_download_restarts_a_fresh_archive_after_a_drop() {
     let d = temp("zip-restart");
     let total = tree(&d.join("share/Game"), 24, |_| 1 << 20);
     let (flaky, pool) = Flaky::start(&d).await;
@@ -530,16 +530,29 @@ async fn a_zip_download_restarts_a_fresh_archive_after_a_drop() {
         }),
     );
     let dest = out.join("g.zip");
-    let n = zipped(
-        pool.clone(),
-        "Game",
-        DownloadKind::Folder,
-        &dest,
-        c.clone(),
-        8,
-    )
-    .await
-    .unwrap();
+    let n = {
+        let (pool, dest, c) = (pool.clone(), dest.clone(), c.clone());
+        within(
+            90,
+            tokio::task::spawn_blocking(move || {
+                download::to_zip_with_in(
+                    &pool,
+                    "console",
+                    "Game",
+                    DownloadKind::Folder,
+                    &dest,
+                    false,
+                    ZipCompression::Deflate,
+                    [8; 16],
+                    &c,
+                    None,
+                )
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    };
     stop2.store(true, Ordering::Relaxed);
     watcher.join().unwrap();
     killer.abort();
@@ -557,6 +570,45 @@ async fn a_zip_download_restarts_a_fresh_archive_after_a_drop() {
         c.bytes.load(Ordering::Relaxed) > total,
         "work done includes the discarded attempt (monotonic, may exceed the archive)"
     );
+    assert!(!out.join("g.zip.ava-part").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_zip_download_resumes_after_a_host_restart() {
+    let d = temp("zip-resume");
+    let total = tree(&d.join("share/Game"), 24, |_| 1 << 20);
+    let (flaky, pool) = Flaky::start(&d).await;
+    let pool = Arc::new(pool);
+    let out = d.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let c = counters();
+    let killer = tokio::spawn(restart_midway(
+        flaky,
+        d.clone(),
+        c.bytes_finalized.clone(),
+        total / 2,
+    ));
+    let dest = out.join("g.zip");
+    let n = zipped(
+        pool.clone(),
+        "Game",
+        DownloadKind::Folder,
+        &dest,
+        c.clone(),
+        10,
+    )
+    .await
+    .unwrap();
+    killer.abort();
+    assert_eq!(n, total);
+    assert!(pool.attempts() >= 2, "the pool never reconnected");
+    // Resumed, not restarted: a restart adds the discarded attempt to the work counter.
+    assert_eq!(c.bytes.load(Ordering::Relaxed), total);
+    let want: BTreeMap<String, Vec<u8>> = files_of(&d.join("share/Game"))
+        .into_iter()
+        .map(|(k, v)| (format!("Game/{k}"), v))
+        .collect();
+    assert!(zip_entries(&dest) == want);
     assert!(!out.join("g.zip.ava-part").exists());
 }
 

@@ -171,9 +171,9 @@ pub struct TransferConfig {
     /// AVA1 only: bytes of the source hashed so far while a `verify` job reads every
     /// file up front (SPEC.md §11.4). The engine shows it as the job's "verify" stage.
     pub progress_verify: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-    /// AVA1 only: set while the console reports files still settling after the upload's JobDone
-    /// (durable-by-log, SPEC.md §15.7); the engine shows it as the job's `settling` note.
-    pub progress_settling: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// AVA1 only: the live notes a running job reports beyond bytes and files (what limits it,
+    /// the 7z/RAR skipping phase, files still settling). The engine puts them in the job snapshot.
+    pub progress_live: Option<std::sync::Arc<LiveNotes>>,
     /// Optional outbound bandwidth cap, in bytes per second. `None` =
     /// unlimited (current behaviour). When set, the transfer loop
     /// sleeps after each shard's wire write to bring the running
@@ -214,7 +214,7 @@ impl TransferConfig {
             progress_files_finalized: None,
             progress_bytes_finalized: None,
             progress_verify: None,
-            progress_settling: None,
+            progress_live: None,
             bandwidth_cap_bps: None,
             cancel: None,
             source_fs: None,
@@ -2415,6 +2415,22 @@ pub fn transfer_file_list_with_flags(
 //
 // Backoff between attempts is exponential (500 ms → 1 s → 2 s → 4 s
 // capped). Non-retryable errors short-circuit the loop.
+
+/// Live notes of a running AVA1 job, written by the AVA1 progress bridge and read by the
+/// engine when it serves the job snapshot. All values are absolute (stored, never added).
+#[derive(Debug, Default)]
+pub struct LiveNotes {
+    /// AVA1's bottleneck code (`ava1::gen::BN_*`; 0 = none).
+    pub bottleneck: std::sync::atomic::AtomicU8,
+    /// 0 = sending, `LIVE_PHASE_SKIPPING` = the decoder is discarding data the console has.
+    pub phase: std::sync::atomic::AtomicU8,
+    pub skip_done_bytes: std::sync::atomic::AtomicU64,
+    pub skip_total_bytes: std::sync::atomic::AtomicU64,
+    /// Files are still settling on the console after the job finished.
+    pub settling: std::sync::atomic::AtomicBool,
+}
+
+pub const LIVE_PHASE_SKIPPING: u8 = 1;
 
 /// The payload's management port. Mirrors `mgmt_addr_for` in the engine.
 const PS5_MGMT_PORT: u16 = 9114;

@@ -186,6 +186,17 @@ impl fmt::Display for MgmtError {
 
 impl std::error::Error for MgmtError {}
 
+/// The text of the error a method FTX2 never had (`fs.stat`) gets on a console whose helper
+/// does not serve AVA1 management.
+const NEEDS_AVA1: &str =
+    "needs a helper that speaks AVA1 management; this console runs an older one";
+
+/// True when `e` says the console's helper cannot serve this method at all (an FTX2-only helper
+/// asked for a method FTX2 never had), as opposed to the payload refusing the call.
+pub fn is_unsupported(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<MgmtError>().is_none() && format!("{e:#}").contains(NEEDS_AVA1)
+}
+
 /// The default per-call deadline (the FTX2 socket default).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -379,7 +390,9 @@ pub fn call_json<T: DeserializeOwned>(
 /// For handlers that used to answer a failure as a successful frame with
 /// `{"ok":false,"err":"<token>"}` (SPEC section 7.3, "Legacy failure bodies"). The AVA1 payload
 /// answers an error status with the token as the cause; this turns that refusal back into
-/// the body the caller already parses. Transport failures stay errors, and so does an FTX2
+/// the body the caller already parses. A handler whose failure body carries data the caller
+/// reads (`net.reach`: `errno`, `timed_out`, `ms`; the mounts: `code`, `mount_point`) sends the
+/// whole body as the cause: a cause that is a JSON object is returned as it is. Transport failures stay errors, and so does an FTX2
 /// `Error` frame (status 0): those were errors before too.
 pub fn call_legacy_ok(addr: &str, method: Method, label: &str, body: &[u8]) -> Result<Vec<u8>> {
     legacy_ok(call_as(addr, method, label, body))
@@ -537,7 +550,7 @@ fn ftx2_call(
     timeout: Option<Duration>,
 ) -> Result<Vec<u8>> {
     let Some((req, ack)) = method.ftx2 else {
-        bail!("{label} needs a helper that speaks AVA1 management; this console runs an older one");
+        bail!("{label} {NEEDS_AVA1}");
     };
     let mut c = Connection::connect(addr)?;
     if let Some(t) = timeout {
@@ -689,6 +702,18 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(v["err"], "exists");
+        // a failure body that carries data comes back as it was sent
+        let kept: Result<Vec<u8>> = Err(MgmtError {
+            label: "NET_REACH".into(),
+            status: 7,
+            cause: r#"{"ok":false,"timed_out":true,"errno":0,"ms":3000}"#.into(),
+        }
+        .into());
+        let v: serde_json::Value = serde_json::from_slice(&legacy_ok(kept).unwrap()).unwrap();
+        assert_eq!(
+            (v["timed_out"].as_bool(), v["ms"].as_u64()),
+            (Some(true), Some(3000))
+        );
         assert!(legacy_ok(Err(anyhow::anyhow!("network: reset"))).is_err());
         assert_eq!(legacy_ok(Ok(b"x".to_vec())).unwrap(), b"x");
     }

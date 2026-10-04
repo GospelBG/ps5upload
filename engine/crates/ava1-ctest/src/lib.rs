@@ -1,6 +1,7 @@
 //! The payload's AVA1 C, built for the host (see build.rs). Test-only.
 #![cfg(unix)]
 
+pub mod mgmt_fs;
 use ava1::frame::Header;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
@@ -386,6 +387,7 @@ pub mod ffi {
         pub fn ava1_test_recv_end(files: u32, bytes: u64, hash: *const u8) -> c_int;
         pub fn ava1_test_recv_resume(hash: *const u8) -> c_int;
         pub fn ava1_test_job_stopped() -> c_int;
+        pub fn ava1_test_op_hold_reply_until_finished(on: c_int);
         pub fn ava1_test_recv_reopen(drop_old: c_int) -> c_int;
         pub fn ava1_test_recv_last_open() -> c_int;
         pub fn ava1_test_recv_ack_credit() -> u64;
@@ -405,6 +407,10 @@ pub mod ffi {
             workers: u8,
         ) -> c_int;
         pub fn ava1_test_server_stop_data();
+        pub fn ava1_test_payload_stop(conn_ms: c_int, sony_ms: c_int) -> c_int;
+        pub fn ava1_test_intercept_shutdown(on: c_int);
+        pub fn ava1_test_sony_lock();
+        pub fn ava1_test_sony_unlock();
         pub fn ava1_test_data_delays(open_ms: u32, map_ms: u32);
         pub fn ava1_test_job_attached(id: *const u8) -> c_int;
         pub fn ava1_test_reap_rules(jobs_dir: *const c_char) -> c_int;
@@ -679,7 +685,16 @@ fn start_data_raw(a: &DataArgs, port: u16) -> u16 {
     rc as u16
 }
 
+/// Serialises the tests that install the shim's process-wide tables, policies and counters
+/// (test_shim.c / test_shim_fs.c): hold the guard for the whole test.
+static SHIM_LOCK: Mutex<()> = Mutex::new(());
+
 impl CServer {
+    /// The shared guard for shim-global state; take it before installing anything.
+    pub fn lock_for_shim_tests() -> MutexGuard<'static, ()> {
+        SHIM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn start(
         secret: [u8; 32],
         peers_path: &Path,
@@ -824,6 +839,29 @@ impl CServer {
     pub fn stop_data_only(&mut self) {
         self.data.as_ref().expect("stop_data_only needs start_data");
         unsafe { ffi::ava1_test_server_stop_data() };
+    }
+
+    /// The payload's real exit sequence (`ava1_payload_stop`): returns its result bits.
+    pub fn payload_stop(&mut self, conn_ms: i32, sony_ms: i32) -> i32 {
+        self.data.as_ref().expect("payload_stop needs start_data");
+        unsafe { ffi::ava1_test_payload_stop(conn_ms, sony_ms) }
+    }
+
+    /// Answer `node.shutdown` with the payload's real shape (reply, then `ava1_payload_stop` 300 ms
+    /// later) instead of the installed management table. Process-wide; off by default.
+    pub fn intercept_shutdown(&self, on: bool) {
+        unsafe { ffi::ava1_test_intercept_shutdown(c_int::from(on)) }
+    }
+
+    /// Holds / releases the Sony API lock, as a handler in the middle of a Sony call does.
+    pub fn sony_lock(&self, held: bool) {
+        unsafe {
+            if held {
+                ffi::ava1_test_sony_lock()
+            } else {
+                ffi::ava1_test_sony_unlock()
+            }
+        }
     }
 
     pub fn start_data_again(&mut self) {
@@ -1288,6 +1326,20 @@ pub fn c_set_same_device(v: i32) {
 /// What the C data layer's `may_read` hook answers for the next download JobOpen
 /// (test_shim.c's `t_allow_read`): false refuses the open with AVA1_ERR_PATH. The
 /// refusal test restores it; a test that starts a server should set it true first.
+/// Names the trust-store directory the data layer must never follow a link into (None: off).
+pub fn c_set_protected(dir: Option<&std::path::Path>) {
+    extern "C" {
+        fn ava1_test_set_protected(dir: *const c_char);
+    }
+    match dir {
+        Some(d) => {
+            let c = CString::new(d.to_str().unwrap()).unwrap();
+            unsafe { ava1_test_set_protected(c.as_ptr()) }
+        }
+        None => unsafe { ava1_test_set_protected(std::ptr::null()) },
+    }
+}
+
 pub fn c_set_read_allowed(v: bool) {
     unsafe { ffi::ava1_test_set_allow_read(v as c_int) };
 }
@@ -2012,4 +2064,18 @@ pub mod t7 {
     pub fn reset_peak() {
         unsafe { ffi::ava1_test_t7_reset_peak() }
     }
+}
+
+/// Holds the Sony API lock on another thread for `ms`, as a worker inside a Sony call does. Returns once
+/// the lock is held; join the handle to know it was released.
+pub fn sony_hold(ms: u64) -> std::thread::JoinHandle<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || {
+        unsafe { ffi::ava1_test_sony_lock() };
+        tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        unsafe { ffi::ava1_test_sony_unlock() };
+    });
+    rx.recv().unwrap();
+    h
 }

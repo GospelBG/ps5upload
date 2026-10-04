@@ -74,12 +74,12 @@ async fn console(tag: &str, handler: RpcHandler) -> (Arc<AvaTransport>, &'static
     let me = Identity::load_or_create(&ava.join("identity")).unwrap();
     let mut peers = PeerStore::in_memory();
     peers.add(me.public(), "engine").unwrap();
-    let ctx = ServerCtx::new(Identity::generate().unwrap(), "host", peers, handler).with_jobs(
-        Arc::new(FolderHost {
+    let ctx = ServerCtx::new(Identity::generate().unwrap(), "host", peers, handler)
+        .with_jobs(Arc::new(FolderHost {
             root: base.join("share"),
             jobs_dir: base.join("jobs"),
-        }),
-    );
+        }))
+        .with_mgmt();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap().to_string();
     tokio::spawn(server::serve(l, Arc::new(ctx)));
@@ -660,32 +660,80 @@ async fn one_session_serves_every_call() {
     );
 }
 
+/// A console that does not advertise CAP_MGMT (an older AVA1 helper: transfers, no management
+/// methods) is sent to FTX2 from its capability bits alone. Nothing is sent to it to find out.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_console_without_management_is_sent_to_ftx2_and_not_asked_again() {
+async fn a_console_without_cap_mgmt_is_sent_to_ftx2_without_a_request() {
     force_auto();
     let n = Arc::new(AtomicUsize::new(0));
     let n2 = n.clone();
-    let (t, _p, c) = console(
-        "old",
+    let base = temp("old");
+    let ava = base.join("ava");
+    std::fs::create_dir_all(&ava).unwrap();
+    let me = Identity::load_or_create(&ava.join("identity")).unwrap();
+    let mut peers = PeerStore::in_memory();
+    peers.add(me.public(), "engine").unwrap();
+    // The data plane yes, management no: no `.with_mgmt()`.
+    let ctx = ServerCtx::new(
+        Identity::generate().unwrap(),
+        "old helper",
+        peers,
         Box::new(move |_, _| {
             n2.fetch_add(1, Ordering::SeqCst);
             err(gen::ERR_UNKNOWN_METHOD, "")
         }),
     )
-    .await;
-    assert!(call(&t, &c, m::HW_INFO, "HW_INFO", b"", T)
-        .await
-        .unwrap()
-        .is_none());
-    assert!(call(&t, &c, m::HW_TEMPS, "HW_TEMPS", b"", T)
-        .await
-        .unwrap()
-        .is_none());
+    .with_jobs(Arc::new(FolderHost {
+        root: base.join("share"),
+        jobs_dir: base.join("jobs"),
+    }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(server::serve(l, Arc::new(ctx)));
+    let pool: &'static Pool = Box::leak(Box::new(Pool::new(ava).with_addr(addr)));
+    let t = Arc::new(AvaTransport::with_pool(pool));
+    let c = "old-console:9114";
+    for m in [m::HW_INFO, m::FS_LIST, m::NODE_STATUS] {
+        assert!(call(&t, c, m, "X", b"{}", T).await.unwrap().is_none());
+    }
     assert_eq!(
         n.load(Ordering::SeqCst),
-        1,
-        "the second call never reached the console"
+        0,
+        "no management request reached it"
     );
+    assert_eq!(
+        pool.attempts(),
+        1,
+        "one session, reused for the three answers"
+    );
+}
+
+/// A console that advertises CAP_MGMT is served over AVA1 even though it has no data plane.
+#[tokio::test(flavor = "multi_thread")]
+async fn cap_mgmt_alone_routes_management_over_ava1() {
+    force_auto();
+    let base = temp("mgmtonly");
+    let ava = base.join("ava");
+    std::fs::create_dir_all(&ava).unwrap();
+    let me = Identity::load_or_create(&ava.join("identity")).unwrap();
+    let mut peers = PeerStore::in_memory();
+    peers.add(me.public(), "engine").unwrap();
+    let ctx = ServerCtx::new(
+        Identity::generate().unwrap(),
+        "mgmt only",
+        peers,
+        Box::new(|_, _| text("hi")),
+    )
+    .with_mgmt();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(server::serve(l, Arc::new(ctx)));
+    let pool: &'static Pool = Box::leak(Box::new(Pool::new(ava).with_addr(addr)));
+    let t = Arc::new(AvaTransport::with_pool(pool));
+    let r = call(&t, "mo-console:9114", m::HW_INFO, "HW_INFO", b"", T)
+        .await
+        .unwrap();
+    assert_eq!(r.unwrap(), b"hi");
 }
 
 #[tokio::test(flavor = "multi_thread")]

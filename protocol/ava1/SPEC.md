@@ -179,8 +179,8 @@ written, not when it is queued, so time spent behind other frames is not counted
 round trip. A sender may skip a Ping or Pong while other frames are queued or being
 written: they are proof of life too.
 
-Liveness counts bytes, not frames: a connection is dead after 6 s (default,
-`dead_after`) with no byte received, so a 16 MiB frame on a slow link is never
+Liveness counts bytes, not frames: a connection is dead after 12 s (default,
+`dead_after`; the ping stays at 2 s, so six pings go unanswered first) with no byte received, so a 16 MiB frame on a slow link is never
 mistaken for silence. Silence is judged by what can be read: a reader that was busy
 elsewhere (writing, waiting to write) past `dead_after` checks the socket first and
 carries on if bytes are waiting; a process that was not running (a late timer tick)
@@ -236,13 +236,21 @@ peer that started it, no session, so a reconnect does not matter), at most 8 ope
   bytes the regular files' sizes; both totals are 0 while unknown), the current step in ext `current`, and,
   once finished, `state` 1 with ext `result` (the operation's reply body, at most 128 KiB) or `state` 2 with
   ext `code` (the `ERR_*`) and the cause token in `current`. A repeat of `job.run` with the same id and the
-  same owner, op and args answers the job's status whatever state it is in (nothing runs twice); other
-  parameters are `ERR_PROTOCOL`, another owner `ERR_UNKNOWN_JOB`.
-* `job.cancel` raises the job's cancel flag and waits up to 2 s for the worker. A delete, chmod, hash,
-  crc32 or backup stops at the next directory entry or read block and the job ends `state 2`,
-  `ERR_CANCELLED`; fsck, cleanup and sdk.scan are one system call and only honour a cancel that arrives
-  before they start. Unlike a copy, a cancelled operation stays listed (finished) so a poller reads how
-  it ended; it is collected a park age after it ended, like any finished job.
+  same owner, op and args answers the job's status whatever state it is in; other parameters are
+  `ERR_PROTOCOL`, another owner `ERR_UNKNOWN_JOB`. A finished operation whose repeat gives the same outcome
+  (every op but BACKUP_SNAPSHOT and BACKUP_RESTORE) stays listed for a grace of 10 s after the first reply
+  that carried its terminal status, so a reply lost on the wire is answered from the stored job and nothing
+  runs twice inside the grace; it is then released by the reaper or by the next `job.status`/`job.run` read
+  after the grace, and a full job table releases the one delivered longest ago at once, so a loop of hashes
+  never fills the 32 slots. After the release a repeat of `job.run` runs the operation again (harmless for
+  delete, chmod, hash and crc32). A backup is kept for the park age instead, because a re-run would take a
+  second snapshot.
+* `job.cancel` raises the job's cancel flag and returns at once (it runs on a reader or RPC worker and
+  never waits for the worker). A delete, chmod, hash, crc32 or backup stops at the next directory entry or
+  read block and the poller then sees `state 2` with `ERR_CANCELLED`; fsck, cleanup and sdk.scan are one
+  system call and only honour a cancel that arrives before they start, so a cancelled fsck holds its job
+  slot (and its worker) until the system call returns. Unlike a copy, a cancelled operation stays listed
+  (finished) so a poller reads how it ended; it is collected like any finished job.
 * An operation that wraps an FTX2 handler (fsck, backup, cleanup, sdk.scan) keeps the handler's
   `{"ok":false,...}` body as its result: the operation ran and the body is the answer. Only an ERROR
   frame is a failed job. DELETE refuses a path outside the writable roots and a mount point (a path on
@@ -389,12 +397,27 @@ call, exactly FTX2's atomic small write (`COMMIT` is implied). Chunked protocol:
 is `<path>.ps5upload.tmp` in the same directory as `path` (so the commit rename never crosses a
 device, with the `st_dev` guard of `fs.rename`); the caller sends chunks with `FSW_AT_OFFSET`
 (or `FSW_APPEND`) in order, the last one also carrying `FSW_COMMIT`. A caller that gives up
-deletes the temporary file (`fs.rename` is not needed; `job.run` DELETE removes it). A chunk at offset 0 (or the first `FSW_APPEND`) truncates an abandoned temporary file first, so a retry
-starts clean. `mode` (ext 1, the
+deletes the temporary file (`fs.rename` is not needed; `job.run` DELETE removes it). A chunk with `FSW_AT_OFFSET` at offset 0 truncates an abandoned temporary file first, so a retry
+starts clean. (`FSW_APPEND` never truncates: it has no offset to say "first", so an `FSW_APPEND` writer starts from a temporary file that does not exist; the engine uses `FSW_AT_OFFSET`.) `mode` (ext 1, the
 permission bits applied at commit; absent = 0644) is optional. Callers that need chunking because
 they write more than 48 KiB: `ps5upload-core/src/cheats.rs:701`, `ps5upload-core/src/profile.rs:664`,
 `ps5upload-core/src/smp_image_rw.rs:158` (the others, `smp_checkout.rs` and `smp_image_rw.rs:305/339`,
 write small state files). The core wrapper `fs_write_bytes` chunks transparently.
+
+Other filesystem methods, as built (`payload/src/mgmt_fs.c`, host-tested): `fs.list` pages by `offset`/`limit`
+(`limit` 0 = 256, at most 256; `more` = entries remain; names that are not valid UTF-8 are listed with `?` for
+their high bytes; `total_scanned` counts what the walk passed). `fs.stat` takes any absolute path without a `..`
+component (the policy of `fs.list`, not of `fs.read`), follows a link (`kind` is `link` only for a dangling
+one), and answers `ERR_IO` with `fs_stat_failed_errno_<n>` for an absent path. `fs.mkdir` honours `mode`
+(applied to the new directory despite the umask; intermediate directories get 0777) and `parents` (0: a missing
+parent is `fs_mkdir_failed`); an existing directory succeeds, an existing non-directory is `ERR_EXISTS`.
+`fs.rename` with `overwrite = 0` refuses an existing destination (`ERR_EXISTS`, `fs_move_exists`); with
+`overwrite = 1` it replaces, as FTX2's move did. `fs.read` reads at most `FS_READ_MAX` and loops internally
+until the ask or the end, so a reply shorter than the ask always has `eof = 1`. `log.klog` sets `more` when the
+read filled the whole ask; `log.syslog` returns the newest `RPC_TEXT_MAX` bytes (or `max_bytes`) and sets `more`
+when older text was cut. A handler whose failure carries data the caller reads (`net.reach`, `fs.mount_pkg`,
+`fs.mount_lwfs`) answers an error status whose cause is the whole `{"ok":false,...}` body (up to 1 KiB), which
+the engine's `call_legacy_ok` hands back as the reply it parses.
 
 Typed bodies decoded by the adapters: `NodeStatus.ucred_elevated` is a `u8` on the wire; the engine
 adapter restores the JSON boolean the client reads (`true`/`false`) and rebuilds the legacy
@@ -445,6 +468,11 @@ A lane carries heartbeats and, on a node with `CAP_DATA_PLANE`, the lane data fr
 and `Bundle` (§12) and `Error`; any other frame without the IGNORABLE flag is answered
 `Error(ERR_PROTOCOL)` and closes the lane.
 
+Lane sockets (informative): both ends ask for 4 MiB `SO_RCVBUF` and `SO_SNDBUF` on every lane, the
+client before it connects and the console on accept, before the first read, and take whatever the
+kernel grants. A lane thread that is busy opening a 15 MiB frame for 10-20 ms then does not close
+the sender's TCP window. A receiver may keep a small pool of frame buffers for chunks whose size is a class (1, 4, 8, 15 or 16 MiB; every other size is allocated exactly, so memory in use never exceeds what the credit window counted, and idle pooled memory never exceeds the admit budget) so a lane does not allocate and fault in a fresh 15 MiB block per frame; this is not visible on the wire.
+
 ## 10. Version 1 scope
 Version 1 is what this document specifies; the sections below say what that is and what it is
 not. Unknown frame types on a control connection are a protocol error; new frame types require a
@@ -478,10 +506,32 @@ Not in version 1, each with its reason:
 - Sources of unknown length: every file's size must be known when the manifest is built.
 - Auto-tuning of the small/large cutoff (the design spec's 64 KiB–4 MiB range): the cutoff
   is the protocol constant `LARGE_CUTOFF`, §12.2.
-- Resuming a zip download within a run: a dropped zip download restarts the archive with a
-  fresh job per attempt (progress stays monotonic). FTX2 resumes mid-entry, so this is a
-  regression against FTX2 and is listed as one in `CUTOVER.md`.
+- Resuming a Deflate zip download: a deflate stream cannot be continued, so the optional
+  Deflate archive restarts with a fresh job per attempt (progress stays monotonic) and says
+  so. The default archive is Stored and does resume (below).
 - Resuming a download whose remote manifest changed: the engine restarts that job.
+
+### 10.1 Zip downloads resume
+
+A download into a `.zip` writes Stored (uncompressed) entries and resumes mid-entry on a
+reconnect, within one engine run (the job id is reused, as for a download to a folder). No
+wire change and no journal record: the receiver is `JF_ORDERED` and its journal already holds the
+durable files and the durable prefix of the file in flight.
+
+- Layout: every entry is `local header ‖ data ‖ data descriptor` (zip64 throughout), in manifest
+  order, then the empty files, then the central directory and the zip64 end records. Because the
+  manifest carries every size, entry `i` starts at the sum of the entries before it: offsets are
+  recomputed on resume, never recorded.
+- Resume: after the §13.4 re-check and before the map is sent, the receiver passes the journal's
+  state (finished files, partial prefix) to the sink (`Sink::position`). The sink verifies each
+  finished entry's header and data descriptor (the descriptor holds the CRC-32), rebuilds the
+  in-flight entry's CRC-32 by reading its durable bytes back, truncates the archive to
+  `data offset + durable bytes` and continues. The sender, told by the map, sends the rest.
+- The sink's fsync runs inside the receiver's batch (data sync, journal append, Durable), so the
+  journal is never ahead of the archive. A sink that cannot honour the journal (a missing or
+  altered archive) makes the receiver drop the journal and start the job over.
+- A file the receiver asks to have sent again (a verify mismatch) still restarts the archive.
+- Deflate remains available as an option (`ZipCompression::Deflate`); it cannot resume.
 - A same-drive `fs.move` over AVA1 is `fs.rename` (§7.3), with the `st_dev` guard; a cross-mount
   move (copy, verify, delete) is an AVA1 job.
 - Typed bodies for the management text methods (§7.3): the filesystem, node and job methods are
@@ -889,12 +939,20 @@ numbers they are fed, so both are tested against models rather than sockets.
 
 - Start: 2 lanes, a 4 MiB chunk and a 1 MiB bundle target; receiver workers start at 4.
 - Lanes: add one while the bottleneck is the network and the last addition raised throughput by
-  ≥ 10 %; otherwise revert it and hold for 30 s. A tick with a lane death or requeue drops one
+  ≥ 10 % (≥ 5 % while the rate is below 90 % of the best rate seen in the job); otherwise revert
+  it and hold for 30 s. A tick with a lane death or requeue drops one
   lane (min 1) and halves the chunk. At most 8 lanes: on a link that scales past that the count
   simply stops growing.
 - Chunk: 1–15 MiB in whole groups; halved on a stall, doubled after 10 stable ticks; never more
-  than half a second of one lane's throughput (min 1 MiB). 15 MiB, not 16: the frame cap (§2)
+  than half a second of one lane's throughput (min 1 MiB). Lanes before chunk: while the network
+  is the bottleneck, fewer than 4 lanes are open and no lane probe has failed yet, the chunk is
+  not doubled past 4 MiB (a bigger frame lengthens every decrypt stall on the receiver); once a
+  probe fails or 4 lanes are open, growth resumes. The sender can switch this policy off
+  (`PS5UPLOAD_AVA1_LANES_FIRST=0`) to A/B it; it is on by default. 15 MiB, not 16: the frame cap (§2)
   counts the header and the MAC, which a 16 MiB body would not fit under.
+- Benchmark pins (sender-local, never on the wire): `PS5UPLOAD_AVA1_LANES=n` holds the lane count
+  at n (1-8) and `PS5UPLOAD_AVA1_CHUNK=m` holds the chunk at m MiB (1-15); a pinned value ignores
+  stalls and the link. Out-of-range values are ignored. For measurement only.
 - Bundle target: a quarter second of one lane's throughput, clamped to 256 KiB–15 MiB. It moves
   with that rate; the effect is that it grows while the network is the limit and shrinks when
   the rate falls (a receiver whose workers wait shows up as a receiver-reported bottleneck, §16.9

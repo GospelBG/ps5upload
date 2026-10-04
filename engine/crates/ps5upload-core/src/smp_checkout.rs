@@ -50,7 +50,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostics::fs_write_bytes;
-use crate::fs_ops::{fs_mkdir, fs_mount, fs_move, fs_read, fs_unmount, MountResult};
+use crate::fs_ops::{fs_exists, fs_mkdir, fs_mount, fs_move, fs_read, fs_unmount, MountResult};
 use crate::volumes::{list_volumes, VolumeList};
 
 /// Directory holding the checkout journal. Fixed, on internal storage:
@@ -448,15 +448,13 @@ pub fn finish(addr: &str) -> Result<CheckoutState> {
     Ok(state)
 }
 
-/// Best-effort existence probe. A zero-byte read either succeeds (the file is
+/// Best-effort existence probe. `fs.stat` either succeeds (the path is
 /// there) or reports ENOENT; anything else — a busy port, a timeout — is
 /// deliberately reported as "exists" so a flaky probe never talks `finish`
 /// out of attempting the move that puts the user's game back.
 fn path_exists(addr: &str, path: &str) -> bool {
-    match fs_read(addr, path, 0, 1) {
-        Ok(_) => true,
-        Err(e) => !is_not_found(&e.to_string()),
-    }
+    // `fs.stat` (the 1-byte read it replaces failed on an empty-file edge case too).
+    fs_exists(addr, path).unwrap_or(true)
 }
 
 fn leaf_of(path: &str) -> &str {

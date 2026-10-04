@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { hostOf } from "../lib/addr";
+import type { SessionState } from "../lib/consoleSession";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 
 /** TCP port of the PS5 ELF loader. Constant — every common PS5
@@ -46,9 +47,6 @@ function persistHost(host: string) {
   }
 }
 
-/** TCP port our payload listens on for FTX2 transfers. Also constant. */
-export const PS5_PAYLOAD_PORT = 9113;
-
 /** TCP port the standalone DPI install daemon listens on once armed. Probed
  *  to detect a DPI that has died mid-session so it can be re-armed. */
 export const PS5_DPI_PORT = 9115;
@@ -59,13 +57,13 @@ export type ProbeStatus = "up" | "down" | "unknown";
  * Capabilities exposed by the ps5upload payload when loaded.
  *
  * These are features of OUR payload, not probes for external tools —
- * ps5upload ships its own ELF loader (port 9021), its own FTX2 transfer
- * runtime (port 9113), and its own disk-image mount path (via the PS5
+ * ps5upload ships its own ELF loader (port 9021), its own AVA1 transfer
+ * runtime (port 9120), and its own disk-image mount path (via the PS5
  * kernel's LVD backend, not an external daemon). XMB title registration
  * remains deliberately out of scope; use a PS5-side installer for that.
  */
 export type PayloadCapability =
-  /** FTX2 binary transfer runtime on :9113 */
+  /** AVA1 transfer runtime on :9120 */
   | "transfer"
   /** Disk image mount via /dev/lvdctl */
   | "mount";
@@ -93,13 +91,14 @@ export interface HostRuntime {
   ucredElevated: boolean | null;
   priorInstance: string | null;
   maxTransferStreams: number | null;
-  /** Whether the FTX2 transfer listener (:9113) accepts TCP. Probed
-   *  alongside the mgmt STATUS frame so the UI can flag the wedge
-   *  state where mgmt (:9114) is up but the transfer port is dead —
-   *  uploads will fail with "connection refused" until the payload is
-   *  redeployed, but the status pill would otherwise show green.
-   *  null = host not yet probed or transfer-port check not run. */
-  transferAlive: boolean | null;
+  /** The AVA1 session verdict from the same single probe that sets
+   *  `payloadStatus`: connected, needs_pairing, helper_old or down. There
+   *  is one listener, so there is no second liveness flag to disagree
+   *  with it. null = host not yet probed. */
+  session: SessionState | null;
+  /** With `session === "helper_old"`: the old helper would not exit when asked
+   *  (`legacy_helper_wedged`), so the console must be restarted before the update. */
+  helperWedged: boolean;
 }
 
 export const EMPTY_HOST_RUNTIME: HostRuntime = {
@@ -109,7 +108,8 @@ export const EMPTY_HOST_RUNTIME: HostRuntime = {
   ucredElevated: null,
   priorInstance: null,
   maxTransferStreams: null,
-  transferAlive: null,
+  session: null,
+  helperWedged: false,
 };
 
 export interface ConnectionState {
@@ -155,11 +155,9 @@ export interface ConnectionState {
    *  yet); the Upload path treats null as 1. The effective stream count is
    *  min(this, the user's upload-streams setting). */
   maxTransferStreams: number | null;
-  /** Mirror of the active console's transfer-port (:9113) liveness.
-   *  True = TCP connect to :9113 succeeded; false = refused/timeout;
-   *  null = host not yet probed. See HostRuntime.transferAlive for
-   *  why this is tracked separately from the mgmt-port STATUS. */
-  transferAlive: boolean | null;
+  /** Mirror of the active console's AVA1 session state (see
+   *  HostRuntime.session). */
+  session: SessionState | null;
   /** True when a fresh payload-info probe is in flight and the
    *  currently-displayed payloadVersion / ps5Kernel may be stale.
    *  Set by Connection's handleSend on entry (the user just kicked
@@ -192,7 +190,7 @@ export interface ConnectionState {
         | "priorInstance"
         | "maxTransferStreams"
         | "payloadProbing"
-        | "transferAlive"
+        | "session"
       >
     >
   ) => void;
@@ -214,7 +212,7 @@ function mirrorRuntime(host: string, rt: HostRuntime) {
     ucredElevated: rt.ucredElevated,
     priorInstance: rt.priorInstance,
     maxTransferStreams: rt.maxTransferStreams,
-    transferAlive: rt.transferAlive,
+    session: rt.session,
   };
 }
 
@@ -230,7 +228,7 @@ export const useConnectionStore = create<ConnectionState>((set) => ({
   ucredElevated: null,
   priorInstance: null,
   maxTransferStreams: null,
-  transferAlive: null,
+  session: null,
   payloadProbing: false,
   step1: "idle",
   step1Msg: "Enter your PS5's address and check",

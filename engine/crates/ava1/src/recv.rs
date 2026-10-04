@@ -94,6 +94,20 @@ pub trait Sink: Send + Sync {
     fn resume_key(&self) -> Option<(String, bool)> {
         None
     }
+    /// Called once per run, after `prepare` and the §13.4 re-check and before the map goes
+    /// out, with what the journal says is durable: the finished files and the partial
+    /// files' ranges. A sink whose bytes live in one ordered stream (the Stored zip) cuts
+    /// that stream back to exactly this state here, so what the sender is told matches
+    /// what the sink holds. An `Err` means the sink cannot honour it: the receiver drops
+    /// the journal, starts the job over and calls this again with nothing durable (which
+    /// must then succeed). Not called for a relay (it keeps no durable bytes).
+    fn position(
+        &self,
+        _done: &BTreeSet<u32>,
+        _partial: &BTreeMap<u32, RangeSet>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Whether a `LocalSink` takes the durable-by-log path unless told otherwise. The environment decides
@@ -1090,14 +1104,38 @@ async fn run_loop(
             },
         );
     }
+    // The sink cuts its stream back to the journal's state (the Stored zip's resume); a
+    // sink that cannot gets a fresh job.
+    if !sink.transient_relay() {
+        let partial_of = |st: &State| -> BTreeMap<u32, RangeSet> {
+            st.ranges
+                .iter()
+                .filter(|(id, rs)| !st.done.contains(id) && rs.covered() > 0)
+                .map(|(id, rs)| (*id, rs.clone()))
+                .collect()
+        };
+        let (s2, d2, p2) = (sink.clone(), st.done.clone(), partial_of(&st));
+        let r = tokio::task::spawn_blocking(move || s2.position(&d2, &p2))
+            .await
+            .map_err(proto)?;
+        if let Err(why) = r {
+            let _ = writeln!(
+                std::io::stderr(),
+                "ava1: the sink cannot resume this job ({why}); starting it over"
+            );
+            jnl = Journal::create(&dir, &open_rec)?;
+            st = State::default();
+            st.apply(&Record::Open(open_rec.clone()));
+            large.clear();
+            let s2 = sink.clone();
+            tokio::task::spawn_blocking(move || s2.position(&BTreeSet::new(), &BTreeMap::new()))
+                .await
+                .map_err(proto)??;
+        }
+    }
     // What the job still needs: the relay's hint when given (Task 24), else the replayed
     // state after the resume check (ruling 4: build it here; never change journal.rs).
-    let ordered_skip = if sink.transient_relay() {
-        need_hint.clone()
-    } else {
-        None
-    };
-    let need = match need_hint {
+    let need = match need_hint.clone() {
         Some(n) => n,
         None => Need {
             done: st.done.clone(),
@@ -1108,6 +1146,15 @@ async fn run_loop(
                 .map(|(id, rs)| (*id, rs.clone()))
                 .collect(),
         },
+    };
+    // An ordered job's cursor must step over what is already durable: the relay's hint,
+    // or the partial files of a resume (no frame will arrive for those bytes).
+    let ordered_skip = if sink.transient_relay() {
+        need_hint
+    } else if o.ordered && !need.partial.is_empty() {
+        Some(need.clone())
+    } else {
+        None
     };
     if !need_sent {
         send_need(link, job_id, &need).await?;

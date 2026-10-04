@@ -1,4 +1,5 @@
 #include "ava1_job.h"
+#include "ava1_frame.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -178,7 +179,8 @@ void ava1_job_foreach(void (*fn)(ava1_job_t *j, void *ctx), void *ctx) {
 static void free_frames(ava1_inframe_t *f) {
     while (f) {
         ava1_inframe_t *n = f->next;
-        free(f->body);
+        if (f->cap) (void)ava1_frame_free(f->body, f->cap);
+        else free(f->body);
         free(f);
         f = n;
     }
@@ -207,7 +209,8 @@ static void job_destroy(ava1_job_t *j) {
     if (j->role_free) j->role_free(j);
     while ((w = j->q_head) != NULL) {
         j->q_head = w->next;
-        free(w->owned);
+        if (w->owned_cap) (void)ava1_frame_free(w->owned, w->owned_cap);
+        else free(w->owned);
         free(w);
     }
     for (i = 0; i < j->pend_n; i++)
@@ -348,7 +351,7 @@ void ava1_job_reap(uint64_t now_ms) {
         /* An operation job (job.run, ava1_op.c) is the same: stamped when it ends, so its result
          * can be read for the full park age. */
         if (j->kind == AVA1_JOB_OPKIND
-                ? (fin && now_ms - j->parked_at_ms > (age < AVA1_OP_DONE_AGE_MS ? age : AVA1_OP_DONE_AGE_MS))
+                ? (fin && now_ms - j->parked_at_ms > ava1_op_keep_ms(__atomic_load_n(&j->op_delivered, __ATOMIC_ACQUIRE)))
                 : j->kind == AVA1_JOB_COPY
                 ? (fin && now_ms - j->parked_at_ms > age)
                 : (now_ms - j->parked_at_ms > age || (fin && now_ms - j->parked_at_ms > done_age))) {

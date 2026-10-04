@@ -14,6 +14,7 @@
 #include "ava1_copy.h"
 #include "ava1_op.h"
 #include "ava1_events.h"
+#include "ava1_frame.h"
 #include "ava1_job.h"
 #include "ava1_platform.h"
 #include "ava1_recv.h"
@@ -255,6 +256,7 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     if (D.running) return -EBUSY; /* one housekeeping thread; a second start changes nothing */
     D.cfg = *cfg;
     if (!D.cfg.budget) D.cfg.budget = 96u << 20;
+    ava1_frame_pool_set_budget(D.cfg.budget); /* idle pool memory never exceeds the admit budget */
     if (!D.cfg.workers_start) D.cfg.workers_start = 4;
     if (!D.cfg.workers_min) D.cfg.workers_min = 2;
     if (!D.cfg.workers_max) D.cfg.workers_max = 16;
@@ -504,7 +506,8 @@ void ava1_data_fail_soon(ava1_job_t *j, uint16_t status, const char *what) {
 /* ---- the feeder: a receiver job's frames, off the reader threads ------------------ */
 
 static void free_frame(ava1_inframe_t *f) {
-    free(f->body);
+    if (f->cap) (void)ava1_frame_free(f->body, f->cap);
+    else free(f->body);
     free(f);
 }
 
@@ -594,11 +597,11 @@ static void feed_lane(ava1_job_t *j, ava1_inframe_t *f) {
     if (f->type == AVA1_TYPE_CHUNK) {
         ava1_chunk_t c;
         (void)ava1_chunk_decode(f->body, f->len, &c);
-        rc = ava1_apply_chunk(j, f->body, f->len, c.file_id, c.offset, c.data, c.data_len);
+        rc = ava1_apply_chunk_pooled(j, f->body, f->len, f->cap, c.file_id, c.offset, c.data, c.data_len);
     } else {
         ava1_bundle_t b;
         (void)ava1_bundle_decode(f->body, f->len, &b);
-        rc = ava1_apply_bundle(j, f->body, f->len, &b);
+        rc = ava1_apply_bundle_pooled(j, f->body, f->len, f->cap, &b);
     }
     free(f); /* the body is the engine's now */
     if (rc == AVA1_E_PROTO) ava1_data_fail_soon(j, AVA1_ERR_PROTOCOL, "a data frame does not fit the manifest");
@@ -1040,8 +1043,9 @@ int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *o
             return AVA1_ERR_UNKNOWN_JOB;
         }
         if (method == AVA1_METHOD_JOB_STATUS) {
+            int fin = j->kind == AVA1_JOB_OPKIND && ava1_op_finished_before(j); /* before encoding */
             st = encode_status(j, out, cap, out_len);
-            if (st == AVA1_STATUS_OK && j->kind == AVA1_JOB_OPKIND) ava1_op_status_delivered(j);
+            if (st == AVA1_STATUS_OK && j->kind == AVA1_JOB_OPKIND) ava1_op_status_delivered(j, fin);
         } else if (j->kind == AVA1_JOB_OPKIND) ava1_op_cancel(j); /* an operation: stays listed, finished */
         else ava1_recv_cancel(j); /* stops it and unlists it: the journal stays */
         ava1_job_put(j);
@@ -1330,7 +1334,7 @@ static int data_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
     pthread_mutex_unlock(&D.mu);
     if (!body) return 0;
     if (len < 16 || (type != AVA1_TYPE_CHUNK && type != AVA1_TYPE_BUNDLE) || !(j = ava1_job_find(body))) {
-        free(body);
+        (void)ava1_frame_free(body, ava1_frame_cap(len));
         return 0; /* a frame for a job that is gone: its credit died with it */
     }
     f = calloc(1, sizeof *f);
@@ -1346,7 +1350,7 @@ static int data_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
         j->in_oom = 1;
         pthread_cond_broadcast(&j->ccv);
         pthread_mutex_unlock(&j->cmu);
-        free(body);
+        (void)ava1_frame_free(body, ava1_frame_cap(len));
         ava1_job_put_nowait(j);
         return 0;
     }
@@ -1359,7 +1363,7 @@ static int data_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
     pthread_mutex_unlock(&j->cmu);
     if (!take) {
         free(f);
-        free(body);
+        (void)ava1_frame_free(body, ava1_frame_cap(len));
         ava1_job_put_nowait(j);
         if (!over) return 0;
         post_error(sid, lane, AVA1_ERR_CREDIT, "the frame exceeds the credit granted");
@@ -1371,6 +1375,7 @@ static int data_on_lane(const uint8_t sid[16], uint16_t lane, uint8_t type, uint
     f->seq = seq;
     f->len = len;
     f->body = body;
+    f->cap = ava1_frame_cap(len);
     pthread_mutex_lock(&j->cmu);
     if (j->held_tail) j->held_tail->next = f;
     else j->held_head = f;

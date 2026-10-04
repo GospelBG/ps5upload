@@ -73,12 +73,12 @@ async fn console(tag: &str, handler: RpcHandler) -> (Arc<AvaTransport>, String) 
     let me = Identity::load_or_create(&ava.join("identity")).unwrap();
     let mut peers = PeerStore::in_memory();
     peers.add(me.public(), "engine").unwrap();
-    let ctx = ServerCtx::new(Identity::generate().unwrap(), "host", peers, handler).with_jobs(
-        Arc::new(FolderHost {
+    let ctx = ServerCtx::new(Identity::generate().unwrap(), "host", peers, handler)
+        .with_jobs(Arc::new(FolderHost {
             root: base.join("share"),
             jobs_dir: base.join("jobs"),
-        }),
-    );
+        }))
+        .with_mgmt();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap().to_string();
     tokio::spawn(server::serve(l, Arc::new(ctx)));
@@ -611,7 +611,8 @@ async fn account_backup_cheat_mod_notice_activity_and_remote_play_calls_round_tr
         .await
         .unwrap();
     run(&t, &c, |a| smp_meta::smp_meta_stats(a)).await.unwrap();
-    run(&t, &c, |a| sdk_changer::sdk_scan(a)).await.unwrap();
+    // sdk.scan runs as a job.run op (Task 5); the scripted console here answers methods only, so it is
+    // covered by ava1-ctest job_run.rs `cleanup_and_a_100_kib_sdk_scan_result_come_back_whole`.
     let sp = run(&t, &c, |a| {
         sdk_changer::sdk_patch(a, "CUSA00001", "0x04000031", false)
     })

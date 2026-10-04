@@ -23,6 +23,7 @@ import {
   type PlannedFile,
   type ReconcileMode,
 } from "../api/ps5";
+import { startPs5ToPs5 } from "../api/ava1";
 import { createRunGen } from "../lib/runGen";
 import { log } from "./logs";
 import {
@@ -34,6 +35,7 @@ import { archiveFormat, useUploadStore, type SourceKind } from "./upload";
 import { useUploadSettingsStore } from "./uploadSettings";
 import { useRecentHostMetricsStore } from "./recentHostMetrics";
 import { effectiveUploadStreams } from "../lib/uploadStreams";
+import { jobLiveFromSnapshot, type JobLive } from "../lib/jobLive";
 
 /** Module-level shortcut to the recent-host-metrics recorder. Pulled
  *  out as a function (not a direct `store.record`) so future call
@@ -99,6 +101,9 @@ export type TransferPhase =
       filesFinalized: number;
       filesFinalizingTotal: number;
       bytesFinalized: number;
+      /** Skipping phase, bottleneck and "finishing on the console" notes,
+       *  present only when the engine sent them (see lib/jobLive.ts). */
+      live?: JobLive;
     }
   | {
       kind: "done";
@@ -109,6 +114,8 @@ export type TransferPhase =
       filesSent: number;
       skippedFiles: number;
       skippedBytes: number;
+      /** What limited the finished transfer, from its commit ack, when reported. */
+      live?: JobLive;
       mountedAt?: string;
       /** Non-fatal mount diagnostics surfaced when `mountAfterUpload`
        *  ran — image-layout invalid, kernel forced RO, etc. Kept on
@@ -155,6 +162,10 @@ interface StartArgs {
    *  safely on the console); it surfaces as `registerWarning` on the
    *  done phase instead. */
   registerAfterUpload?: boolean;
+  /** PS5 to PS5: the bytes come from another console through this engine instead of from a
+   *  local path. `srcPath` is then a path on that console (`fromAddr`), `addr` the destination
+   *  console. The rest of the lifecycle (job card, poll, done/failed) is the ordinary one. */
+  ps5Source?: { fromAddr: string };
 }
 
 /** Stable idle reference — returned by `phaseForHost`/selectors when a console
@@ -244,6 +255,7 @@ export const useTransferStore = create<TransferState>((set) => {
       mountAfterUpload = false,
       mountReadOnly = true,
       registerAfterUpload = false,
+      ps5Source,
     }) {
       // Per-console key: everything below (gen, poll timer, phase write) is
       // scoped to this host so a concurrent one-shot on another console runs
@@ -350,7 +362,9 @@ export const useTransferStore = create<TransferState>((set) => {
       const streams = effectiveUploadStreams(addr);
       let jobId: string;
       try {
-        if (isFolder && strategy === "resume") {
+        if (ps5Source) {
+          jobId = await startPs5ToPs5(ps5Source.fromAddr, srcPath, addr, dest);
+        } else if (isFolder && strategy === "resume") {
           jobId = await startTransferDirReconcile(
             srcPath,
             dest,
@@ -449,7 +463,7 @@ export const useTransferStore = create<TransferState>((set) => {
         if (!isLive()) return;
         let snap: JobSnapshot;
         try {
-          snap = await jobStatus(jobId);
+          snap = await jobStatus(jobId, addr);
         } catch (e) {
           if (!isLive()) return;
           const msg = e instanceof Error ? e.message : String(e);
@@ -671,6 +685,7 @@ export const useTransferStore = create<TransferState>((set) => {
             filesSent: snap.files_sent ?? 0,
             skippedFiles: snap.skipped_files ?? 0,
             skippedBytes: snap.skipped_bytes ?? 0,
+            live: jobLiveFromSnapshot(snap),
             mountedAt,
             mountWarnings: mountWarnings.length > 0 ? mountWarnings : undefined,
             registeredAs,
@@ -751,6 +766,7 @@ export const useTransferStore = create<TransferState>((set) => {
             filesFinalized: snap.files_finalized ?? 0,
             filesFinalizingTotal: snap.files_finalizing_total ?? 0,
             bytesFinalized: snap.bytes_finalized ?? 0,
+            live: jobLiveFromSnapshot(snap),
           });
           pollTimers.set(key, setTimeout(poll, POLL_INTERVAL_MS));
         }

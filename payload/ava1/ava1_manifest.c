@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -283,7 +284,7 @@ static int frec_push(frec_t **v, uint32_t *n, uint32_t *cap, const char *p, cons
 
 /* One implementation for both modes (ruling C1). The walk follows the path order Rust's
  * walk produces; the entries are sorted by `path_cmp` afterwards either way. */
-int ava1_mstore_walk_ex(ava1_mstore_t *m, const char *root, unsigned flags) {
+int ava1_mstore_walk_deny(ava1_mstore_t *m, const char *root, unsigned flags, int (*deny)(const char *abs)) {
     strv_t dirs = { 0 };
     frec_t *found = NULL;
     uint32_t found_n = 0, found_cap = 0;
@@ -317,6 +318,9 @@ int ava1_mstore_walk_ex(ava1_mstore_t *m, const char *root, unsigned flags) {
                 rc = AVA1_E_IO;
                 break;
             }
+            /* A link into the trust store is skipped whole (a directory link is not descended, a file
+             * link is not listed). Judged on the canonical target by the hook. */
+            if (S_ISLNK(lst.st_mode) && deny && deny(abs)) continue;
             /* One stat per file: only a symlink needs its target's stat too. */
             if (S_ISLNK(lst.st_mode)) {
                 if (stat(abs, &st) != 0) {
@@ -358,7 +362,22 @@ int ava1_mstore_walk_ex(ava1_mstore_t *m, const char *root, unsigned flags) {
     return rc;
 }
 
+int ava1_mstore_walk_ex(ava1_mstore_t *m, const char *root, unsigned flags) {
+    return ava1_mstore_walk_deny(m, root, flags, NULL);
+}
+
 int ava1_mstore_walk(ava1_mstore_t *m, const char *root) { return ava1_mstore_walk_ex(m, root, 0); }
+
+int ava1_open_read_safe(const char *path, int (*deny)(const char *abs)) {
+    char res[AVA1_MAX_PATH + 600];
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd >= 0) return fd;
+    if (errno != ELOOP && errno != EMLINK) return -errno; /* FreeBSD says EMLINK for O_NOFOLLOW on a link */
+    if (!realpath(path, res)) return -errno;
+    if (deny && deny(res)) return -EACCES;
+    fd = open(res, O_RDONLY | O_NOFOLLOW);
+    return fd >= 0 ? fd : -errno;
+}
 
 int ava1_mstore_single(ava1_mstore_t *m, const char *file) {
     struct stat st;

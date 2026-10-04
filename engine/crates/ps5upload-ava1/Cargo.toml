@@ -14,13 +14,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 zip = { version = "8", default-features = false, features = ["deflate"] }
 flate2 = "1"
+crc32fast = "1"
 # Same pin and feature set as ps5upload-core (decode only; the writer is a dev-dependency).
 sevenz-rust2 = { version = "0.23", default-features = false }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
 
 [dev-dependencies]
 ftx2-proto = { path = "../ftx2-proto" }
-crc32fast = "1"
 sevenz-rust2 = { version = "0.23", default-features = false, features = ["compress"] }
 ava1-chaos = { path = "../ava1-chaos" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }

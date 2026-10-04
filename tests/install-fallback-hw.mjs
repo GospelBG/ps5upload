@@ -194,7 +194,7 @@ async function main() {
     await sleep(1000);
   }
   note(!!alive, 'payload SURVIVED the full fallback chain (mgmt port answers)',
-    alive ? `v${alive.version} txns=${alive.active_transactions}` : 'mgmt port did not answer');
+    alive ? `v${alive.version} commands=${alive.command_count}` : 'mgmt port did not answer');
 
   // Cleanup staged dummy (best-effort).
   await postJson(`${ENGINE}/api/ps5/fs/delete`, { addr: MGMT, path: STAGE }).catch(() => {});

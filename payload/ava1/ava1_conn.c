@@ -388,3 +388,19 @@ void ava1_conn_drain(ava1_conn_t *c, uint32_t ms) {
         ava1_platform_sleep_ms(2);
     }
 }
+
+int ava1_conn_tune_buffers(int fd, int *rcv, int *snd) {
+    int want = AVA1_LANE_SOCKBUF, got = 0, ok = 0;
+    socklen_t n = sizeof got;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &want, sizeof want) == 0) ok = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &want, sizeof want) == 0) ok = 1;
+    if (rcv) {
+        *rcv = getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &n) == 0 ? got : 0;
+    }
+    got = 0;
+    n = sizeof got;
+    if (snd) {
+        *snd = getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &got, &n) == 0 ? got : 0;
+    }
+    return ok ? 0 : -1;
+}

@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 
-use crate::conn::{now_us, Frame, FrameReader, FrameWriter, Pace};
+use crate::conn::{now_us, Frame, FrameBody, FrameReader, FrameWriter, Pace};
 use crate::gen::{self, Bye, Ping, Pong};
 use crate::session::Timing;
 use crate::wire::FrameMessage;
@@ -37,7 +37,7 @@ enum Out {
         ty: u8,
         flags: u8,
         channel: u32,
-        body: Vec<u8>,
+        body: FrameBody,
         /// The writer flips it the moment it takes the frame out of the queue, before
         /// the write. Un-taken when the writer dies (the queue died with it), the
         /// frame provably never left this process — the data plane uses that to
@@ -121,7 +121,7 @@ impl Outbox {
         ty: u8,
         flags: u8,
         channel: u32,
-        body: Vec<u8>,
+        body: impl Into<FrameBody>,
     ) -> Result<(), Ava1Error> {
         self.send_frame_marked(ty, flags, channel, body, None).await
     }
@@ -134,9 +134,10 @@ impl Outbox {
         ty: u8,
         flags: u8,
         channel: u32,
-        body: Vec<u8>,
+        body: impl Into<FrameBody>,
         taken: Option<Arc<AtomicBool>>,
     ) -> Result<(), Ava1Error> {
+        let body = body.into();
         let counted = Counted::new(&self.unwritten);
         self.tx
             .send(Out::Frame {
@@ -159,7 +160,7 @@ impl Outbox {
             ty: M::TYPE,
             flags: 0,
             channel,
-            body,
+            body: body.into(),
             taken: None,
         })
     }

@@ -123,7 +123,6 @@ fn running(started_at_ms: u64, bytes_sent: u64, total_bytes: u64) -> JobState {
         files_finalized: 0,
         files_finalizing_total: 0,
         bytes_finalized: 0,
-        settling: None,
     }
 }
 

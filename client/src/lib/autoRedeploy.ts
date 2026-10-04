@@ -74,7 +74,7 @@ export const MAX_LIVE_HELPER_HOLDS = 4;
  * - `hold` — a helper process is still there; leave it (and count the hold).
  */
 export function liveHelperDecision(input: {
-  /** :9113 or :9114 accepted a TCP connection just now. */
+  /** :9120 (the helper's AVA1 port) accepted a TCP connection just now. */
   portsOpen: boolean;
   /** Consecutive holds for this console so far. */
   held: number;

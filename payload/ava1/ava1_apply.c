@@ -517,8 +517,22 @@ static int enqueue(ava1_job_t *j, ava1_work_t *w, int front) {
     return 0;
 }
 
+static void release_owned(uint8_t *owned, size_t cap) {
+    if (cap) (void)ava1_frame_free(owned, cap);
+    else free(owned);
+}
+
 int ava1_apply_chunk(ava1_job_t *j, uint8_t *owned, size_t owned_len, uint32_t file_id, uint64_t off,
                      const uint8_t *data, size_t len) {
+    return ava1_apply_chunk_pooled(j, owned, owned_len, 0, file_id, off, data, len);
+}
+
+int ava1_apply_bundle(ava1_job_t *j, uint8_t *owned, size_t owned_len, const ava1_bundle_t *b) {
+    return ava1_apply_bundle_pooled(j, owned, owned_len, 0, b);
+}
+
+int ava1_apply_chunk_pooled(ava1_job_t *j, uint8_t *owned, size_t owned_len, size_t owned_cap, uint32_t file_id,
+                            uint64_t off, const uint8_t *data, size_t len) {
     ava1_work_t *w;
     uint64_t size;
     /* Inside the file (written so a hostile offset cannot wrap), group-aligned, and a whole
@@ -526,18 +540,19 @@ int ava1_apply_chunk(ava1_job_t *j, uint8_t *owned, size_t owned_len, uint32_t f
     if (file_id >= j->m.n || j->m.e[file_id].kind != AVA1_ENTRY_FILE || off % AVA1_GROUP_LEN != 0 ||
         off > (size = j->m.e[file_id].size) || len > size - off ||
         (len % AVA1_GROUP_LEN != 0 && off + len != size)) {
-        free(owned);
+        release_owned(owned, owned_cap);
         give_back(j, owned_len);
         return AVA1_E_PROTO;
     }
     w = calloc(1, sizeof *w);
     if (!w) {
-        free(owned);
+        release_owned(owned, owned_cap);
         give_back(j, owned_len);
         return AVA1_E_IO;
     }
     w->kind = AVA1_W_CHUNK;
     w->owned = owned;
+    w->owned_cap = owned_cap;
     w->owned_len = owned_len;
     w->file_id = file_id;
     w->offset = off;
@@ -546,7 +561,8 @@ int ava1_apply_chunk(ava1_job_t *j, uint8_t *owned, size_t owned_len, uint32_t f
     return enqueue(j, w, 0);
 }
 
-int ava1_apply_bundle(ava1_job_t *j, uint8_t *owned, size_t owned_len, const ava1_bundle_t *b) {
+int ava1_apply_bundle_pooled(ava1_job_t *j, uint8_t *owned, size_t owned_len, size_t owned_cap,
+                            const ava1_bundle_t *b) {
     ava1_work_t *w;
     ava1_r_t it;
     ava1_bundle_record_t r;
@@ -563,18 +579,19 @@ int ava1_apply_bundle(ava1_job_t *j, uint8_t *owned, size_t owned_len, const ava
         n++;
     }
     if (k != 0 || n != b->records_count) {
-        free(owned);
+        release_owned(owned, owned_cap);
         give_back(j, owned_len);
         return AVA1_E_PROTO;
     }
     w = calloc(1, sizeof *w);
     if (!w) {
-        free(owned);
+        release_owned(owned, owned_cap);
         give_back(j, owned_len);
         return AVA1_E_IO;
     }
     w->kind = AVA1_W_BUNDLE;
     w->owned = owned;
+    w->owned_cap = owned_cap;
     w->owned_len = owned_len;
     w->data = b->records;
     w->len = b->records_len;
@@ -1196,7 +1213,7 @@ static void run_work(ava1_job_t *j, ava1_work_t *w) {
     if (rc == -ENOSPC) worker_fail(j, AVA1_ERR_NO_SPACE, "the destination drive is full", ENOSPC);
     else if (rc == BAD_RECORD) worker_fail(j, AVA1_ERR_PROTOCOL, "a bundle record names no file", 0);
     else if (rc < 0) worker_fail(j, AVA1_ERR_IO, "write failed", -rc);
-    free(w->owned);
+    release_owned(w->owned, w->owned_cap);
     give_back(j, w->owned_len);
 }
 

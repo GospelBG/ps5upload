@@ -777,9 +777,9 @@ static void serve_loop(conn_t *k, int idx, const uint8_t sid[16], uint16_t lane,
              * admitted against credit, read into its own heap buffer and handed over. */
             const ava1_data_hooks_t *dh = S.cfg.data;
             if (!dh || !dh->admit || !dh->on_lane || dh->admit(sid, lane, blen) != 0) break;
-            heap = malloc(blen ? blen : 1);
+            heap = ava1_frame_alloc(blen, NULL); /* pooled: released with ava1_frame_free(heap, ava1_frame_cap(blen)) */
             if (!heap || ava1_conn_recv_body(&k->io, heap, blen) != 0) {
-                free(heap);
+                (void)ava1_frame_free(heap, ava1_frame_cap(blen));
                 dh->on_lane(sid, lane, h.type, h.channel, NULL, blen);
                 break;
             }
@@ -1092,6 +1092,14 @@ static void *accept_main(void *arg) {
 #ifdef SO_NOSIGPIPE
         (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
+        {
+            /* Before the first read: 4 MiB each way, whatever the kernel grants. */
+            static int logged;
+            int rcv = 0, snd = 0;
+            (void)ava1_conn_tune_buffers(fd, &rcv, &snd);
+            if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+                slog("ava1: lane socket buffers asked %d, kernel gave rcv %d snd %d", AVA1_LANE_SOCKBUF, rcv, snd);
+        }
         ip = from.sin_addr.s_addr;
         k = calloc(1, sizeof *k);
         pthread_mutex_lock(&mu);

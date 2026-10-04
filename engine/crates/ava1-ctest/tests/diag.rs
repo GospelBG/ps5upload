@@ -65,9 +65,16 @@ struct Rig {
     me: Arc<Identity>,
     mine: Arc<Mutex<PeerStore>>,
     ava: PathBuf,
+    // Declared last so it drops last: the server stops before the next test may start one.
+    _one_at_a_time: std::sync::MutexGuard<'static, ()>,
 }
 
+/// The installed management table, its counters and the C server's dispatcher are process-wide:
+/// tests that start a server run one at a time. Lock order: RIG, then EVENTS.
+static RIG: Mutex<()> = Mutex::new(());
+
 fn start(tag: &str) -> Rig {
+    let one_at_a_time = RIG.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(mgmt::install_diag(), 0);
     let d = dir(tag);
     let ava = d.join("ava");
@@ -90,6 +97,7 @@ fn start(tag: &str) -> Rig {
         me,
         mine: Arc::new(Mutex::new(mine)),
         ava,
+        _one_at_a_time: one_at_a_time,
     }
 }
 
@@ -796,6 +804,9 @@ fn c_event_log_rolls_into_dot_old_keeping_the_newest_lines() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_real_upload_leaves_open_and_done_lines_with_its_numbers() {
+    // RIG first, then EVENTS (the bundle test's order): this test starts its own C server, which
+    // must not run beside another test's.
+    let _one_at_a_time = RIG.lock().unwrap_or_else(|e| e.into_inner());
     let _ev = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
     let d = dir("events-upload");
     let src = d.join("src");

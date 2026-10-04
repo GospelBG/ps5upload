@@ -43,7 +43,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostics::fs_write_bytes;
-use crate::fs_ops::{fs_chmod, fs_mkdir, fs_move, fs_read};
+use crate::fs_ops::{fs_chmod, fs_exists, fs_mkdir, fs_move, fs_read, is_not_found};
 
 const CONFIG_PATH: &str = "/data/shadowmount/config.ini";
 const SESSION_DIR: &str = "/data/ps5upload/editing";
@@ -226,22 +226,9 @@ fn wait_for_mount(addr: &str, image_path: &str, present: bool) -> Result<Option<
 }
 
 fn path_exists(addr: &str, path: &str) -> bool {
-    match fs_read(addr, path, 0, 1) {
-        Ok(_) => true,
-        Err(e) => !is_not_found(&e.to_string()),
-    }
-}
-
-fn is_not_found(message: &str) -> bool {
-    message.contains("ENOENT")
-        || message.contains("No such file")
-        || message.split("_errno_").skip(1).any(|rest| {
-            rest.chars()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>()
-                == "2"
-        })
-        || message.contains("fs_read_stat_failed")
+    // Anything but a definite "no such path" counts as present, so a flaky probe never talks the
+    // caller out of putting the user's image back.
+    fs_exists(addr, path).unwrap_or(true)
 }
 
 fn blip(addr: &str, state: &ImageRwSession) -> Result<String> {
