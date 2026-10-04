@@ -119,6 +119,10 @@ struct ava1_job {
     int fail_journal;
     uint32_t pre_files;
     int pre_slow_logged;
+    /* Whole-job totals for the end-of-job summary (never reset by the periodic line): the job
+     * thread's scan/data/dirs/journal microseconds; commit is the sum over workers (atomic). */
+    uint64_t start_us, tot_scan_us, tot_data_us, tot_dirs_us, tot_jnl_us, tot_commit_us, tot_batches, tot_files;
+    int timing;                     /* the periodic stats line is on (opt-in, read once per job) */
     ava1_file_range_t *last_ranges; /* the last journal batch's ranges (resume check, Task 13) */
     uint32_t last_ranges_n;
     uint64_t credit, outstanding;   /* granted; lane-frame bytes held */

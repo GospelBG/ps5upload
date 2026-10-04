@@ -349,6 +349,8 @@ pub mod ffi {
         pub fn ava1_test_apply_trace(on: c_int);
         pub fn ava1_test_apply_probe(out: *mut u64);
         pub fn ava1_test_apply_probe_prep(out: *mut u64);
+        pub fn ava1_test_apply_summary(out: *mut u8, cap: usize) -> usize;
+        pub fn ava1_test_apply_timing() -> c_int;
         pub fn ava1_test_apply_hook_sleep(ms: u32);
         pub fn ava1_test_apply_dup_on_commit(id: u32, off: u64, d: *const u8, len: usize) -> c_int;
         pub fn ava1_test_apply_fail_dir_sync(id: u32);
@@ -1475,6 +1477,18 @@ impl CApplyJob {
             batch_dir_sync_threads: o[6],
             per_chunk_fsync: o[7] != 0,
         }
+    }
+
+    /// The one-line summary the job prints when it ends (where its time went).
+    pub fn summary(&self) -> String {
+        let mut b = vec![0u8; 1024];
+        let n = unsafe { ffi::ava1_test_apply_summary(b.as_mut_ptr(), b.len()) };
+        String::from_utf8_lossy(&b[..n]).into_owned()
+    }
+
+    /// Whether this job's periodic stats line is on (the timing opt-in, read at its start).
+    pub fn timing_on(&self) -> bool {
+        unsafe { ffi::ava1_test_apply_timing() != 0 }
     }
 
     /// The same for prepare's directory syncs: (calls, on a worker, distinct threads).

@@ -15,6 +15,7 @@
 #include "ava1_frame.h" /* AVA1_FLAG_IGNORABLE */
 #include "ava1_internal.h"
 #include "ava1_platform.h"
+#include "ava1_send.h" /* ava1_send_timing_enabled: the shared timing opt-in */
 #include "ava1_thread.h"
 
 #define CREDIT_FLUSH (4u << 20)
@@ -367,6 +368,23 @@ void ava1_apply_status(ava1_job_t *j) {
     if (ava1_status_encode(&st, &w) == 0) ava1_job_emit(j, AVA1_TYPE_STATUS, AVA1_FLAG_IGNORABLE, b, w.len);
 }
 
+size_t ava1_apply_summary(const ava1_job_t *j, char *out, size_t cap) {
+    double wall = (double)(mono_us() - j->start_us);
+    int n;
+    if (wall < 1.0) wall = 1.0;
+#define SHARE(us) (100.0 * (double)(us) / wall)
+    n = snprintf(out, cap,
+                 "[ava1] job %02x%02x%02x%02x: finished in %.0f ms, %llu batches, share of time: scan %.1f%% data fsync "
+                 "%.1f%% dirs %.1f%% journal %.1f%% (job thread); commit %.1f%% preallocate %.1f%% (summed over workers)",
+                 j->id[0], j->id[1], j->id[2], j->id[3], wall / 1000.0, (unsigned long long)j->tot_batches,
+                 SHARE(j->tot_scan_us), SHARE(j->tot_data_us), SHARE(j->tot_dirs_us), SHARE(j->tot_jnl_us),
+                 SHARE(__atomic_load_n(&j->tot_commit_us, __ATOMIC_RELAXED)),
+                 SHARE(__atomic_load_n(&j->pre_us, __ATOMIC_RELAXED)));
+#undef SHARE
+    if (n < 0) return 0;
+    return (size_t)n < cap ? (size_t)n : (cap ? cap - 1 : 0);
+}
+
 /* Every end of a job goes through here, success included (finish() passes AVA1_STATUS_OK):
  * one place sets `finished`, journals Done and sends JobDone, exactly once. */
 void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, int journal_done) {
@@ -387,6 +405,11 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
     pthread_mutex_unlock(&j->mu);
     if (!first) return;
     ava1_log_job_event(status == AVA1_STATUS_OK ? "done" : "fail", j, status);
+    if (j->start_us) { /* the apply engine ran: where its time went (a download or a move has none) */
+        char line[400];
+        (void)ava1_apply_summary(j, line, sizeof line);
+        fprintf(stderr, "%s\n", line);
+    }
     if (__atomic_load_n(&j->pre_files, __ATOMIC_RELAXED))
         fprintf(stderr, "[ava1] job %02x%02x%02x%02x: preallocate took %llu ms for %llu MiB\n", j->id[0], j->id[1],
                 j->id[2], j->id[3], (unsigned long long)(__atomic_load_n(&j->pre_us, __ATOMIC_RELAXED) / 1000u),
@@ -1429,6 +1452,12 @@ static void sync_batch(ava1_job_t *j) {
         j->st_data_us += u2 - u1;
         j->st_dirs_us += u3 - u2;
         j->st_jnl_us += u4 - u3;
+        j->tot_batches++;
+        j->tot_files += nfiles;
+        j->tot_scan_us += u1 - u0;
+        j->tot_data_us += u2 - u1;
+        j->tot_dirs_us += u3 - u2;
+        j->tot_jnl_us += u4 - u3;
     }
     if (ava1_jnl_len(&j->jnl) > AVA1_JNL_COMPACT_AT) {
         uint64_t c0 = mono_us();
@@ -1720,6 +1749,7 @@ static void run_commit(ava1_job_t *j, uint32_t id) {
     uint64_t t0 = mono_us();
     commit_large(j, id);
     __atomic_add_fetch(&j->st_commit_us, mono_us() - t0, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&j->tot_commit_us, mono_us() - t0, __ATOMIC_RELAXED);
     pthread_mutex_lock(&j->mu);
     j->commits_inflight--;
     pthread_cond_broadcast(&j->cv);
@@ -1941,7 +1971,7 @@ static void *job_main(void *arg) {
             j->last_batch_ms = now;
             if (!j->stopping) ava1_apply_commit_ready(j);
         }
-        if (j->st_batches && now - j->st_log_ms >= 10000) log_stats(j, now);
+        if (j->timing && j->st_batches && now - j->st_log_ms >= 10000) log_stats(j, now);
         if (all_done(j)) finish(j);
         if (now - j->status_ms >= 250) {
             j->status_ms = now;
@@ -1956,6 +1986,8 @@ int ava1_apply_start(ava1_job_t *j) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
     ava1_wtune_init(&j->tune, cfg->workers_start, cfg->workers_min, cfg->workers_max);
     j->batch_max = 256;
+    j->start_us = mono_us();
+    j->timing = ava1_send_timing_enabled();
     j->tune_ms = j->status_ms = j->last_batch_ms = j->last_batch_end_ms = ava1_mono_ms();
     if (add_workers(j, cfg->workers_start) != 0 && j->nworkers == 0) return -1;
     j->want_workers = j->nworkers;

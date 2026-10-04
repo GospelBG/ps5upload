@@ -226,3 +226,36 @@ The Phat's usb0 numbers are far below the Pro's for both protocols and its AVA1 
 third of FTX2's there; that is unexplained and is a reason to re-run the Phat before the release.
 FTX2 resume failed in every Phat run (the harness did not wait for the helper's ports after a
 restart; fixed in `a67ea278`, re-run pending on the Phat).
+
+### 4.1 Receive/apply path changes since those runs (perf-apply, review 003; not yet measured on hardware)
+
+Host/loopback tests only (the consoles were reserved); every row of §4 above must be re-run. What
+changed and what each is expected to move:
+
+| change | where | expected effect |
+|--------|-------|-----------------|
+| preallocation outside `j->mu` (§2.1) | `lfile_open` | removes the multi-second stall of every worker and the feeder at each new large file on a slow drive; the Phat's usb0 upload should lose its two-minute preallocation freeze for the other lanes. Preallocation and ENOSPC-first are unchanged. |
+| commits on workers (§3.3) | `ava1_apply_commit_ready` | the 1,641 large files of the 223k corpus (four fsyncs each) stop blocking every batch; they overlap with the chunk work. |
+| striped directory fsyncs (§3.3, §4) | `ava1_sync_dirset` in prepare and every batch; engine `LocalSink::sync` | prepare's serial ~3 ms x thousands of parents and the per-batch serial directory fsyncs shrink by up to the worker count; this is the expected top item for the 82.5 files/s game upload. |
+| per-chunk fsync on a slow drive (§6) | `sync_batch`, `write_chunk` | should bring the Phat's usb0 large-file upload toward FTX2's 34-35 MB/s; the line `slow drive: ... fsync per chunk from now on` shows it fired. |
+| per-job stats | `ava1_apply_summary` | one line at every job's end: share of wall time in scan / data fsync / dirs / journal (job thread) and commit / preallocate (summed over workers); plus `preallocate took N ms for M MiB` and, above 1 s per GiB, `preallocation on this drive is slow`. |
+
+The periodic per-batch line (`per batch ms: scan ... data ... dirs ...`) is now opt-in like the sender's
+stage timers: `PS5UPLOAD_AVA1_TIMING=1` on a host, or create `/data/ps5upload/debug/ava1-timing` on the
+console. The end-of-job line above is always printed. To read where a slow upload spends its time:
+turn the flag on, run it, and read `/data/ps5upload/stderr.log`.
+
+Deferred (recorded here, not done):
+
+- **Directory-fsync deferral** (review 003 §3.3's second option) was not taken: striping keeps the
+  invariant "no journal record names a file whose directory is unsynced" (SPEC 15.4) and needs no
+  `lstat` of every done file on resume. Durable-by-log (`02-design-durable-by-log.md`) supersedes both.
+- **Engine side**: `LocalSink` (downloads) still does one `fsync` per file serially and opens each file
+  under its state mutex; only its directory fsyncs are parallel now. It never preallocates, so item 1
+  has no engine counterpart. A packed-sink design belongs with durable-by-log (§3.4).
+- **Compaction while commits are in flight** is skipped for that batch (it retries after the next one);
+  on a job that always has a large file committing, the journal grows past `AVA1_JNL_COMPACT_AT` until a
+  quiet batch. Not measured; if it shows, compact between a commit's journal record and the next one's
+  start instead.
+- The slow-drive switch is one-way for the life of the job and never reverts; a drive that recovers
+  (a USB hub contention that ends) keeps paying one small flush per chunk.

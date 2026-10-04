@@ -57,6 +57,10 @@ void ava1_apply_quiesce(ava1_job_t *j);
 /* Queues the commit of every large file whose ranges and root are all durable onto the
  * workers and returns at once (a commit is four fsyncs; it must not stop the job thread). */
 void ava1_apply_commit_ready(ava1_job_t *j);
+/* One line: where the job's time went, as a share of its wall time (scan, data fsync, directory
+ * fsyncs, journal on the job thread; commit and preallocate summed over workers, so they can pass
+ * 100% together). Printed once when the job ends, always. Returns the length written. */
+size_t ava1_apply_summary(const ava1_job_t *j, char *out, size_t cap);
 /* Sends a finished job's JobDone again (a sender that lost the first one asks again). */
 void ava1_apply_done_again(ava1_job_t *j);
 /* The staged tree was renamed before a crash or sync failure: sync its parent and

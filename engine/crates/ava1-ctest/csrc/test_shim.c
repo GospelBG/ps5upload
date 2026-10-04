@@ -1396,6 +1396,9 @@ void ava1_test_apply_probe(uint64_t out[8]) {
     pthread_mutex_unlock(&g_dir_mu);
 }
 
+size_t ava1_test_apply_summary(char *out, size_t cap) { return g_job ? ava1_apply_summary(g_job, out, cap) : 0; }
+int ava1_test_apply_timing(void) { return g_job ? g_job->timing : 0; }
+
 /* The same for prepare's directory syncs: out[0..3] = calls, on a worker, distinct threads. */
 void ava1_test_apply_probe_prep(uint64_t out[3]) {
     pthread_mutex_lock(&g_dir_mu);
