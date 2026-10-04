@@ -369,6 +369,7 @@ pub mod ffi {
         pub fn ava1_test_recv_end(files: u32, bytes: u64, hash: *const u8) -> c_int;
         pub fn ava1_test_recv_resume(hash: *const u8) -> c_int;
         pub fn ava1_test_job_stopped() -> c_int;
+        pub fn ava1_test_op_hold_reply_until_finished(on: c_int);
         pub fn ava1_test_recv_reopen(drop_old: c_int) -> c_int;
         pub fn ava1_test_recv_last_open() -> c_int;
         pub fn ava1_test_recv_ack_credit() -> u64;

@@ -1745,6 +1745,13 @@ int ava1_test_recv_end(uint32_t files, uint64_t bytes, const uint8_t hash[32]) {
 
 int ava1_test_recv_resume(const uint8_t hash[32]) { return ava1_recv_resume(g_job, hash); }
 
+/* Holds job.run's reply until the operation it started has finished: the race where an op ends
+ * while its "running" reply is being built (it must stay listed for the next job.status). */
+static void wait_op_finished(ava1_job_t *j) {
+    for (int i = 0; i < 2000 && !__atomic_load_n(&j->finished, __ATOMIC_ACQUIRE); i++) usleep(1000);
+}
+void ava1_test_op_hold_reply_until_finished(int on) { ava1_op_test_pre_encode = on ? wait_op_finished : NULL; }
+
 int ava1_test_job_stopped(void) {
     int s;
     pthread_mutex_lock(&g_job->mu);

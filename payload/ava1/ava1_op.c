@@ -228,10 +228,14 @@ void ava1_op_cancel(ava1_job_t *j) {
  * instead, because a re-run after a lost reply would take a second snapshot. */
 static int releasable(const op_t *o) { return o->op != AVA1_JOB_OP_BACKUP_SNAPSHOT && o->op != AVA1_JOB_OP_BACKUP_RESTORE; }
 
-void ava1_op_status_delivered(ava1_job_t *j) {
+void (*ava1_op_test_pre_encode)(ava1_job_t *j);
+
+int ava1_op_finished_before(ava1_job_t *j) { return __atomic_load_n(&j->finished, __ATOMIC_ACQUIRE) != 0; }
+
+void ava1_op_status_delivered(ava1_job_t *j, int was_finished) {
     op_t *o = op_of(j);
     uint8_t id[16];
-    if (!o || !__atomic_load_n(&j->finished, __ATOMIC_ACQUIRE) || !releasable(o)) return;
+    if (!o || !was_finished || !releasable(o)) return;
     memcpy(id, j->id, 16);
     ava1_job_free_one(id); /* unlists; the caller's reference still holds it until it returns */
 }
@@ -260,8 +264,9 @@ int ava1_op_run_rpc(const uint8_t *body, uint32_t len, const uint8_t owner[32], 
             ava1_rpc_msg(out, cap, out_len, "a job with this id has different parameters");
             rc = AVA1_ERR_PROTOCOL;
         } else {
+            int fin = ava1_op_finished_before(j);
             rc = ava1_op_encode_status(j, out, cap, out_len);
-            if (rc == AVA1_STATUS_OK) ava1_op_status_delivered(j);
+            if (rc == AVA1_STATUS_OK) ava1_op_status_delivered(j, fin);
         }
         ava1_job_put(j);
         pthread_mutex_unlock(&g_run_mu);
@@ -320,8 +325,12 @@ int ava1_op_run_rpc(const uint8_t *body, uint32_t len, const uint8_t owner[32], 
         return AVA1_ERR_INTERNAL;
     }
     o->started = 1;
-    rc = ava1_op_encode_status(j, out, cap, out_len);
-    if (rc == AVA1_STATUS_OK) ava1_op_status_delivered(j); /* an op that already finished */
+    {
+        int fin = ava1_op_finished_before(j); /* before encoding: see ava1_op_status_delivered */
+        if (ava1_op_test_pre_encode) ava1_op_test_pre_encode(j);
+        rc = ava1_op_encode_status(j, out, cap, out_len);
+        if (rc == AVA1_STATUS_OK) ava1_op_status_delivered(j, fin); /* an op that already finished */
+    }
     ava1_job_put(j);
     pthread_mutex_unlock(&g_run_mu);
     return rc;

@@ -989,3 +989,20 @@ async fn an_atomic_copy_keeps_the_source_mode_and_a_nul_in_a_path_is_refused() {
     assert_eq!(count_files(&victim), 2);
     drop(r.srv);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_op_that_finishes_while_its_running_reply_is_built_stays_readable() {
+    // The reply to job.run is encoded after the op has finished, but the "was it finished" read
+    // came first: the job must stay listed, or the engine's next job.status gets ERR_UNKNOWN_JOB.
+    let r = rig("jr-race").await;
+    let f = r.d.join("race.bin");
+    std::fs::write(&f, b"hello").unwrap();
+    let a = serde_json::json!({ "path": f.to_str().unwrap() }).to_string();
+    unsafe { ffi::ava1_test_op_hold_reply_until_finished(1) };
+    let (code, _) = run(&r.me, id(201), gen::JOB_OP_HASH, &a).await;
+    unsafe { ffi::ava1_test_op_hold_reply_until_finished(0) };
+    assert_eq!(code, gen::STATUS_OK);
+    let st = status(&r.me, id(201)).await; // ERR_UNKNOWN_JOB before the fix
+    assert_eq!(st.state, Some(1));
+    drop(r.srv);
+}

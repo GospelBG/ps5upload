@@ -58,8 +58,13 @@ int ava1_op_encode_status(ava1_job_t *j, uint8_t *out, size_t cap, size_t *out_l
  * its next check and the job stays listed (finished, ERR_CANCELLED) so a poller reads how it ended. */
 void ava1_op_cancel(ava1_job_t *j);
 /* A status reply was produced for `j`: when it was terminal and the operation is repeatable, the job
- * is released (unlisted) now instead of holding a table slot until the reaper. */
-void ava1_op_status_delivered(ava1_job_t *j);
+ * is released (unlisted) now instead of holding a table slot until the reaper. `was_finished` is
+ * `ava1_op_finished_before(j)` read BEFORE the reply was encoded: an operation that finished while
+ * a "running" reply was being built must stay listed, or the next job.status finds no job. */
+int ava1_op_finished_before(ava1_job_t *j);
+/* Test seam (NULL in the payload): called between that read and the encoding of job.run's reply. */
+extern void (*ava1_op_test_pre_encode)(ava1_job_t *j);
+void ava1_op_status_delivered(ava1_job_t *j, int was_finished);
 /* How long a finished operation that is not released on read stays listed (ms). */
 #define AVA1_OP_DONE_AGE_MS 30000u
 
