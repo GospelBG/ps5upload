@@ -282,11 +282,25 @@ pub fn join_ack_tag(
     )
 }
 
-/// The six-digit code both devices show while pairing, bound to this handshake.
-pub fn pairing_code(hash: &[u8; 64]) -> u32 {
+/// The server's commitment to its pairing nonce, sent in `ServerInfo` before the client
+/// has revealed anything (SPEC.md §4.6).
+pub fn pair_commit(nonce_s: &[u8; 16]) -> [u8; 32] {
+    Blake2b::<U32>::new()
+        .chain_update(nonce_s)
+        .finalize()
+        .into()
+}
+
+/// The six-digit code both devices show while pairing, bound to this handshake and to
+/// both sides' nonces (SPEC.md §4.6). The server committed to `nonce_s` before it saw
+/// `nonce_c`, so an active man in the middle cannot grind either nonce until the two
+/// codes agree.
+pub fn pairing_code(hash: &[u8; 64], nonce_c: &[u8; 16], nonce_s: &[u8; 16]) -> u32 {
     let d = Blake2b::<U32>::new()
         .chain_update(b"AVA1 pairing")
         .chain_update(hash)
+        .chain_update(nonce_c)
+        .chain_update(nonce_s)
         .finalize();
     u32::from_le_bytes([d[0], d[1], d[2], d[3]]) % 1_000_000
 }
@@ -434,8 +448,45 @@ mod tests {
         assert_eq!(r.remote_static(), Some(c.public()));
         let (a, b) = (i.finish(), r.finish());
         assert_eq!((a.c2s, a.s2c, a.hash), (b.c2s, b.s2c, b.hash));
-        assert_eq!(pairing_code(&a.hash), pairing_code(&b.hash));
-        assert!(pairing_code(&a.hash) < 1_000_000);
+        let (nc, ns) = ([1u8; 16], [2u8; 16]);
+        assert_eq!(
+            pairing_code(&a.hash, &nc, &ns),
+            pairing_code(&b.hash, &nc, &ns)
+        );
+        assert!(pairing_code(&a.hash, &nc, &ns) < 1_000_000);
+    }
+
+    fn arr<const N: usize>(h: &str) -> [u8; N] {
+        hex::decode(h).unwrap().try_into().unwrap()
+    }
+
+    #[test]
+    fn the_pairing_code_reproduces_the_vectors() {
+        let mut n = 0;
+        for l in include_str!("../../../../protocol/ava1/vectors/pairing.txt").lines() {
+            if l.starts_with('#') || l.trim().is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let (h, nc, ns): ([u8; 64], [u8; 16], [u8; 16]) = (arr(f[1]), arr(f[2]), arr(f[3]));
+            assert_eq!(hex::encode(&pair_commit(&ns)), f[4], "{l}");
+            assert_eq!(pairing_code(&h, &nc, &ns).to_string(), f[5], "{l}");
+            n += 1;
+        }
+        assert!(n >= 3);
+    }
+
+    #[test]
+    fn the_pairing_code_depends_on_both_nonces_and_the_hash() {
+        let (h, nc, ns) = ([5u8; 64], [1u8; 16], [2u8; 16]);
+        let base = pairing_code(&h, &nc, &ns);
+        // 10^6 codes: a single-bit change colliding is a 1-in-a-million fluke per case,
+        // and these inputs are fixed, so the assertion is deterministic.
+        assert_ne!(base, pairing_code(&h, &[9u8; 16], &ns), "nonce_c");
+        assert_ne!(base, pairing_code(&h, &nc, &[9u8; 16]), "nonce_s");
+        assert_ne!(base, pairing_code(&[6u8; 64], &nc, &ns), "h");
+        // Order matters: the nonces are not interchangeable.
+        assert_ne!(base, pairing_code(&h, &ns, &nc));
     }
 
     #[test]

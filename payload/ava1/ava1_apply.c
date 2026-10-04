@@ -1,4 +1,5 @@
 #include "ava1_apply.h"
+#include "ava1_events.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -375,6 +376,7 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
     }
     pthread_mutex_unlock(&j->mu);
     if (!first) return;
+    ava1_log_job_event(status == AVA1_STATUS_OK ? "done" : "fail", j, status);
     if (credit) ava1_budget_give(credit);
     if (journal_done) {
         ava1_jnl_done_t d;

@@ -1,10 +1,9 @@
 //! Fan curve editor over FTX2.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FanCurvePoint {
@@ -38,20 +37,13 @@ pub fn fan_curve_set(addr: &str, points: &[FanCurvePoint]) -> Result<()> {
             bail!("duty must be 0-100%");
         }
     }
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::json!({ "points": points });
-    c.send_frame(FrameType::HwFanCurveSet, &serde_json::to_vec(&body)?)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected HW_FAN_CURVE_SET: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::HwFanCurveSetAck {
-        bail!("expected HW_FAN_CURVE_SET_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(
+        addr,
+        m::HW_FAN_CURVE_SET,
+        "HW_FAN_CURVE_SET",
+        &serde_json::to_vec(&body)?,
+    )?;
     let parsed: FanCurveSetResult = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(
@@ -67,19 +59,7 @@ pub fn fan_curve_set(addr: &str, points: &[FanCurvePoint]) -> Result<()> {
 }
 
 pub fn fan_curve_get(addr: &str) -> Result<Vec<FanCurvePoint>> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::HwFanCurveGet, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected HW_FAN_CURVE_GET: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::HwFanCurveGetAck {
-        bail!("expected HW_FAN_CURVE_GET_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::HW_FAN_CURVE_GET, "HW_FAN_CURVE_GET", &[])?;
     let parsed: FanCurveGetResult = serde_json::from_slice(&resp)?;
     Ok(parsed.points)
 }

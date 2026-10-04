@@ -4,10 +4,9 @@
 //! then pushes the result back to the payload cache via TmdbStore.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m, Method};
 
 #[cfg(not(target_os = "android"))]
 use std::io::Read;
@@ -73,29 +72,10 @@ pub struct TmdbFetchResponse {
     pub sku: Option<String>,
 }
 
-fn send_recv(
-    addr: &str,
-    req_type: FrameType,
-    ack_type: FrameType,
-    body: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    let mut c = Connection::connect(addr)?;
-    let empty: Vec<u8> = Vec::new();
-    let body = body.unwrap_or(&empty);
-    c.send_frame(req_type, body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected {:?}: {}",
-            req_type,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != ack_type {
-        bail!("expected {:?}, got {:?}", ack_type, ft);
-    }
-    Ok(resp)
+fn send_recv(addr: &str, method: Method, label: &str, body: Option<&[u8]>) -> Result<Vec<u8>> {
+    // The handler's `{"ok":false,...}` bodies carry data the callers read; call_keep gives them back
+    // as the FTX2 path did, and leaves a plain refusal an error ("payload rejected <label>: <cause>").
+    mgmt::call_keep(addr, method, label, body.unwrap_or(&[]))
 }
 
 fn is_valid_title_id(s: &str) -> bool {
@@ -329,8 +309,8 @@ fn tmdb_store_on_payload(addr: &str, title_id: &str, json: &str) -> Result<()> {
     let req = serde_json::json!({ "title_id": title_id, "json": json });
     let resp = send_recv(
         addr,
-        FrameType::TmdbStore,
-        FrameType::TmdbStoreAck,
+        m::TMDB_STORE,
+        "TmdbStore",
         Some(&serde_json::to_vec(&req)?),
     )?;
     let v: serde_json::Value = serde_json::from_slice(&resp)?;
@@ -361,8 +341,8 @@ pub fn tmdb_fetch(
     let req = serde_json::json!({ "title_id": input, "refresh": refresh });
     let resp = send_recv(
         addr,
-        FrameType::TmdbFetch,
-        FrameType::TmdbFetchAck,
+        m::TMDB_FETCH,
+        "TmdbFetch",
         Some(&serde_json::to_vec(&req)?),
     )?;
     let v: serde_json::Value = serde_json::from_slice(&resp)?;

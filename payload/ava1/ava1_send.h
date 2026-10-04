@@ -47,6 +47,8 @@ void ava1_send_start(ava1_job_t *j);
 extern uint32_t ava1_send_test_fail_sends;
 extern uint32_t ava1_send_test_fail_writer_starts;
 extern uint64_t ava1_send_test_chunk_bytes;
+/* Whether the per-download stage-timer line is on (flag file or PS5UPLOAD_AVA1_TIMING). */
+int ava1_send_timing_enabled(void);
 /* Tests only: one sender job's window and queues, driven step by step (no threads). */
 void ava1_send_test_begin(uint64_t credit);
 void ava1_send_test_end(void);

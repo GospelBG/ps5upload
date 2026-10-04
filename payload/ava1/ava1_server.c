@@ -814,13 +814,14 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     ava1_welcome_t wel;
     ava1_noise_t ns;
     ava1_identity_t eph;
-    uint8_t secret[32], sid[16], pl[512], msg[600], c2s[32], s2c[32];
+    uint8_t secret[32], sid[16], nonce_s[16], pl[512], msg[600], c2s[32], s2c[32];
     char peer_name[64];
     size_t pn, mn;
     uint8_t type, flags;
     uint32_t ch;
     ava1_w_t w;
-    int known, open, busy = 0, notify = 0, idx, filled = 0;
+    int known, open, busy = 0, notify = 0, idx, filled = 0, ci_ok;
+    uint32_t pair_code = 0;
 
     memset(&ns, 0, sizeof ns);
     memset(&eph, 0, sizeof eph);
@@ -835,7 +836,8 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
         (void)send_error(&k->io, AVA1_ERR_PROTOCOL, "bad Hs1");
         goto out;
     }
-    if (ava1_platform_random(secret, 32) != 0 || ava1_platform_random(sid, 16) != 0) {
+    if (ava1_platform_random(secret, 32) != 0 || ava1_platform_random(sid, 16) != 0 ||
+        ava1_platform_random(nonce_s, 16) != 0) {
         (void)send_error(&k->io, AVA1_ERR_INTERNAL, "no random source");
         goto out;
     }
@@ -858,6 +860,8 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
      * for: the caps are what a client is entitled to rely on. */
     if (!S.cfg.data) si.caps &= ~AVA1_CAP_DATA_PLANE;
     memcpy(si.session_id, sid, 16);
+    /* Commit to the pairing nonce before the client has shown its own (SPEC.md 4.6). */
+    ava1_pair_commit(nonce_s, si.pair_commit);
     si.has_name = 1;
     si.name = (const uint8_t *)S.cfg.name;
     si.name_len = (uint16_t)strlen(S.cfg.name);
@@ -868,14 +872,20 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
         goto out;
     if (ava1_conn_recv(&k->io, &type, &flags, &ch, buf, CTRL_MAX, &len) != 0 || type != AVA1_TYPE_HS3 ||
         ava1_hs3_decode(buf, len, &m3) != 0 ||
-        ava1_noise_read(&ns, m3.noise, m3.noise_len, pl, sizeof pl, &pn) != 0 ||
-        ava1_client_info_decode(pl, pn, &ci) != 0)
+        ava1_noise_read(&ns, m3.noise, m3.noise_len, pl, sizeof pl, &pn) != 0)
         goto out;
-    clean_name(ci.name, ci.has_name ? ci.name_len : 0, peer_name);
+    ci_ok = ava1_client_info_decode(pl, pn, &ci) == 0;
+    if (ci_ok) clean_name(ci.name, ci.has_name ? ci.name_len : 0, peer_name);
     if (ava1_noise_split(&ns, c2s, s2c) != 0) goto out;
     ava1_control_key(c2s, k->io.recv_key);
     ava1_control_key(s2c, k->io.send_key);
     k->io.keyed = 1;
+    if (!ci_ok) {
+        /* No pairing nonce (SPEC.md 4.6): refused, sealed like every frame from here on. */
+        (void)send_error(&k->io, AVA1_ERR_PROTOCOL, "bad ClientInfo");
+        goto out;
+    }
+    pair_code = ava1_pairing_code(ns.h, ci.nonce_c, nonce_s);
     pthread_mutex_lock(&mu);
     known = ava1_peers_contains(&S.peers, ns.rs);
     open = now_ms() < S.pairing_until_ms;
@@ -897,6 +907,7 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     }
     memset(&wel, 0, sizeof wel);
     wel.knows_you = known ? 1 : 0;
+    memcpy(wel.nonce_s, nonce_s, 16); /* the reveal; the client checks it against si.pair_commit */
     if (known && S.cfg.has_launch && memcmp(ns.rs, S.cfg.launch_key, 32) == 0) {
         wel.has_launch_proof = 1;
         ava1_launch_proof(S.cfg.launch_token, ns.h, wel.launch_proof);
@@ -918,7 +929,7 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
         }
         pthread_mutex_unlock(&mu);
     }
-    if (notify && S.cfg.on_pair_request) S.cfg.on_pair_request(peer_name, ava1_pairing_code(ns.h));
+    if (notify && S.cfg.on_pair_request) S.cfg.on_pair_request(peer_name, pair_code);
     conn_publish(idx, sid, 0, k);
     serve_loop(k, idx, sid, 0, 0, buf);
     /* Withdraw first: from here on a send to this session fails (E_CLOSED), so a job

@@ -893,3 +893,20 @@ async fn a_destination_that_ends_its_job_stops_the_relay_within_seconds() {
     );
     assert!(reason.starts_with("ava1_"), "reason {reason}");
 }
+
+#[test]
+fn a_zip_entrys_own_mtime_is_carried_into_the_manifest() {
+    let d = temp("zip-mtime");
+    let path = d.join("t.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    let when = zip::DateTime::from_date_and_time(2024, 2, 29, 12, 30, 40).unwrap();
+    zip.start_file(
+        "dated",
+        zip::write::SimpleFileOptions::default().last_modified_time(when),
+    )
+    .unwrap();
+    zip.write_all(b"x").unwrap();
+    zip.finish().unwrap();
+    let (m, _src) = ps5upload_ava1::zip_source::ZipSource::open(&path, &[]).unwrap();
+    assert_eq!(m.entries[0].mtime, 1_709_209_840);
+}

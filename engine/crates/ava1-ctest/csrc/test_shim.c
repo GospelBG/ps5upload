@@ -28,6 +28,10 @@
 #include "ava1_server.h"
 #include "ava1_thread.h"
 #include "mgmt_rpc.h"
+#include "ava1_op.h"
+#include "fs_jobs.h"
+#include "net_probe.h"
+#include "ava1_events.h"
 
 static uint32_t g_pair_requests, g_last_code, g_logs;
 
@@ -128,7 +132,7 @@ static int stub_launch(void *st, int fd, uint64_t t, const char *b, uint64_t l) 
     usleep(20 * 1000);
     g_stub_sony_in--;
     pthread_mutex_unlock(&g_stub_sony);
-    if (strstr(b, "NOPE")) return stub_send_frame(61, "{\"ok\":false,\"err\":\"launch_failed\"}", 33);
+    if (strstr(b, "NOPE")) return stub_send_frame(61, "{\"ok\":false,\"err\":\"launch_failed\"}", 34);
     if (!strstr(b, "title_id")) return stub_send_frame(STUB_FRAME_ERROR, "launch_title_id_missing", 23);
     return stub_send_frame(61, NULL, 0);
 }
@@ -201,6 +205,121 @@ static int stub_silent(void *st, int fd, uint64_t t, const char *b, uint64_t l) 
     return 0;
 }
 
+/* ---- P3 Task 9: the diagnostics stubs. They answer the way runtime.c's handlers do (same
+ * bodies, same limits), so the runners in mgmt_rpc.c (mgmt_call_tail, mgmt_call_probe) and the
+ * net.reach probe (payload/src/net_probe.c, the real code) run unchanged on the host. ---- */
+
+static int g_diag_inflight, g_diag_peak;
+
+static void diag_enter(void) {
+    int n = __atomic_add_fetch(&g_diag_inflight, 1, __ATOMIC_SEQ_CST), p = __atomic_load_n(&g_diag_peak, __ATOMIC_SEQ_CST);
+    while (n > p && !__atomic_compare_exchange_n(&g_diag_peak, &p, n, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+    }
+}
+static void diag_leave(void) { __atomic_sub_fetch(&g_diag_inflight, 1, __ATOMIC_SEQ_CST); }
+static void diag_env_enter(uint16_t frame) {
+    (void)frame;
+    diag_enter();
+}
+static void diag_env_leave(void) { diag_leave(); }
+
+static uint32_t g_stub_syslog_len = 200000;
+static int g_stub_syslog_mode; /* 0 = text, 1 = the sysctl error frame, 2 = empty */
+
+/* A reproducible log: numbered lines of 40 bytes ("line 00000001 .... \n"), `n` bytes in all. */
+static char *numbered_log(size_t n) {
+    char *b = malloc(n + 1);
+    size_t off = 0, i = 0;
+    if (!b) return NULL;
+    while (off < n) {
+        char line[48];
+        int w = snprintf(line, sizeof line, "line %08zu ..............................\n", i++);
+        size_t take = (size_t)w < n - off ? (size_t)w : n - off;
+        memcpy(b + off, line, take);
+        off += take;
+    }
+    b[n] = '\0';
+    return b;
+}
+
+/* log.klog: {"max_bytes":N}; like handle_klog_read, default 16 KiB, ceiling 64 KiB. */
+static int stub_klog(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    const char *p = strstr(b, "\"max_bytes\"");
+    size_t n = 16 * 1024;
+    char *log;
+    int rc;
+    (void)st; (void)fd; (void)t; (void)l;
+    if (p && (p = strchr(p, ':')) && atoll(p + 1) > 0) n = (size_t)atoll(p + 1);
+    if (n > 64 * 1024) n = 64 * 1024;
+    log = numbered_log(n);
+    if (!log) return -1;
+    rc = stub_send_frame(109, log, n);
+    free(log);
+    return rc;
+}
+
+/* log.syslog: kern.msgbuf, up to 1 MiB (the handler's HARD_CAP). */
+static int stub_syslog(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    char *log;
+    int rc;
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    if (g_stub_syslog_mode == 3) { /* slow: holds its slot (the in-flight bound tests) */
+        usleep(60 * 1000);
+    }
+    if (g_stub_syslog_mode == 1) return stub_send_frame(STUB_FRAME_ERROR, "syslog_tail_sysctl_errno_12", 27);
+    if (g_stub_syslog_mode == 2) return stub_send_frame(145, "", 0);
+    log = numbered_log(g_stub_syslog_len);
+    if (!log) return -1;
+    rc = stub_send_frame(145, log, g_stub_syslog_len);
+    free(log);
+    return rc;
+}
+
+static int stub_netif(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    static const char body[] =
+        "{\"interfaces\":[{\"name\":\"eth0\",\"mac\":\"aa:bb:cc:dd:ee:ff\",\"ipv4\":\"192.168.1.50\",\"mtu\":1500,\"flags\":65,\"up\":true}],"
+        "\"source\":\"getifaddrs\"}";
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    return stub_send_frame(111, body, sizeof body - 1);
+}
+
+/* net.reach: the real probe. */
+static int stub_reach(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    char resp[320];
+    size_t n = net_probe_reach(b, (size_t)l, resp, sizeof resp);
+    (void)st; (void)fd; (void)t;
+    return stub_send_frame(149, resp, n);
+}
+
+static int stub_speed(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    return stub_send_frame(123, "{\"ok\":true}", 11);
+}
+
+static int stub_modules(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    static const char body[] =
+        "{\"modules\":[{\"handle\":1,\"name\":\"libkernel.sprx\",\"base\":\"0x800000000\",\"code_size\":4096}]}";
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    return stub_send_frame(115, body, sizeof body - 1);
+}
+
+void ava1_test_mgmt_set_syslog(uint32_t len, int mode) {
+    g_stub_syslog_len = len;
+    g_stub_syslog_mode = mode;
+}
+
+/* mgmt_tail_window(): returns clipped; *start is the window's first byte. */
+int ava1_test_tail_window(const char *text, size_t len, size_t cap, size_t *start) {
+    return mgmt_tail_window(text, len, cap, start);
+}
+
+/* The event log (ava1_events.c). */
+void ava1_test_events_set(const char *path, uint32_t limit) {
+    ava1_events_set_path(path);
+    ava1_events_set_limit(limit);
+}
+void ava1_test_events_log(const char *line) { ava1_log_event(line); }
+
 #define STUB_RUN(name, helper) \
     static int run_##name(const uint8_t *q, uint32_t n, mgmt_ctx_t *cx) { return helper(q, n, cx, name); }
 STUB_RUN(stub_volumes, mgmt_call_text)
@@ -212,6 +331,12 @@ STUB_RUN(stub_env, mgmt_call_text)
 STUB_RUN(stub_two_frames, mgmt_call_text)
 STUB_RUN(stub_silent, mgmt_call_text)
 STUB_RUN(stub_status, mgmt_call_node_status)
+STUB_RUN(stub_klog, mgmt_call_tail)
+STUB_RUN(stub_syslog, mgmt_call_tail)
+STUB_RUN(stub_netif, mgmt_call_text)
+STUB_RUN(stub_reach, mgmt_call_probe)
+STUB_RUN(stub_speed, mgmt_call_text)
+STUB_RUN(stub_modules, mgmt_call_text)
 
 static const mgmt_entry_t k_stub_table[] = {
     {AVA1_METHOD_NODE_STATUS, 20, 21, 0, run_stub_status},
@@ -224,6 +349,25 @@ static const mgmt_entry_t k_stub_table[] = {
     {AVA1_METHOD_FS_UNMOUNT, 54, 55, 0, run_stub_two_frames},
     {AVA1_METHOD_FS_MOUNT_PKG, 124, 125, 0, run_stub_silent},
 };
+
+/* P3 Task 9: its own table (installed by ava1_test_mgmt_install_diag), so it can never collide
+ * with the methods other tasks add to k_stub_table. */
+static const mgmt_entry_t k_diag_table[] = {
+    {AVA1_METHOD_LOG_KLOG, 108, 109, 0, run_stub_klog},
+    {AVA1_METHOD_LOG_SYSLOG, 144, 145, 0, run_stub_syslog},
+    {AVA1_METHOD_NET_INTERFACES, 110, 111, 0, run_stub_netif},
+    {AVA1_METHOD_NET_REACH, 148, 149, 0, run_stub_reach},
+    {AVA1_METHOD_NET_SPEEDTEST, 122, 123, 0, run_stub_speed},
+    {AVA1_METHOD_PROC_MODULES, 114, 115, 0, run_stub_modules},
+};
+
+int ava1_test_mgmt_install_diag(void) {
+    __atomic_store_n(&g_diag_inflight, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_diag_peak, 0, __ATOMIC_SEQ_CST);
+    return mgmt_rpc_install(k_diag_table, sizeof k_diag_table / sizeof k_diag_table[0], NULL, diag_env_enter,
+                            diag_env_leave);
+}
+int ava1_test_mgmt_diag_peak(void) { return __atomic_load_n(&g_diag_peak, __ATOMIC_SEQ_CST); }
 
 int ava1_test_mgmt_install(void) {
     __atomic_store_n(&g_stub_enters, 0, __ATOMIC_SEQ_CST);
@@ -1195,14 +1339,18 @@ int ava1_test_apply_dup_on_commit(uint32_t id, uint64_t off, const uint8_t *d, s
 /* Read by the data layer's same_device hook from the job's threads. */
 void ava1_test_set_same_device(int v) { __atomic_store_n(&g_same_device, v, __ATOMIC_SEQ_CST); }
 static int t_same_device(const char *a, const char *b) {
-    (void)a;
-    (void)b;
-    return __atomic_load_n(&g_same_device, __ATOMIC_SEQ_CST);
+    int v = __atomic_load_n(&g_same_device, __ATOMIC_SEQ_CST);
+    if (v == 2) { /* "a mount": the path is on another device than any different folder */
+        char ra[1024], rb[1024];
+        if (!realpath(a, ra) || !realpath(b, rb)) return -1;
+        return strcmp(ra, rb) == 0 ? 1 : 0;
+    }
+    return v;
 }
 static int g_deny_write;
 static uint8_t g_kind = AVA1_JOB_UPLOAD, g_owner = 1; /* the receiver driver's JobOpen */
 static int t_allow(const char *p) {
-    (void)p;
+    if (strstr(p, "/ps5-denied/")) return 0; /* the path-policy tests (job.run delete/chmod) */
     return !__atomic_load_n(&g_deny_write, __ATOMIC_SEQ_CST);
 }
 /* The data layer's may_read hook (downloads): a test flips it through the FFI setter. */
@@ -1615,6 +1763,126 @@ int ava1_test_apply_reserve(size_t n, int take) {
     return ava1_apply_reserve(g_job, n);
 }
 
+/* ---- P3 Task 5: job.run operations wrapped around stub FTX2 handlers -------------------- */
+
+/* A slow stub: `loops` rounds of 20 ms, each reporting one unit of progress and honouring
+ * job.cancel the way backup.c does (mgmt_op_cancelled / mgmt_op_progress). */
+static int stub_slow(const char *b, const char *cancel_token, int cancel_frame_type) {
+    uint32_t i, loops = 0;
+    const char *p = strstr(b, "\"loops\":");
+    if (p) loops = (uint32_t)strtoul(p + 8, NULL, 10);
+    mgmt_op_total(loops, (uint64_t)loops * 100u);
+    for (i = 0; i < loops; i++) {
+        if (mgmt_op_cancelled()) return stub_send_frame((uint16_t)cancel_frame_type, cancel_token, strlen(cancel_token));
+        usleep(20 * 1000);
+        mgmt_op_progress(1, 100);
+    }
+    return 0;
+}
+
+static int stub_op_fsck(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st; (void)fd; (void)t; (void)l;
+    if (strstr(b, "\"error\"")) return stub_send_frame(STUB_FRAME_ERROR, "libSceFsInternalForVsh_unavailable", strlen("libSceFsInternalForVsh_unavailable"));
+    if (stub_slow(b, "fsck_cancelled", STUB_FRAME_ERROR) != 0) return 0;
+    if (strstr(b, "dirty")) /* a normal frame whose body says ok:false: the operation's answer, not a failure */
+        return stub_send_frame(127, "{\"ok\":false,\"code\":3,\"device\":\"/dev/md1\",\"repair\":false}", strlen("{\"ok\":false,\"code\":3,\"device\":\"/dev/md1\",\"repair\":false}"));
+    return stub_send_frame(127, "{\"ok\":true,\"code\":0,\"device\":\"/dev/md1\",\"repair\":false}", strlen("{\"ok\":true,\"code\":0,\"device\":\"/dev/md1\",\"repair\":false}"));
+}
+
+static int stub_op_snapshot(void *st, int fd, uint64_t t, const char *b) {
+    (void)st; (void)fd; (void)t;
+    if (strstr(b, "\"fail\"")) return stub_send_frame(STUB_FRAME_ERROR, "backup_snapshot_io_error", strlen("backup_snapshot_io_error"));
+    if (stub_slow(b, "backup_cancelled", STUB_FRAME_ERROR) != 0) return 0;
+    {
+        static const char r[] = "{\"ok\":true,\"tag\":\"t\",\"timestamp\":1,\"files\":2,\"bytes\":3,\"err\":\"\"}";
+        return stub_send_frame(177, r, sizeof r - 1);
+    }
+}
+
+static int stub_op_restore(void *st, int fd, uint64_t t, const char *b) {
+    (void)st; (void)fd; (void)t; (void)b;
+    {
+        static const char r[] = "{\"ok\":false,\"tag\":\"t\",\"restored\":0,\"err\":\"snapshot not found or restore failed\"}";
+        return stub_send_frame(181, r, sizeof r - 1);
+    }
+}
+
+static int stub_op_cleanup(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st; (void)fd; (void)t; (void)b; (void)l;
+    {
+        static const char r[] = "{\"ok\":true,\"removed_files\":4,\"removed_dirs\":1}";
+        return stub_send_frame(33, r, sizeof r - 1);
+    }
+}
+
+/* sdk.scan: a 100 KiB reply (a result the status poll must carry whole). */
+static int stub_op_sdk_scan(void *st, int fd, uint64_t t) {
+    size_t n = 100 * 1024;
+    char *buf = malloc(n + 1);
+    int rc;
+    (void)st; (void)fd; (void)t;
+    if (!buf) return -1;
+    memset(buf, 'a', n);
+    memcpy(buf, "{\"titles\":\"", 11);
+    memcpy(buf + n - 2, "\"}", 2);
+    buf[n] = '\0';
+    rc = stub_send_frame(215, buf, n);
+    free(buf);
+    return rc;
+}
+
+static int stub_lo_fsck(void *st, int fd, uint64_t t, const char *b, uint64_t l) { return stub_op_fsck(st, fd, t, b, l); }
+static int stub_lo_snapshot(void *st, int fd, uint64_t t, const char *b, uint64_t l) { (void)l; return stub_op_snapshot(st, fd, t, b); }
+static int stub_lo_restore(void *st, int fd, uint64_t t, const char *b, uint64_t l) { (void)l; return stub_op_restore(st, fd, t, b); }
+static int stub_lo_cleanup(void *st, int fd, uint64_t t, const char *b, uint64_t l) { return stub_op_cleanup(st, fd, t, b, l); }
+static int stub_lo_sdk(void *st, int fd, uint64_t t, const char *b, uint64_t l) { (void)b; (void)l; return stub_op_sdk_scan(st, fd, t); }
+
+static const mgmt_op_entry_t k_stub_ops[] = {
+    {AVA1_JOB_OP_FSCK, 126, 127, 0, stub_lo_fsck},
+    {AVA1_JOB_OP_BACKUP_SNAPSHOT, 176, 177, 0, stub_lo_snapshot},
+    {AVA1_JOB_OP_BACKUP_RESTORE, 180, 181, 0, stub_lo_restore},
+    {AVA1_JOB_OP_CLEANUP, 32, 33, 0, stub_lo_cleanup},
+    {AVA1_JOB_OP_SDK_SCAN, 214, 215, 0, stub_lo_sdk},
+};
+
+/* The operations a data-layer test server serves: the real fs_jobs.c ones and the stubs. */
+static void install_ops(void) {
+    ava1_op_unregister_all();
+    fsj_register_ops();
+    (void)mgmt_rpc_install_ops(k_stub_ops, sizeof k_stub_ops / sizeof k_stub_ops[0]);
+    __atomic_store_n(&fsj_test_file_delay_us, 0, __ATOMIC_SEQ_CST);
+    fsj_test_cross_name = NULL;
+}
+
+/* Runs the reaper as if an hour had passed: finished jobs go, running ones stay. */
+void ava1_test_reap_far(void) { ava1_job_reap(ava1_mono_ms() + 3600u * 1000u); }
+
+static char g_cross_name[64];
+/* A folder with this base name reports another device (a mount point); NULL or "" = off. */
+void ava1_test_fsj_cross_name(const char *name) {
+    if (!name || !name[0]) {
+        fsj_test_cross_name = NULL;
+        return;
+    }
+    snprintf(g_cross_name, sizeof g_cross_name, "%s", name);
+    fsj_test_cross_name = g_cross_name;
+}
+
+static int g_cab_left;
+static int cab_cancelled(void *arg) {
+    (void)arg;
+    return --g_cab_left < 0;
+}
+
+/* fsj_copy_atomic with a cancel after `blocks` blocks (negative: never). */
+int ava1_test_copy_atomic(const char *src, const char *dst, int blocks) {
+    fsj_hooks_t h = { cab_cancelled, NULL, NULL, NULL };
+    g_cab_left = blocks < 0 ? 1 << 30 : blocks;
+    return fsj_copy_atomic(src, dst, &h);
+}
+
+void ava1_test_fsj_delay_us(uint32_t us) { __atomic_store_n(&fsj_test_file_delay_us, us, __ATOMIC_SEQ_CST); }
+
 /* ---- the data layer on the wire (Task 14) ----------------------------------------- */
 
 /* The data server's hook: the data plane's own methods first (Task 19), then node.info. */
@@ -1648,6 +1916,7 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     __atomic_store_n(&ava1_copy_test_delete_delay_ms, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&ava1_copy_test_delete_active, 0, __ATOMIC_SEQ_CST);
     if (ava1_data_start(&dc) != 0) return -100;
+    install_ops();
     ava1_apply_fault = t_fault;
     memset(&cfg, 0, sizeof cfg);
     ava1_identity_from_secret(&cfg.identity, secret);

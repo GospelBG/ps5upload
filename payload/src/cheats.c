@@ -1015,7 +1015,7 @@ static void state_path(const char *title_id, char *out, size_t cap) {
 }
 
 /* Load enabled state from sidecar. Updates cf->mods[].enabled. */
-static void load_state(const char *title_id, cheat_file_t *cf) {
+static void cheats_load_state(const char *title_id, cheat_file_t *cf) {
     char path[MAX_CHEAT_FILEPATH];
     state_path(title_id, path, sizeof(path));
     int fd = open(path, O_RDONLY);
@@ -1257,7 +1257,7 @@ static int reapply_enabled_for_game(pid_t pid, intptr_t base,
             free(cf);
             continue;
         }
-        load_state(title_id, cf);
+        cheats_load_state(title_id, cf);
 
         int has_enabled = 0;
         for (int m = 0; m < cf->mod_count; m++) {
@@ -1529,7 +1529,7 @@ int cheats_list_mods(const char *title_id, char *buf, size_t cap,
             free(cf);
             continue;
         }
-        load_state(title_id, cf);
+        cheats_load_state(title_id, cf);
 
         for (int mi = 0; mi < cf->mod_count; mi++) {
             cheat_mod_t *m = &cf->mods[mi];

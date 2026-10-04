@@ -13,10 +13,15 @@ BLAKE3_DIR := third_party/blake3
 # Use the SIMD dispatcher + all x86-64 assembly backends (SSE2/SSE4.1/AVX2/AVX512).
 # Zen 2 (PS5) supports through AVX2; dispatcher picks best at runtime.
 # Portable falls back on unsupported hardware.
-BLAKE3_SRCS := $(BLAKE3_DIR)/blake3.c \
-               $(BLAKE3_DIR)/blake3_portable.c \
-               $(BLAKE3_DIR)/blake3_dispatch.c \
-               $(BLAKE3_DIR)/blake3_sse2_x86-64_unix.S \
+BLAKE3_C_SRCS := $(BLAKE3_DIR)/blake3.c \
+                 $(BLAKE3_DIR)/blake3_portable.c \
+                 $(BLAKE3_DIR)/blake3_dispatch.c
+# The C files are built as separate objects at -O2 (review P5): the rest of the payload is
+# compiled without -O, which left the BLAKE3 dispatcher, chunk state and parent merges at
+# -O0 on every hashed byte (the assembly kernels were unaffected). Third-party code is
+# not held to -Werror, like SQLite and Monocypher. The assembly stays in SRCS.
+BLAKE3_OBJS := $(patsubst %.c,build/%.o,$(BLAKE3_C_SRCS))
+BLAKE3_SRCS := $(BLAKE3_DIR)/blake3_sse2_x86-64_unix.S \
                $(BLAKE3_DIR)/blake3_sse41_x86-64_unix.S \
                $(BLAKE3_DIR)/blake3_avx2_x86-64_unix.S \
                $(BLAKE3_DIR)/blake3_avx512_x86-64_unix.S
@@ -51,7 +56,7 @@ AVA1_SRCS := ava1/ava1_wire.c ava1/ava1_frame.c ava1/ava1_keys.c ava1/ava1_noise
              ava1/ava1_aead.c ava1/ava1_chacha_avx2.c ava1/ava1_b3.c ava1/ava1_ranges.c \
              ava1/ava1_journal.c ava1/ava1_tune.c ava1/ava1_thread.c ava1/ava1_manifest.c \
              ava1/ava1_job.c ava1/ava1_data.c ava1/ava1_apply.c ava1/ava1_recv.c ava1/ava1_send.c \
-             ava1/ava1_copy.c ava1/ava1_calibrate.c \
+             ava1/ava1_copy.c ava1/ava1_calibrate.c ava1/ava1_op.c ava1/ava1_events.c \
              ava1/gen/ava1_gen.c src/ava1_glue.c
 # AVA1 is built as objects at -O2: it seals every byte of a transfer, and the rest of the
 # payload is compiled without -O (i.e. -O0). The AVX2 ChaCha20 alone gets -mavx2;
@@ -157,7 +162,7 @@ SRCS := src/main.c src/runtime.c src/shell_builtin.c src/takeover.c src/register
         src/backup.c src/remoteplay.c src/fan_curve.c src/notif.c \
         src/wake_watchdog.c src/cheats.c src/xml_encoding.c src/activity.c src/sdk_changer.c src/fakelib_overlay.c \
         src/tmdb.c src/fw_spoof.c src/ftp_server.c src/focus_probe.c \
-        src/content_db.c src/mgmt_rpc.c \
+        src/content_db.c src/mgmt_rpc.c src/fs_jobs.c src/net_probe.c \
         third_party/tiny_aes/aes.c \
         $(BLAKE3_SRCS)
 
@@ -188,8 +193,12 @@ $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h:
 # without this a change to either printed "Built" while leaving the previous
 # link in place. Adding -lSceIpmi did exactly that — the stale ELF had no
 # libSceIpmi in DT_NEEDED until the sources were touched.
-$(ELF): $(SRCS) $(HEADERS) $(SQLITE_OBJ) $(MONO_OBJ) $(AVA1_OBJS) Makefile
-	$(CC) $(CFLAGS) -o $@ $(SRCS) $(AVA1_OBJS) $(SQLITE_OBJ) $(MONO_OBJ) $(LIBS)
+$(ELF): $(SRCS) $(HEADERS) $(SQLITE_OBJ) $(MONO_OBJ) $(BLAKE3_OBJS) $(AVA1_OBJS) Makefile
+	$(CC) $(CFLAGS) -o $@ $(SRCS) $(BLAKE3_OBJS) $(AVA1_OBJS) $(SQLITE_OBJ) $(MONO_OBJ) $(LIBS)
+
+build/$(BLAKE3_DIR)/%.o: $(BLAKE3_DIR)/%.c $(HEADERS) Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -Werror,$(CFLAGS)) -O2 -c -o $@ $<
 
 build/ava1/%.o: %.c $(HEADERS) Makefile
 	@mkdir -p $(dir $@)

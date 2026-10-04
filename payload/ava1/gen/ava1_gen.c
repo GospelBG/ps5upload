@@ -144,6 +144,7 @@ int ava1_server_info_encode(const ava1_server_info_t *m, ava1_w_t *w) {
     ava1_w_u16(w, m->version);
     ava1_w_u64(w, m->caps);
     ava1_w_fixed(w, m->session_id, 16);
+    ava1_w_fixed(w, m->pair_commit, 32);
     if (m->has_name) ext_n++;
     ava1_w_u16(w, ext_n);
     if (m->has_name) {
@@ -162,6 +163,7 @@ int ava1_server_info_decode(const uint8_t *buf, size_t len, ava1_server_info_t *
     m->version = ava1_r_u16(&r);
     m->caps = ava1_r_u64(&r);
     ava1_r_fixed(&r, m->session_id, 16);
+    ava1_r_fixed(&r, m->pair_commit, 32);
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {
         uint16_t tag = ava1_r_u16(&r);
@@ -219,6 +221,7 @@ int ava1_server_info_count(const uint8_t *p, uint32_t len, uint32_t *count) {
 
 int ava1_client_info_encode(const ava1_client_info_t *m, ava1_w_t *w) {
     uint16_t ext_n = 0;
+    ava1_w_fixed(w, m->nonce_c, 16);
     if (m->has_name) ext_n++;
     ava1_w_u16(w, ext_n);
     if (m->has_name) {
@@ -234,6 +237,7 @@ int ava1_client_info_decode(const uint8_t *buf, size_t len, ava1_client_info_t *
     uint16_t ext_n, i;
     memset(m, 0, sizeof(*m));
     ava1_r_init(&r, buf, len);
+    ava1_r_fixed(&r, m->nonce_c, 16);
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {
         uint16_t tag = ava1_r_u16(&r);
@@ -2480,6 +2484,7 @@ int ava1_hs3_decode(const uint8_t *buf, size_t len, ava1_hs3_t *m) {
 int ava1_welcome_encode(const ava1_welcome_t *m, ava1_w_t *w) {
     uint16_t ext_n = 0;
     ava1_w_u8(w, m->knows_you);
+    ava1_w_fixed(w, m->nonce_s, 16);
     if (m->has_launch_proof) ext_n++;
     ava1_w_u16(w, ext_n);
     if (m->has_launch_proof) {
@@ -2496,6 +2501,7 @@ int ava1_welcome_decode(const uint8_t *buf, size_t len, ava1_welcome_t *m) {
     memset(m, 0, sizeof(*m));
     ava1_r_init(&r, buf, len);
     m->knows_you = ava1_r_u8(&r);
+    ava1_r_fixed(&r, m->nonce_s, 16);
     ext_n = ava1_r_u16(&r);
     for (i = 0; i < ext_n && !r.err; i++) {
         uint16_t tag = ava1_r_u16(&r);

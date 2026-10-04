@@ -4815,6 +4815,10 @@ mod rar_support {
     pub struct RarLayout {
         /// Extractable files (sanitised path, unpacked size), archive order.
         pub files: Vec<(String, u64)>,
+        /// Each file's own last-modified time, Unix seconds (0 = none), parallel to
+        /// `files`. UnRAR hands it over as a packed DOS time in the host's local
+        /// zone and 2 s resolution; [`dos_local_to_unix`] undoes that.
+        pub mtimes: Vec<u64>,
         /// Directory entries, sanitised.
         pub dirs: Vec<String>,
         /// A solid archive cannot skip an entry without decoding it.
@@ -4835,6 +4839,7 @@ mod rar_support {
         .map_err(|e| map_rar_open_err(&path_str, "open rar", e))?;
         let solid = opened.is_solid();
         let (mut files, mut dirs) = (Vec::new(), Vec::new());
+        let mut mtimes: Vec<u64> = Vec::new();
         for entry in opened {
             let e = entry.map_err(|e| map_rar_err("read rar header", e))?;
             let Some(rel) = sanitize_rar_entry(&e.filename) else {
@@ -4853,11 +4858,57 @@ mod rar_support {
                 continue;
             }
             files.push((rel, e.unpacked_size));
+            mtimes.push(dos_local_to_unix(e.file_time));
         }
         if files.iter().any(|(_, s)| rar_size_unknown(*s)) {
             measure_unknown_sizes(&path_str, password, solid, &mut files)?;
         }
-        Ok(RarLayout { files, dirs, solid })
+        Ok(RarLayout {
+            files,
+            mtimes,
+            dirs,
+            solid,
+        })
+    }
+
+    /// UnRAR's packed DOS time (the host's local zone) as Unix seconds; 0 when absent.
+    pub fn dos_local_to_unix(t: u32) -> u64 {
+        if t == 0 {
+            return 0;
+        }
+        let f = |sh: u32, m: u32| ((t >> sh) & m) as i64;
+        let (y, mo, d) = (1980 + f(25, 0x7f), f(21, 0xf), f(16, 0x1f));
+        let (h, mi, s) = (f(11, 0x1f), f(5, 0x3f), f(0, 0x1f) * 2);
+        #[cfg(unix)]
+        {
+            // SAFETY: `tm` is fully initialised below and mktime only reads/normalises it.
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            tm.tm_year = (y - 1900) as _;
+            tm.tm_mon = (mo.max(1) - 1) as _;
+            tm.tm_mday = d.max(1) as _;
+            tm.tm_hour = h as _;
+            tm.tm_min = mi as _;
+            tm.tm_sec = s as _;
+            tm.tm_isdst = -1;
+            let t = u64::try_from(unsafe { libc::mktime(&mut tm) }).unwrap_or(0);
+            // An entry with no time at all comes back from UnRAR as a garbage DOS value
+            // (the header's raw time is not exposed by the crate), so a stamp in the
+            // future is read as "none". A real archive dated tomorrow loses its mtime.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            if t > now + 86_400 {
+                0
+            } else {
+                t
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // No libc zone lookup here: read the stamp as UTC (off by the host's offset).
+            let _ = (y, mo, d, h, mi, s);
+            0
+        }
     }
 
     /// UnRAR reports a header whose unpacked size is unknown (a RAR5 flag, written
@@ -4881,6 +4932,21 @@ mod rar_support {
             None => Archive::new(path_str).open_for_processing(),
         }
         .map_err(|e| map_rar_open_err(path_str, "open rar", e))?;
+        {
+            // A long silent "planning" phase must be explainable (review L7). Ignores a
+            // closed stderr rather than panicking like eprintln!.
+            use std::io::Write as _;
+            let n = files.iter().filter(|(_, s)| rar_size_unknown(*s)).count();
+            let _ = writeln!(
+                std::io::stderr(),
+                "rar plan: {n} entries have an unknown size; {} to measure them",
+                if solid {
+                    "decoding the whole solid archive"
+                } else {
+                    "decoding just those entries"
+                }
+            );
+        }
         let mut idx = 0usize; // next file in header order (excluded files included)
                               // `files` holds only non-excluded files, so match by path.
         let wanted: std::collections::HashMap<String, usize> = files

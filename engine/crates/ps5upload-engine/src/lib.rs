@@ -3283,6 +3283,10 @@ struct FsReadPreviewReq {
     addr: Option<String>,
     path: String,
     max_bytes: Option<u64>,
+    /// Where to start reading (default 0). A bug report reads the TAIL of a log that has
+    /// outgrown the 256 KiB preview cap: the newest lines are the ones that explain a crash.
+    #[serde(default)]
+    offset: Option<u64>,
 }
 
 /// POST /api/ps5/fs/read-preview — read up to `max_bytes` of a console file,
@@ -3303,8 +3307,16 @@ async fn ps5_fs_read_preview(
     let cap = req.max_bytes.unwrap_or(256 * 1024).min(256 * 1024);
     let addr = mgmt_addr_or_default(req.addr, &state.default_ps5_addr);
     let path = req.path.clone();
+    let offset = req.offset.unwrap_or(0);
     let r = tokio::task::spawn_blocking(move || {
-        fs_read_with_timeout(&addr, &path, 0, cap, Some(Duration::from_secs(10)), false)
+        fs_read_with_timeout(
+            &addr,
+            &path,
+            offset,
+            cap,
+            Some(Duration::from_secs(10)),
+            false,
+        )
     })
     .await
     .map_err(anyhow::Error::from)
@@ -11315,7 +11327,7 @@ mod bug_bundle_tests {
             "logs/app.jsonl",
             "logs/engine.log",
             "ps5/klog.txt",
-            "ps5/payload-logs/03_tx_events.log",
+            "ps5/payload-logs/03_ava_events.log",
             "images/shot.png",
         ] {
             assert!(bundle_path_ok(p), "should accept {p}");

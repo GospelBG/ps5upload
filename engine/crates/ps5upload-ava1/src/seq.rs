@@ -39,9 +39,14 @@ pub enum SevenzFault {
     /// drop files); never falls back to FTX2, which would drop them too.
     #[error("{}", ps5upload_core::transfer::SEVENZ_LAYOUT_UNSUPPORTED)]
     UnsupportedLayout,
-    /// A feature this source does not handle (the engine may fall back to FTX2).
+    /// An unsupported coder method or header feature (the engine falls back to FTX2).
     #[error("the 7z archive is not usable as an AVA1 source: {0}")]
     Unsupported(String),
+    /// A duplicate name, a path that is both a file and a directory, or a decoder memory
+    /// limit: FTX2 has the same problem (it writes both duplicates, or hits the same
+    /// limit), so this is terminal (`ava1_7z_unsupported`), never a fallback.
+    #[error("the 7z archive cannot be uploaded: {0}")]
+    Conflict(String),
 }
 
 fn fault(f: SevenzFault) -> io::Error {
@@ -77,8 +82,8 @@ fn map_open_error(e: SzError) -> io::Error {
         SzError::UnsupportedVersion { .. }
         | SzError::ExternalUnsupported
         | SzError::UnsupportedCompressionMethod(_)
-        | SzError::Unsupported(_)
-        | SzError::MaxMemLimited { .. } => fault(SevenzFault::Unsupported(e.to_string())),
+        | SzError::Unsupported(_) => fault(SevenzFault::Unsupported(e.to_string())),
+        SzError::MaxMemLimited { .. } => fault(SevenzFault::Conflict(e.to_string())),
         other => fault(SevenzFault::Corrupt(other.to_string())),
     }
 }
@@ -169,7 +174,7 @@ impl SevenzSource {
         let nblocks = archive.blocks.len();
         let mut folders: Vec<Vec<Member>> = (0..nblocks).map(|_| Vec::new()).collect();
         let mut empties = Vec::new();
-        let mut files: BTreeMap<String, (Option<usize>, u64)> = BTreeMap::new();
+        let mut files: BTreeMap<String, (Option<usize>, u64, u64)> = BTreeMap::new();
         let mut dirs: BTreeSet<String> = BTreeSet::new();
         for (fi, e) in archive.files.iter().enumerate() {
             let block = archive
@@ -208,10 +213,13 @@ impl SevenzSource {
             if excluded {
                 continue;
             }
-            if files.insert(rel.clone(), (block, size)).is_some() {
-                return Err(fault(SevenzFault::Unsupported(format!(
-                    "{rel} appears twice"
-                ))));
+            let mtime = if e.has_last_modified_date {
+                crate::archive_time::nt_to_unix(u64::from(e.last_modified_date()))
+            } else {
+                0
+            };
+            if files.insert(rel.clone(), (block, size, mtime)).is_some() {
+                return Err(fault(SevenzFault::Conflict(format!("{rel} appears twice"))));
             }
         }
         if files.is_empty() {
@@ -235,7 +243,7 @@ impl SevenzSource {
             }
         }
         if files.keys().any(|p| dirs.contains(p)) {
-            return Err(fault(SevenzFault::Unsupported(
+            return Err(fault(SevenzFault::Conflict(
                 "a path is both a file and a directory".into(),
             )));
         }
@@ -250,12 +258,12 @@ impl SevenzSource {
                 root: None,
             });
         }
-        for (p, (_, size)) in &files {
+        for (p, (_, size, mtime)) in &files {
             entries.push(Entry {
                 kind: gen::ENTRY_FILE,
                 mode: 0o644,
                 size: *size,
-                mtime: 0,
+                mtime: *mtime,
                 path: p.clone(),
                 root: None,
             });
@@ -268,7 +276,7 @@ impl SevenzSource {
         let restarts = entries
             .iter()
             .map(|e| match files.get(&e.path) {
-                Some((Some(b), _)) if e.kind == gen::ENTRY_FILE => *b as u64,
+                Some((Some(b), _, _)) if e.kind == gen::ENTRY_FILE => *b as u64,
                 _ => u64::MAX,
             })
             .collect();
@@ -441,7 +449,9 @@ impl SeqSource for SevenzSource {
                 return Err(map_pass_error(e));
             }
             if !reached_last {
-                return Err(fault(SevenzFault::UnsupportedLayout));
+                // Stream-less entries inside a folder were refused at open, so this is a
+                // damaged archive (or a crate change), which FTX2 would hit too.
+                return Err(short_folder(j, members.len()));
             }
         }
         for p in &self.empties {
@@ -459,6 +469,13 @@ impl SeqSource for SevenzSource {
     fn restart_for(&self, file_id: u32) -> Restart {
         Restart(self.restarts.get(file_id as usize).copied().unwrap_or(0))
     }
+}
+
+/// A folder whose decode ended before its last wanted entry.
+fn short_folder(yielded: usize, listed: usize) -> io::Error {
+    fault(SevenzFault::Corrupt(format!(
+        "the folder yielded {yielded} of {listed} entries"
+    )))
 }
 
 fn map_pass_error(e: SzError) -> io::Error {
@@ -486,5 +503,39 @@ impl Source for NoSource {
     }
     fn stat(&self, rel: &str) -> io::Result<SourceMeta> {
         Err(io::Error::other(format!("{rel}: no random access")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_folder_is_corrupt_not_unsupported_layout() {
+        let e = short_folder(2, 5);
+        assert_eq!(
+            fault_of(&e),
+            Some(&SevenzFault::Corrupt(
+                "the folder yielded 2 of 5 entries".into()
+            ))
+        );
+        assert!(e.to_string().contains("yielded 2 of 5"), "{e}");
+    }
+
+    #[test]
+    fn only_coder_methods_may_fall_back_to_ftx2() {
+        let mem = SzError::MaxMemLimited {
+            max_kb: 1,
+            actaul_kb: 2,
+        };
+        assert!(matches!(
+            fault_of(&map_open_error(mem)),
+            Some(SevenzFault::Conflict(_))
+        ));
+        let m = SzError::UnsupportedCompressionMethod("x".into());
+        assert!(matches!(
+            fault_of(&map_open_error(m)),
+            Some(SevenzFault::Unsupported(_))
+        ));
     }
 }

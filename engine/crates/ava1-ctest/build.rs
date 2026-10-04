@@ -29,8 +29,44 @@ fn main() {
         .define("BLAKE3_NO_AVX512", None)
         .define("BLAKE3_USE_NEON", "0")
         .include(&b3)
+        // -O2 like the payload build (review P5): cargo's debug profile would otherwise
+        // compile it at -O0, and the differential tests hash a lot.
+        .opt_level(2)
         .warnings(false)
         .compile("ava1b3");
+    // P3 Task 7: the shim expands the REAL rows of the "P3 Task 7" block of mgmt_table.def, with the
+    // FTX2 frame numbers from runtime.c, so the table and the tests cannot drift apart.
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    {
+        let table = std::fs::read_to_string(p.join("src/mgmt_table.def")).unwrap();
+        let mut rows = String::new();
+        let mut inside = false;
+        for line in table.lines() {
+            if line.starts_with("/* ---- P3 Task 7:") {
+                inside = true;
+            } else if line.starts_with("/* ---- end Task 7") {
+                inside = false;
+            } else if inside && (line.starts_with("MGMT_H0(") || line.starts_with("MGMT_H1(")) {
+                rows.push_str(line);
+                rows.push('\n');
+            }
+        }
+        assert!(!rows.is_empty(), "no P3 Task 7 rows in mgmt_table.def");
+        std::fs::write(out.join("t7_rows.def"), rows).unwrap();
+        let runtime = std::fs::read_to_string(p.join("src/runtime.c")).unwrap();
+        let mut frames = String::new();
+        for line in runtime.lines() {
+            if line.starts_with("#define FTX2_FRAME_") && line.contains('u') {
+                frames.push_str(line);
+                frames.push('\n');
+            }
+        }
+        std::fs::write(out.join("t7_frames.h"), frames).unwrap();
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("src/mgmt_table.def").display()
+    );
     cc::Build::new()
         .files([
             ava1.join("ava1_wire.c"),
@@ -54,18 +90,25 @@ fn main() {
             ava1.join("ava1_send.c"),
             ava1.join("ava1_copy.c"),
             ava1.join("ava1_calibrate.c"),
+            ava1.join("ava1_op.c"),
+            ava1.join("ava1_events.c"),
             ava1.join("ava1_b3.c"),
             ava1.join("platform_posix.c"),
             ava1.join("gen/ava1_gen.c"),
             p.join("src/mgmt_rpc.c"),
+            p.join("src/fs_jobs.c"),
+            p.join("src/net_probe.c"),
             here.join("csrc/sizes.c"),
             here.join("csrc/test_shim.c"),
+            here.join("csrc/test_shim_t7.c"),
+            p.join("src/sony_api_lock.c"),
             here.join("csrc/firmware_shim.c"),
         ])
         .include(&ava1)
         .include(ava1.join("gen"))
         .include(&mono)
         .include(&b3)
+        .include(&out)
         // blake3_impl.h must see the same configuration in ava1_b3.c as in the
         // ava1b3 build, whose blake3_hash_many it calls.
         .define("BLAKE3_NO_SSE2", None)
@@ -79,6 +122,51 @@ fn main() {
         .extra_warnings(true)
         .warnings_into_errors(true)
         .compile("ava1c");
+    // P3 Task 6: the real "P3 Task 6" rows of payload/src/mgmt_table.def over stub handlers
+    // (csrc/mgmt_t6_shim.c), so the tests drive the real table's methods, flags and runners.
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let def = std::fs::read_to_string(p.join("src/mgmt_table.def")).unwrap();
+    let mut block = String::new();
+    let mut inside = false;
+    for l in def.lines() {
+        if l.starts_with("/* ---- P3 Task") {
+            inside = l.starts_with("/* ---- P3 Task 6");
+        } else if inside
+            || [
+                "AVA1_METHOD_APP_LAUNCH,",
+                "AVA1_METHOD_APP_LIST,",
+                "AVA1_METHOD_PROC_PROCESS_LIST,",
+            ]
+            .iter()
+            .any(|m| l.contains(m))
+        {
+            block.push_str(l);
+            block.push('\n');
+        }
+    }
+    assert!(!block.is_empty(), "no `P3 Task 6` block in mgmt_table.def");
+    std::fs::write(out.join("mgmt_t6.def"), block).unwrap();
+    cc::Build::new()
+        .files([
+            here.join("csrc/mgmt_t6_shim.c"),
+            p.join("src/sony_api_lock.c"),
+        ])
+        .include(&ava1)
+        .include(ava1.join("gen"))
+        .include(p.join("include"))
+        .include(&out)
+        .warnings(true)
+        .extra_warnings(true)
+        .warnings_into_errors(true)
+        .compile("ava1t6");
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("src/mgmt_table.def").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("src/sony_api_lock.c").display()
+    );
     // The AVX2 ChaCha20 is its own unit, built with -mavx2 only on x86-64 (where the
     // run-time CPUID check picks it); elsewhere it compiles to nothing.
     let mut avx2 = cc::Build::new();
@@ -102,6 +190,18 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         p.join("include/mgmt_rpc.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("src/fs_jobs.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("include/fs_jobs.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        p.join("src/net_probe.c").display()
     );
     println!("cargo:rerun-if-changed={}", mono.display());
     println!("cargo:rerun-if-changed={}", b3.display());

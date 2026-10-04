@@ -12,6 +12,8 @@
 
 #include "ava1_apply.h"
 #include "ava1_copy.h"
+#include "ava1_op.h"
+#include "ava1_events.h"
 #include "ava1_job.h"
 #include "ava1_platform.h"
 #include "ava1_recv.h"
@@ -906,6 +908,14 @@ static void open_now(opening_t *o, const uint8_t sid[16], const uint8_t peer[32]
             j = NULL;
         }
     }
+    if (j) {
+        ava1_log_job_event(ack.status == AVA1_STATUS_OK ? "open" : "open-refused", j, ack.status);
+    } else {
+        char ev[96];
+        snprintf(ev, sizeof ev, "open-refused job=%02x%02x%02x%02x kind=%u status=%u", q.job_id[0], q.job_id[1],
+                 q.job_id[2], q.job_id[3], (unsigned)q.kind, (unsigned)ack.status);
+        ava1_log_event(ev);
+    }
     /* Any send failure means the session is gone or breaking: a job left attached to it
      * would never be reached (and never reaped), so park it. */
     if ((ava1_data_test_ack_fail ? ava1_data_test_ack_fail : send_ack(sid, &ack, j ? "" : msg, 0)) != 0 && j)
@@ -920,6 +930,7 @@ static int encode_status(ava1_job_t *j, uint8_t *out, size_t cap, size_t *out_le
     ava1_status_t st;
     ava1_w_t w;
     int rc;
+    if (j->kind == AVA1_JOB_OPKIND) return ava1_op_encode_status(j, out, cap, out_len);
     memset(&st, 0, sizeof st);
     pthread_mutex_lock(&j->mu);
     memcpy(st.job_id, j->id, 16);
@@ -1016,11 +1027,18 @@ int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *o
             ava1_job_put(j);
             return AVA1_ERR_UNKNOWN_JOB;
         }
-        if (method == AVA1_METHOD_JOB_STATUS) st = encode_status(j, out, cap, out_len);
+        if (method == AVA1_METHOD_JOB_STATUS) {
+            st = encode_status(j, out, cap, out_len);
+            if (st == AVA1_STATUS_OK && j->kind == AVA1_JOB_OPKIND) ava1_op_status_delivered(j);
+        } else if (j->kind == AVA1_JOB_OPKIND) ava1_op_cancel(j); /* an operation: stays listed, finished */
         else ava1_recv_cancel(j); /* stops it and unlists it: the journal stays */
         ava1_job_put(j);
         return st;
     }
+    case AVA1_METHOD_JOB_RUN:
+        return ava1_op_run_rpc(body, len, peer, out, cap, out_len);
+    case AVA1_METHOD_JOB_LIST:
+        return ava1_op_list_rpc(peer, out, cap, out_len);
     case AVA1_METHOD_DISK_CALIBRATE:
         return ava1_calibrate(body, len, out, cap, out_len);
     default:
@@ -1104,6 +1122,7 @@ static int route(const uint8_t sid[16], const uint8_t peer[32], uint8_t type, co
         ava1_job_put_nowait(j);
         return 0;
     }
+    if (type == AVA1_TYPE_RESUME) ava1_log_job_event("resume", j, AVA1_STATUS_OK);
     if (j->on_frame) { /* a sender job (Task 18): the receiving peer's acks and map */
         /* A Resume re-attaches it: the new session's lanes that came up before the attach
          * never told the job, so its writers start here (as after a JobOpen's attach). */

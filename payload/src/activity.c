@@ -94,8 +94,14 @@ static void json_escape(const char *in, char *out, size_t cap) {
 static void load_state(void) {
     FILE *f = fopen(ACTIVITY_FILE, "r");
     if (!f) return;
-    char buf[65536];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    /* 64 KiB on the heap: the AVA1 management workers also hold Sony calls on their stack. */
+    const size_t buf_cap = 65536;
+    char *buf = malloc(buf_cap);
+    if (!buf) {
+        fclose(f);
+        return;
+    }
+    size_t n = fread(buf, 1, buf_cap - 1, f);
     fclose(f);
     buf[n] = '\0';
 
@@ -140,6 +146,7 @@ static void load_state(void) {
 
         p = obj_end + 1;
     }
+    free(buf);
 
     if (g_count > 0) {
         pthread_mutex_lock(&g_lock);

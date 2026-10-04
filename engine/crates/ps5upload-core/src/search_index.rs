@@ -10,11 +10,10 @@
 //! and would burn battery on a laptop client. Local payload indexing
 //! gives sub-100ms search results regardless of network conditions.
 
-use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexStartResult {
@@ -32,19 +31,7 @@ pub struct IndexStartResult {
 pub fn index_start(addr: &str, roots: &[&str]) -> Result<IndexStartResult> {
     let body = serde_json::json!({ "roots": roots });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::IndexStart, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected INDEX_START: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::IndexStartAck {
-        bail!("expected INDEX_START_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::INDEX_START, &body)?;
     let parsed: IndexStartResult = serde_json::from_slice(&resp)?;
     Ok(parsed)
 }
@@ -68,19 +55,7 @@ pub struct IndexStatus {
 }
 
 pub fn index_status(addr: &str) -> Result<IndexStatus> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::IndexStatus, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected INDEX_STATUS: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::IndexStatusAck {
-        bail!("expected INDEX_STATUS_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::INDEX_STATUS, &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -106,34 +81,20 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResults {
     pub results: Vec<SearchHit>,
+    /// True when the payload's reply buffer filled and hits past it were dropped (it said so with
+    /// `"truncated":true` instead of looking complete). Absent from an older payload (false).
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 pub fn search_index(addr: &str, q: &SearchQuery) -> Result<SearchResults> {
     let body = serde_json::to_vec(q)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::SearchIndex, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected SEARCH_INDEX: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::SearchIndexAck {
-        bail!("expected SEARCH_INDEX_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::INDEX_SEARCH, &body)?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
 pub fn index_cancel(addr: &str) -> Result<()> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::IndexCancel, &[])?;
-    let (hdr, _resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft != FrameType::IndexCancelAck {
-        bail!("expected INDEX_CANCEL_ACK, got {ft:?}");
-    }
+    mgmt::call(addr, m::INDEX_CANCEL, &[])?;
     Ok(())
 }
 

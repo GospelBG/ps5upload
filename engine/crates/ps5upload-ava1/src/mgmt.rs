@@ -18,8 +18,13 @@ use anyhow::Result;
 use ava1::gen::{self, MgmtText};
 use ava1::wire::Message;
 use ava1::Ava1Error;
-use ps5upload_core::mgmt::{self, Method, MgmtError, MgmtTransport};
+use ps5upload_core::mgmt::{
+    self, ops, JobCall, JobOp, JobProgress, Method, MgmtError, MgmtTransport,
+};
 use tokio::sync::{Semaphore, SemaphorePermit};
+
+#[path = "mgmt_paged.rs"]
+mod paged;
 
 use crate::mgmt_convert as conv;
 use crate::pool::{host_of, pool, Pool};
@@ -71,14 +76,62 @@ fn is_read_only(method: u16) -> bool {
             | gen::METHOD_HW_TEMPS
             | gen::METHOD_HW_POWER
             | gen::METHOD_HW_STORAGE
+            | gen::METHOD_APP_LIST
+            | gen::METHOD_APP_INFO_QUERY
+            | gen::METHOD_APP_DB_QUERY
+            | gen::METHOD_PROC_FOCUS
+            | gen::METHOD_PROC_LIST
+            | gen::METHOD_PROC_PROCESS_LIST
+            | gen::METHOD_PROC_MODULES
+            | gen::METHOD_SAVES_LIST
+            | gen::METHOD_SHOTS_LIST
+            | gen::METHOD_VIDEOS_LIST
+            | gen::METHOD_INDEX_STATUS
+            | gen::METHOD_INDEX_SEARCH
+            // P3 Task 7: reads of the hardware, accounts, cheats, notices and Remote Play state
+            | gen::METHOD_HW_DRIVE_SENSORS
+            | gen::METHOD_HW_FAN_CURVE_GET
+            | gen::METHOD_POWER_TELEMETRY
+            | gen::METHOD_TIME_GET
+            | gen::METHOD_TIME_STATE_GET
+            | gen::METHOD_USER_LIST
+            | gen::METHOD_PROFILE_INFO
+            | gen::METHOD_BACKUP_LIST
+            | gen::METHOD_CHEATS_LIST
+            | gen::METHOD_CHEATS_GET
+            | gen::METHOD_CHEATS_STATUS
+            | gen::METHOD_SMP_META_STATS
+            | gen::METHOD_SDK_SCAN
+            | gen::METHOD_FTP_STATUS
+            | gen::METHOD_FWSPOOF_STATUS
+            | gen::METHOD_NOTIF_LIST
+            | gen::METHOD_ACTIVITY_GET
+            | gen::METHOD_ACTIVITY_DB_QUERY
+            | gen::METHOD_RP_STATUS
+            | gen::METHOD_RP_READINESS
+            | gen::METHOD_RP_DEVICES
     )
 }
+
+/// The Sony-lock methods that can run for seconds (register / unregister may take 10 s or more,
+/// launch is patient). The payload serialises them under `sony_api_lock`, so more than
+/// [`SONY_LONG`] of them in flight would only park workers that other calls need.
+pub fn is_sony_long(method: u16) -> bool {
+    matches!(
+        method,
+        gen::METHOD_APP_REGISTER | gen::METHOD_APP_UNREGISTER | gen::METHOD_APP_LAUNCH
+    )
+}
+
+/// Slots of the general pool the long Sony-lock methods may hold at once.
+pub const SONY_LONG: usize = 2;
 
 /// The per-console in-flight gate: [`GENERAL`] slots for everyone, [`RESERVED`] more for
 /// the priority methods. The total never exceeds the payload's eight.
 pub struct MgmtGate {
     general: Semaphore,
     reserved: Semaphore,
+    sony_long: Semaphore,
 }
 
 impl Default for MgmtGate {
@@ -86,8 +139,16 @@ impl Default for MgmtGate {
         Self {
             general: Semaphore::new(GENERAL),
             reserved: Semaphore::new(RESERVED),
+            sony_long: Semaphore::new(SONY_LONG),
         }
     }
+}
+
+/// What a call holds while it is in flight: its slot, and for the long Sony-lock methods
+/// one of the [`SONY_LONG`] sub-slots as well.
+pub struct CallPermit<'a> {
+    _sony: Option<SemaphorePermit<'a>>,
+    _slot: SemaphorePermit<'a>,
 }
 
 impl MgmtGate {
@@ -105,6 +166,31 @@ impl MgmtGate {
         }
     }
 
+    /// The permit for `method`: the sub-limit first (long Sony-lock methods only), then the slot.
+    /// Priority methods never take the sub-limit, so it cannot delay a cancel.
+    pub async fn acquire_for(&self, method: u16) -> CallPermit<'_> {
+        let sony = if is_sony_long(method) {
+            Some(
+                self.sony_long
+                    .acquire()
+                    .await
+                    .expect("gate is never closed"),
+            )
+        } else {
+            None
+        };
+        CallPermit {
+            _sony: sony,
+            _slot: self.acquire(is_priority(method)).await,
+        }
+    }
+
+    /// Calls currently holding a slot.
+    pub fn in_flight(&self) -> usize {
+        let (g, r) = self.available();
+        (GENERAL + RESERVED).saturating_sub(g + r)
+    }
+
     /// Free general / reserved slots (test seam).
     pub fn available(&self) -> (usize, usize) {
         (
@@ -114,10 +200,23 @@ impl MgmtGate {
     }
 }
 
+/// The text of an RPC timeout. `behind` is set when the call never got a gate slot: it
+/// queued behind that many calls instead of being slow itself (review L4).
+fn timeout_message(label: &str, timeout: Duration, behind: Option<usize>) -> String {
+    match behind {
+        Some(n) => format!("{label}: timed out after {timeout:?} waiting behind {n} calls"),
+        None => format!("{label}: timed out after {timeout:?}"),
+    }
+}
+
 enum PoolRef {
     Global,
     Fixed(&'static Pool),
 }
+
+/// First line of a `log.klog` / `log.syslog` reply the console had to clamp (SPEC.md section 7.3).
+pub const TAIL_CLIPPED: &str =
+    "[earlier log text omitted: the console returned only the newest part of this log]\n";
 
 pub struct AvaTransport {
     pool: PoolRef,
@@ -157,7 +256,7 @@ impl AvaTransport {
         self
     }
 
-    fn pool(&self) -> &Pool {
+    pub(crate) fn pool(&self) -> &Pool {
         match &self.pool {
             PoolRef::Global => pool(),
             PoolRef::Fixed(p) => p,
@@ -177,7 +276,7 @@ impl AvaTransport {
 
     /// Whether this console is served over AVA1 for management: the same `use_ava1`
     /// decision uploads make, minus a console that just said it has no management methods.
-    fn serves(&self, console: &str) -> bool {
+    pub(crate) fn serves(&self, console: &str) -> bool {
         if mode() == Mode::Auto {
             let mut n = self.no_mgmt.lock().unwrap_or_else(|e| e.into_inner());
             match n.get(&host_of(console)) {
@@ -191,7 +290,7 @@ impl AvaTransport {
         use_ava1_in(self.pool(), console)
     }
 
-    fn mark_no_mgmt(&self, console: &str) {
+    pub(crate) fn mark_no_mgmt(&self, console: &str) {
         self.no_mgmt
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -201,7 +300,7 @@ impl AvaTransport {
     /// One RPC: gate permit, `ERR_BUSY` retries, one resend on a lost session for
     /// read-only methods. `Ok` is the body of a status-0 reply; a non-zero status is a
     /// [`MgmtError`] carrying the legacy token.
-    async fn rpc(
+    pub(crate) async fn rpc(
         &self,
         console: &str,
         method: u16,
@@ -213,14 +312,25 @@ impl AvaTransport {
         let mut busy = 0usize;
         let mut resent = false;
         loop {
+            let queued = std::sync::atomic::AtomicBool::new(false);
             let attempt = tokio::time::timeout(timeout, async {
                 let session = self.pool().session(console).await?;
-                let _permit = gate.acquire(is_priority(method)).await;
+                queued.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _permit = gate.acquire_for(method).await;
+                queued.store(false, std::sync::atomic::Ordering::Relaxed);
                 session.rpc(method, body).await
             })
             .await;
             let reply = match attempt {
-                Err(_) => return Err(anyhow::anyhow!("{label}: timed out after {timeout:?}")),
+                Err(_) => {
+                    let behind = queued
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .then(|| gate.in_flight());
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        timeout_message(label, timeout, behind)
+                    ));
+                }
                 Ok(Err(e)) => {
                     let lost =
                         matches!(e, Ava1Error::Lost(_) | Ava1Error::Closed | Ava1Error::Io(_));
@@ -244,6 +354,24 @@ impl AvaTransport {
         }
     }
 
+    /// One `MgmtText` call: the reply's body and its `more` flag (a paged reply is not the whole answer).
+    async fn text_page(
+        &self,
+        console: &str,
+        method: Method,
+        label: &str,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<MgmtText> {
+        let req = MgmtText {
+            body: body.to_vec(),
+            more: None,
+        }
+        .to_bytes()?;
+        let reply = self.rpc(console, method.id, label, &req, timeout).await?;
+        Ok(MgmtText::decode(&reply)?)
+    }
+
     async fn text(
         &self,
         console: &str,
@@ -252,13 +380,9 @@ impl AvaTransport {
         body: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>> {
-        let req = MgmtText {
-            body: body.to_vec(),
-            more: None,
-        }
-        .to_bytes()?;
-        let reply = self.rpc(console, method.id, label, &req, timeout).await?;
-        let t = MgmtText::decode(&reply)?;
+        let t = self
+            .text_page(console, method, label, body, timeout)
+            .await?;
         // A paged reply is not the whole answer. The two log tails are clamped reads whose
         // `more` only says older text exists, which the legacy handlers never reported.
         let tail = matches!(method.id, gen::METHOD_LOG_KLOG | gen::METHOD_LOG_SYSLOG);
@@ -269,6 +393,13 @@ impl AvaTransport {
                 cause: "reply_paged".into(),
             }
             .into());
+        }
+        if tail && t.more.unwrap_or(0) != 0 {
+            // Say so in the text itself: a bug report that quietly starts mid-log reads as if
+            // the console had nothing older (the legacy FTX2 reply had no such limit).
+            let mut v = TAIL_CLIPPED.as_bytes().to_vec();
+            v.extend_from_slice(&t.body);
+            return Ok(v);
         }
         Ok(t.body)
     }
@@ -340,8 +471,17 @@ impl AvaTransport {
                 Ok(Some(Vec::new()))
             }
             gen::METHOD_FS_CHMOD => match conv::fs_chmod_request(body, label)? {
-                // Recursive chmod is a job.run op (Task 5); FTX2 still serves it until then.
-                None => Ok(None),
+                // Recursive chmod is a job.run op: progress, cancel, no socket held for minutes.
+                None => {
+                    let call = JobCall {
+                        op_id: 0,
+                        subject: "",
+                        deadline: timeout,
+                    };
+                    self.run_job_async(console, ops::CHMOD_R, label, body, &call)
+                        .await
+                        .map(|_| Some(Vec::new()))
+                }
                 Some(req) => {
                     self.rpc(console, id, label, &req.to_bytes()?, timeout)
                         .await?;
@@ -359,6 +499,28 @@ impl AvaTransport {
                 let size = self.write_chunks(console, label, &ask, timeout).await?;
                 json(serde_json::json!({ "ok": true, "size": size }))
             }
+            // The two methods whose work can take minutes (a whole tree removed, every title
+            // scanned) run as jobs; the caller keeps the legacy body and reply.
+            gen::METHOD_NODE_CLEANUP | gen::METHOD_SDK_SCAN => {
+                let op = if id == gen::METHOD_NODE_CLEANUP {
+                    ops::CLEANUP
+                } else {
+                    ops::SDK_SCAN
+                };
+                let call = JobCall {
+                    op_id: 0,
+                    subject: "",
+                    deadline: timeout,
+                };
+                self.run_job_async(console, op, label, body, &call).await
+            }
+            gen::METHOD_APP_LIST
+            | gen::METHOD_SAVES_LIST
+            | gen::METHOD_SHOTS_LIST
+            | gen::METHOD_VIDEOS_LIST => self
+                .paged_text(console, method, label, body, timeout)
+                .await
+                .map(Some),
             _ => self
                 .text(console, method, label, body, timeout)
                 .await
@@ -409,11 +571,9 @@ impl AvaTransport {
     }
 
     /// Writes `ask.data` as one atomic call, or as `FSW_CHUNK_MAX` chunks at their offsets
-    /// with `COMMIT` on the last. A failed chunk leaves the `.ps5upload.tmp` file for the
-    /// next write at offset 0 to truncate (SPEC.md section 7.5).
-    ///
-    /// TODO(Task 5): remove `<path>.ps5upload.tmp` best-effort on failure once `job.run`
-    /// DELETE is available here; no removal method exists before it. Tracked in CUTOVER.md.
+    /// with `COMMIT` on the last. A chunk that fails after an earlier one was accepted leaves
+    /// `<path>.ps5upload.tmp` on the console; it is removed best-effort (a `job.run` DELETE),
+    /// and if that fails too the next write at offset 0 truncates it (SPEC.md section 7.5).
     async fn write_chunks(
         &self,
         console: &str,
@@ -433,16 +593,45 @@ impl AvaTransport {
                 data: ask.data[lo..hi].to_vec(),
                 mode: None,
             };
-            self.rpc(
-                console,
-                gen::METHOD_FS_WRITE,
-                label,
-                &req.to_bytes()?,
-                timeout,
-            )
-            .await?;
+            if let Err(e) = self
+                .rpc(
+                    console,
+                    gen::METHOD_FS_WRITE,
+                    label,
+                    &req.to_bytes()?,
+                    timeout,
+                )
+                .await
+            {
+                // Only after a chunk was accepted is there a temporary file of ours to remove:
+                // a refusal of the first chunk may name someone else's.
+                if i > 0 {
+                    self.remove_tmp(console, &ask.path).await;
+                }
+                return Err(e);
+            }
         }
         Ok(ask.data.len())
+    }
+
+    /// Best effort: deletes `<path>.ps5upload.tmp`. Never fails the caller, who is already
+    /// reporting the write's own error.
+    async fn remove_tmp(&self, console: &str, path: &str) {
+        let body = serde_json::json!({ "path": format!("{path}.ps5upload.tmp") }).to_string();
+        let call = JobCall {
+            op_id: 0,
+            subject: "",
+            deadline: Duration::from_secs(5),
+        };
+        let _ = self
+            .run_job_async(
+                console,
+                ops::DELETE,
+                "FS_WRITE_BYTES",
+                body.as_bytes(),
+                &call,
+            )
+            .await;
     }
 }
 
@@ -460,6 +649,51 @@ impl MgmtTransport for AvaTransport {
                 return Ok(None);
             }
             crate::block_on(self.run(addr, method, label, body, timeout))
+        })
+    }
+
+    fn run_job(
+        &self,
+        addr: &str,
+        op: JobOp,
+        label: &str,
+        body: &[u8],
+        call: &JobCall<'_>,
+    ) -> Result<Option<Vec<u8>>> {
+        run_blocking(|| {
+            if !self.serves(addr) {
+                return Ok(None);
+            }
+            let r = crate::block_on(self.run_job_async(addr, op, label, body, call));
+            if let Err(e) = &r {
+                let unknown = e
+                    .downcast_ref::<MgmtError>()
+                    .is_some_and(|m| m.status == gen::ERR_UNKNOWN_METHOD);
+                if unknown && mode() == Mode::Auto {
+                    // An older helper without job.run: FTX2 serves the operation.
+                    self.mark_no_mgmt(addr);
+                    return Ok(None);
+                }
+            }
+            r
+        })
+    }
+
+    fn job_progress(&self, addr: &str, op_id: u64) -> Result<Option<Option<JobProgress>>> {
+        run_blocking(|| {
+            if !self.serves(addr) {
+                return Ok(None);
+            }
+            crate::block_on(self.job_progress_async(addr, op_id)).map(Some)
+        })
+    }
+
+    fn job_cancel(&self, addr: &str, op_id: u64) -> Result<Option<bool>> {
+        run_blocking(|| {
+            if !self.serves(addr) {
+                return Ok(None);
+            }
+            crate::block_on(self.job_cancel_async(addr, op_id)).map(Some)
         })
     }
 }
@@ -575,6 +809,19 @@ mod tests {
         );
         drop(held);
         assert_eq!(g.available(), (GENERAL, RESERVED));
+    }
+
+    #[tokio::test]
+    async fn a_gate_wait_timeout_says_it_waited_behind_calls() {
+        let g = MgmtGate::default();
+        let mut held = Vec::new();
+        for _ in 0..GENERAL {
+            held.push(g.acquire(false).await);
+        }
+        assert_eq!(g.in_flight(), GENERAL);
+        let m = timeout_message("HW_INFO", Duration::from_secs(30), Some(g.in_flight()));
+        assert_eq!(m, "HW_INFO: timed out after 30s waiting behind 6 calls");
+        assert!(!timeout_message("HW_INFO", Duration::from_secs(30), None).contains("behind"));
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@
 
 #include "ava1_aead.h"
 #include "ava1_data.h"
+#include "ava1_events.h"
 #include "ava1_gen.h"
 #include "ava1_journal.h"
 #include "ava1_noise.h"
@@ -21,6 +22,7 @@
 #include "ava1_store.h"
 #include "ava1_trust.h"
 #include "config.h"
+#include "fs_jobs.h"
 #include "mgmt_rpc.h"
 #include "cross_device.h" /* payload/include, not next to the AVA1 sources */
 #include "monocypher.h"
@@ -191,6 +193,9 @@ int ava1_payload_start(void) {
             /* Not fatal: the server and FTX2 keep working without the data plane. */
             on_log("ava1: cannot create the jobs folder; transfers stay on FTX2");
         } else {
+            /* The human-readable job event log a bug report reads (SPEC section 7.3 / Task 9). */
+            ava1_events_set_path(AVA1_DIR "/events.log");
+            ava1_log_event("payload start: data layer up");
             /* Wall time only here: GC compares file mtimes, which are wall-clock. */
             rc = ava1_jobs_gc(AVA1_JOBS, (int64_t)time(NULL), 7 * 86400);
             if (rc < 0)
@@ -206,6 +211,7 @@ int ava1_payload_start(void) {
                 cfg.data = ava1_data_hooks();
                 cfg.caps = AVA1_CAP_DATA_PLANE;
                 g_data_on = 1;
+                fsj_register_ops(); /* job.run: delete, chmod -R, hash, crc32 (the table adds the rest) */
             }
         }
     }
