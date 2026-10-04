@@ -79,6 +79,10 @@ const PS5_LOADER_PORT: u16 = 9021;
 /// running — UI can show that and skip the "send payload" step.
 const PS5_MGMT_PORT: u16 = 9114;
 
+/// The same payload's AVA1 port (P3 cutover, MGMT_METHODS "raw :9114 probe"). A payload that
+/// only speaks AVA1 no longer opens 9114, so "our payload is running" is either port.
+const PS5_AVA1_PORT: u16 = 9120;
+
 /// Max wallclock for a single discovery run, in seconds. The default
 /// (3s) covers a typical home LAN; the 10s ceiling handles enterprise
 /// LANs where mDNS announcements arrive over a longer window. We
@@ -411,7 +415,7 @@ async fn probe_and_score_accum(
         let task = tokio::spawn(async move {
             let (loader_open, payload_open) = tokio::join!(
                 tcp_probe(&probe_ip, PS5_LOADER_PORT),
-                tcp_probe(&probe_ip, PS5_MGMT_PORT),
+                payload_port_open(&probe_ip),
             );
             (loader_open, payload_open)
         });
@@ -461,6 +465,16 @@ async fn tcp_probe(ip: &str, port: u16) -> bool {
         timeout(PROBE_TIMEOUT, TcpStream::connect(&addr)).await,
         Ok(Ok(_))
     )
+}
+
+/// True when either of our payload's ports (AVA1 :9120, FTX2 management :9114) accepts a connection.
+async fn payload_port_open(ip: &str) -> bool {
+    any_port_open(ip, PS5_AVA1_PORT, PS5_MGMT_PORT).await
+}
+
+async fn any_port_open(ip: &str, a: u16, b: u16) -> bool {
+    let (x, y) = tokio::join!(tcp_probe(ip, a), tcp_probe(ip, b));
+    x || y
 }
 
 /// Concurrent /24 sweep against PS5_MGMT_PORT (9114) on the local
@@ -556,7 +570,7 @@ async fn lan_sweep_for_payload_port() -> Vec<(Ipv4Addr, Option<String>)> {
             tasks.push(tokio::spawn(async move {
                 // Permit released on drop when the probe completes.
                 let _permit = sem.acquire_owned().await.ok()?;
-                if tcp_probe(&candidate.to_string(), PS5_MGMT_PORT).await {
+                if payload_port_open(&candidate.to_string()).await {
                     Some(candidate)
                 } else {
                     None
@@ -648,6 +662,19 @@ fn score(
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[tokio::test]
+    async fn a_payload_is_seen_on_either_of_its_ports() {
+        let open = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let open_port = open.local_addr().unwrap().port();
+        let closed = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(any_port_open("127.0.0.1", open_port, closed).await);
+        assert!(any_port_open("127.0.0.1", closed, open_port).await);
+        assert!(!any_port_open("127.0.0.1", closed, closed).await);
+    }
 
     #[test]
     fn loader_port_alone_clears_threshold() {
