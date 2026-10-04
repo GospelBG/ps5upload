@@ -1446,6 +1446,16 @@ static void apply_opts(ava1_data_cfg_t *cfg) {
     cfg->recover_every_ms = g_opt_every;
     cfg->recover_max = g_opt_rmax;
 }
+/* review 007 #5: point the console's durable-by-log off-switch at a test file (NULL: the real path). */
+static char g_log_flag_buf[1024];
+void ava1_test_set_log_small_flag(const char *path) {
+    if (!path) {
+        ava1_log_small_flag_path = AVA1_LOG_SMALL_OFF_FLAG;
+        return;
+    }
+    snprintf(g_log_flag_buf, sizeof g_log_flag_buf, "%s", path);
+    ava1_log_small_flag_path = g_log_flag_buf;
+}
 static int g_hold_commit;                           /* commits wait at COMMIT_VERIFIED while set */
 static uint32_t g_prealloc_fault = UINT32_MAX - 1;  /* a file whose preallocation answers ENOSPC */
 static void t_hook(ava1_job_t *j, int point, uint32_t id) {

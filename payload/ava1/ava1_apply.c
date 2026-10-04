@@ -1187,7 +1187,7 @@ static int apply_record(ava1_job_t *j, const ava1_bundle_record_t *r) {
     for (fd = 0; !rc && (uint32_t)fd < j->pend_n; fd++) rc = j->pend_small[fd] == r->file_id;
     pthread_mutex_unlock(&j->mu);
     if (rc) return 0;
-    if (ava1_data_log_small()) return apply_record_logged(j, r, e, path, root);
+    if (j->log_small) return apply_record_logged(j, r, e, path, root);
     if (!ava1_pend_reserve(pend_gate_stopping, pend_gate_idle, j)) return 0; /* stopping */
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0 && errno == ENOENT && mkparents(path) == 0) fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
