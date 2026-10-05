@@ -37,10 +37,9 @@ pub fn corpus_root() -> Option<PathBuf> {
                 return Some(PathBuf::from(v));
             }
         }
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .ok()?;
-        (!home.trim().is_empty()).then(|| PathBuf::from(home).join(".ps5upload").join("fakelibs"))
+        // The engine's data folder (PS5UPLOAD_DATA_DIR, else ~/.ps5upload): a phone has no
+        // home folder, the app points the variable at its private data folder (#379).
+        crate::remote::store::data_dir().map(|d| d.join("fakelibs"))
     })
     .clone()
 }
@@ -277,13 +276,12 @@ pub async fn scan_status(AxumPath(id): AxumPath<String>) -> impl IntoResponse {
 /// The address the payload's filesystem RPCs answer on.
 ///
 /// Callers hand us whatever they hold: a bare host (the Backport panel passes
-/// `addr={host}`) or a transfer address (`:9113`). `list_dir`/`fs_read` only
-/// answer on the mgmt port, so both have to be normalised. This lives in one
+/// `addr={host}`) or an address with a retired port suffix; both name one console. This lives in one
 /// named place on purpose — while it was inlined, the scan path simply forgot
 /// it, every listing failed, and a console full of backported games reported
 /// "No backported games found" with zero errors.
 fn fs_addr(addr: &str) -> String {
-    crate::mgmt_addr_for(addr)
+    crate::console_addr(addr)
 }
 
 #[cfg(test)]
@@ -291,13 +289,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fs_addr_normalises_to_the_mgmt_port() {
-        // The scan regression: a bare host and a transfer address must BOTH
-        // land on the mgmt port. When they did not, `harvest` silently
-        // reported every title as "not backported".
-        assert_eq!(fs_addr("192.168.1.50"), "192.168.1.50:9114");
-        assert_eq!(fs_addr("192.168.1.50:9113"), "192.168.1.50:9114");
-        assert_eq!(fs_addr("192.168.1.50:9114"), "192.168.1.50:9114");
+    fn fs_addr_normalises_to_the_bare_host() {
+        // The scan regression: a bare host and a retired-port address must land on the same
+        // console, or `harvest` silently reported every title as "not backported".
+        assert_eq!(fs_addr("192.168.1.50"), "192.168.1.50");
+        assert_eq!(fs_addr("192.168.1.50:9113"), "192.168.1.50");
+        assert_eq!(fs_addr("192.168.1.50:9114"), "192.168.1.50");
     }
 }
 

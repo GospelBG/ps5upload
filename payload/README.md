@@ -5,22 +5,20 @@ The C payload that runs on the PS5. Built with the
 in [`../scripts/ps5-sdk.env`](../scripts/ps5-sdk.env)), sent to the
 console's ELF loader, and left resident until reboot or rest mode.
 
-It listens on two ports:
-
-| Port | Accepts |
-|---|---|
-| **9113** | Transfer frames only |
-| **9114** | Everything else — status, filesystem, mount, app, hardware, package, shell |
-
-A frame sent to the wrong port is answered with `wrong_port` rather than
-half-working.
+It listens on one port, **9120**, for AVA1 (`protocol/ava1/SPEC.md`):
+transfers, status, filesystem, mount, app, hardware, package and shell
+calls all travel over one encrypted session with up to 8 data lanes.
 
 ## Layout
 
 `src/main.c` handles startup: credential elevation, runtime ownership,
-the management thread, the transfer loop, and cleanup. `src/runtime.c` is
-the FTX2 runtime itself — framing, the transaction journal, resume,
-direct and spooled writes, and most command handlers. `src/takeover.c`
+the takeover, the one-time removal of the retired transfer folders
+(`src/state_migrate.c`), starting the AVA1 server, and cleanup. It binds no
+socket of its own. `src/runtime.c` holds the management handlers the AVA1
+table (`src/mgmt_table.def`, dispatched by `src/mgmt_rpc.c`) calls, and the
+instance lifecycle (ownership record, reap, shutdown). `ava1/` is the AVA1 protocol in C (frames,
+generated codecs in `ava1/gen/`, Noise handshake, server); never edit
+`ava1/gen/` by hand. `src/takeover.c`
 asks an older resident payload to stand down before binding.
 
 The rest of `src/` is one module per capability: registration and launch,
@@ -57,17 +55,12 @@ Everything compiles with `-Wall -Wextra -Werror`.
 
 Logic that can be separated from the console lives in a header under
 `include/` and gets a host-compiled self-test in `tests/`, run by
-`make test-payload` with the same warning flags. Current cores:
+`make test-payload` with the same warning flags.
 
-| Header | Self-test covers |
-|---|---|
-| `hw_guard.h` | Recovering from a faulting Sony getter without losing the helper |
-| `ptrace_recovery.h` | Timeout recovery never resuming injected registers |
-| `appdb_scan.h` | Reading `app.db` — a real SQLite record reader, because column values are stored with no separators between them |
-| `ftp_format.h` | PASV/EPSV/LIST reply shapes, which clients parse strictly |
-| `sdk_param.h` | Rewriting `param.json` version fields, and reporting when nothing changed |
-| `elf_param.h` | Finding SDK fields via program headers, not by scanning for magic bytes |
-| `timed_init.h` | Bounded one-time init that never starts a second initializer |
+See `tests/*_selftest.c` for the full list (hardware guards, ptrace recovery, `app.db`
+reading, FTP, SDK param rewriting, installer, cheats, wake watchdog and more). AVA1 itself is
+tested from Rust: `cargo test -p ava1-ctest -- --test-threads=1` in `engine/` compiles
+`ava1/` on the host and checks it against the Rust side.
 
 Prefer adding to this set over testing on hardware: a host self-test runs
 in milliseconds and can't wedge a console.

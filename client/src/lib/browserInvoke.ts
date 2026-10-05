@@ -15,6 +15,7 @@
  */
 
 import { getEngineUrl } from "../state/engine";
+import { consoleAddr } from "./addr";
 
 // ── Error types ──────────────────────────────────────────────────────────────
 
@@ -481,6 +482,7 @@ export async function browserInvoke<T>(
         addr: args["addr"],
         path: args["path"],
         max_bytes: args["maxBytes"] ?? args["max_bytes"],
+        offset: args["offset"] ?? undefined,
       });
 
     // App lifecycle (suspend / resume / kill / list). Without these the
@@ -531,7 +533,12 @@ export async function browserInvoke<T>(
       return getJson<T>(addrUrl("/api/ps5/remoteplay/status", args["addr"]));
 
     case "remoteplay_cancel":
-      return postJson<T>("/api/ps5/remoteplay/cancel", { addr: args["addr"] });
+      // In the query like the desktop app: engines before the cancel fix read only that, and sent
+      // a body-only addr to the default console instead.
+      return postJson<T>(
+        addrUrl("/api/ps5/remoteplay/cancel", args["addr"] as string | null),
+        { addr: args["addr"] },
+      );
 
     case "remoteplay_request": {
       // TS caller nests everything under `req`.
@@ -806,6 +813,32 @@ export async function browserInvoke<T>(
     case "pkg_remote_probe":
       return postJson<T>("/api/pkg/remote/probe", { url: args["url"] });
 
+    // What a link actually serves (package / other file / not a download) and
+    // download-only to a console folder (R4, #368).
+    case "link_probe":
+      return postJson<T>("/api/link/probe", {
+        url: args["url"],
+        insecure_tls: args["insecure_tls"] ?? args["insecureTls"] ?? false,
+      });
+    case "link_download":
+      return postJson<T>("/api/link/download", args["req"], /*long=*/ true);
+
+    // R6 (#370): the packages inside a RAR, and a package already on the console.
+    case "rar_packages":
+      return postJson<T>(
+        "/api/rar/packages",
+        {
+          archive_path: args["req"]?.archive_path,
+          password: args["req"]?.password,
+        },
+        /*long=*/ true,
+      );
+    case "pkg_console_probe":
+      return postJson<T>("/api/pkg/console-probe", {
+        host: args["host"],
+        path: args["path"],
+      });
+
     // Download-then-install: the engine pulls the package to ITS disk, which
     // for the browser build is the machine running the engine, not the one
     // running the browser. Same routes, so the mode works from the web UI.
@@ -864,6 +897,18 @@ export async function browserInvoke<T>(
         session: args["session"],
       });
 
+    // Windows network fixes (F2.1): run by the engine, on the computer the console talks to.
+    case "host_net_open_settings":
+      return postJson<T>("/api/host-net/open-settings", {
+        adapter: args["adapter"],
+      });
+    case "host_net_allow_firewall":
+      return postJson<T>(
+        "/api/host-net/allow-firewall",
+        { profile: args["profile"], confirm: args["confirm"] },
+        /*long=*/ true,
+      );
+
     case "payload_restore":
       // Browser-only command (no Tauri twin): the desktop resolves its
       // bundled payload path and calls `payload_send`, which a browser
@@ -882,13 +927,13 @@ export async function browserInvoke<T>(
     // ── Payload probe ────────────────────────────────────────────────────────
 
     case "payload_check": {
-      // Rust probes.rs: GET /api/ps5/status?addr={ip}:9114, wraps the
+      // Rust probes.rs: GET /api/ps5/status?addr={ip}, wraps the
       // response as { ok, reachable, engine, status } or
       // { ok:false, reachable:false, engine, error }. Keep `engine` in step
       // with the Rust side: an engine that never answered is not evidence
       // about the console (see the 2026-09-14 post-mortem in probes.rs).
       const ip = args["ip"] as string;
-      const addr = uenc(`${ip}:9114`);
+      const addr = uenc(consoleAddr(ip));
       const url = `${getEngineUrl()}/api/ps5/status?addr=${addr}`;
       try {
         const r = await fetch(url, { signal: AbortSignal.timeout(5_000) });

@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { consoleAddr } from "../../lib/addr";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+} from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { usePackageViewer } from "../../state/packageViewer";
 import { useShallow } from "zustand/react/shallow";
@@ -12,6 +21,7 @@ import {
   Trash2,
   Pencil,
   FolderPlus,
+  FolderUp,
   RefreshCw,
   Scissors,
   Copy,
@@ -27,12 +37,31 @@ import {
   ScanSearch,
   Hash,
   BadgeCheck,
+  FolderOpen,
+  Link2,
 } from "lucide-react";
 import { pickPath, pickPaths } from "../../lib/pickPath";
+import { useWebviewDropAll } from "../../lib/useWebviewDrop";
+import { writeClipboard } from "../../lib/clipboard";
+import {
+  fsKeyAction,
+  keysBelongElsewhere,
+  nextSort,
+  normalizeTypedPath,
+  sortEntries,
+  type SortKey,
+  type SortState,
+} from "./fsBrowse";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { isTauriEnv } from "../../lib/tauriEnv";
 import { isInstallPackagePath } from "../../lib/pkgDropDedupe";
-import { PageHeader, Button, ConnectionGate, Spinner, ErrorCard } from "../../components";
+import {
+  PageHeader,
+  Button,
+  ConnectionGate,
+  Spinner,
+  ErrorCard,
+} from "../../components";
 import { BrowseButton } from "../../components/BrowseButton";
 import EditSessionBanner from "../../components/EditSessionBanner";
 // Direct import to avoid the barrel's circular-dep warning at build.
@@ -43,7 +72,7 @@ import {
 } from "../../components/ConfirmDialog";
 import { useTr } from "../../state/lang";
 
-import { useConnectionStore, PS5_PAYLOAD_PORT } from "../../state/connection";
+import { useConnectionStore } from "../../state/connection";
 import {
   fsDelete,
   fsMove,
@@ -53,9 +82,12 @@ import {
   fsOpStatus,
   fsOpCancel,
   jobStatus,
+  jobCancel,
   startTransferDownload,
   startTransferDownloadZip,
   startTransferFile,
+  startTransferDir,
+  pathKind,
   fetchVolumes,
   type Volume,
 } from "../../api/ps5";
@@ -90,6 +122,9 @@ import { useElapsed } from "../../lib/useElapsed";
 import { useScrollLock } from "../../lib/useScrollLock";
 import { runBulkDelete as runBulkDeleteLoop } from "../../lib/bulkDelete";
 import { formatBytes } from "../../lib/format";
+import { formatEtaSeconds } from "../../lib/uploadEta";
+import { useRateEta } from "../../lib/useRateEta";
+import { jobLiveFromSnapshot, type JobLive } from "../../lib/jobLive";
 import { humanizePs5Error } from "../../lib/humanizeError";
 
 /**
@@ -115,6 +150,8 @@ interface DirEntry {
   name: string;
   kind: string; // "file" | "dir" | "link" | "other" | "unknown"
   size: number;
+  /** Seconds since the epoch; older helpers omit it. */
+  mtime?: number;
 }
 
 function formatDuration(sec: number): string {
@@ -300,6 +337,14 @@ export default function FileSystemScreen() {
     name: string;
     op: "rename" | "mkdir" | "upload";
   } | null>(null);
+  // Byte progress of an "Add files" upload, from the engine's transfer job. `index` and
+  // `count` place the current file in a multi-file pick; `settling` carries the console's
+  // own "finishing" counts once the bytes are all sent.
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(
+    null,
+  );
+  // The user pressed Cancel on an "Add files" upload: the loop stops quietly.
+  const uploadCancelled = useRef(false);
   // Lifted into Zustand so the in-flight bulk op survives navigation.
   // The async runner writes to the store; the screen reads from it.
   // Re-mount after a tab switch sees the still-running operation.
@@ -517,7 +562,7 @@ export default function FileSystemScreen() {
     let cancelled = false;
     (async () => {
       try {
-        const vols = await fetchVolumes(`${host}:${PS5_PAYLOAD_PORT}`);
+        const vols = await fetchVolumes(consoleAddr(host));
         if (!cancelled) {
           // Only show writable, non-placeholder volumes — the picker
           // is for navigation, and a placeholder ("disk not yet
@@ -733,8 +778,13 @@ export default function FileSystemScreen() {
     try {
       // The activity bar reads the task store; a big folder can take minutes to delete.
       await trackTask(
-        { kind: "fs-delete", origin: "files.delete", label: `Delete ${name}`, consoleId: host },
-        () => fsDelete(`${host}:${PS5_PAYLOAD_PORT}`, itemPath),
+        {
+          kind: "fs-delete",
+          origin: "files.delete",
+          label: `Delete ${name}`,
+          consoleId: host,
+        },
+        () => fsDelete(consoleAddr(host), itemPath),
       );
       await refresh();
     } catch (e) {
@@ -792,7 +842,7 @@ export default function FileSystemScreen() {
     setError(null);
     try {
       await fsMove(
-        `${host}:${PS5_PAYLOAD_PORT}`,
+        consoleAddr(host),
         joinPath(path, oldName),
         joinPath(path, newName),
       );
@@ -944,7 +994,7 @@ export default function FileSystemScreen() {
     for (const r of renames) {
       try {
         await fsMove(
-          `${host}:${PS5_PAYLOAD_PORT}`,
+          consoleAddr(host),
           joinPath(path, r.from),
           joinPath(path, r.to),
         );
@@ -1007,7 +1057,7 @@ export default function FileSystemScreen() {
     setBusyEntry({ name, op: "mkdir" });
     setError(null);
     try {
-      await fsMkdir(`${host}:${PS5_PAYLOAD_PORT}`, joinPath(path, name));
+      await fsMkdir(consoleAddr(host), joinPath(path, name));
       setMkdirDraft(null);
       await refresh();
     } catch (e) {
@@ -1039,23 +1089,33 @@ export default function FileSystemScreen() {
    *
    *  Sequential on purpose: these land inside one mounted image, and the
    *  payload writes a packed shard's records serially anyway. */
-  const runUpload = async (
-    srcPaths: string[],
-    replaceRemoteName?: string,
-  ) => {
+  const runUpload = async (srcPaths: string[], replaceRemoteName?: string) => {
     if (srcPaths.length === 0) return;
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(host);
     setError(null);
-    for (const src of srcPaths) {
+    uploadCancelled.current = false;
+    for (let i = 0; i < srcPaths.length; i++) {
+      if (uploadCancelled.current) break;
+      const src = srcPaths[i];
       const localName = src.split(/[\\/]/).pop() || "file";
       const remoteName = replaceRemoteName ?? localName;
       setBusyEntry({ name: remoteName, op: "upload" });
+      const progressBase = { index: i, count: srcPaths.length, jobId: "" };
+      setUploadProgress({
+        ...progressBase,
+        sent: 0,
+        total: 0,
+        live: undefined,
+      });
       try {
-        const jobId = await startTransferFile(
-          src,
-          joinPath(path, remoteName),
-          addr,
-        );
+        // A folder (picked with Add folder, or dropped) uploads whole, into a same-named
+        // folder here; a file goes up on its own.
+        const isFolder =
+          replaceRemoteName === undefined && (await pathKind(src)) === "folder";
+        const jobId = isFolder
+          ? await startTransferDir(src, joinPath(path, remoteName), addr)
+          : await startTransferFile(src, joinPath(path, remoteName), addr);
+        progressBase.jobId = jobId;
         // Poll to terminal before starting the next one, so a failure
         // stops the batch instead of racing more writes onto a full or
         // read-only mount.
@@ -1063,8 +1123,15 @@ export default function FileSystemScreen() {
           const snap = await jobStatus(jobId);
           if (snap.status === "done") break;
           if (snap.status === "failed") {
+            if (uploadCancelled.current) break;
             throw new Error(snap.error ?? "upload failed");
           }
+          setUploadProgress({
+            ...progressBase,
+            sent: snap.bytes_sent ?? 0,
+            total: snap.total_bytes ?? 0,
+            live: jobLiveFromSnapshot(snap),
+          });
           await new Promise((r) => setTimeout(r, 500));
         }
       } catch (e) {
@@ -1080,12 +1147,22 @@ export default function FileSystemScreen() {
           { body: human },
         );
         setBusyEntry(null);
+        setUploadProgress(null);
         await refresh();
         return;
       }
     }
     setBusyEntry(null);
+    setUploadProgress(null);
     await refresh();
+  };
+
+  /** Stops an "Add files" upload: the engine ends the transfer job, and the batch stops
+   *  before the next file. What already landed stays; the half-written file does not. */
+  const cancelUpload = () => {
+    uploadCancelled.current = true;
+    const id = uploadProgress?.jobId;
+    if (id) void jobCancel(id).catch(() => {});
   };
 
   /** Toolbar: pick one or more local files and copy them into this folder. */
@@ -1100,6 +1177,26 @@ export default function FileSystemScreen() {
     if (!picked || picked.length === 0) return;
     await addPicked(picked);
   };
+
+  const addFolderHere = async () => {
+    const picked = await pickPath({
+      mode: "folder",
+      title: tr(
+        "fs_add_folder_dialog_title",
+        undefined,
+        "Pick a folder to copy onto the PS5",
+      ),
+    });
+    if (typeof picked !== "string") return;
+    await addPicked([picked]);
+  };
+
+  // Files and folders dragged in from the computer's file manager land in this folder
+  // (a .pkg too: this screen copies it, it does not offer to install it).
+  const dropActive = useWebviewDropAll(
+    (paths) => void addPicked(paths),
+    !loading && !!host?.trim() && busyEntry === null,
+  );
 
   /** Upload picked files (local or on a saved server) into this folder, asking first when
    *  one would overwrite a file already here. */
@@ -1204,7 +1301,7 @@ export default function FileSystemScreen() {
       const sizeByName = new Map<string, number>(
         (entries ?? []).map((e) => [e.name, e.size]),
       );
-      const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+      const addr = consoleAddr(host);
       // Same op_id-tracked deleter shape as the cut/copy/paste loop:
       // mint a fresh 64-bit op_id per item, register it with the
       // bulk-op store, spawn a parallel poller that scrapes
@@ -1248,9 +1345,9 @@ export default function FileSystemScreen() {
                   fsBulk.setCurrentBytesCopied(snap.bytes_copied);
                 }
               } catch {
-                // 404 from the engine = op finished. Other errors
-                // (transient mgmt-port stall) silently retry next tick.
-                break;
+                // A 404 ("not in flight") arrives before the engine has registered the
+                // op as well as after it ends, and a blip throws too. None of them may
+                // end the poller: it stops when the delete call returns.
               }
               await new Promise((r) => setTimeout(r, 500));
             }
@@ -1323,8 +1420,44 @@ export default function FileSystemScreen() {
   // Cut / Copy: stage selection into the shared clipboard. Clears local
   // selection so the UI reflects that the items are "in flight" via
   // the toolbar instead of by highlighting.
-  const stageClipboard = (op: "cut" | "copy") => {
-    const items: ClipboardItem[] = selectedEntries.map((e) => ({
+  // ── FileZilla-style browsing: sort columns, keyboard, row menu, typed path ──
+  const [sort, setSort] = useState<SortState>({ key: "name", desc: false });
+  const sortedEntries = useMemo(
+    () => (entries ? sortEntries(entries, sort) : []),
+    [entries, sort],
+  );
+  const [rowMenu, setRowMenu] = useState<{
+    x: number;
+    y: number;
+    entry: DirEntry;
+  } | null>(null);
+  const [pathDraft, setPathDraft] = useState<string | null>(null);
+
+  const openEntry = (e: DirEntry) => {
+    if (e.kind === "dir") setPath(joinPath(path, e.name));
+    else viewEntry(e);
+  };
+  const startRename = (name: string) => {
+    setRenaming(name);
+    setRenameDraft(name);
+  };
+  const copyEntryPath = async (e: DirEntry) => {
+    const ok = await writeClipboard(joinPath(path, e.name));
+    if (!ok)
+      setError(
+        tr(
+          "fs_copy_path_failed",
+          undefined,
+          "Couldn't copy the path to the clipboard.",
+        ),
+      );
+  };
+
+  const stageClipboard = (
+    op: "cut" | "copy",
+    list: DirEntry[] = selectedEntries,
+  ) => {
+    const items: ClipboardItem[] = list.map((e) => ({
       path: joinPath(path, e.name),
       name: e.name,
       size: e.size,
@@ -1347,7 +1480,7 @@ export default function FileSystemScreen() {
   // Clipboard clears only when every cut succeeded cleanly. Any
   // failure keeps the clipboard so the user can retry (maybe after
   // freeing space or fixing permissions).
-  const runPaste = async () => {
+  const runPaste = async (into: string = path) => {
     // Single-flight guard PER CONSOLE: same rationale as runBulkDelete.
     if (fsBulk.op !== null) return;
     if (clipboard.items.length === 0 || !clipboard.op) return;
@@ -1359,7 +1492,16 @@ export default function FileSystemScreen() {
     // and let the user decide once for the whole paste. Before this, pasting
     // a file over one that already existed just failed with
     // `fs_copy_dest_exists` and no way forward.
-    const existingNames = new Set((entries ?? []).map((e) => e.name));
+    // Pasting into a subfolder (the row menu's "Paste into"): its own listing decides the
+    // conflicts, not the folder on screen.
+    const existingNames =
+      into === path
+        ? new Set((entries ?? []).map((e) => e.name))
+        : new Set(
+            (await fsListDir(consoleAddr(host), into).catch(() => [])).map(
+              (e) => e.name,
+            ),
+          );
     const conflicts = items.filter((i) => existingNames.has(i.name));
     let overwrite = false;
     if (conflicts.length > 0) {
@@ -1392,9 +1534,9 @@ export default function FileSystemScreen() {
       op: op === "cut" ? "paste-move" : "paste-copy",
       total: items.length,
       fromPath: clipboard.sourceLabel ?? "",
-      toPath: path,
+      toPath: into,
     });
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(host);
     const errors: string[] = [];
     const duplicated: string[] = [];
     try {
@@ -1404,7 +1546,7 @@ export default function FileSystemScreen() {
         // — that's what gives a 28 GiB copy a sub-second Stop.
         if (fsBulk.cancelRequested) break;
         const item = items[i];
-        const target = joinPath(path, item.name);
+        const target = joinPath(into, item.name);
         fsBulk.setProgress({
           done: i,
           currentPath: item.path,
@@ -1446,11 +1588,10 @@ export default function FileSystemScreen() {
                 fsBulk.setCurrentBytesCopied(snap.bytes_copied);
               }
             } catch {
-              // 404 from the engine means the op finished — break
-              // out so we don't keep polling. Other errors (network
-              // blip, transient mgmt-port stall) silently retry on
-              // the next tick.
-              break;
+              // Breaking here used to end progress for the whole copy: a 404 arrives
+              // before the engine registers the op (the console-ready check runs first)
+              // as well as after it ends, and a blip throws too. Keep polling; the
+              // poller stops when the copy call returns.
             }
             await new Promise((r) => setTimeout(r, 500));
           }
@@ -1462,17 +1603,22 @@ export default function FileSystemScreen() {
         const cancelWatcher = (async () => {
           while (!pollerStopped) {
             if (fsBulk.cancelRequested) {
+              // Keep asking until the engine says the op took the cancel: an early press
+              // lands before the engine has registered the copy, and a single try was
+              // lost (the copy ran to the end). The engine also remembers an early
+              // cancel, so this converges either way; the loop ends when the copy call
+              // returns (`pollerStopped`).
+              let acknowledged = false;
               try {
-                await fsOpCancel(addr, opId);
+                acknowledged = await fsOpCancel(addr, opId);
               } catch (e) {
-                // Best effort — even if the cancel RPC fails, the
-                // payload's cp_rf will still complete the current
-                // file and the loop will exit between items. On a
-                // single 28 GiB file though, "between items" never
-                // fires — log so we know when this drops.
+                // Best effort — a failed cancel RPC is retried below. On a single
+                // 28 GiB file "between items" never fires, so log when this drops.
                 console.warn("fsOpCancel (copy) failed:", e);
               }
-              break;
+              if (acknowledged) break;
+              await new Promise((r) => setTimeout(r, 300));
+              continue;
             }
             await new Promise((r) => setTimeout(r, 200));
           }
@@ -1719,7 +1865,7 @@ export default function FileSystemScreen() {
     // Single-flight per console: only one download at a time on THIS
     // console (others download concurrently into their own slots).
     if (fsDownload.active) return;
-    const addr = `${host}:${PS5_PAYLOAD_PORT}`;
+    const addr = consoleAddr(host);
     const remote = joinPath(path, entry.name);
     const kind: "file" | "folder" = entry.kind === "dir" ? "folder" : "file";
 
@@ -1741,7 +1887,8 @@ export default function FileSystemScreen() {
       if (!destZip || typeof destZip !== "string") return;
       dest = destZip;
       rootName = destZip.split(/[\\/]/).pop() || `${entry.name}.zip`;
-      start = () => startTransferDownloadZip(remote, destZip, addr, kind, systemFileRead);
+      start = () =>
+        startTransferDownloadZip(remote, destZip, addr, kind, systemFileRead);
     } else {
       const picked = await pickPath({
         mode: "folder",
@@ -1754,7 +1901,8 @@ export default function FileSystemScreen() {
       if (typeof picked !== "string") return;
       dest = picked;
       rootName = entry.name;
-      start = () => startTransferDownload(remote, picked, addr, kind, systemFileRead);
+      start = () =>
+        startTransferDownload(remote, picked, addr, kind, systemFileRead);
     }
     setError(null);
     let jobId: string;
@@ -1869,6 +2017,67 @@ export default function FileSystemScreen() {
   //     known volume root." Treat it as null so the picker shows
   //     "(custom path)" instead of arbitrarily picking the
   //     longest-named volume.
+  // The keyboard map (fsBrowse.fsKeyAction). One window listener reading the newest state
+  // through a ref, so it never re-subscribes per render; a text field or a dialog keeps its keys.
+  const keyHandler = useRef<(e: KeyboardEvent) => void>(() => {});
+  keyHandler.current = (e: KeyboardEvent) => {
+    if (
+      keysBelongElsewhere(e.target) ||
+      renaming !== null ||
+      mkdirDraft !== null
+    )
+      return;
+    if (!entries || !host?.trim()) return;
+    const action = fsKeyAction(e);
+    if (!action) return;
+    const sel = selectedEntries;
+    const busy = busyEntry !== null || fsBulk.op !== null;
+    switch (action) {
+      case "select-all":
+        setSelected(new Set(entries.map((x) => x.name)));
+        break;
+      case "copy":
+      case "cut":
+        if (sel.length === 0) return;
+        stageClipboard(action);
+        break;
+      case "paste":
+        if (busy || clipboard.items.length === 0) return;
+        void runPaste();
+        break;
+      case "delete":
+        if (busy || sel.length === 0) return;
+        if (sel.length === 1) void runDelete(sel[0].name);
+        else void runBulkDelete();
+        break;
+      case "rename":
+        if (sel.length !== 1) return;
+        startRename(sel[0].name);
+        break;
+      case "refresh":
+        void refresh();
+        break;
+      case "up":
+        if (path === "/") return;
+        setPath(parent(path));
+        break;
+      case "open":
+        if (sel.length !== 1) return;
+        openEntry(sel[0]);
+        break;
+      case "clear":
+        setSelected(new Set());
+        setRowMenu(null);
+        break;
+    }
+    e.preventDefault();
+  };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => keyHandler.current(e);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   const currentVolumePath = useMemo(() => {
     if (!volumes || volumes.length === 0) return null;
     if (path === "/" || path === "") return null;
@@ -1887,6 +2096,78 @@ export default function FileSystemScreen() {
 
   return (
     <div className="app-page">
+      {dropActive && (
+        <div
+          className="pointer-events-none fixed inset-0 z-40 flex items-center justify-center bg-[var(--color-accent-soft)] ring-4 ring-inset ring-[var(--color-accent)]"
+          data-testid="fs-drop-overlay"
+        >
+          <div className="rounded-lg bg-[var(--color-surface)] px-5 py-3 text-sm font-medium shadow-lg">
+            {tr("fs_drop_here", { path }, `Drop to copy into ${path}`)}
+          </div>
+        </div>
+      )}
+      {rowMenu && (
+        <RowMenu
+          x={rowMenu.x}
+          y={rowMenu.y}
+          onClose={() => setRowMenu(null)}
+          items={[
+            {
+              icon: rowMenu.entry.kind === "dir" ? FolderOpen : Eye,
+              label: tr("fs_menu_open", undefined, "Open"),
+              run: () => openEntry(rowMenu.entry),
+            },
+            {
+              icon: Download,
+              label: tr("fs_menu_download", undefined, "Download"),
+              run: () => void runDownload(rowMenu.entry),
+              disabled: downloadOp.active,
+            },
+            {
+              icon: Scissors,
+              label: tr("fs_cut", "Cut"),
+              run: () => stageClipboard("cut", [rowMenu.entry]),
+            },
+            {
+              icon: Copy,
+              label: tr("fs_menu_copy", undefined, "Copy"),
+              run: () => stageClipboard("copy", [rowMenu.entry]),
+            },
+            ...(rowMenu.entry.kind === "dir" && clipboard.items.length > 0
+              ? [
+                  {
+                    icon: ClipboardPaste,
+                    label: tr(
+                      "fs_menu_paste_into",
+                      undefined,
+                      "Paste into this folder",
+                    ),
+                    run: () =>
+                      void runPaste(joinPath(path, rowMenu.entry.name)),
+                    disabled: fsBulk.op !== null,
+                  },
+                ]
+              : []),
+            {
+              icon: Pencil,
+              label: tr("fs_rename", "Rename"),
+              run: () => startRename(rowMenu.entry.name),
+            },
+            {
+              icon: Link2,
+              label: tr("fs_menu_copy_path", undefined, "Copy path"),
+              run: () => void copyEntryPath(rowMenu.entry),
+            },
+            {
+              icon: Trash2,
+              label: tr("delete", undefined, "Delete"),
+              run: () => void runDelete(rowMenu.entry.name),
+              destructive: true,
+              disabled: busyEntry !== null,
+            },
+          ]}
+        />
+      )}
       {confirmDialogNode}
       {alertDialogNode}
       {promptDialogNode}
@@ -1901,11 +2182,29 @@ export default function FileSystemScreen() {
               remote
               icon={<Upload size={12} />}
               label={tr("fs_add_files", "Add files")}
-              title={tr("fs_add_files_dialog_title", undefined, "Pick files to copy onto the PS5")}
+              title={tr(
+                "fs_add_files_dialog_title",
+                undefined,
+                "Pick files to copy onto the PS5",
+              )}
               disabled={loading || !host?.trim() || busyEntry !== null}
               onMainClick={() => void addFilesHere()}
               onPick={(p) => void addPicked([p])}
             />
+            <Button
+              variant="secondary"
+              size="sm"
+              leftIcon={<FolderUp size={12} />}
+              onClick={() => void addFolderHere()}
+              disabled={loading || !host?.trim() || busyEntry !== null}
+              title={tr(
+                "fs_add_folder_dialog_title",
+                undefined,
+                "Pick a folder to copy onto the PS5",
+              )}
+            >
+              {tr("fs_add_folder", undefined, "Add folder")}
+            </Button>
             <Button
               variant="secondary"
               size="sm"
@@ -1988,7 +2287,11 @@ export default function FileSystemScreen() {
                       distinction survives, without implying selection. */}
                   <Icon
                     size={12}
-                    className={external ? "text-[var(--color-ps4)]" : "text-[var(--color-muted)]"}
+                    className={
+                      external
+                        ? "text-[var(--color-ps4)]"
+                        : "text-[var(--color-muted)]"
+                    }
                   />
                   {v.path}
                   <span className="opacity-60">
@@ -2028,32 +2331,67 @@ export default function FileSystemScreen() {
             >
               <ArrowUp size={14} />
             </button>
-            {crumbs(path).map((c, i, arr) => (
-              <span key={c.path} className="flex shrink-0 items-center gap-1">
+            {pathDraft !== null ? (
+              <input
+                autoFocus
+                value={pathDraft}
+                onChange={(ev) => setPathDraft(ev.target.value)}
+                onKeyDown={(ev) => {
+                  if (ev.key === "Enter") {
+                    const next = normalizeTypedPath(pathDraft);
+                    if (next) {
+                      setPath(next);
+                      setPathDraft(null);
+                    }
+                  }
+                  if (ev.key === "Escape") setPathDraft(null);
+                }}
+                onBlur={() => setPathDraft(null)}
+                spellCheck={false}
+                aria-label={tr("fs_go_to_path", undefined, "Go to path")}
+                className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-0.5 font-mono text-xs"
+              />
+            ) : (
+              <>
+                {crumbs(path).map((c, i, arr) => (
+                  <span
+                    key={c.path}
+                    className="flex shrink-0 items-center gap-1"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setPath(c.path)}
+                      className={
+                        "rounded px-1.5 py-0.5 font-mono " +
+                        (i === arr.length - 1
+                          ? "font-medium text-[var(--color-text)]"
+                          : "text-[var(--color-muted)] hover:bg-[var(--color-surface-3)] hover:text-[var(--color-text)]")
+                      }
+                    >
+                      {i === 0 ? (
+                        <Home size={12} className="inline -translate-y-[1px]" />
+                      ) : (
+                        c.label
+                      )}
+                    </button>
+                    {i < arr.length - 1 && (
+                      <ChevronRight
+                        size={12}
+                        className="text-[var(--color-muted)]"
+                      />
+                    )}
+                  </span>
+                ))}
                 <button
                   type="button"
-                  onClick={() => setPath(c.path)}
-                  className={
-                    "rounded px-1.5 py-0.5 font-mono " +
-                    (i === arr.length - 1
-                      ? "font-medium text-[var(--color-text)]"
-                      : "text-[var(--color-muted)] hover:bg-[var(--color-surface-3)] hover:text-[var(--color-text)]")
-                  }
+                  onClick={() => setPathDraft(path)}
+                  title={tr("fs_go_to_path", undefined, "Go to path")}
+                  className="ml-1 shrink-0 rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-3)] hover:text-[var(--color-text)]"
                 >
-                  {i === 0 ? (
-                    <Home size={12} className="inline -translate-y-[1px]" />
-                  ) : (
-                    c.label
-                  )}
+                  <Pencil size={12} />
                 </button>
-                {i < arr.length - 1 && (
-                  <ChevronRight
-                    size={12}
-                    className="text-[var(--color-muted)]"
-                  />
-                )}
-              </span>
-            ))}
+              </>
+            )}
           </div>
           <RecentPathsDropdown onPick={(p) => setPath(p)} currentPath={path} />
         </div>
@@ -2081,7 +2419,7 @@ export default function FileSystemScreen() {
             <div className="ml-auto flex items-center gap-1">
               <button
                 type="button"
-                onClick={runPaste}
+                onClick={() => void runPaste()}
                 disabled={bulkOp.op !== null || !host?.trim()}
                 className="flex items-center gap-1 rounded-md bg-[var(--color-accent)] px-2 py-1 text-xs font-medium text-[var(--color-accent-contrast)] disabled:opacity-50"
               >
@@ -2237,7 +2575,7 @@ export default function FileSystemScreen() {
         )}
 
         {busyEntry && bulkOp.op === null && (
-          <div className="mb-3 flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface-2)] p-2 text-xs">
+          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface-2)] p-2 text-xs">
             <Spinner size={12} tone="accent" />
             <span className="font-medium">
               {busyEntry.op === "rename"
@@ -2249,6 +2587,12 @@ export default function FileSystemScreen() {
             <span className="text-[var(--color-muted)]">
               {busyEntry.name} · {formatDuration(elapsedMs / 1000)}
             </span>
+            {busyEntry.op === "upload" && uploadProgress && (
+              <UploadProgressDetail
+                progress={uploadProgress}
+                onCancel={cancelUpload}
+              />
+            )}
           </div>
         )}
 
@@ -2335,11 +2679,36 @@ export default function FileSystemScreen() {
                 `${entries.length} item${entries.length === 1 ? "" : "s"}`,
               )}
             </span>
+            <span className="ml-auto flex items-center gap-1">
+              {(
+                [
+                  ["name", tr("fs_sort_name", undefined, "Name")],
+                  ["size", tr("fs_sort_size", undefined, "Size")],
+                  ["mtime", tr("fs_sort_modified", undefined, "Modified")],
+                ] as [SortKey, string][]
+              ).map(([k, label]) => (
+                <button
+                  key={k}
+                  type="button"
+                  onClick={() => setSort((cur) => nextSort(cur, k))}
+                  className={
+                    "rounded px-1.5 py-0.5 hover:bg-[var(--color-surface-3)] " +
+                    (sort.key === k
+                      ? "font-medium text-[var(--color-text)]"
+                      : "")
+                  }
+                  aria-pressed={sort.key === k}
+                >
+                  {label}
+                  {sort.key === k ? (sort.desc ? " ↓" : " ↑") : ""}
+                </button>
+              ))}
+            </span>
           </div>
         )}
 
         <ul className="grid gap-1">
-          {entries?.map((e) => {
+          {sortedEntries.map((e) => {
             const isDir = e.kind === "dir";
             const Icon = isDir ? Folder : FileIcon;
             const isRenaming = renaming === e.name;
@@ -2347,6 +2716,15 @@ export default function FileSystemScreen() {
             return (
               <li
                 key={e.name}
+                onDoubleClick={(ev) => {
+                  if ((ev.target as HTMLElement).closest("input,button"))
+                    return;
+                  openEntry(e);
+                }}
+                onContextMenu={(ev) => {
+                  ev.preventDefault();
+                  setRowMenu({ x: ev.clientX, y: ev.clientY, entry: e });
+                }}
                 className={
                   "list-row-contain-sm flex items-center gap-3 rounded-md border p-2 text-sm " +
                   (isSelected
@@ -2688,6 +3066,96 @@ function RecentPathsDropdown({
   );
 }
 
+/** Byte progress of an "Add files" upload (see `runUpload`). */
+interface UploadProgress {
+  sent: number;
+  total: number;
+  /** Which file of the pick this is (0-based) and how many there are. */
+  index: number;
+  count: number;
+  jobId: string;
+  /** The engine's live notes: carries the console's "finishing" counts. */
+  live: JobLive | undefined;
+}
+
+/** Bytes, percent, speed, time left and a bar for an "Add files" upload, and Cancel. Once every
+ *  byte is sent the console still has to make the files permanent: that phase says so (with the
+ *  console's own count when it sends one) instead of sitting at 100%. */
+function UploadProgressDetail({
+  progress,
+  onCancel,
+}: {
+  progress: UploadProgress;
+  onCancel: () => void;
+}) {
+  const tr = useTr();
+  const { sent, total, index, count, jobId, live } = progress;
+  const { rate, etaSeconds } = useRateEta(jobId, sent, total);
+  const pct = total > 0 ? Math.min(100, (sent / total) * 100) : null;
+  const finishing = total > 0 && sent >= total;
+  const settleLeft = live?.settling ? live.settleLeft : undefined;
+  return (
+    <div className="mt-1 basis-full" data-testid="fs-upload-progress">
+      <div className="mb-1 flex flex-wrap items-center gap-x-2 font-mono text-[var(--color-muted)]">
+        {count > 1 && (
+          <span>
+            {tr(
+              "fs_bulk_progress",
+              { done: index + 1, total: count },
+              "{done} of {total}",
+            )}
+          </span>
+        )}
+        <span>
+          {pct !== null
+            ? `${formatBytes(sent)} / ${formatBytes(total)} (${pct.toFixed(0)}%)`
+            : formatBytes(sent)}
+        </span>
+        {!finishing && rate > 0 && <span>{formatBytes(rate)}/s</span>}
+        {!finishing && etaSeconds !== null && (
+          <span>
+            {tr(
+              "fs_progress_eta",
+              { time: formatEtaSeconds(etaSeconds) },
+              `about ${formatEtaSeconds(etaSeconds)} left`,
+            )}
+          </span>
+        )}
+        {finishing && (
+          <span className="text-[var(--color-warn)]">
+            {tr(
+              "upload_phase_settling",
+              undefined,
+              "Finishing on the console…",
+            )}
+            {settleLeft !== undefined &&
+              ` ${tr(
+                "fs_finishing_files_left",
+                { left: settleLeft.toLocaleString() },
+                `${settleLeft.toLocaleString()} files left`,
+              )}`}
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={onCancel}
+          className="ml-auto rounded-md border border-[var(--color-border)] px-2 py-0.5 hover:bg-[var(--color-surface-3)]"
+        >
+          {tr("cancel", undefined, "Cancel")}
+        </button>
+      </div>
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-surface-3)]">
+        <div
+          className={`h-full bg-[var(--color-accent)] transition-[width] duration-300 ${
+            pct === null || finishing ? "animate-pulse" : ""
+          }`}
+          style={{ width: `${Math.max(pct ?? 0, 4)}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
 function BulkOpBanner({
   host,
   op,
@@ -2741,15 +3209,27 @@ function BulkOpBanner({
     currentSize !== null && currentSize > 0 && currentBytesCopied > 0
       ? Math.min(100, (currentBytesCopied / currentSize) * 100)
       : null;
-  // Item-level speed: bytes since this item started divided by
-  // elapsed time on this item. Approximation — uses the bulk-op
-  // started_at as the item's start, which is fine for a single-item
-  // paste (the user's PPSA09519.exfat case) and gives a low-side
-  // number for multi-item pastes (sums prior items into the elapsed).
-  const itemSpeed =
-    elapsedSec > 0 && currentBytesCopied > 0
-      ? currentBytesCopied / elapsedSec
-      : 0;
+  // Rate and time left for the item being copied, from the byte counter the poller
+  // keeps current (a trailing window: a big copy moves in bursts). The key restarts the
+  // window for each item, so an earlier item's pace never leaks into the next one.
+  const { rate: itemSpeed, etaSeconds: itemEta } = useRateEta(
+    `${currentName}|${done}`,
+    currentBytesCopied,
+    currentSize ?? 0,
+  );
+  // Every byte is written but the item is not done yet: the console is renaming into
+  // place (and, for a move, deleting the original). It moves no bytes, so say so rather
+  // than sit on 100%.
+  const finishing =
+    op !== "delete" &&
+    currentSize !== null &&
+    currentSize > 0 &&
+    currentBytesCopied >= currentSize;
+  // Whole-batch bar: finished items plus the current item's fraction.
+  const pctOverall =
+    total > 0
+      ? Math.min(100, ((done + (itemPct ?? 0) / 100) / total) * 100)
+      : pctByFiles;
 
   return (
     <div className="mb-3 rounded-md border border-[var(--color-accent)] bg-[var(--color-surface-2)] p-3 text-xs">
@@ -2764,29 +3244,46 @@ function BulkOpBanner({
           )}
           {" · "}
           {formatDuration(elapsedSec)}
-          {itemSpeed > 0 && ` · ${formatBytes(itemSpeed)}/s`}
+          {!finishing && itemSpeed > 0 && ` · ${formatBytes(itemSpeed)}/s`}
+          {!finishing &&
+            itemEta !== null &&
+            ` · ${tr(
+              "fs_progress_eta",
+              { time: formatEtaSeconds(itemEta) },
+              `about ${formatEtaSeconds(itemEta)} left`,
+            )}`}
+          {finishing &&
+            ` · ${tr("upload_phase_settling", undefined, "Finishing on the console…")}`}
         </span>
-        {/* Stop button now drives a real cancel: the loop fires
-            FS_OP_CANCEL via a side-watcher so the payload's cp_rf
-            bails within ~one 4 MiB buffer (sub-second on PS5
-            NVMe). The between-items check still applies for
-            delete (no per-byte cancel concept). */}
+        {/* Cancel drives a real cancel: the loop asks the engine to end the console's
+            copy job (job.cancel), which stops within a moment however big the file is, and
+            the engine then removes the half-written destination. The source is never
+            touched. Delete has no mid-file cancel, so its button waits for the item. */}
         <button
           type="button"
           onClick={() => useFsBulkOpStore.getState().requestCancel(host)}
           disabled={cancelRequested}
+          data-testid="fs-bulk-cancel"
           className="ml-auto rounded-md border border-[var(--color-border)] px-2 py-0.5 text-xs hover:bg-[var(--color-surface-3)] disabled:opacity-50"
-          title={tr(
-            "fs_bulk_stop_tooltip",
-            undefined,
+          title={
             op === "delete"
-              ? "Stop after the current item finishes"
-              : "Cancel the current copy and skip the rest",
-          )}
+              ? tr(
+                  "fs_bulk_stop_tooltip",
+                  undefined,
+                  "Stop after the current item finishes",
+                )
+              : tr(
+                  "fs_bulk_cancel_copy_tooltip",
+                  undefined,
+                  "Cancel the current copy and skip the rest. The original is not touched; the half-copied files are removed.",
+                )
+          }
         >
           {cancelRequested
             ? tr("fs_bulk_stopping", undefined, "Stopping…")
-            : tr("fs_bulk_stop", undefined, "Stop")}
+            : op === "delete"
+              ? tr("fs_bulk_stop", undefined, "Stop")
+              : tr("fs_bulk_cancel_copy", undefined, "Cancel copy")}
         </button>
       </div>
 
@@ -2820,6 +3317,16 @@ function BulkOpBanner({
             />
           </div>
         )}
+
+      {cancelRequested && op !== "delete" && (
+        <div className="mb-2 rounded-md border border-[var(--color-warn)] bg-[var(--color-warn-soft)] p-2 text-xs text-[var(--color-warn)]">
+          {tr(
+            "fs_bulk_cancel_copy_explainer",
+            undefined,
+            "Cancelling: the PS5 is stopping the copy and removing the half-copied files. Your original files are not touched.",
+          )}
+        </div>
+      )}
 
       {cancelRequested && op === "delete" && (
         // Delete has no per-byte cancel; explain why it's slower.
@@ -2857,9 +3364,11 @@ function BulkOpBanner({
       <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-surface-3)]">
         <div
           className={`h-full bg-[var(--color-accent)] transition-[width] duration-300 ${
-            done < total ? "animate-pulse" : ""
+            done < total && (itemPct === null || finishing)
+              ? "animate-pulse"
+              : ""
           }`}
-          style={{ width: `${Math.max(pctByFiles, 4)}%` }}
+          style={{ width: `${Math.max(pctOverall, 4)}%` }}
         />
       </div>
     </div>
@@ -2970,6 +3479,87 @@ function DownloadOpBanner({
           style={{ width: `${pct}%` }}
         />
       </div>
+    </div>
+  );
+}
+
+interface RowMenuItem {
+  icon: ComponentType<{ size?: number; className?: string }>;
+  label: string;
+  run: () => void;
+  disabled?: boolean;
+  destructive?: boolean;
+}
+
+/** The Files row's right-click menu: at the pointer, kept on screen, closed by a click
+ *  elsewhere, Escape, scroll or a resize. */
+function RowMenu({
+  x,
+  y,
+  items,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  items: RowMenuItem[];
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ left: x, top: y });
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setPos({
+      left: Math.max(4, Math.min(x, window.innerWidth - r.width - 4)),
+      top: Math.max(4, Math.min(y, window.innerHeight - r.height - 4)),
+    });
+  }, [x, y]);
+  useEffect(() => {
+    const close = (e: Event) => {
+      if (e instanceof MouseEvent && ref.current?.contains(e.target as Node))
+        return;
+      onClose();
+    };
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("mousedown", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [onClose]);
+  return (
+    <div
+      ref={ref}
+      role="menu"
+      data-testid="fs-row-menu"
+      style={{ left: pos.left, top: pos.top }}
+      className="fixed z-50 min-w-[12rem] rounded-md border border-[var(--color-border)] bg-[var(--color-surface-raised)] py-1 text-sm shadow-lg"
+    >
+      {items.map((it) => (
+        <button
+          key={it.label}
+          type="button"
+          role="menuitem"
+          disabled={it.disabled}
+          onClick={() => {
+            onClose();
+            it.run();
+          }}
+          className={
+            "flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-[var(--color-surface-3)] disabled:opacity-40 " +
+            (it.destructive ? "text-[var(--color-bad)]" : "")
+          }
+        >
+          <it.icon size={14} className="shrink-0" />
+          {it.label}
+        </button>
+      ))}
     </div>
   );
 }

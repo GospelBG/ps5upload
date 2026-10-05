@@ -13,13 +13,6 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 const PS5_LOADER_PORT: u16 = 9021;
-/// Management port — lightweight, served by its own pthread inside the
-/// payload. Used for HELLO / STATUS / FS_* / CLEANUP / QUERY_TX /
-/// TAKEOVER_REQUEST. Responsive even during an active transfer, which
-/// is the whole point of the 9113/9114 split. Transfer commands
-/// (BEGIN_TX / STREAM_SHARD / COMMIT_TX / ABORT_TX) accept their `addr`
-/// from the renderer, which supplies :9113 directly.
-const PS5_MGMT_PORT: u16 = 9114;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Name resolution gets its own, longer budget — separate from the connect
 /// budget above.
@@ -124,7 +117,7 @@ pub async fn payload_check(ip: String) -> serde_json::Value {
     // ps5_engine.rs. The renderer-supplied `ip` is free-form; without
     // encoding a `&`/`#`/space corrupts the query string and the STATUS
     // round-trip targets the wrong address.
-    let addr = crate::commands::ps5_engine::urlencoding(&format!("{ip}:{PS5_MGMT_PORT}"));
+    let addr = crate::commands::ps5_engine::urlencoding(&ip);
     let url = format!("{engine_url}/api/ps5/status?addr={addr}");
     let client = match crate::engine_http::engine_client_builder()
         .timeout(Duration::from_secs(5))
@@ -217,7 +210,7 @@ async fn do_payload_send(ip: &str, path: &str, target_port: u16) -> Result<u64, 
         ));
     }
     // Does the ELF we're about to load identify as a ps5upload payload?
-    // Only ps5upload payloads bind :9114/:9113, so only they contend with a
+    // Only ps5upload payloads bind :9120, so only they contend with a
     // running ps5upload — and only they warrant evicting it (below). Other
     // ELFs (the DPI install daemon on :9115, scene tools) bind different
     // ports and can load ALONGSIDE ps5upload, so they must NOT knock it
@@ -252,36 +245,68 @@ async fn do_payload_send(ip: &str, path: &str, target_port: u16) -> Result<u64, 
     // Best-effort old-payload eviction. When the user resends payload
     // bytes to :9021, the PS5 ELF loader spawns a fresh process — but
     // the OLD ps5upload payload is unaware and keeps running. The two
-    // contend for :9114 and the new bind fails, leaving the OLD
-    // payload still answering with whatever its (possibly stale) wire
-    // protocol expects. Symptom users see: "I sent the payload but
-    // installs still fail with read frame header." Send a Shutdown
-    // frame to the existing :9114 first, give it a moment to free
-    // the ports, THEN push the new ELF. No-op when nothing's
-    // listening on :9114 (first send of the session, console
+    // contend for :9120 and the new bind fails, leaving the OLD
+    // payload still answering with whatever its (possibly stale)
+    // behaviour expects. Symptom users see: "I sent the payload but
+    // nothing changed." Send a node.shutdown to the existing helper
+    // first, give it a moment to free the port, THEN push the new
+    // ELF. No-op when nothing's listening on :9120 (first send of the
+    // session, console
     // rebooted, etc) — shutdown_running_payload returns Ok(false)
     // and we proceed normally.
     //
     // GATED on `sending_ps5upload`: we ONLY evict when the incoming ELF is
-    // itself a ps5upload payload (the only thing that contends for :9114).
+    // itself a ps5upload payload (the only thing that contends for :9120).
     // Loading a different-port daemon — e.g. the DPI installer (:9115) —
     // leaves ps5upload running, so an install no longer drops the transfer
     // connection. (On a single-payload loader the loader itself may still
     // clobber ps5upload; that's outside our control, and the post-install
     // payload restore — which IS a ps5upload send — cleans up the ports.)
+    // An OLDER helper is replaced by the engine's replace flow (the old protocol's shutdown,
+    // the stamped helper, the AVA1 wait) instead of the shutdown below, which only speaks AVA1.
+    // The replace sends the BUNDLED helper, so it is taken only when the chosen file IS the
+    // bundled helper; any other ELF (a downgrade, a test build) is the person's deliberate
+    // choice and goes through the shutdown-then-send path, and THEIR file is what gets sent.
     if target_port == PS5_LOADER_PORT && sending_ps5upload {
-        let mgmt_addr = format!("{ip}:9114");
-        // Off the async runtime — Connection is blocking I/O.
+        let state = engine_helper_state(ip).await;
+        if state.as_deref() == Some("helper_old") {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("read {path}: {e}"))?;
+            let bundled = tokio::task::spawn_blocking(move || file_is_bundled(&bytes))
+                .await
+                .unwrap_or(false);
+            if old_helper_path(state.as_deref(), bundled) == OldHelperPath::Replace {
+                engine_replace_helper(ip).await?;
+                return Ok(size);
+            }
+        }
+    }
+    if target_port == PS5_LOADER_PORT && sending_ps5upload {
+        let host = ip.to_string();
+        // Off the async runtime — the management call is blocking I/O.
         let _ = tokio::task::spawn_blocking(move || {
-            ps5upload_core::payload_lifecycle::shutdown_running_payload(&mgmt_addr)
+            ps5upload_core::payload_lifecycle::shutdown_running_payload(&host)
         })
         .await;
-        // Brief grace period for the OS to recycle :9114 after the
+        // Brief grace period for the OS to recycle :9120 after the
         // old process exits. 600 ms is enough for the typical FreeBSD
         // close-wait → unbind transition on the PS5 we've measured;
         // anything more would noticeably slow the user-facing send.
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     }
+
+    // A ps5upload helper is sent from memory so its AVA1 trust slot can be stamped.
+    let helper_bytes = if target_port == PS5_LOADER_PORT && sending_ps5upload {
+        let mut v = Vec::with_capacity(size as usize);
+        file.read_to_end(&mut v)
+            .await
+            .map_err(|e| format!("read {path}: {e}"))?;
+        stamp_ava1_trust(&mut v).await;
+        Some(v)
+    } else {
+        None
+    };
 
     let addr = format!("{ip}:{target_port}");
     let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
@@ -291,24 +316,32 @@ async fn do_payload_send(ip: &str, path: &str, target_port: u16) -> Result<u64, 
     let sent = timeout(SEND_TIMEOUT, async {
         let mut buf = [0u8; 64 * 1024];
         let mut total = 0u64;
-        loop {
-            let n = file
-                .read(&mut buf)
-                .await
-                .map_err(|e| format!("read {path}: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            total = total.saturating_add(n as u64);
-            if total > PAYLOAD_SEND_MAX_BYTES {
-                return Err(format!(
-                    "payload exceeded {PAYLOAD_SEND_MAX_BYTES} bytes while streaming"
-                ));
-            }
+        if let Some(v) = &helper_bytes {
             stream
-                .write_all(&buf[..n])
+                .write_all(v)
                 .await
                 .map_err(|e| format!("write: {e}"))?;
+            total = v.len() as u64;
+        } else {
+            loop {
+                let n = file
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| format!("read {path}: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                total = total.saturating_add(n as u64);
+                if total > PAYLOAD_SEND_MAX_BYTES {
+                    return Err(format!(
+                        "payload exceeded {PAYLOAD_SEND_MAX_BYTES} bytes while streaming"
+                    ));
+                }
+                stream
+                    .write_all(&buf[..n])
+                    .await
+                    .map_err(|e| format!("write: {e}"))?;
+            }
         }
         // Bound the half-close FIN: if the PS5 loader's TCP stack
         // doesn't promptly ACK our FIN (e.g. its keepalive interval
@@ -372,12 +405,153 @@ pub async fn payload_send(ip: String, path: String, port: Option<u16>) -> serde_
     }
 }
 
+/// This engine's AVA1 public key and the launch token that goes with it (SPEC.md §5.2),
+/// or `None` if the engine is unreachable or silent.
+async fn fetch_ava1_identity(url: &str) -> Option<([u8; 32], Option<[u8; 16]>)> {
+    // A wedged engine must not hang the send: give up after 2 s and send unstamped.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let client = crate::engine_http::engine_client_builder().build().ok()?;
+        let v: serde_json::Value = client.get(url).send().await.ok()?.json().await.ok()?;
+        let k = ava1::hex::decode(v.get("public_key")?.as_str()?)?;
+        let key = <[u8; 32]>::try_from(k).ok()?;
+        // Absent when the engine does not count this caller as local: the token is the
+        // engine's own secret, and it stamps its own sends without us.
+        let token = v
+            .get("launch_token")
+            .and_then(|t| t.as_str())
+            .and_then(ava1::hex::decode)
+            .and_then(|t| <[u8; 16]>::try_from(t).ok());
+        Some((key, token))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Stamps this engine's AVA1 key — and a launch token, when the engine gives one — into a
+/// ps5upload helper ELF, so the console trusts this engine without pairing and this engine
+/// trusts the console it just launched without a pairing code either (SPEC.md §5.1, §5.2).
+/// An unreachable engine or an ELF without a slot (an older build) is sent unchanged; the
+/// console then opens its pairing window instead.
+async fn stamp_ava1_trust(bytes: &mut [u8]) {
+    let url = format!("{}/api/ava1/identity", crate::engine::url());
+    let fetched = fetch_ava1_identity(&url).await;
+    let key = fetched.as_ref().map(|(k, _)| k);
+    let token = fetched.and_then(|(_, t)| t);
+    // The same step the engine's own helper sends take (ava1_api::stamped_helper).
+    if let Err(why) = ava1::trust::stamp_helper(bytes, key, || token) {
+        eprintln!("[payload_send] {why}");
+    }
+}
+
+/// What the engine says about the console's running helper (`GET /api/ps5/helper/state`):
+/// `ava1`, `helper_old`, `starting`, `ava1_failed` or `not_running`. `None` when the engine
+/// does not answer (an older engine without the route): the caller then keeps the plain flow.
+async fn engine_helper_state(ip: &str) -> Option<String> {
+    let url = format!(
+        "{}/api/ps5/helper/state?host={}",
+        crate::engine::url(),
+        crate::commands::ps5_engine::urlencoding(ip)
+    );
+    tokio::time::timeout(Duration::from_secs(4), async {
+        let client = crate::engine_http::engine_client_builder().build().ok()?;
+        let r = client.get(&url).send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = r.json().await.ok()?;
+        v.get("state")?.as_str().map(str::to_string)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// An older helper (one that only speaks the old protocol) is replaced by the ENGINE, not shut
+/// down from here: `POST /api/ps5/helper/replace` asks it to exit, waits for its ports to close,
+/// sends the stamped helper (so no pairing code appears) and waits for the AVA1 port. Returns
+/// `Err` with the engine's token at the start (`legacy_helper_wedged`: the old helper did not
+/// exit, the console must be restarted; `helper_not_running`) so the UI can say what to do.
+async fn engine_replace_helper(ip: &str) -> Result<(), String> {
+    let url = format!("{}/api/ps5/helper/replace", crate::engine::url());
+    let client = crate::engine_http::engine_client_builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let r = client
+        .post(&url)
+        .json(&serde_json::json!({ "host": ip }))
+        .send()
+        .await
+        .map_err(|e| format!("replace helper: {e}"))?;
+    if r.status().is_success() {
+        return Ok(());
+    }
+    let status = r.status();
+    let body = r.text().await.unwrap_or_default();
+    Err(replace_failure(status.as_u16(), &body))
+}
+
+/// How an older helper is dealt with when a ps5upload ELF is sent to the loader.
+#[derive(Debug, PartialEq, Eq)]
+enum OldHelperPath {
+    /// The engine's replace flow (it sends the bundled helper).
+    Replace,
+    /// The shutdown-then-send path: the person's own file is what gets sent.
+    ShutdownThenSend,
+}
+
+/// The replace flow only for an older helper AND the bundled helper file.
+fn old_helper_path(engine_state: Option<&str>, file_is_bundled: bool) -> OldHelperPath {
+    if engine_state == Some("helper_old") && file_is_bundled {
+        OldHelperPath::Replace
+    } else {
+        OldHelperPath::ShutdownThenSend
+    }
+}
+
+/// True when `file` is byte-for-byte the helper this app embeds.
+fn file_is_bundled(file: &[u8]) -> bool {
+    same_as_gz(file, EMBEDDED_PAYLOAD_GZ)
+}
+
+fn same_as_gz(file: &[u8], gz: &[u8]) -> bool {
+    let mut out = Vec::with_capacity(file.len());
+    let decoder = flate2::read::GzDecoder::new(gz);
+    if std::io::Read::read_to_end(
+        &mut std::io::Read::take(decoder, EMBEDDED_PAYLOAD_MAX_BYTES),
+        &mut out,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    blake3::hash(&out) == blake3::hash(file)
+}
+
+/// The error text for a refused replace: the engine's `error` (which starts with its token)
+/// when the body has one, else the raw body or the status.
+fn replace_failure(status: u16, body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| {
+            if body.trim().is_empty() {
+                format!("helper replace failed (HTTP {status})")
+            } else {
+                body.trim().to_string()
+            }
+        })
+}
+
 /// Launch the ELF at `path` through Payload Manager (:8084). The stored copy
 /// is removed once it has been launched; the payload keeps running.
 async fn payload_send_via_payload_manager(ip: &str, path: &str) -> Result<u64, String> {
-    let bytes = tokio::fs::read(path)
+    let mut bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("read {path}: {e}"))?;
+    stamp_ava1_trust(&mut bytes).await;
     // Our own name, never the file's: Payload Manager files uploads under a
     // folder derived from the name and its cleanup clears that folder, so a
     // user's own "ps5upload" entry must not be the one we land in.
@@ -684,7 +858,7 @@ fn memmem_ascii(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// True when the file we're about to send is a ps5upload payload — by
 /// filename (`ps5upload.elf`) or by the ASCII signature embedded in its
-/// section headers. This is the only kind of ELF that binds :9114/:9113
+/// section headers. This is the only kind of ELF that binds :9120
 /// and thus contends with a running ps5upload, so it's the only kind that
 /// should trigger eviction of the current payload. `head` is the leading
 /// chunk of the file (payload_probe / do_payload_send both pass 512 KiB).
@@ -700,6 +874,24 @@ fn is_ps5upload_payload(path: &str, head: &[u8]) -> bool {
     base.contains("ps5upload")
         || memmem_ascii(head, b"ps5upload")
         || memmem_ascii(head, b"PS5UPLOAD")
+}
+
+#[cfg(test)]
+mod ava1_fetch_tests {
+    #[tokio::test]
+    async fn a_silent_engine_does_not_hang_the_fetch() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api/ava1/identity", l.local_addr().unwrap());
+        let _hold = tokio::spawn(async move {
+            let mut keep = Vec::new();
+            while let Ok(c) = l.accept().await {
+                keep.push(c);
+            }
+        });
+        let t = std::time::Instant::now();
+        assert!(super::fetch_ava1_identity(&url).await.is_none());
+        assert!(t.elapsed() < std::time::Duration::from_secs(3));
+    }
 }
 
 #[cfg(test)]
@@ -721,6 +913,55 @@ mod payload_send_tests {
     /// `&[]`, which surfaced to users as a gunzip failure on send. Since
     /// every target now `include_bytes!`s the same file, this one test
     /// covers desktop and mobile alike.
+    #[test]
+    fn only_the_bundled_helper_takes_the_replace_flow() {
+        // The older helper and the bundled file: the engine replaces it.
+        assert_eq!(
+            old_helper_path(Some("helper_old"), true),
+            OldHelperPath::Replace
+        );
+        // A custom ELF keeps the person's choice: shutdown, then send THEIR file.
+        assert_eq!(
+            old_helper_path(Some("helper_old"), false),
+            OldHelperPath::ShutdownThenSend
+        );
+        // Anything but an older helper is the plain flow, bundled or not.
+        for st in [Some("ava1"), Some("not_running"), None] {
+            assert_eq!(old_helper_path(st, true), OldHelperPath::ShutdownThenSend);
+        }
+    }
+
+    #[test]
+    fn a_file_is_the_bundled_helper_only_when_every_byte_matches() {
+        use std::io::Write;
+        let elf = b"\x7FELF the bundled helper".to_vec();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&elf).unwrap();
+        let gz = gz.finish().unwrap();
+        assert!(same_as_gz(&elf, &gz));
+        let mut other = elf.clone();
+        *other.last_mut().unwrap() ^= 1;
+        assert!(
+            !same_as_gz(&other, &gz),
+            "a one-byte difference is a custom build"
+        );
+        assert!(!same_as_gz(&elf[..4], &gz));
+        assert!(!same_as_gz(&elf, b"not gzip"));
+    }
+
+    #[test]
+    fn a_refused_replace_keeps_the_engines_token_first() {
+        assert_eq!(
+            replace_failure(
+                409,
+                r#"{"error":"legacy_helper_wedged: the older helper did not exit"}"#
+            ),
+            "legacy_helper_wedged: the older helper did not exit"
+        );
+        assert_eq!(replace_failure(502, "plain text"), "plain text");
+        assert_eq!(replace_failure(500, ""), "helper replace failed (HTTP 500)");
+    }
+
     #[test]
     fn embedded_payload_decompresses_to_elf() {
         use std::io::Read;

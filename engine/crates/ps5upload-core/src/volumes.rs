@@ -10,11 +10,10 @@
 //!   - smoke/bench tests sanity-checking that `/data` is reachable
 //!   - delta transfers choosing a target drive with sufficient free space
 
-use anyhow::{bail, Context, Result};
-use ftx2_proto::FrameType;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 /// Rough size of the PS5 content allocator's hidden pool — capacity that
 /// `statfs(2)` on `/data`/`/user` advertises but the console will not actually
@@ -201,25 +200,38 @@ impl VolumeList {
     }
 }
 
-/// Connect to the payload, send FS_LIST_VOLUMES, await FS_LIST_VOLUMES_ACK,
-/// return parsed list.
+/// What `fs.freespace` says about the drive holding a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct FreeSpace {
+    /// Free space less the working margin: what a write may still fill.
+    pub usable_bytes: u64,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+    pub reserve_bytes: u64,
+    /// The drive's device id: two paths with the same one share the room.
+    pub dev: u64,
+}
+
+/// `fs.freespace`: the usable room on the drive holding `path` (which need not exist yet: the
+/// nearest existing ancestor is asked). Fails on a console whose payload lacks the method; the
+/// caller may fall back to [`list_volumes`].
+pub fn free_space(addr: &str, path: &str) -> Result<FreeSpace> {
+    let body = serde_json::to_vec(&serde_json::json!({ "path": path }))
+        .context("serialize fs_freespace body")?;
+    let resp = mgmt::call_as(
+        addr,
+        m::FS_FREESPACE,
+        &format!("FS_FREESPACE({path})"),
+        &body,
+    )?;
+    serde_json::from_slice(&resp).context("decode FS_FREESPACE reply as JSON")
+}
+
+/// Ask the payload for its storage volumes (`fs.volumes`) and parse the list.
 ///
-/// Returns an error if the payload replies with an unexpected frame type
-/// (including `FrameType::Error`) or if the JSON body fails to parse.
+/// Returns an error if the payload refuses the call or the JSON body fails to parse.
 pub fn list_volumes(addr: &str) -> Result<VolumeList> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::FsListVolumes, b"")?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_LIST_VOLUMES: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::FsListVolumesAck {
-        bail!("expected FS_LIST_VOLUMES_ACK, got {:?}", ft);
-    }
+    let resp = mgmt::call(addr, m::FS_VOLUMES, b"")?;
     let parsed: VolumeList =
         serde_json::from_slice(&resp).context("decode FS_LIST_VOLUMES_ACK body as JSON")?;
     Ok(parsed)

@@ -25,7 +25,7 @@ pub fn global() -> Result<Arc<Remote>, RemoteError> {
             let dir = super::store::data_dir().ok_or_else(|| {
                 "no home folder to keep saved connections in; set PS5UPLOAD_DATA_DIR".to_string()
             })?;
-            let store = Store::open(&dir).map_err(|e| format!("saved connections: {e}"))?;
+            let store = Store::open(&dir).map_err(|e| e.to_string())?;
             Ok(Arc::new(Remote {
                 store: Arc::new(store),
                 pool: Arc::new(Pool::new(Box::new(RealConnector))),
@@ -35,6 +35,7 @@ pub fn global() -> Result<Arc<Remote>, RemoteError> {
         .map_err(RemoteError::Io)
 }
 
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use future
 #[async_trait::async_trait]
 pub trait Connector: Send + Sync {
     async fn connect(
@@ -92,6 +93,7 @@ impl Pool {
     }
 
     /// Sign-ins so far (tests use it to see a session reused or dropped).
+    #[cfg(test)]
     pub fn connects(&self) -> usize {
         self.connects.load(Ordering::SeqCst)
     }
@@ -164,6 +166,7 @@ impl Backoff {
             Duration::from_secs(10),
         ])
     }
+    #[cfg(test)]
     pub fn instant() -> Self {
         Self(vec![Duration::ZERO; 3])
     }

@@ -61,11 +61,17 @@ fn default_download_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("PS5UPLOAD_LINK_DOWNLOAD_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME")
+    // Desktop: ~/Downloads/ps5upload. No home folder (a phone): the engine's data folder,
+    // which the app points at its private storage (#379); temp only as a last resort.
+    if let Some(home) = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    home.join("Downloads").join("ps5upload")
+        .filter(|h| !h.is_empty())
+    {
+        return PathBuf::from(home).join("Downloads").join("ps5upload");
+    }
+    crate::remote::store::data_dir()
+        .map(|d| d.join("downloads"))
+        .unwrap_or_else(|| std::env::temp_dir().join("ps5upload"))
 }
 
 /// Strip anything that is not safe in a file name. The name comes from a URL,
@@ -194,11 +200,16 @@ async fn start_handler(
             &format!("cannot create {}: {e}", dir.display()),
         );
     }
-    let name = safe_file_name(if probe.filename.is_empty() {
+    let mut name = safe_file_name(if probe.filename.is_empty() {
         "package.pkg"
     } else {
         &probe.filename
     });
+    // A link that serves a package need not say so in its URL (a share link, a redirect, an
+    // extensionless path). The local file the install reads back must look like one.
+    if !name.to_ascii_lowercase().ends_with(".pkg") {
+        name.push_str(".pkg");
+    }
     let path = dir.join(name);
 
     // Refuse to silently resume into, or clobber, an unrelated file of the

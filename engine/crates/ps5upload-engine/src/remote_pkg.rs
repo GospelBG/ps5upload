@@ -360,7 +360,7 @@ impl PieceStat {
 /// most of the transfer spent ramping up and none of it at speed, which is
 /// the shape of the 1.9 MB/s reports — a browser or download manager holds
 /// its connections open and never pays this.
-fn build_agent(parallelism: usize, insecure_tls: bool) -> ureq::Agent {
+pub(crate) fn build_agent(parallelism: usize, insecure_tls: bool) -> ureq::Agent {
     let keep = parallelism.max(1);
     let config = ureq::Agent::config_builder()
         // Certificate verification stays ON unless the caller asked for it to
@@ -1776,6 +1776,7 @@ pub(crate) mod origin_tests {
                             if !saw {
                                 return;
                             }
+                            #[allow(deprecated)] // pre-1.99 spelling of try_update
                             let refuse = refusals
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                                     if n > 0 {

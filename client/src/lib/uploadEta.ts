@@ -18,7 +18,7 @@
 /** Defaults used when no measurement is available yet.
  *
  *  `100 MiB/s` ≈ 80% of gigabit Ethernet's theoretical max once you
- *  account for FTX2 framing overhead, TCP windowing, and the PS5
+ *  account for protocol framing overhead, TCP windowing, and the PS5
  *  payload's per-shard processing cost. Wi-Fi typically runs 30-60.
  *  We start optimistic and self-correct downward as soon as we have
  *  one real measurement for the host.

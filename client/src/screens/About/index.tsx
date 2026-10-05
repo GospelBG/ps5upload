@@ -50,7 +50,7 @@ const FEATURES: {
     titleFallback: "Fast transfers",
     bodyKey: "about_feat_fast_transfers_body",
     bodyFallback:
-      "FTX2 binary protocol with BLAKE3 shard verification + pack-small-files optimization. Uses your LAN flat-out.",
+      "AVA1 transfer protocol with BLAKE3 verification, encrypted sessions, resumable jobs and small-file packing. Uses your LAN flat-out.",
   },
   {
     icon: HardDrive,

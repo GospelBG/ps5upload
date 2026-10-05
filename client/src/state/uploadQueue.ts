@@ -1,3 +1,4 @@
+import { consoleAddr } from "../lib/addr";
 import { create } from "zustand";
 
 import { pkgMkdirChain } from "../lib/pkgStorage";
@@ -19,6 +20,7 @@ import {
   startTransfer7z,
   startTransferRar,
   uploadQueueLoad,
+  UPLOAD_QUEUE_KEY,
   uploadQueueSave,
   UploadJobError,
   powerStandby,
@@ -41,6 +43,8 @@ import {
   type RateSample,
 } from "../lib/rollingRate";
 import { archiveFormat, type SourceKind } from "./upload";
+import { rarPasswordProblem } from "../lib/rarPassword";
+import { jobLiveFromSnapshot, type JobLive } from "../lib/jobLive";
 import {
   runPkgInstall,
   installSampleFeed,
@@ -88,17 +92,20 @@ import {
   type InstallRequest,
   type InstallResult,
 } from "./consoleQueueBridge";
-import { PS5_PAYLOAD_PORT } from "./connection";
 import { trStatic } from "../lib/trStatic";
 import { ensurePayloadCurrent } from "../lib/ensurePayloadCurrent";
-import { effectiveUploadStreams } from "../lib/uploadStreams";
 import {
   autoRecoverBackoffMs,
   isAutoRecoverable,
   MAX_AUTO_RECOVER_ATTEMPTS,
   PostUploadStepError,
+  refineHelperReason,
   shouldAutoRecover,
 } from "../lib/uploadRecovery";
+import { helperState } from "../api/ava1";
+import { isTauriEnv } from "../lib/tauriEnv";
+import { createQueueLeader } from "../lib/queueLeader";
+import { useConnectionStore } from "./connection";
 
 /** The engine job id currently uploading on each console (bare host key).
  *  runOne records it so stopHost/stop can ask the engine to TRULY cancel the
@@ -106,6 +113,27 @@ import {
  *  transient run state, not persisted queue data. A stale id (job already
  *  finished) is a harmless no-op server-side. */
 const runningJobByHost = new Map<string, string>();
+
+/** Engine jobs this tab asked to cancel. A cancel lands at the next shard boundary, so the job
+ *  can still report `running` for a moment: a restart of its item waits for it to end instead of
+ *  adopting a job that is about to die (see `liveJobFor`). */
+const cancelledJobs = new Set<string>();
+function cancelEngineJob(jobId: string): Promise<void> {
+  cancelledJobs.add(jobId);
+  return jobCancel(jobId);
+}
+
+/** How long a restart waits for a job this tab cancelled to finish ending. */
+const CANCEL_SETTLE_TRIES = 30;
+const CANCEL_SETTLE_MS = 500;
+
+/** Items whose engine job is being looked up after a reload (see `reattachRunning`). The runner
+ *  skips them, so a start from elsewhere cannot launch a fresh upload while the engine's job for
+ *  the same item is still running. */
+const reattaching = new Set<string>();
+
+/** One queue runner per browser profile; see lib/queueLeader. */
+const queueLeader = createQueueLeader();
 
 /**
  * Pause between queued jobs so the PS5 payload can drain the detached
@@ -154,7 +182,7 @@ export interface QueueItem {
    *  user picked these on the Upload screen at queue-add time; the
    *  runner sends the file to this exact path. */
   resolvedDest: string;
-  /** Transfer-port addr (e.g. `192.168.1.2:9113`). */
+  /** Console address (a bare host such as `192.168.1.2`). */
   addr: string;
   strategy: UploadStrategy;
   reconcileMode: ReconcileMode;
@@ -230,18 +258,37 @@ export interface QueueItem {
   /** Total bytes the engine pre-stat'd for this source. 0 until first
    *  Running tick lands. */
   totalBytes: number;
+  /** Bytes the source is expected to take on the PS5, captured at add time
+   *  from the Upload screen's inspection (pkg header, folder walk or archive
+   *  central directory — for archives the UNCOMPRESSED total). 0 when the
+   *  inspection had no size (plain files, multi-part sets, queued installs);
+   *  the queue size chip (lib/queueSize) then falls back to `totalBytes`,
+   *  which only lands once the item starts running. */
+  estimatedBytes?: number;
   /** Smoothed bytes/sec while running (trailing 2 s window via
    *  `lib/rollingRate`); set to the wall-clock average bytes/sec on
    *  done; 0 when pending or failed. Persisted with the queue so the
    *  done-row average survives an app restart and stays comparable
    *  across runs. */
   bytesPerSec: number;
-  /** P3 / v2.18.0 — apply-phase counters forwarded from JobSnapshot.
-   *  Surface a "Finalized N of M files" pill on the queue row during
-   *  the post-100% commit-apply phase. Both 0 outside the finalize
-   *  phase and on pre-P3 payloads that don't emit APPLY_PROGRESS. */
+  /** Durable-file counters forwarded from JobSnapshot. Surface a
+   *  "Finalized N of M files" pill on the queue row while the console
+   *  makes the last files durable. Both 0 until the console reports its
+   *  first durable file. */
   filesFinalized: number;
   filesFinalizingTotal: number;
+  /** Transient live notes (skipping phase, bottleneck, "finishing on the
+   *  console") forwarded from the job snapshot while running; only set when
+   *  the engine sent them. Not persisted meaningfully: stale on reload. */
+  live?: JobLive;
+  /** The engine job that ran this item (set when it starts, kept after it ends): the key for
+   *  the finished job's "Why was this slow?" summary. Stale after a restart is harmless: the
+   *  summary is simply not found. */
+  jobId?: string;
+  /** Set on a reopened web UI for an item whose engine job was still running (or had just
+   *  finished) when the tab closed: the runner adopts this job instead of starting a new
+   *  one, then does the item's post-upload steps. Cleared the moment the runner takes it. */
+  attachJobId?: string;
   /** Mount path the runner produced when `mountAfterUpload` is true and
    *  the image upload + mount succeeded. Surfaced to the row so users
    *  see where the image landed without flipping to the Volumes tab. */
@@ -300,6 +347,7 @@ export type AddQueueItem = Pick<
   | "registerAfterUpload"
   | "contentId"
   | "category"
+  | "estimatedBytes"
   | "installAfterUpload"
   | "deletePkgAfterInstall"
   | "install"
@@ -326,6 +374,9 @@ interface QueueState {
   /** Last queue load/save failure. Non-null means restart durability is not
    * currently guaranteed and must be shown in the queue UI. */
   persistenceError: string | null;
+  /** False in a second web-UI tab: another tab of this browser runs the queue, and this one only
+   *  shows it (every action is a no-op). Always true on the desktop. */
+  isLeader: boolean;
 
   hydrate: () => Promise<void>;
   add: (item: AddQueueItem) => void;
@@ -352,6 +403,10 @@ interface QueueState {
   retryFailed: () => void;
   /** Retry one failed row. Returns false when the row is missing/not failed. */
   retryItem: (id: string) => boolean;
+  /** Retry one archive row that failed for a missing or wrong password, with the password
+   *  the person just typed. The password lives on the in-memory item only (the save redacts
+   *  it) and is never logged. False when the password is empty or the row is not a failed one. */
+  retryWithPassword: (id: string, password: string) => boolean;
   /** Re-drive one console's uploads that FAILED on a recoverable
    *  (connection-class) error, then restart that console's drain loop.
    *  This is the "slept past the in-loop recovery budget" case: a standby
@@ -546,6 +601,120 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     Object.values(rh).some(Boolean);
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** Web UI only: the engine kept running these items' jobs while the tab was closed. Ask it
+   *  about each; one that is still running, or finished while the tab was away, goes back to its
+   *  item (`attachJobId`) and the console's queue restarts, so the runner adopts the job,
+   *  shows its progress and does the item's post-upload steps. A job the engine no longer knows
+   *  (it restarted) or one that failed leaves the item pending, to be started again and
+   *  resumed from the console's journal as before. Never throws. */
+  const reattachRunning = async (
+    list: Array<{ id: string; jobId: string; addr: string }>,
+  ) => {
+    const hosts = new Set<string>();
+    for (const { id, jobId, addr } of list) {
+      try {
+        const snap = await jobStatus(jobId, addr);
+        if (snap.status === "running" || snap.status === "done") {
+          set((s) => ({ items: patchItem(s.items, id, { attachJobId: jobId }) }));
+          hosts.add(hostOf(addr));
+        }
+      } catch {
+        /* the engine does not know the job: the item stays pending */
+      } finally {
+        // Looked up: the runner may take this item now (to adopt its job, or to start it fresh).
+        reattaching.delete(id);
+      }
+    }
+    for (const h of hosts) void get().startHost(h);
+  };
+
+  /** The next pending item on `h` that the runner may take: not one whose engine job is still
+   *  being looked up (see `reattaching`). */
+  const pickPending = (h: string) =>
+    nextPendingForHost(
+      reattaching.size === 0
+        ? get().items
+        : get().items.filter((it) => !reattaching.has(it.id)),
+      h,
+    );
+
+  /** Elects this tab's role once, then keeps it up to date. Resolves to whether this tab is the
+   *  runner. A tab that loses the lease stops its loops without touching the engine's jobs (the
+   *  new runner re-attaches to them); a tab that wins it loads the saved queue and adopts. */
+  let electionStarted = false;
+  const ensureLeaderElection = async (): Promise<boolean> => {
+    if (!electionStarted) {
+      electionStarted = true;
+      queueLeader.start((lead) => {
+        if (lead === get().isLeader) return;
+        if (lead) {
+          set({ isLeader: true });
+          void get().hydrate();
+        } else {
+          // Another tab took the lease (this one stalled past the TTL): stop scheduling and
+          // show the queue read-only. The jobs keep running; the new runner adopts them.
+          for (const h of Object.keys(get().runningHosts)) hostGen.set(h, ++genCounter);
+          set({ isLeader: false, runningHosts: {}, running: false });
+          void syncFollower();
+        }
+      });
+      if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+        window.addEventListener("storage", (e: StorageEvent) => {
+          if (e.key === UPLOAD_QUEUE_KEY && !get().isLeader) void syncFollower();
+        });
+      }
+    }
+    const lead = await queueLeader.claim();
+    set({ isLeader: lead });
+    return lead;
+  };
+
+  /** A second tab's view of the queue: the runner's saved document, as is. Running rows stay
+   *  running, so the progress the runner saves shows here too. */
+  const syncFollower = async () => {
+    try {
+      const doc = await uploadQueueLoad<Partial<QueueDocument>>();
+      const items = doc.items ?? [];
+      const rh: Record<string, boolean> = {};
+      for (const it of items) if (it.status === "running") rh[hostOf(it.addr)] = true;
+      set({
+        items,
+        continueOnFailure: doc.continueOnFailure ?? false,
+        loaded: true,
+        persistenceError: null,
+        isLeader: false,
+        runningHosts: rh,
+        running: anyRunning(rh),
+      });
+    } catch (e) {
+      console.error("[upload-queue] follower sync failed:", e);
+      set({ loaded: true, isLeader: false });
+    }
+  };
+
+  /** The engine job of `item`'s earlier attempt, when it is still running and should be adopted
+   *  instead of starting the upload again; null when a fresh start is right. A job this tab
+   *  cancelled is waited out (it is about to end) rather than adopted. */
+  const liveJobFor = async (
+    jobId: string,
+    addr: string,
+    isLive: () => boolean,
+  ): Promise<string | null> => {
+    for (let i = 0; i < CANCEL_SETTLE_TRIES; i++) {
+      let status: string;
+      try {
+        status = (await jobStatus(jobId, addr)).status;
+      } catch {
+        return null; // the engine does not know it
+      }
+      if (status !== "running") return null;
+      if (!cancelledJobs.has(jobId)) return jobId;
+      await sleep(CANCEL_SETTLE_MS);
+      if (!isLive()) throw new Error("queue stopped");
+    }
+    throw new Error("The previous transfer of this item is still stopping. Try again in a moment.");
+  };
+
   /** Schedule a debounced whole-document save. Idempotent — multiple
    *  calls within 300 ms collapse into one fsync. The runner can
    *  legitimately fire a half-dozen patches per second (bytes_sent
@@ -555,10 +724,12 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     // with only what was added since the app started. hydrate() saves the
     // merged list once it has loaded.
     if (!get().loaded) return;
+    // A second tab never writes: it would overwrite the runner's queue with its stale view.
+    if (!get().isLeader) return;
     if (saveTimer !== null) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       saveTimer = null;
-      if (!get().loaded) return;
+      if (!get().loaded || !get().isLeader) return;
       const { items, continueOnFailure } = get();
       // Redact RAR passwords before persisting — they stay in the live
       // in-memory items (so the current run can extract) but never touch disk.
@@ -683,6 +854,8 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     installPhase: QueueItem["installPhase"];
     installedTitle: string | null;
     installNote?: string | null;
+    /** The finished transfer's bottleneck note, when the engine reported one. */
+    live?: JobLive;
   }> => {
     if (item.sourceKind === "install") return runInstallItem(item);
     const isFolder =
@@ -705,8 +878,25 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       }
     }
 
+    // A reopened web UI hands the engine's still-running job back to its item (see hydrate):
+    // adopt it rather than start the upload again. Read from the store, not the argument,
+    // so a recovery pass of this same item starts fresh.
+    const attachId = get().items.find((it) => it.id === item.id)?.attachJobId;
+    if (attachId) {
+      set((s) => ({ items: patchItem(s.items, item.id, { attachJobId: undefined }) }));
+    }
+    // Never start a fresh upload for an item whose engine job is still running: adopt it.
+    // (The reload path above covers the common case; this closes the window where something else
+    // starts the item while its job is still being looked up, and a retry of a job that is alive.)
+    const earlierJob = attachId
+      ? null
+      : get().items.find((it) => it.id === item.id)?.jobId;
+    const adoptId =
+      attachId ?? (earlierJob ? await liveJobFor(earlierJob, item.addr, isLive) : null);
     let jobId: string;
-    if (isArchive) {
+    if (adoptId) {
+      jobId = adoptId;
+    } else if (isArchive) {
       // A .zip/.7z is decompressed host-side and streamed in (lands
       // extracted). Carry the persisted tx_id for cross-session shard resume,
       // just like folders; there's no reconcile mode (no local tree to diff).
@@ -753,10 +943,6 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         item.txIdHex,
         item.excludes,
         bandwidthCap,
-        // Clamp to THIS item's console — the queue drains every console
-        // in parallel, so the active tab's advertised max is the wrong
-        // capability for a background console's transfer.
-        effectiveUploadStreams(item.addr),
       );
     } else if (isFolder) {
       const bandwidthCap = useUploadSettingsStore.getState().bandwidthCapMbps;
@@ -794,7 +980,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     // plans the whole archive inside the request handler before minting the
     // id (user report, 5.4.7).
     if (!isLive()) {
-      void jobCancel(jobId).catch(() => {
+      void cancelEngineJob(jobId).catch(() => {
         /* engine gone — the transfer dies with it either way */
       });
       throw new Error("queue stopped");
@@ -803,6 +989,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     // engine to truly cancel the transfer (overwritten by the next item;
     // staleness is harmless — cancelling a finished job is a server no-op).
     runningJobByHost.set(hostOf(item.addr), jobId);
+    set((s) => ({ items: patchItem(s.items, item.id, { jobId }) }));
 
     // Trailing-window samples for the live bytes/sec readout. Closure-
     // scoped so a Stop + restart of the same item resets cleanly: the
@@ -811,7 +998,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     const samples: RateSample[] = [{ ts: startedAtMs, bytes: 0 }];
 
     while (isLive()) {
-      const snap = await jobStatus(jobId);
+      const snap = await jobStatus(jobId, item.addr);
       if (!isLive()) {
         throw new Error("queue stopped");
       }
@@ -1134,9 +1321,32 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             measuredAtMs: Date.now(),
           });
         }
+        // The finished transfer's bottleneck (commit ack); a stale skipping/settling
+        // note from the last running tick must not outlive the job.
+        const finishedLive = jobLiveFromSnapshot({
+          bottleneck: snap.bottleneck,
+          commit_ack: snap.commit_ack,
+        });
+        if (finishedLive?.unsettled) {
+          // The engine stopped waiting for the console to finish saving the files: not a clean success.
+          pushNotification(
+            "warning",
+            withConsolePrefix(
+              item.addr,
+              trStatic("upload_warn_unsettled_title", "Upload finished, but not confirmed saved"),
+            ),
+            {
+              body: trStatic(
+                "upload_warn_unsettled",
+                "Every byte reached the console, but it has not confirmed saving all files yet. They finish on their own; if the console loses power first, send the folder again.",
+              ),
+            },
+          );
+        }
         return {
           bytesSent: finalBytes,
           bytesPerSec: averageRate(finalBytes, elapsedMs),
+          live: finishedLive,
           mountedAt,
           mountWarnings,
           registeredAs,
@@ -1176,6 +1386,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           // OR outside the finalize phase).
           filesFinalized: snap.files_finalized ?? 0,
           filesFinalizingTotal: snap.files_finalizing_total ?? 0,
+          live: jobLiveFromSnapshot(snap),
         }),
       }));
       await sleep(POLL_INTERVAL_MS);
@@ -1200,7 +1411,8 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     // v2.23.1). Best-effort; never throws. Each loop preflights its OWN
     // console's first item.
     const head = pickNext();
-    if (head) {
+    // An item that adopts a running job needs no payload check: the console is mid-transfer.
+    if (head && !head.attachJobId) {
       try {
         await ensurePayloadCurrent(hostOf(head.addr));
       } catch (e) {
@@ -1279,6 +1491,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             installPhase,
             installedTitle,
             installNote,
+            live,
           } =
             await runOne(next, isLive);
           // Always flip to "done" once runOne returns success — the
@@ -1302,6 +1515,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
               installPhase,
               installedTitle,
               installNote: installNote ?? null,
+              live,
               recovering: false,
               recoverAttempt: 0,
               completedAt: Date.now(),
@@ -1324,8 +1538,24 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           // — without the structured fields the user just sees the
           // raw chain (which often ends in {"error":"…","detail":"…"}
           // JSON that's hard to read in a queue row).
-          const reason =
+          let reason =
             e instanceof UploadJobError ? (e.reason ?? null) : null;
+          // "No AVA1 listener" says nothing about WHY. Ask the engine what the console runs:
+          // an older helper is not fixed by re-sending (and the browser build cannot send at
+          // all), so surface it as `helper_old` and let the banner's Update helper handle it,
+          // instead of three blind retries.
+          if (reason === "helper_not_ava1") {
+            const refined = refineHelperReason(
+              reason,
+              await helperState(hostOf(next.addr)),
+            );
+            if (refined === "helper_old") {
+              useConnectionStore
+                .getState()
+                .setHostStatus(hostOf(next.addr), { session: "helper_old" });
+            }
+            reason = refined;
+          }
           const detail =
             e instanceof UploadJobError ? (e.detail ?? null) : null;
 
@@ -1337,12 +1567,15 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             !isInstall &&
             autoResume &&
             recoverAttempt < MAX_AUTO_RECOVER_ATTEMPTS &&
-            shouldAutoRecover(e, reason, message);
+            shouldAutoRecover(e, reason, message, {
+              canSendHelper: isTauriEnv(),
+            });
 
           if (!canRecover) {
             set((s) => ({
               items: patchItem(s.items, next.id, {
                 status: "failed",
+                live: undefined,
                 bytesPerSec: 0,
                 recovering: false,
                 recoverAttempt: 0,
@@ -1404,10 +1637,10 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           }
           // Re-deploy the payload, then poll until it answers. force=true:
           // we got here from a connection-class transfer failure, so the
-          // payload is suspect — its transfer port (:9113) may be dead even
-          // if the mgmt port (:9114) still answers the version check. A
+          // payload is suspect — its transfer listener may be dead even
+          // if management still answers the version check. A
           // plain (non-force) call would see "version matches → current" and
-          // skip the redeploy, leaving the dead :9113 in place so the resume
+          // skip the redeploy, leaving the dead listener in place so the resume
           // retry fails again — the "had to re-send the ELF manually" bug.
           // Re-send is idempotent and the resume continues from committed
           // shards, so a needless redeploy on a transient blip only costs the
@@ -1444,28 +1677,28 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     }
   };
 
-  return {
+  const actions: QueueState = {
     items: [],
     continueOnFailure: false,
     running: false,
     runningHosts: {},
     loaded: false,
     persistenceError: null,
+    isLeader: true,
 
     async hydrate() {
-      // Browser-only dev/test contexts: Tauri invoke is unavailable.
-      // Mark loaded with the empty in-memory state and skip the call,
-      // otherwise every Upload screen mount logs an "invoke undefined"
-      // error to the user-visible logs. In production (Tauri), this
-      // guard is a no-op.
-      const w = window as unknown as {
-        isTauri?: boolean;
-        __TAURI_INTERNALS__?: unknown;
-      };
-      if (!w.isTauri && !w.__TAURI_INTERNALS__) {
-        set({ loaded: true });
-        return;
+      // The browser build elects one runner per profile. A tab that is not the runner shows the
+      // queue the runner saves and does nothing else: no adopting jobs, no uploads, no saves.
+      if (!isTauriEnv()) {
+        const lead = await ensureLeaderElection();
+        if (!lead) {
+          await syncFollower();
+          return;
+        }
+        if (!get().isLeader) set({ isLeader: true });
       }
+      // The browser build reads the queue from localStorage (uploadQueueLoad has that branch),
+      // so it hydrates too: without this a self-hosted UI forgot its whole queue on reload.
       try {
         const doc = await uploadQueueLoad<Partial<QueueDocument>>();
         // Sanitise on load:
@@ -1477,8 +1710,11 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         //   crash the runner. Mint a fresh one — those items lose
         //   resume continuity (acceptable since they pre-date the
         //   feature) but they won't crash.
+        const wasRunning: Array<{ id: string; jobId: string; addr: string }> = [];
         const items = (doc.items ?? []).map((it) => {
           const next = { ...it };
+          // Never carried across a reload: a stale id would adopt a job that is not this item's.
+          delete next.attachJobId;
           // An install that was running is never re-run by itself: Sony may
           // already have accepted it, and repeating a patch install can wipe
           // the base game.
@@ -1491,7 +1727,17 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             );
             next.completedAt = Date.now();
           }
-          if (next.status === "running") next.status = "pending";
+          if (next.status === "running") {
+            // The web UI's engine outlives the tab, so this item's job may still be going:
+            // remember it so it can be re-attached below. (The desktop engine dies with the
+            // app, so there the job is gone and the item simply re-runs.)
+            if (next.jobId && next.sourceKind !== "install") {
+              wasRunning.push({ id: next.id, jobId: next.jobId, addr: next.addr });
+              // Hold the runner off this item until its job has been looked up.
+              if (!isTauriEnv()) reattaching.add(next.id);
+            }
+            next.status = "pending";
+          }
           if (!next.txIdHex) next.txIdHex = generateTxIdHex();
           // Back-fill the bytes/sec field added in 2.2.22 — older
           // persisted docs don't carry it. Treat unknown as 0 so the
@@ -1549,6 +1795,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           persistenceError: null,
         });
         if (live.length > 0) scheduleSave();
+        if (!isTauriEnv() && wasRunning.length > 0) void reattachRunning(wasRunning);
       } catch (e) {
         // load_json_or_default returns {} on missing file, so this
         // catch only fires on real corruption (bad JSON, IO error,
@@ -1577,7 +1824,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         sourcePath: installKey(input.request),
         displayName: input.displayName,
         resolvedDest: "",
-        addr: `${bare}:${PS5_PAYLOAD_PORT}`,
+        addr: consoleAddr(bare),
         strategy: "overwrite",
         reconcileMode: "fast",
         excludes: [],
@@ -1677,6 +1924,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         status: "pending",
         bytesSent: 0,
         totalBytes: 0,
+        estimatedBytes: input.estimatedBytes ?? 0,
         bytesPerSec: 0,
         filesFinalized: 0,
         filesFinalizingTotal: 0,
@@ -1786,7 +2034,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         const jid = runningJobByHost.get(h);
         if (jid) {
           runningJobByHost.delete(h);
-          void jobCancel(jid).catch(() => {});
+          void cancelEngineJob(jid).catch(() => {});
         }
       }
       set({ items: keep, runningHosts: {}, running: false });
@@ -1832,6 +2080,21 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       return true;
     },
 
+    retryWithPassword(id, password) {
+      if (!password) return false;
+      const item = get().items.find((candidate) => candidate.id === id);
+      if (!item || item.status !== "failed") return false;
+      if (!rarPasswordProblem(item.errorReason, item.error)) return false;
+      set((s) => ({
+        items: s.items.map((candidate) =>
+          candidate.id === id ? { ...candidate, rarPassword: password } : candidate,
+        ),
+      }));
+      if (!get().retryItem(id)) return false;
+      void get().startHost(hostOf(item.addr));
+      return true;
+    },
+
     async resumeFailedRecoverable(host) {
       if (!useUploadSettingsStore.getState().autoResume) return 0;
       const h = hostOf(host);
@@ -1842,7 +2105,9 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           // Never re-run an install by itself (a repeated patch install can
           // wipe the base game): only uploads resume on reconnect.
           it.sourceKind !== "install" &&
-          isAutoRecoverable(it.errorReason, it.error),
+          isAutoRecoverable(it.errorReason, it.error, {
+            canSendHelper: isTauriEnv(),
+          }),
       );
       let resumed = 0;
       for (const it of candidates) {
@@ -1874,7 +2139,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         return { runningHosts: rh, running: true };
       });
       try {
-        await runDrainLoop(() => nextPendingForHost(get().items, h), isLive);
+        await runDrainLoop(() => pickPending(h), isLive);
       } finally {
         // Only clear our own flag if we're still the live generation — a
         // stopHost() or a superseding startHost() already owns it otherwise.
@@ -1946,7 +2211,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       const jid = runningJobByHost.get(h);
       if (jid) {
         runningJobByHost.delete(h);
-        void jobCancel(jid).catch(() => {
+        void cancelEngineJob(jid).catch(() => {
           /* engine gone / already finished — worker stop below still applies */
         });
       }
@@ -2002,6 +2267,40 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       }
     },
   };
+
+  // A tab that is not the runner shows the queue and changes nothing: every action is a no-op
+  // with the neutral answer its caller expects (see lib/queueLeader).
+  const readOnlyMessage =
+    "The queue is running in another tab of this browser. Use that tab to change it.";
+  const refusals: Partial<Record<keyof QueueState, () => unknown>> = {
+    add: () => undefined,
+    enqueueInstall: () => ({
+      id: "",
+      done: Promise.resolve({ ok: false, message: readOnlyMessage }),
+    }),
+    retryInstall: () => null,
+    retryInstallViaUpload: () => Promise.resolve({ ok: false, message: readOnlyMessage }),
+    remove: () => undefined,
+    cancelItem: () => undefined,
+    moveUp: () => undefined,
+    moveDown: () => undefined,
+    clear: () => undefined,
+    retryFailed: () => undefined,
+    retryItem: () => false,
+    retryWithPassword: () => false,
+    resumeFailedRecoverable: () => Promise.resolve(0),
+    setContinueOnFailure: () => undefined,
+    start: () => Promise.resolve(),
+    stop: () => undefined,
+    startHost: () => Promise.resolve(),
+    stopHost: () => undefined,
+  };
+  const guarded = { ...actions } as Record<string, unknown>;
+  for (const [name, refuse] of Object.entries(refusals)) {
+    const real = (actions as unknown as Record<string, (...a: unknown[]) => unknown>)[name];
+    guarded[name] = (...args: unknown[]) => (get().isLeader ? real(...args) : refuse!());
+  }
+  return guarded as unknown as QueueState;
 });
 
 // pkgLibrary queues installs through the bridge (it can't import this module).

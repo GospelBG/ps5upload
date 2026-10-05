@@ -42,8 +42,8 @@ function arg(name, def) {
 
 const PS5 = arg('ps5', '192.168.86.99');
 const ENGINE = arg('engine', 'http://127.0.0.1:19113');
-const MGMT = `${PS5}:9114`;
-const DATA = `${PS5}:9113`;
+const MGMT = PS5;
+const DATA = PS5;
 const STAGE = '/data/ps5upload/tests/install-fallback/dummy.pkg';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -194,7 +194,7 @@ async function main() {
     await sleep(1000);
   }
   note(!!alive, 'payload SURVIVED the full fallback chain (mgmt port answers)',
-    alive ? `v${alive.version} txns=${alive.active_transactions}` : 'mgmt port did not answer');
+    alive ? `v${alive.version} commands=${alive.command_count}` : 'mgmt port did not answer');
 
   // Cleanup staged dummy (best-effort).
   await postJson(`${ENGINE}/api/ps5/fs/delete`, { addr: MGMT, path: STAGE }).catch(() => {});

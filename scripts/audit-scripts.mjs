@@ -7,9 +7,6 @@ const repoRoot = path.resolve(import.meta.dirname, "..");
 const strict = process.argv.includes("--strict");
 
 const manualEntrypoints = new Set([
-  // Manual throughput harness against a live PS5 (see its header). Its only
-  // mention was in docs/, which moved to the ps5upload-docs repo.
-  "bench/multistream-hw-test.mjs",
   "scripts/bundle-fonts.py",
   "scripts/find-orphan-i18n.mjs",
   "scripts/hw-test-loop.sh",
@@ -18,13 +15,6 @@ const manualEntrypoints = new Set([
   "scripts/release-posts.js",
   "scripts/translate-i18n.py",
   "tests/lab/README.md",
-  // Both test_*.py are hardware-lab manual entrypoints. The
-  // launch-only one was already documented; the install_launch one
-  // was passing the audit via an accidental self-reference (the
-  // grep counts the basename appearing in the file's own argparse
-  // help text). Rename-safe addition keeps strict-mode passes.
-  "tests/lab/test_install_launch.py",
-  "tests/lab/test_launch_only.py",
 ]);
 
 function gitLsFiles(prefixes) {

@@ -37,11 +37,6 @@ use uuid::Uuid;
 /// One in-flight install. The session lives from `install/start` until
 /// the user dismisses the result or cancels. The HTTP-host listener
 /// uses `parts` to satisfy Range requests.
-///
-/// Several fields are recorded for diagnostics / future introspection
-/// endpoints (e.g. listing active sessions in the engine logs) even
-/// though no current handler reads them — `#[allow(dead_code)]` documents
-/// this intentional surplus rather than churn the struct each release.
 /// A package being proxied from an HTTP(S) origin for an install-from-a-link
 /// session (see `remote_pkg`).
 ///
@@ -146,7 +141,6 @@ pub(crate) fn console_path_url(url: &str) -> Option<(String, String)> {
 const SERVE_RATE_LOG_SECS: u64 = 15;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct InstallSession {
     pub id: String,
     pub parts: Vec<PathBuf>,
@@ -194,17 +188,6 @@ pub struct InstallSession {
     /// over HTTP and the DPI daemon performs the install, so this session
     /// legitimately never gets a BGFT task_id.
     pub serve_only: bool,
-    /// True once the console-side "install finished" toast has been sent.
-    ///
-    /// The status endpoint is polled repeatedly and a session can be observed
-    /// terminal on any number of those polls, so without this latch the
-    /// console would get a fresh toast every poll interval forever.
-    pub notified_console: bool,
-    /// Free bytes on the data volume at the first status poll — the baseline
-    /// the progress tracker measures "bytes consumed" against. `None` until the
-    /// first poll captures it (or if volumes couldn't be listed). See
-    /// `observe_consumed` / `install_verdict`.
-    pub install_start_free_bytes: Option<u64>,
     /// Max bytes the install has consumed so far (monotonic) — `max(free-space
     /// drop, title-dir size)`. Drives the live progress % and the stall clock.
     pub progress_consumed_bytes: u64,
@@ -241,13 +224,6 @@ pub struct InstallSession {
     /// is its derived `bytes()`; see `TransferCoverage` for why neither a raw
     /// sum nor a furthest-offset can stand in for it.
     pub transfer: TransferCoverage,
-    /// The DPI daemon's answer for a Stream/serve-only session, recorded on the
-    /// session rather than only in the HTTP reply. A caller that stopped waiting
-    /// (browser, proxy, or a client timeout) still gets the verdict from the
-    /// status poll, and a slow hand-off stops being an ambiguous outcome.
-    pub dpi_ok: Option<bool>,
-    pub dpi_rc: Option<i32>,
-    pub dpi_detail: String,
     /// Unix time of the last sign of life for this session — a pkg-host range
     /// served, or a status poll. Session expiry is measured from THIS, not from
     /// creation: a 200-300 GB install on a modest link runs for many hours, and
@@ -333,10 +309,8 @@ mod persist {
             Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
             _ if cfg!(test) => return None,
             _ => {
-                let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
-                PathBuf::from(home.ok().filter(|h| !h.trim().is_empty())?)
-                    .join(".ps5upload")
-                    .join("state")
+                // The engine's data folder (PS5UPLOAD_DATA_DIR, else ~/.ps5upload; #379).
+                crate::remote::store::data_dir()?.join("state")
             }
         };
         std::fs::create_dir_all(&dir).ok()?;
@@ -428,8 +402,6 @@ mod persist {
                     terminal_status: None,
                     launchable: None,
                     serve_only: s.serve_only,
-                    notified_console: false,
-                    install_start_free_bytes: None,
                     progress_consumed_bytes: 0,
                     last_progress_unix: None,
                     stalled: false,
@@ -439,9 +411,6 @@ mod persist {
                     bytes_served: 0,
                     transfer_bytes: 0,
                     transfer: TransferCoverage::new(s.total_size),
-                    dpi_ok: None,
-                    dpi_rc: None,
-                    dpi_detail: String::new(),
                     remote: None,
                 };
                 (s.id, session)
@@ -713,7 +682,10 @@ async fn payload_restore_handler(Json(req): Json<PayloadRestoreRequest>) -> Resp
     }
     let res = tokio::task::spawn_blocking(move || {
         use ps5upload_core::payload_lifecycle as pl;
-        let bytes = crate::bundled_payload::image_bytes(crate::bundled_payload::Image::Payload)?;
+        let bytes = payload_restore_bytes(
+            || crate::bundled_payload::image_bytes(crate::bundled_payload::Image::Payload),
+            crate::ava1_api::stamped_helper,
+        )?;
         pl::send_elf_to_loader(
             &ps5_ip,
             pl::PS5_LOADER_PORT,
@@ -744,6 +716,17 @@ async fn payload_restore_handler(Json(req): Json<PayloadRestoreRequest>) -> Resp
     }
 }
 
+/// The bytes `payload-restore` sends: the helper image from `load`, passed through
+/// `stamp` (in production `ava1_api::stamped_helper`, like the desktop app's sends) so
+/// the console trusts this engine's AVA1 identity without pairing (SPEC.md §5.1).
+fn payload_restore_bytes(
+    load: impl FnOnce() -> Result<std::borrow::Cow<'static, [u8]>, String>,
+    stamp: impl FnOnce(&[u8]) -> Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let image = load()?;
+    Ok(stamp(&image))
+}
+
 pub fn router(state: PkgInstallStateHandle) -> Router {
     Router::new()
         // Packages routinely exceed the app-wide 64 MiB JSON/form limit.
@@ -765,6 +748,7 @@ pub fn router(state: PkgInstallStateHandle) -> Router {
         // the whole image to the PS5 first.
         .route("/api/ffpkg/extract", post(extract_handler))
         .route("/api/pkg/remote/probe", post(remote_probe_handler))
+        .route("/api/pkg/console-probe", post(console_probe_handler))
         // Unified install (spec 2): one endpoint owns resolve → deliver →
         // install (through the :9115 daemon) → verify → record. Replaces the
         // old install/start + dpi-* surface. Status is per-job; history is a
@@ -780,6 +764,13 @@ pub fn router(state: PkgInstallStateHandle) -> Router {
         )
         .route("/api/pkg/install/sessions", get(install_sessions_handler))
         .route("/api/pkg/install/cancel", post(install_cancel_handler))
+        // Windows: fixes for "the console cannot reach this computer" (F2.1). Neither is silent:
+        // one only opens Settings, the other refuses a request the UI has not confirmed.
+        .route("/api/host-net/open-settings", post(host_net_open_settings))
+        .route(
+            "/api/host-net/allow-firewall",
+            post(host_net_allow_firewall),
+        )
         .route("/api/pkg/installed", get(installed_pkg_inventory_handler))
         // "Do you already have this?" answered by the same artifact matching the
         // install tracker uses, so the UI and the completion check can't
@@ -1090,8 +1081,8 @@ async fn installed_pkg_inventory_handler(Query(q): Query<InstalledPkgQuery>) -> 
     if !valid_title_id(&q.title_id) {
         return json_err(StatusCode::BAD_REQUEST, "invalid title_id");
     }
-    // Normalize the port like every other entry point: the inventory is read
-    // over :9114, and an address carrying a different port doesn't fail — it
+    // Normalize the port like every other entry point: the address is reduced
+    // to the bare host, so an address carrying a port doesn't fail — it
     // reports an empty console.
     let addr = normalize_mgmt_addr(&q.addr);
     let title_id = q.title_id;
@@ -1377,7 +1368,7 @@ async fn parse_remote_handler(_remote_path: &str) -> Response<Body> {
 
 #[derive(Debug, Deserialize)]
 pub struct InstallStartRequest {
-    /// PS5 mgmt-port address, e.g. "192.168.1.42:9114".
+    /// PS5 address, e.g. "192.168.1.42" (a `:port` suffix is dropped).
     pub ps5_addr: String,
     /// Proceed with a staged re-install of an already-installed full game.
     ///
@@ -1919,17 +1910,17 @@ pub(crate) async fn install_start_handler(
         },
         package_type: package_type.clone(),
         package_fingerprint,
-        // Normalize to the MANAGEMENT port, always. Every observation this
+        // Normalize to the bare host, always. Every observation this
         // session makes — the on-disk artifact check, the free-space and
         // title-dir signals that decide `installed_bytes`, the Sony-log
-        // verdict — goes to :9114. A caller that sends a bare IP (a script,
+        // verdict — goes to the console's one AVA1 port. A caller that sends a bare IP (a script,
         // the web UI, a future client) used to get a session whose every
         // filesystem frame failed instantly: 0 ms status polls, `Absent`
         // forever, `installed_bytes: 0`, and a phase stuck on `install` until
         // the 600 s startup-stall deadline fired. Measured 2026-09-14 with a
         // portless addr while the exact package was already installed on the
         // console — the tracker could not see it. `req.ps5_addr` may also
-        // arrive on the transfer port (:9113), which `mgmt_addr_for` swaps.
+        // arrive on a retired port suffix, which `console_addr` drops.
         ps5_mgmt_addr: normalize_mgmt_addr(&req.ps5_addr),
         task_id: None,
         err_code: 0,
@@ -1943,8 +1934,6 @@ pub(crate) async fn install_start_handler(
         terminal_status: None,
         launchable: None,
         serve_only: req.serve_only,
-        notified_console: false,
-        install_start_free_bytes: None,
         progress_consumed_bytes: 0,
         last_progress_unix: None,
         stalled: false,
@@ -1954,9 +1943,6 @@ pub(crate) async fn install_start_handler(
         bytes_served: 0,
         transfer_bytes: 0,
         transfer: TransferCoverage::new(expected_size),
-        dpi_ok: None,
-        dpi_rc: None,
-        dpi_detail: String::new(),
         remote,
     };
 
@@ -2288,6 +2274,60 @@ fn staged_file_size(addr: &str, path: &str) -> u64 {
         .unwrap_or(0)
 }
 
+// ─── /api/host-net/* (Windows network fixes) ─────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct OpenSettingsRequest {
+    #[serde(default)]
+    pub adapter: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AllowFirewallRequest {
+    pub profile: String,
+    /// The person said yes in the UI. Without it the engine does nothing.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// The profile to add a rule for, or why the request is refused. Pure, so the "never silently"
+/// rule is a tested fact rather than a comment.
+fn allow_firewall_decision(req: &AllowFirewallRequest) -> Result<&'static str, &'static str> {
+    if !req.confirm {
+        return Err("the request was not confirmed by the person");
+    }
+    crate::win_net::allowed_profile(&req.profile).ok_or("unknown network profile")
+}
+
+/// POST /api/host-net/open-settings — opens Windows Settings at the network page (the person
+/// changes the category themselves).
+async fn host_net_open_settings(Json(req): Json<OpenSettingsRequest>) -> Response<Body> {
+    let r =
+        tokio::task::spawn_blocking(move || crate::win_net::open_network_settings(&req.adapter))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+    match r {
+        Ok(()) => json_ok(&serde_json::json!({ "ok": true })),
+        Err(e) => json_err(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+/// POST /api/host-net/allow-firewall — adds an inbound rule for this engine on one network
+/// profile through an elevated `netsh` (Windows asks for consent). Refused without `confirm`.
+async fn host_net_allow_firewall(Json(req): Json<AllowFirewallRequest>) -> Response<Body> {
+    let profile = match allow_firewall_decision(&req) {
+        Ok(p) => p,
+        Err(why) => return json_err(StatusCode::FORBIDDEN, why),
+    };
+    let r = tokio::task::spawn_blocking(move || crate::win_net::allow_on_profile(profile))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    match r {
+        Ok(()) => json_ok(&serde_json::json!({ "ok": true, "profile": profile })),
+        Err(e) => json_err(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
 // ─── /api/pkg/install/cancel ─────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -2414,34 +2454,23 @@ async fn install_cancel_handler(
     })
 }
 
-/// Normalize whatever address the caller gave into the payload's MANAGEMENT
-/// address (`ip:9114`), whatever port it arrived on.
-///
-/// Callers today pass `ip:9114`, but the engine's public surfaces accept a
-/// bare IP, and the transfer port (`:9113`) turns up in the same slots — both
-/// of which must end up on `:9114`. A wrong port here does not fail loudly:
-/// every frame (FS_LIST_DIR, the artifact hash, the Sony log read) fails
-/// instantly and every caller degrades to "nothing is there". That is how a
-/// session with a portless address sat at `phase=install` for the full 600 s
-/// stall while the exact package was already installed on the console
-/// (measured 2026-09-14).
+/// Normalize whatever address the caller gave into the console's address as the engine uses
+/// it: the host only (`console_addr`), whatever port it arrived on. A session's address is
+/// used for every observation it makes (artifact check, free-space, title-dir, Sony log), so it
+/// is normalized once, at creation, rather than by each caller.
 pub(crate) fn normalize_mgmt_addr(addr: &str) -> String {
     let host = strip_host_port(addr);
     if host.is_empty() {
         return addr.to_string();
     }
-    // A bare IPv6 literal has to go back in brackets, or `::1:9114` is a
-    // different (invalid) address than `[::1]:9114`.
-    if host.contains(':') {
-        format!("[{host}]:{PS5_MGMT_PORT}")
+    // The console's AVA1 port is the pool's concern; the engine names the host only. A bare
+    // IPv6 literal goes back in brackets.
+    crate::console_addr(&if host.contains(':') {
+        format!("[{host}]")
     } else {
-        format!("{host}:{PS5_MGMT_PORT}")
-    }
+        host
+    })
 }
-
-/// The payload's management port. Mirrors the crate-root constant of the same
-/// name (`mgmt_addr_for`) and `ps5upload_core::transfer`'s.
-const PS5_MGMT_PORT: u16 = 9114;
 
 /// Read a title's installed `APP_VER`, or `None` when it cannot be read (title
 /// absent, payload too old, console busy). `None` deliberately means "unknown"
@@ -3088,7 +3117,7 @@ async fn resolve_console_source(
 ) -> Result<ResolvedSource, String> {
     let (host, path) = console_path_url(url)
         .ok_or_else(|| format!("{url} is not a ps5://<console>/<path> location"))?;
-    let mgmt = crate::mgmt_addr_for(&host);
+    let mgmt = crate::console_addr(&host);
     let (m, p) = (mgmt.clone(), path.clone());
     let size = tokio::task::spawn_blocking(move || remote_pkg_size(&m, &p))
         .await
@@ -3195,6 +3224,71 @@ async fn remote_probe_handler(Json(req): Json<RemoteProbeRequest>) -> Response<B
                     .and_then(|n| n.to_str())
                     .unwrap_or("")
                     .to_string(),
+                content_id: meta.content_id,
+                title: meta.title,
+                title_id: meta.title_id,
+                category: meta.category,
+                app_ver: meta.app_ver,
+                platform: meta.platform,
+                package_type,
+                fingerprint: meta.fingerprint,
+            })
+        }
+        Err(e) => json_err(StatusCode::BAD_GATEWAY, &e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConsoleProbeRequest {
+    /// The console, as the other install routes name it (`host` or `host:port`).
+    pub host: String,
+    /// Absolute path of a package already on the console.
+    pub path: String,
+}
+
+/// Identify a package that is already on the console (R6, #370): after a RAR's packages are
+/// unpacked there, the client reads each one's category and title so a base installs before
+/// its patch. Reads only the header ranges, over the helper.
+async fn console_probe_handler(Json(req): Json<ConsoleProbeRequest>) -> Response<Body> {
+    let host = req.host.trim().to_string();
+    let path = req.path.trim().to_string();
+    if host.is_empty() || host.contains('/') || !path.starts_with('/') || path.contains('\0') {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "host and an absolute console path are required",
+        );
+    }
+    let url = format!("ps5://{host}{path}");
+    let probe_req = InstallStartRequest {
+        ps5_addr: String::new(),
+        allow_destructive_reinstall: false,
+        insecure_tls: false,
+        path: None,
+        split_root: None,
+        remote_url: None,
+        package_type_override: None,
+        local_ps5_path: None,
+        content_id: None,
+        expected_size: None,
+        package_fingerprint: None,
+        delete_staging: false,
+        serve_only: true,
+    };
+    match resolve_console_source(&url, &probe_req).await {
+        Ok((_, _, total_size, meta, _)) => {
+            let package_type = meta
+                .package_type
+                .clone()
+                .or_else(|| {
+                    ps5upload_pkg::package_type_for_category_and_platform(
+                        &meta.category,
+                        &meta.platform,
+                    )
+                })
+                .unwrap_or_default();
+            json_ok(&RemoteProbeResponse {
+                total_size,
+                filename: path.rsplit('/').next().unwrap_or("").to_string(),
                 content_id: meta.content_id,
                 title: meta.title,
                 title_id: meta.title_id,
@@ -3741,7 +3835,7 @@ fn plain_response(status: StatusCode, msg: &str) -> Response<Body> {
 /// truncates IPv6 to `[` because IPv6 addresses contain colons.
 ///
 /// rsplit_once on the LAST `:` correctly cuts off the port for both
-/// `1.2.3.4:9114` → `1.2.3.4` and `[2001:db8::1]:9114` → `[2001:db8::1]`.
+/// `1.2.3.4:9120` → `1.2.3.4` and `[2001:db8::1]:9120` → `[2001:db8::1]`.
 /// We then strip surrounding brackets to normalise to the bare form
 /// `peer.ip().to_string()` emits.
 ///
@@ -3750,7 +3844,7 @@ fn plain_response(status: StatusCode, msg: &str) -> Response<Body> {
 ///     brackets if present)
 ///   - empty input → empty string (caller is expected to handle)
 pub(crate) fn strip_host_port(host_port: &str) -> String {
-    // Bracketed IPv6 with port: `[2001:db8::1]:9114` →
+    // Bracketed IPv6 with port: `[2001:db8::1]:9120` →
     // rsplit_once on `]:` gives `[2001:db8::1` (with leading bracket).
     if let Some((host, port)) = host_port.rsplit_once("]:") {
         // host has leading `[` from the original; port is just digits.
@@ -3898,7 +3992,7 @@ mod persist_tests {
         let saved = serde_json::json!([{
             "id": id, "parts": [part], "part_sizes": [size], "total_size": size,
             "content_id": "UP0000-TEST00000_00-0000000000000000", "title": "t",
-            "package_type": "app", "package_fingerprint": "f", "ps5_mgmt_addr": "1.2.3.4:9114",
+            "package_type": "app", "package_fingerprint": "f", "ps5_mgmt_addr": "1.2.3.4:9120",
             "serve_only": true, "staging_path": null,
             "created_at_unix": now_unix(), "last_activity_unix": now_unix()
         }]);
@@ -4015,11 +4109,11 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
     fn a_link_that_fits_is_not_shortened() {
         let short = "http://192.168.86.199:20081/UP9000-PPSA03016_00-MARVELSPIDERMAN2.pkg";
         assert_eq!(
-            super::shorten_for_installer("127.0.0.1:9114", short).unwrap(),
+            super::shorten_for_installer("127.0.0.1:9120", short).unwrap(),
             None
         );
         assert_eq!(
-            super::shorten_for_installer("127.0.0.1:9114", "/data/pkg/a.pkg").unwrap(),
+            super::shorten_for_installer("127.0.0.1:9120", "/data/pkg/a.pkg").unwrap(),
             None
         );
     }
@@ -4028,7 +4122,7 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
     /// alias leads back to the exact link.
     #[test]
     fn an_over_long_link_becomes_an_alias_that_fits() {
-        let short = super::shorten_for_installer("127.0.0.1:9114", LONG)
+        let short = super::shorten_for_installer("127.0.0.1:9120", LONG)
             .unwrap()
             .expect("shortened");
         assert!(
@@ -4139,22 +4233,15 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
     /// `install` for the full 600 s stall — while the exact package was
     /// already installed on the console.
     #[test]
-    fn a_session_address_is_always_normalized_to_the_mgmt_port() {
-        assert_eq!(normalize_mgmt_addr("192.168.86.100"), "192.168.86.100:9114");
-        assert_eq!(
-            normalize_mgmt_addr("192.168.86.100:9114"),
-            "192.168.86.100:9114"
-        );
-        // A caller may hand us the transfer port; the mgmt port is what every
-        // frame this session sends must target.
-        assert_eq!(
-            normalize_mgmt_addr("192.168.86.100:9113"),
-            "192.168.86.100:9114"
-        );
+    fn a_session_address_is_always_normalized_to_the_bare_host() {
+        assert_eq!(normalize_mgmt_addr("192.168.86.100"), "192.168.86.100");
+        assert_eq!(normalize_mgmt_addr("192.168.86.100:9120"), "192.168.86.100");
+        // An older client may hand us either retired port; the port is ignored.
+        assert_eq!(normalize_mgmt_addr("192.168.86.100:9120"), "192.168.86.100");
         // Hostnames and IPv6 literals follow the same rule.
-        assert_eq!(normalize_mgmt_addr("ps5.lan"), "ps5.lan:9114");
-        assert_eq!(normalize_mgmt_addr("[::1]"), "[::1]:9114");
-        assert_eq!(normalize_mgmt_addr("[::1]:9113"), "[::1]:9114");
+        assert_eq!(normalize_mgmt_addr("ps5.lan"), "ps5.lan");
+        assert_eq!(normalize_mgmt_addr("[::1]"), "[::1]");
+        assert_eq!(normalize_mgmt_addr("[::1]:9120"), "[::1]");
     }
 
     #[test]
@@ -4270,7 +4357,7 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
     fn install_start_request_delete_staging_defaults_true() {
         // Back-compat: an older client that omits delete_staging must keep the
         // historical always-clean behaviour (true), not silently flip to keep.
-        let json = r#"{"ps5_addr":"1.2.3.4:9114","local_ps5_path":"/x.pkg"}"#;
+        let json = r#"{"ps5_addr":"1.2.3.4:9120","local_ps5_path":"/x.pkg"}"#;
         let req: InstallStartRequest = serde_json::from_str(json).unwrap();
         assert!(
             req.delete_staging,
@@ -4282,7 +4369,7 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
     fn install_start_request_delete_staging_false_round_trips() {
         // The current client sends the real preference; false must be honoured.
         let json =
-            r#"{"ps5_addr":"1.2.3.4:9114","local_ps5_path":"/x.pkg","delete_staging":false}"#;
+            r#"{"ps5_addr":"1.2.3.4:9120","local_ps5_path":"/x.pkg","delete_staging":false}"#;
         let req: InstallStartRequest = serde_json::from_str(json).unwrap();
         assert!(!req.delete_staging);
         // And it must flow through to a kept pkg.
@@ -4295,10 +4382,10 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
     #[test]
     fn strip_host_port_handles_ipv4_and_ipv6() {
         // IPv4 with port — the common case.
-        assert_eq!(strip_host_port("192.168.1.42:9114"), "192.168.1.42");
+        assert_eq!(strip_host_port("192.168.1.42:9120"), "192.168.1.42");
         // IPv6 bracketed with port — the SocketAddr-emitted form.
-        assert_eq!(strip_host_port("[2001:db8::1]:9114"), "2001:db8::1");
-        assert_eq!(strip_host_port("[::1]:9114"), "::1");
+        assert_eq!(strip_host_port("[2001:db8::1]:9120"), "2001:db8::1");
+        assert_eq!(strip_host_port("[::1]:9120"), "::1");
         // No port — should pass through unchanged.
         assert_eq!(strip_host_port("192.168.1.42"), "192.168.1.42");
         // Bare bracketless IPv6 without port — the disambiguation
@@ -4307,7 +4394,7 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
         assert_eq!(strip_host_port("::1"), "::1");
         assert_eq!(strip_host_port("2001:db8::1"), "2001:db8::1");
         // Hostname with port.
-        assert_eq!(strip_host_port("my-ps5.local:9114"), "my-ps5.local");
+        assert_eq!(strip_host_port("my-ps5.local:9120"), "my-ps5.local");
         // Empty input.
         assert_eq!(strip_host_port(""), "");
         // Edge: bracketed IPv6 with empty/invalid port — Round 4 found
@@ -4337,7 +4424,7 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
         // Pin the shape so a divergence between the two routes would
         // break Sony's installer header cross-check visibly here.
         let url = pkg_host_url_for(
-            "127.0.0.1:9114",
+            "127.0.0.1:9120",
             "abc-123",
             "UP9000-CUSA12345_00-GAMECONTENT12345",
         )
@@ -4359,7 +4446,7 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
         // direct-install URL must honour it so the daemon fetches from
         // the same port the engine is actually listening on.
         std::env::set_var("PS5UPLOAD_ENGINE_PORT", "29113");
-        let url = pkg_host_url_for("127.0.0.1:9114", "s", "IV0001-X").expect("loopback");
+        let url = pkg_host_url_for("127.0.0.1:9120", "s", "IV0001-X").expect("loopback");
         std::env::remove_var("PS5UPLOAD_ENGINE_PORT");
         assert!(
             url.starts_with("http://127.0.0.1:29113/"),
@@ -4375,7 +4462,7 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
         // LAN IP instead. It must win over lan_ip_for_ps5 regardless of the
         // ps5_addr, and an empty value must fall through to the guess.
         std::env::set_var("PS5UPLOAD_PKG_HOST_IP", "192.168.86.199");
-        let url = pkg_host_url_for("192.168.86.100:9114", "s", "IV0001-X").expect("override ip");
+        let url = pkg_host_url_for("192.168.86.100:9120", "s", "IV0001-X").expect("override ip");
         std::env::remove_var("PS5UPLOAD_PKG_HOST_IP");
         assert!(
             url.starts_with("http://192.168.86.199:"),
@@ -4384,7 +4471,7 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
         // An empty override must not be treated as a valid IP.
         std::env::set_var("PS5UPLOAD_PKG_HOST_IP", "   ");
         let url2 =
-            pkg_host_url_for("127.0.0.1:9114", "s", "IV0001-X").expect("empty falls through");
+            pkg_host_url_for("127.0.0.1:9120", "s", "IV0001-X").expect("empty falls through");
         std::env::remove_var("PS5UPLOAD_PKG_HOST_IP");
         assert!(
             url2.starts_with("http://127.0.0.1:"),
@@ -4450,8 +4537,6 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
             terminal_status: None,
             launchable: None,
             serve_only: false,
-            notified_console: false,
-            install_start_free_bytes: None,
             progress_consumed_bytes: 0,
             last_progress_unix: None,
             stalled: false,
@@ -4461,9 +4546,6 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
             bytes_served: 0,
             transfer_bytes: 0,
             transfer: TransferCoverage::new(total),
-            dpi_ok: None,
-            dpi_rc: None,
-            dpi_detail: String::new(),
             remote: None,
         }
     }
@@ -4816,7 +4898,7 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
         // untouched. This is the safety default: any caller that forgets the
         // field gets the install, not a silent no-op.
         let req: InstallStartRequest = serde_json::from_str(
-            r#"{"ps5_addr":"1.2.3.4:9114","path":"/x.pkg","delete_staging":true}"#,
+            r#"{"ps5_addr":"1.2.3.4:9120","path":"/x.pkg","delete_staging":true}"#,
         )
         .expect("parse");
         assert!(!req.serve_only);
@@ -4830,7 +4912,7 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
         // hangs the FW<11 helper). Pin that the field round-trips so the
         // client↔engine contract can't silently regress to the crashing path.
         let req: InstallStartRequest = serde_json::from_str(
-            r#"{"ps5_addr":"1.2.3.4:9114","path":"/x.pkg","serve_only":true}"#,
+            r#"{"ps5_addr":"1.2.3.4:9120","path":"/x.pkg","serve_only":true}"#,
         )
         .expect("parse");
         assert!(req.serve_only);
@@ -5065,5 +5147,67 @@ mod container_ip_tests {
         ] {
             assert!(!is_container_bridge_ip(ip.parse().unwrap()), "{ip}");
         }
+    }
+}
+
+#[cfg(test)]
+mod payload_restore_tests {
+    use std::borrow::Cow;
+
+    /// A helper image with an empty AVA1 trust slot, as the payload build leaves it.
+    fn slotted_elf() -> Vec<u8> {
+        let mut elf = vec![0x11u8; 4096];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[2000..2064].fill(0);
+        elf[2000..2009].copy_from_slice(ava1::trust::MAGIC);
+        elf
+    }
+
+    const KEY: [u8; 32] = [0x5a; 32];
+
+    /// Stands in for `ava1_api::stamped_helper` without touching the real data dir.
+    fn stamp_test_key(elf: &[u8]) -> Vec<u8> {
+        let mut bytes = elf.to_vec();
+        ava1::trust::stamp_helper(&mut bytes, Some(&KEY), || None).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn the_restored_helper_is_stamped_before_it_is_sent() {
+        let bytes =
+            super::payload_restore_bytes(|| Ok(Cow::Owned(slotted_elf())), stamp_test_key).unwrap();
+        assert_eq!(
+            ava1::trust::read(&bytes),
+            Some(KEY),
+            "payload-restore sends the helper without passing it through the stamp"
+        );
+    }
+
+    #[test]
+    fn a_helper_that_cannot_be_loaded_is_not_sent() {
+        let r = super::payload_restore_bytes(|| Err("no image".into()), stamp_test_key);
+        assert_eq!(r.unwrap_err(), "no image");
+    }
+}
+
+#[cfg(test)]
+mod host_net_tests {
+    use super::*;
+
+    fn req(profile: &str, confirm: bool) -> AllowFirewallRequest {
+        AllowFirewallRequest {
+            profile: profile.into(),
+            confirm,
+        }
+    }
+
+    #[test]
+    fn the_firewall_is_never_changed_without_the_persons_confirmation() {
+        assert!(allow_firewall_decision(&req("Public", false)).is_err());
+        assert_eq!(allow_firewall_decision(&req("Public", true)), Ok("Public"));
+        assert!(allow_firewall_decision(&req("any", true)).is_err());
+        let r: AllowFirewallRequest = serde_json::from_str(r#"{"profile":"Public"}"#).unwrap();
+        assert!(!r.confirm, "a missing flag is a no");
+        assert!(allow_firewall_decision(&r).is_err());
     }
 }

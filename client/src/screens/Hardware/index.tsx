@@ -726,7 +726,7 @@ export default function HardwareScreen() {
             <>
               {/* Canonical mgmtAddr() (from lib/addr.ts) handles
                   the "user pasted ip:port" edge case — raw string
-                  concat would produce ip:9113:9114 which Connection
+                  concat would produce a doubled ip:port which Connection
                   ::connect's SocketAddr parse rejects with a BAD_
                   GATEWAY, leaving the panel silently broken. */}
               <PowerTelemetryPanel mgmtAddr={mgmtAddr(host)} />

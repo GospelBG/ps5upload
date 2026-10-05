@@ -5,6 +5,12 @@
 // TCP send) stay in-process.
 
 import { trStatic } from "../lib/trStatic";
+import { humanizePs5Error } from "../lib/humanizeError";
+import {
+  classifySession,
+  reportIfNotPaired,
+  type SessionState,
+} from "../lib/consoleSession";
 import { Channel } from "@tauri-apps/api/core";
 import { getEngineUrl } from "../state/engine";
 // Logging wrapper: every command leaves a trace breadcrumb + logs failures at
@@ -142,7 +148,7 @@ export async function zipInspectStream(
 // 7z support reuses the ZipInspect / ZipInspectProgress shapes — the engine
 // returns the same fields. The host decompresses the archive's single LZMA2
 // stream (commonly one .exfat image) forward-only and streams the files into
-// the same FTX2 shard pipeline, so they land already-extracted on the PS5.
+// the same AVA1 upload pipeline, so they land already-extracted on the PS5.
 // Game metadata (title) is not surfaced for 7z: a 7z-of-.exfat has no
 // host-visible param.json, so `title` etc. stay null.
 
@@ -481,7 +487,12 @@ export async function sendPayload(
     { ip, path: elfPath, port: port ?? null },
   );
   if (resp && resp.ok === false) {
-    throw new Error(resp.error ?? resp.status ?? "payload_send failed");
+    const msg = resp.error ?? resp.status ?? "payload_send failed";
+    // The engine's replace guard tokens get their own localized text; every other
+    // failure keeps its raw message.
+    throw new Error(
+      /replace_(in_progress|cooldown)/i.test(msg) ? humanizePs5Error(msg) : msg,
+    );
   }
 }
 
@@ -643,7 +654,6 @@ export async function startTransferDirReconcile(
   txId?: string | null,
   excludes?: string[],
   bandwidthCapMbps?: number,
-  streams?: number,
 ): Promise<string> {
   const res = await invoke<{ job_id: string }>("transfer_dir_reconcile", {
     req: {
@@ -655,9 +665,6 @@ export async function startTransferDirReconcile(
       excludes: excludes ?? [],
       bandwidth_cap_mbps:
         bandwidthCapMbps && bandwidthCapMbps > 0 ? bandwidthCapMbps : null,
-      // Resolved upstream as min(user setting, payload max_transfer_streams).
-      // <=1 (or undefined) → single stream, unchanged behaviour.
-      streams: streams && streams > 1 ? streams : null,
     },
   });
   return res.job_id;
@@ -797,7 +804,7 @@ export async function dirDiffPreview(
  *  engine's copy would be shared by every browser pointed at it — so
  *  this is deliberately per-browser, like the rest of the web UI's
  *  settings. */
-const UPLOAD_QUEUE_KEY = "ps5upload.uploadQueue";
+export const UPLOAD_QUEUE_KEY = "ps5upload.uploadQueue";
 
 /** Whole-document load for the upload-queue store. The renderer owns
  *  the shape — see state/uploadQueue.ts. Returns `{}` for first-time
@@ -1681,7 +1688,7 @@ export interface DiscoveredHost {
   services: string[];
   /** :9021 reachable — the universal payload-loader port. */
   loader_port_open: boolean;
-  /** :9114 reachable — our own payload is already running here. */
+  /** The helper's AVA1 port (9120) is reachable — our own payload is already running here. */
   payload_port_open: boolean;
   /** 0-100 score; see commands/discover.rs::confidence for weights. */
   confidence: number;
@@ -2260,8 +2267,8 @@ export interface ProcessKillAck {
   err?: string | null;
 }
 
-/** Enumerate running processes (detailed). `addr` is the mgmt addr
- *  (ip:9114). Read-only. */
+/** Enumerate running processes (detailed). `addr` is the console
+ *  address. Read-only. */
 export async function processList(addr: string): Promise<ProcessListResult> {
   return invoke<ProcessListResult>("process_list_get", { addr });
 }
@@ -2991,11 +2998,14 @@ export async function fsReadPreview(
   addr: string,
   path: string,
   maxBytes?: number,
+  /** Start here instead of the beginning: a log's TAIL (the newest lines). */
+  offset?: number,
 ): Promise<FsReadPreviewResult> {
   return invoke<FsReadPreviewResult>("fs_read_preview", {
     addr,
     path,
     maxBytes: maxBytes ?? null,
+    offset: offset ?? null,
   });
 }
 
@@ -4085,12 +4095,12 @@ export interface JobSnapshot {
   status: JobStatus;
   /** Present on a running job that reports stages (an FPKG build). */
   stage?: JobStageSnapshot;
-  /** A finished FPKG build's content id (the transfer id field, reused). */
+  /** The job id in hex (an FPKG build reuses the field for its content id). */
   tx_id_hex?: string;
   started_at_ms?: number;
   elapsed_ms?: number;
-  /** Populated for `running` (live counter, 200 ms cadence) AND `done`
-   *  (final count from COMMIT_TX_ACK). */
+  /** Bytes sent so far. Populated for `running` (live counter, 200 ms cadence)
+   *  AND `done` (the job's final count). */
   bytes_sent?: number;
   /** Populated for `running` only — total expected bytes so the UI can
    *  render percent + ETA. Pre-computed from source size at job start. */
@@ -4102,50 +4112,63 @@ export interface JobSnapshot {
   /** Reconcile-mode skip counts. 0 for plain uploads. */
   skipped_files?: number;
   skipped_bytes?: number;
-  /** Per-file progress (Running, multi-file uploads). Climbs as the
-   *  engine reads each source file into a pack frame (one bump per file).
-   *  Smoother than deriving file-count from bytes_sent, which jumps in
-   *  ~200-file chunks on packed-shard ACKs and looked like
-   *  "start → finished" on 46k-file game folders. `undefined` (or 0)
-   *  means the upload path doesn't report it; the UI falls back to its
-   *  size-derived estimate. */
+  /** Files read from the source so far (running multi-file uploads): one bump
+   *  per source file as the sender takes it up. Smoother than deriving a file
+   *  count from bytes_sent, which jumps in large steps on folders of many
+   *  small files. `undefined` (or 0) means the upload path doesn't report it;
+   *  the UI falls back to its size-derived estimate. */
   files_processing?: number;
-  /** P3 / v2.18.0: files the payload has fully committed during the
-   *  post-100% COMMIT_TX apply loop. Ticks up from 0 to
-   *  `files_finalizing_total` as APPLY_PROGRESS frames arrive from
-   *  new payloads (those that recognise TX_FLAG_APPLY_PROGRESS_REQUESTED,
-   *  which the engine sets on every multi-file BEGIN_TX). UI surfaces
-   *  this as a "Finalized N of M files" counter on the running banner
-   *  so users see motion through the 10-30 min commit phase that used
-   *  to be a silent black box. `undefined` (or 0) on old payloads
-   *  that don't emit progress — UI falls back to the plain "Finalizing
-   *  on PS5…" pill from v2.17.3. */
+  /** Files the console has made durable so far (AVA1's durable-file count: each
+   *  file is fsynced and renamed into place before it counts). The UI shows it
+   *  as "Finalized N of M files" on the running banner. `undefined` (or 0)
+   *  until the console reports its first durable file; the UI then falls back
+   *  to the plain "Finalizing on PS5…" pill. */
   files_finalized?: number;
-  /** P3 / v2.18.0: total files the payload will commit. Surfaced as a
-   *  paired denominator for `files_finalized`. 0 outside the finalize
-   *  phase. */
+  /** Total files the job will make durable: the denominator for
+   *  `files_finalized`. 0 when the job does not know it yet. */
   files_finalizing_total?: number;
-  /** P3 / v2.18.0: cumulative bytes finalized during commit-apply.
-   *  Second progress dimension alongside file count; useful when file
-   *  sizes vary wildly. */
+  /** Bytes the console has made durable so far. A second progress dimension
+   *  beside the file count, useful when file sizes vary wildly. */
   bytes_finalized?: number;
+  /** The sending phase when it is not plain sending: `"skipping"` while a 7z/RAR
+   *  resume discards data the console already has. Absent otherwise (and on engines
+   *  that do not report it). Contract: protocol/ava1/CLIENT_CONTRACT.md. */
+  phase?: string;
+  /** Skipping progress: bytes decoded so far and bytes to skip in all. */
+  skip_done_bytes?: number;
+  skip_total_bytes?: number;
+  /** What limits the transfer (AVA1's words: "network", "source", "console drive",
+   *  "console workers", "console memory", "none"). Live on a running job when the
+   *  engine reports it; a finished job carries it in `commit_ack`. */
+  bottleneck?: string;
+  /** True while files are still settling on the console after the job finished
+   *  ("Finishing on the console"). Absent until the engine sends it. */
+  settling?: boolean;
+  /** While `settling`: files the console still has to make permanent, and the most it had.
+   *  Absent on engines that do not send the counts. */
+  settle_files_left?: number;
+  settle_files_total?: number;
+  /** The final status of a finished job (AVA1: protocol, files, bytes, bottleneck, ...). */
+  commit_ack?: { bottleneck?: string } & Record<string, unknown>;
   /** Files actually sent (Done only). */
   files_sent?: number;
-  shards_sent?: number;
   dest?: string;
   error?: string;
-  /** Machine-parseable error category lifted from the payload's
-   *  error frame body. Populated alongside `error` when the failure
-   *  originated from a PS5 protocol error frame. UI uses this for
-   *  humanized rendering (e.g. `direct_writer_io_error` → "PS5 is
-   *  out of free space"). `undefined` for local-side / non-payload
-   *  errors — fall back to `error` text. */
+  /** Machine-parseable error category. Populated alongside `error` when the
+   *  failure came from the console (a refusal or an AVA1 job failure) or is one
+   *  the engine names (`helper_not_ava1`, `not_paired`, `zip_unsupported`, ...).
+   *  UI uses this for humanized rendering (e.g. `insufficient_space` → "PS5 is
+   *  out of free space"). `undefined` for local-side errors — fall back to
+   *  `error` text. */
   error_reason?: string;
-  /** Human-readable detail string lifted from the payload's error
-   *  frame `"detail"` field. Often pinpoints the on-PS5 path or
-   *  underlying errno. Shown as a secondary line under the
+  /** Human-readable detail from the console's refusal. Often pinpoints the
+   *  on-PS5 path or underlying errno. Shown as a secondary line under the
    *  humanized title. */
   error_detail?: string;
+  /** The console the failure came from, when the engine names one (a PS5 to PS5 relay talks
+   *  to two: the failure may be the source's, not the destination the caller polls
+   *  against). A not-paired failure opens THIS console's pairing dialog. */
+  error_console?: string;
 }
 
 /** Job-failure exception carrying the structured `error_reason` +
@@ -4193,6 +4216,13 @@ export function humanizeJobErrorReason(
       "The PS5 couldn't write to the destination mid-transfer — most often the drive filled up or an external drive disconnected. Check free space / reconnect the drive, then click Retry (the upload resumes from where it stopped).",
     );
   }
+  const refused = /^ava1_refused_(\d+)$/.exec(reason);
+  if (refused) {
+    return trStatic(
+      "joberr.ava1_refused",
+      "The PS5 refused this request (code {code}). Retry; if it repeats, update the helper and this app to the same version and include the code in a bug report.",
+    ).replace("{code}", refused[1]);
+  }
   switch (reason) {
     case "preflight_insufficient_space":
       return trStatic(
@@ -4226,6 +4256,11 @@ export function humanizeJobErrorReason(
         "joberr.size_mismatch",
         "The transfer didn't finish before being interrupted — a file on the PS5 is incomplete, so it wasn't published (your old copy, if any, is untouched). This usually means the PS5 went into rest mode or lost power mid-upload. Keep the console awake (Settings → System → Power Saving → Set Time Until PS5 Turns Off), then re-run this item — Resume now re-sends only the missing files, or choose Override for a clean copy.",
       );
+    case "ava1_stalled":
+      return trStatic(
+        "joberr.ava1_stalled",
+        "The transfer stopped making progress (the source stopped sending data). Retry; if it repeats, check the source drive or network share.",
+      );
     case "fs_delete_path_not_allowed":
     case "fs_mkdir_path_not_allowed":
     case "fs_list_dir_path_denied":
@@ -4238,6 +4273,179 @@ export function humanizeJobErrorReason(
         "joberr.fs_read_path_not_allowed",
         'This file is in a read-only system partition that\'s normally blocked. Enable Settings → "Allow downloading system files" to download from /system, /system_data, and other protected paths.',
       );
+    // An archive the uploader cannot stream (the same decoding crates the retired transport
+    // used, so nothing a fallback once handled is lost). Reasons: the engine's own
+    // `zip_unsupported` / `7z_unsupported` / `rar_unsupported`, and the source-level
+    // `ava1_7z_unsupported`, `ava1_7z_unsupported_layout`, `ava1_rar_unsupported`.
+    case "zip_unsupported":
+    case "ava1_zip_unsupported":
+      return trStatic(
+        "joberr.zip_unsupported",
+        "This .zip uses something the uploader can't stream (encryption, a compression method other than Deflate or Stored, or an unsafe or duplicate file path). Extract it on your computer and upload the folder instead.",
+      );
+    case "7z_unsupported":
+    case "ava1_7z_unsupported":
+      return trStatic(
+        "joberr.sevenz_unsupported",
+        "This .7z uses a compression method or feature the uploader can't stream. Extract it on your computer and upload the folder instead.",
+      );
+    case "7z_unsupported_layout":
+    case "ava1_7z_unsupported_layout":
+      return trStatic(
+        "joberr.sevenz_unsupported_layout",
+        "This .7z keeps directories or empty files between its files inside one solid block, a layout the uploader can't stream. Re-pack it with 7-Zip, or extract it and upload the folder.",
+      );
+    case "rar_unsupported":
+    case "ava1_rar_unsupported":
+      return trStatic(
+        "joberr.rar_unsupported",
+        "This .rar has duplicate or unsafe file paths, or a feature the uploader can't stream. Extract it on your computer and upload the folder instead.",
+      );
+    // AVA1-era reasons (engine ps5upload-ava1 upload/download/copy/console, mgmt seam).
+    case "ava1_busy":
+    case "ava1_open_timeout":
+      return trStatic(
+        "joberr.ava1_busy",
+        "The PS5 helper is busy and did not accept this transfer in time. Wait for its other work to finish, then click Retry.",
+      );
+    case "ava1_unreachable":
+      return trStatic(
+        "joberr.ava1_unreachable",
+        "The PS5 could not be reached. Check that it is on and on the same network, and that the helper is running, then click Retry.",
+      );
+    case "ava1_no_space":
+      return trStatic(
+        "joberr.fs_write_failed_no_space",
+        "The destination drive ran out of space (or the file is too big for that filesystem). Free space on the PS5 / external drive — or pick a different destination — then click Retry.",
+      );
+    case "ava1_not_allowed":
+      return trStatic(
+        "joberr.fs_delete_path_not_allowed",
+        "PS5 refused access to that path. Use /data/, /user/, or a mounted /mnt/ext*, /mnt/usb* path.",
+      );
+    case "ava1_exists":
+      return trStatic(
+        "joberr.ava1_exists",
+        "The destination already exists on the PS5. Choose Override to replace it, or pick a different destination.",
+      );
+    case "ava1_commit_exists":
+      return trStatic(
+        "joberr.ava1_commit_exists",
+        "The file was uploaded but could not be published because the destination already exists. Choose Override to replace it, or pick a different destination.",
+      );
+    case "ava1_cross_device":
+    case "ava1_commit_cross_device":
+      return trStatic(
+        "joberr.ava1_cross_device",
+        "The destination is on a different drive than the staging area, so the PS5 could not move the file into place. Pick a destination on the same drive, or upload to the internal drive first.",
+      );
+    case "ava1_wrong_console":
+      return trStatic(
+        "joberr.ava1_wrong_console",
+        "The device at this address is not the PS5 this app paired with. Check the address, or pair with this console again.",
+      );
+    case "ava1_no_identity":
+      return trStatic(
+        "joberr.ava1_no_identity",
+        "This app has no pairing identity yet. Pair it with the PS5 from the Connection screen, then retry.",
+      );
+    case "zip_read_error":
+      return trStatic(
+        "joberr.zip_read_error",
+        "The .zip could not be read (the file or its drive may have gone away mid-read). Check the source is still connected, then click Retry.",
+      );
+    case "ava1_zip_corrupt":
+      return trStatic(
+        "joberr.ava1_zip_corrupt",
+        "This .zip could not be read: it is damaged or incomplete. Download it again or re-create it, then retry.",
+      );
+    case "ava1_7z_corrupt":
+      return trStatic(
+        "joberr.ava1_7z_corrupt",
+        "This .7z could not be read: it is damaged or incomplete. Download it again or re-create it, then retry.",
+      );
+    case "ava1_7z_encrypted":
+      return trStatic(
+        "joberr.ava1_7z_encrypted",
+        "This .7z is encrypted, which the uploader cannot stream. Extract it on your computer and upload the folder instead.",
+      );
+    case "ava1_7z_unsafe_path":
+      return trStatic(
+        "joberr.ava1_7z_unsafe_path",
+        "This .7z contains a file path that is unsafe (it leaves its own folder). Extract it on your computer and upload the folder instead.",
+      );
+    case "rar_password_required":
+    case "rar_password_wrong":
+    case "ava1_rar_password_required":
+    case "ava1_rar_password_wrong":
+      return trStatic(
+        "joberr.rar_password",
+        "This .rar needs a password, or the password given was wrong. Enter the correct password and retry.",
+      );
+    case "ava1_rar_corrupt":
+    case "ava1_rar_missing_volume":
+    case "ava1_rar_reordered":
+    case "ava1_rar_failed":
+      return trStatic(
+        "joberr.rar_corrupt",
+        "This .rar is damaged, or some of its parts are missing or out of order. Make sure every part is present, then retry.",
+      );
+    case "ava1_copy_lost":
+      return trStatic(
+        "joberr.ava1_copy_lost",
+        "The PS5 lost track of this copy (the helper restarted or the connection dropped). Click Retry to start it again.",
+      );
+    case "ava1_copy_failed":
+      return trStatic(
+        "joberr.ava1_copy_failed",
+        "The PS5 could not finish copying. Check free space and that the source and destination are still available, then retry.",
+      );
+    case "ava1_local_io":
+      return trStatic(
+        "joberr.ava1_local_io",
+        "This computer could not write the downloaded file. Check the destination folder's permissions and free space, then retry.",
+      );
+    case "ava1_bad_manifest":
+      return trStatic(
+        "joberr.ava1_bad_manifest",
+        "The PS5 sent a file list this app could not understand. Update the helper and this app to the same version, then retry.",
+      );
+    case "helper_not_ava1":
+      return isTauriEnv()
+        ? trStatic(
+            "joberr.helper_not_ava1",
+            "The PS5 helper is not running. Send it from the Connection screen (or use Update helper if the banner offers it), then retry.",
+          )
+        : trStatic(
+            "joberr.helper_not_ava1_web",
+            "The PS5 helper is not running. This web UI cannot send it: start the ps5upload payload on the console with your usual payload loader (or use Update helper if the banner offers it), then retry.",
+          );
+    case "helper_old":
+      return trStatic(
+        "joberr.helper_old",
+        "The PS5 is running an older helper. Click Update helper in the banner at the top, then retry.",
+      );
+    case "ava1_not_paired":
+    case "not_paired":
+      return trStatic(
+        "joberr.not_paired",
+        "This PS5 has not accepted this app yet. Pair them (the Pair… button), then retry.",
+      );
+    case "helper_starting":
+      return trStatic(
+        "joberr.helper_starting",
+        "The PS5 helper is still starting. Wait a few seconds, then retry.",
+      );
+    case "ava1_failed":
+      return trStatic(
+        "joberr.ava1_failed",
+        "The PS5 helper started but its transfer server did not. Restart the console, then retry.",
+      );
+    case "helper_not_running":
+      return trStatic(
+        "joberr.helper_not_running",
+        "No helper is running on the PS5. Send the helper first (Connection screen on the desktop app, or your payload loader), then retry.",
+      );
     case "tx_table_full":
       return trStatic(
         "joberr.tx_table_full",
@@ -4248,7 +4456,12 @@ export function humanizeJobErrorReason(
   }
 }
 
-export async function jobStatus(jobId: string): Promise<JobSnapshot> {
+export async function jobStatus(
+  jobId: string,
+  /** The console the job runs against, when known: a not-paired failure opens THAT
+   *  console's pairing dialog. Without it the failure opens nothing. */
+  host?: string,
+): Promise<JobSnapshot> {
   const raw = await invoke<Record<string, unknown>>("job_status", { jobId });
   // Cheap shape validation. If the Rust side ever returns a non-snapshot
   // payload (e.g., an error envelope we forgot to map to a thrown
@@ -4260,6 +4473,14 @@ export async function jobStatus(jobId: string): Promise<JobSnapshot> {
   if (status !== "running" && status !== "done" && status !== "failed") {
     throw new Error(
       `job_status returned unexpected shape (missing/invalid status): ${JSON.stringify(raw).slice(0, 200)}`,
+    );
+  }
+  if (status === "failed") {
+    // A transfer that died because the console has not accepted this app opens the pairing dialog.
+    const named = (raw as { error_console?: unknown }).error_console;
+    reportIfNotPaired(
+      (raw as { error_reason?: unknown }).error_reason ?? raw.error,
+      typeof named === "string" && named.trim() ? named : host,
     );
   }
   return raw as unknown as JobSnapshot;
@@ -4385,7 +4606,7 @@ export async function portProbe(
 }
 
 /**
- * Check whether the PS5 runtime (:9113) is currently serving. Returns a
+ * Check whether the PS5 runtime (AVA1, :9120) is currently serving. Returns a
  * lightly-parsed shape — the full command's return covers more details
  * but these are the fields the status UI actually renders.
  *
@@ -4488,12 +4709,6 @@ export async function payloadCheck(ip: string): Promise<{
    *  "clean" | "killed_externally" | "wedged" | "stale" | "replaced". null on payloads
    *  older than this field, which is indistinguishable from "unknown". */
   priorInstance: string | null;
-  /** Max parallel upload streams this payload will service concurrently
-   *  (from STATUS_ACK `max_transfer_streams`). Absent on payloads that
-   *  predate multi-stream → null, which the caller treats as 1 (single
-   *  stream). The Upload path resolves the actual count as
-   *  min(user setting, this). See docs/multistream-upload.md. */
-  maxTransferStreams: number | null;
   /** Whether the ENGINE answered at all — a different question from
    *  `reachable`, which is about the console. Every console verdict comes
    *  from the engine, so when this is false the console's state is simply
@@ -4503,6 +4718,9 @@ export async function payloadCheck(ip: string): Promise<{
    *  Defaults to true when absent so an older engine degrades to the old
    *  interpretation rather than claiming a console outage it can't see. */
   engineReachable: boolean;
+  /** The ONE status verdict (connected / needs_pairing / helper_old / down),
+   *  classified from the same reply. See lib/consoleSession.ts. */
+  session: SessionState;
   /** Raw error string from the engine when reachable=false. Lets the
    *  Connection screen's wait-for-boot banner surface what actually
    *  went wrong (TCP connect refused, STATUS_ACK timeout, etc.)
@@ -4519,13 +4737,14 @@ export async function payloadCheck(ip: string): Promise<{
       ps5_kernel?: string;
       ucred_elevated?: boolean;
       prior_instance?: string;
-      max_transfer_streams?: number;
     };
   }>("payload_check", { ip });
+  const error = resp?.reachable ? null : (resp?.error ?? null);
   return {
     reachable: !!resp?.reachable,
     loaded: !!resp?.loaded,
     engineReachable: resp?.engine !== false,
+    session: classifySession({ reachable: !!resp?.reachable, error }),
     payloadVersion: resp?.status?.version ?? null,
     ps5Kernel: resp?.status?.ps5_kernel ?? null,
     ucredElevated:
@@ -4536,12 +4755,7 @@ export async function payloadCheck(ip: string): Promise<{
       typeof resp?.status?.prior_instance === "string"
         ? resp.status.prior_instance
         : null,
-    maxTransferStreams:
-      typeof resp?.status?.max_transfer_streams === "number" &&
-      resp.status.max_transfer_streams > 0
-        ? resp.status.max_transfer_streams
-        : null,
-    error: resp?.reachable ? null : (resp?.error ?? null),
+    error,
   };
 }
 
@@ -4831,6 +5045,10 @@ export interface CheatTitle {
   /** Game version the downloaded cheat targets, parsed from its filename
    *  (e.g. "01.08"). Empty when the filename carries no version. */
   version?: string;
+  /** Formats on the console for this title: "json" | "shn" | "mc4". */
+  formats?: string[];
+  /** How many of its cheats are switched on. */
+  enabled?: number;
   running: boolean;
 }
 
@@ -5242,7 +5460,33 @@ export interface InstallRequestBody {
   title_id?: string | null;
   package_app_ver?: string | null;
   category?: string | null;
-  options?: { delete_source_copy_after?: boolean; allow_destructive_reinstall?: boolean };
+  options?: {
+    delete_source_copy_after?: boolean;
+    allow_destructive_reinstall?: boolean;
+    /** Skip the console-local attempt and serve the package through Stream (console_path only). */
+    force_stream?: boolean;
+  };
+}
+
+/** What the engine found about the link to the console on Windows (see engine win_net.rs). */
+export interface NetDiag {
+  adapter: string;
+  local_ip: string;
+  category: "public" | "private" | "domain" | "unknown";
+  firewall_enabled?: boolean | null;
+  allowed_by_rule?: boolean | null;
+}
+
+/** Open Windows Settings at the network page for `adapter`. Nothing is changed by this call. */
+export async function hostNetOpenSettings(adapter: string): Promise<void> {
+  await invoke("host_net_open_settings", { adapter });
+}
+
+/** Add an inbound firewall rule for ps5upload on `profile` through an elevated `netsh`. Windows
+ *  shows its own consent prompt. Call it only after the person confirmed; the engine refuses an
+ *  unconfirmed request. */
+export async function hostNetAllowFirewall(profile: "public" | "private"): Promise<void> {
+  await invoke("host_net_allow_firewall", { profile, confirm: true });
 }
 
 export interface InstallStatus {
@@ -5268,6 +5512,12 @@ export interface InstallStatus {
   app_ver_after: string | null;
   patch_verdict: string | null;
   shortened: boolean;
+  /** The PS5 refused a package from its own storage and the engine can safely send it through
+   *  Stream: offer "Retry with Stream". Absent from an older engine. */
+  retry_with_stream?: boolean;
+  /** Windows only: the local adapter facing the console and what Windows says about it, set
+   *  when the console could not reach this computer. Absent elsewhere and from an older engine. */
+  net_diag?: NetDiag | null;
   started_at: number;
   updated_at: number;
 }

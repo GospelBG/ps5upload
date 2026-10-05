@@ -1,6 +1,6 @@
-// Shared profile definitions for the FTX2 sweep.
+// Shared profile definitions for the upload sweep.
 //
-// Kept in one file so gen-fixtures and run-ftx2-sweep stay in lockstep.
+// Kept in one file so gen-fixtures and run-sweep stay in lockstep.
 // Add a profile by appending to PROFILES; give it a unique `name` and at most
 // one tag in the opt-in tag set below. `bytesTotal` is derived (not declared)
 // so sizes stay correct if the raw numbers change.
@@ -33,25 +33,25 @@ export const PROFILES = [
     name: 'small-file',
     kind: 'file',
     size: 1 * MIB,
-    note: 'small single-shard direct-mode',
+    note: 'small file',
   },
   {
     name: 'medium-file',
     kind: 'file',
     size: 32 * MIB,
-    note: 'exactly one shard at current shard size',
+    note: 'medium file',
   },
   {
     name: 'large-file',
     kind: 'file',
     size: 128 * MIB,
-    note: 'previous single-file baseline; 4 shards; persistent-fd win lives here',
+    note: 'previous single-file baseline; persistent-fd win lives here',
   },
   {
     name: 'huge-file',
     kind: 'file',
     size: 1 * GIB,
-    note: 'deep persistent-writer test, 32 shards',
+    note: 'deep persistent-writer test',
   },
 
   // ── Directory workloads ───────────────────────────────────────────────────

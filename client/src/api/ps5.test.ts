@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { searchPS5 } from "./ps5";
+import { searchPS5, sendPayload } from "./ps5";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -64,10 +64,26 @@ describe("searchPS5", () => {
     expect(result.scanned).toBe(257);
     expect(result.truncated).toBe(false);
     expect(mockedInvoke).toHaveBeenCalledWith("ps5_list_dir", {
-      addr: "192.168.1.2:9114",
+      addr: "192.168.1.2",
       path: "/data",
       offset: 256,
       limit: 256,
     });
+  });
+});
+
+describe("sendPayload replace guard", () => {
+  beforeEach(() => mockedInvoke.mockReset());
+
+  it("turns the engine's replace_in_progress / replace_cooldown into localized text", async () => {
+    mockedInvoke.mockResolvedValueOnce({ ok: false, error: "replace_cooldown: wait 40 s" });
+    await expect(sendPayload("10.0.0.2", "/h.elf")).rejects.toThrow(/wait a minute/i);
+    mockedInvoke.mockResolvedValueOnce({ ok: false, error: "replace_in_progress" });
+    await expect(sendPayload("10.0.0.2", "/h.elf")).rejects.toThrow(/already being replaced/i);
+  });
+
+  it("leaves every other failure as the engine said it", async () => {
+    mockedInvoke.mockResolvedValueOnce({ ok: false, error: "connect 10.0.0.2:9021: timeout" });
+    await expect(sendPayload("10.0.0.2", "/h.elf")).rejects.toThrow("connect 10.0.0.2:9021: timeout");
   });
 });

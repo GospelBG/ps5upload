@@ -2,6 +2,7 @@
 
 #include "ftp_format.h"
 #include "cross_device.h"
+#include "path_policy.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,14 +116,14 @@ struct ftp_session {
     _Atomic int data_listen_fd;
     struct sockaddr_in data_addr;
     int data_offset;
-    char cwd[512];
+    char cwd[1024]; /* as long as abs_path's result buffer: a longer cwd was silently cut short */
     char root[512];
     int readonly;
     int authenticated;
     char user[64];
     char pass[64];
     int use_pasv;
-    char rename_path[512];
+    char rename_path[1024];
     char pending_user[64];
     char transfer_type;
     char line_buf[1024];
@@ -194,9 +195,24 @@ static void ftp_kick_all_sessions(void) {
     pthread_mutex_unlock(&g_ftp.sessions_mu);
 }
 
-static void normalize_path(const char *src, char *out, size_t cap) {
-    char stack[64][256];
+/* Resolves "." and ".." in a path. The 64 x 256 component stack (16 KiB) lives on the heap: the AVA1
+ * management workers run it next to Sony calls (mgmt_audit.py stack rejects 16 KiB+ stack arrays). On
+ * an allocation failure the answer is "/" (the FTP root), never the unresolved input. */
+/* Returns 0, or -1 when a component or the result did not fit and was dropped (the caller must then
+ * refuse the path rather than use a different one). */
+static int normalize_path(const char *src, char *out, size_t cap) {
+    char (*stack)[256] = malloc(64 * sizeof *stack);
     int sp = 0;
+    int dropped = 0;
+    if (!stack) {
+        if (cap > 1) {
+            out[0] = '/';
+            out[1] = '\0';
+        } else if (cap) {
+            out[0] = '\0';
+        }
+        return -1;
+    }
     const char *p = src;
     while (*p) {
         while (*p == '/') p++;
@@ -213,6 +229,8 @@ static void normalize_path(const char *src, char *out, size_t cap) {
             memcpy(stack[sp], start, len);
             stack[sp][len] = '\0';
             sp++;
+        } else {
+            dropped = 1;
         }
     }
     size_t pos = 0;
@@ -223,32 +241,63 @@ static void normalize_path(const char *src, char *out, size_t cap) {
             if (pos > 1) out[pos++] = '/';
             memcpy(out + pos, stack[i], slen);
             pos += slen;
+        } else {
+            dropped = 1;
         }
     }
     if (pos < cap) out[pos] = '\0';
     else out[cap - 1] = '\0';
     if (pos == 1 && cap > 1) out[1] = '\0';
+    free(stack);
+    return dropped ? -1 : 0;
 }
+
+/* What abs_path returns for a path it refuses. A process that CAN write to / (root, as in the host
+ * selftest) would otherwise create it, so mutating handlers test for it explicitly. */
+#define FTP_DENIED_PATH "/.ps5upload-denied"
 
 static void abs_path(struct ftp_session *s, const char *arg, char *out, size_t cap) {
     char virtual[1024];
+    int vn;
     if (!arg || !arg[0]) {
-        snprintf(virtual, sizeof(virtual), "%s", s->cwd);
+        vn = snprintf(virtual, sizeof(virtual), "%s", s->cwd);
     } else if (arg[0] == '/') {
-        snprintf(virtual, sizeof(virtual), "%s", arg);
+        vn = snprintf(virtual, sizeof(virtual), "%s", arg);
     } else {
         const char *cwd_rel = s->cwd + strlen(s->root);
         if (*cwd_rel == '\0') cwd_rel = "/";
-        snprintf(virtual, sizeof(virtual), "%s/%s", cwd_rel, arg);
+        vn = snprintf(virtual, sizeof(virtual), "%s/%s", cwd_rel, arg);
     }
     char normalized[1024];
-    normalize_path(virtual, normalized, sizeof(normalized));
-    size_t root_len = strlen(s->root);
-    if (root_len <= 1) {
-        snprintf(out, cap, "%s", normalized);
-    } else {
-        snprintf(out, cap, "%s%s", s->root, normalized);
+    /* An argument that does not fit, or a component normalize_path had to drop, is judged as a whole:
+     * refused, never used cut short. */
+    if (vn < 0 || (size_t)vn >= sizeof(virtual) || normalize_path(virtual, normalized, sizeof(normalized)) != 0) {
+        snprintf(out, cap, "%s", FTP_DENIED_PATH);
+        return;
     }
+    size_t root_len = strlen(s->root);
+    int wn;
+    if (root_len <= 1) {
+        wn = snprintf(out, cap, "%s", normalized);
+    } else {
+        wn = snprintf(out, cap, "%s%s", s->root, normalized);
+    }
+    /* A path that does not fit is never used cut short (a policy check on the prefix could disagree
+     * with the path): it becomes a name that cannot exist, like a denied one. */
+    if (wn < 0 || (size_t)wn >= cap) {
+        snprintf(out, cap, "%s", FTP_DENIED_PATH);
+        return;
+    }
+    /* The AVA1 trust store (identity, paired peers) is not served over FTP, whatever the root is and
+     * however the path is spelled or linked: a path in or above it becomes a name that cannot exist. */
+    if (path_in_protected(out)) snprintf(out, cap, "%s", FTP_DENIED_PATH);
+}
+
+/* Rename, delete and rmdir of the AVA1 trust store's directory OR OF AN ANCESTOR of it (moving or
+ * replacing /data/ps5upload moves or replaces ava/{identity,peers}) are refused. abs_path already
+ * turns paths inside the store into a name that cannot exist. */
+static int ftp_touches_trust_store(const char *path) {
+    return strcmp(path, FTP_DENIED_PATH) == 0 || path_contains_protected(path) || path_in_protected(path);
 }
 
 static void handle_user(struct ftp_session *s, const char *arg) {
@@ -288,7 +337,7 @@ static void handle_syst(struct ftp_session *s) {
 static void handle_pwd(struct ftp_session *s) {
     const char *p = s->cwd + strlen(s->root);
     if (*p == '\0') p = "/";
-    char msg[600];
+    char msg[1100];
     snprintf(msg, sizeof(msg), "\"%s\" is the current directory", p);
     send_resp(s->ctrl_fd, 257, msg);
 }
@@ -301,7 +350,13 @@ static void handle_cwd(struct ftp_session *s, const char *arg) {
         send_resp(s->ctrl_fd, 550, "Failed to change directory");
         return;
     }
-    snprintf(s->cwd, sizeof(s->cwd), "%s", path);
+    int cn = snprintf(s->cwd, sizeof(s->cwd), "%s", path);
+    if (cn < 0 || (size_t)cn >= sizeof(s->cwd)) {
+        /* never keep a truncated working directory */
+        snprintf(s->cwd, sizeof(s->cwd), "%s", s->root);
+        send_resp(s->ctrl_fd, 550, "Failed to change directory");
+        return;
+    }
     send_resp(s->ctrl_fd, 250, "Directory successfully changed");
 }
 
@@ -313,7 +368,13 @@ static void handle_cdup(struct ftp_session *s) {
         send_resp(s->ctrl_fd, 550, "Failed to change directory");
         return;
     }
-    snprintf(s->cwd, sizeof(s->cwd), "%s", path);
+    int cn = snprintf(s->cwd, sizeof(s->cwd), "%s", path);
+    if (cn < 0 || (size_t)cn >= sizeof(s->cwd)) {
+        /* never keep a truncated working directory */
+        snprintf(s->cwd, sizeof(s->cwd), "%s", s->root);
+        send_resp(s->ctrl_fd, 550, "Failed to change directory");
+        return;
+    }
     send_resp(s->ctrl_fd, 250, "Directory successfully changed");
 }
 
@@ -414,8 +475,8 @@ static void send_listing(struct ftp_session *s, int names_only) {
             continue;
         }
 
-        char fullpath[512];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", s->cwd, ent->d_name);
+        char fullpath[1024 + 300];
+        if (snprintf(fullpath, sizeof(fullpath), "%s/%s", s->cwd, ent->d_name) >= (int)sizeof(fullpath)) continue;
         struct stat st;
         if (stat(fullpath, &st) != 0) continue;
         char timestr[64];
@@ -445,7 +506,7 @@ static void handle_retr(struct ftp_session *s, const char *arg) {
         send_resp(s->ctrl_fd, 501, "Filename required");
         return;
     }
-    char path[512];
+    char path[1024];
     abs_path(s, arg, path, sizeof(path));
     atomic_store(&s->abort_requested, 0);
     open_data_connection(s);
@@ -503,8 +564,12 @@ static void handle_stor(struct ftp_session *s, const char *arg) {
         send_resp(s->ctrl_fd, 501, "Filename required");
         return;
     }
-    char path[512];
+    char path[1024];
     abs_path(s, arg, path, sizeof(path));
+    if (ftp_touches_trust_store(path)) {
+        send_resp(s->ctrl_fd, 550, "Not permitted");
+        return;
+    }
     atomic_store(&s->abort_requested, 0);
     open_data_connection(s);
     if (s->data_fd < 0) {
@@ -551,12 +616,13 @@ static void handle_stor(struct ftp_session *s, const char *arg) {
         total += n;
     }
     free(buf);
-    if (!aborted) ftruncate(fd, total);
+    int trunc_err = !aborted && ftruncate(fd, total) != 0;
     close(fd);
     ftp_close_socket(&s->data_fd);
     s->data_offset = 0;
     atomic_store(&s->abort_requested, 0);
-    if (!aborted) send_resp(s->ctrl_fd, 226, "Transfer complete");
+    if (trunc_err) send_resp(s->ctrl_fd, 451, "Could not finish the file");
+    else if (!aborted) send_resp(s->ctrl_fd, 226, "Transfer complete");
 }
 
 static void handle_feat(struct ftp_session *s) {
@@ -593,8 +659,8 @@ static void handle_mlsd(struct ftp_session *s) {
     struct dirent *ent;
     char linebuf[1024];
     while ((ent = readdir(d)) != NULL) {
-        char fullpath[600];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", s->cwd, ent->d_name);
+        char fullpath[1024 + 300];
+        if (snprintf(fullpath, sizeof(fullpath), "%s/%s", s->cwd, ent->d_name) >= (int)sizeof(fullpath)) continue;
         struct stat st;
         if (stat(fullpath, &st) != 0) continue;
         char timestr[32];
@@ -633,8 +699,12 @@ static void handle_rnfr(struct ftp_session *s, const char *arg) {
         send_resp(s->ctrl_fd, 501, "Filename required");
         return;
     }
-    char path[512];
+    char path[1024];
     abs_path(s, arg, path, sizeof(path));
+    if (ftp_touches_trust_store(path)) {
+        send_resp(s->ctrl_fd, 550, "Not permitted");
+        return;
+    }
     struct stat st;
     if (stat(path, &st) != 0) {
         send_resp(s->ctrl_fd, 550, "File not found");
@@ -658,19 +728,28 @@ static void handle_rnto(struct ftp_session *s, const char *arg) {
         send_resp(s->ctrl_fd, 501, "Filename required");
         return;
     }
-    char path[512];
+    char path[1024];
     abs_path(s, arg, path, sizeof(path));
+    if (ftp_touches_trust_store(path)) {
+        send_resp(s->ctrl_fd, 550, "Not permitted");
+        return;
+    }
     /* A cross-DEVICE rename() does not return EXDEV on this kernel — it
      * panics the console. An FTP client dragging a file from /mnt/usb0
      * to /data is an ordinary thing to do, so refuse it here rather than
      * let the kernel take the machine down. 553 tells the client the
      * name was disallowed; copy-then-delete is the safe alternative and
      * every client can do it. */
-    if (xdev_rename_crosses(s->rename_path, path, xdev_stat_dev)
-        == XDEV_CROSSES) {
+    xdev_result_t xr = xdev_rename_crosses_l(s->rename_path, path, xdev_lstat_dev, xdev_stat_dev);
+    if (xr == XDEV_CROSSES) {
         s->rename_path[0] = '\0';
         send_resp(s->ctrl_fd, 553,
                   "Cannot rename across devices - copy then delete instead");
+        return;
+    }
+    if (!xdev_rename_is_safe(xr)) { /* unknown is refused: fail closed (review 007 #4) */
+        s->rename_path[0] = '\0';
+        send_resp(s->ctrl_fd, 550, "Cannot verify the destination drive");
         return;
     }
     if (rename(s->rename_path, path) != 0) {
@@ -817,7 +896,7 @@ static void handle_size(struct ftp_session *s, const char *arg) {
         send_resp(s->ctrl_fd, 501, "Filename required");
         return;
     }
-    char path[512];
+    char path[1024];
     abs_path(s, arg, path, sizeof(path));
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -835,7 +914,7 @@ static void handle_mdtm(struct ftp_session *s, const char *arg) {
         send_resp(s->ctrl_fd, 501, "Filename required");
         return;
     }
-    char path[512];
+    char path[1024];
     abs_path(s, arg, path, sizeof(path));
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -864,8 +943,12 @@ static void handle_mkd(struct ftp_session *s, const char *arg) {
         send_resp(s->ctrl_fd, 501, "Directory name required");
         return;
     }
-    char path[512];
+    char path[1024];
     abs_path(s, arg, path, sizeof(path));
+    if (ftp_touches_trust_store(path)) {
+        send_resp(s->ctrl_fd, 550, "Not permitted");
+        return;
+    }
     if (mkdir(path, 0755) != 0) {
         send_resp(s->ctrl_fd, 550, "Failed to create directory");
         return;
@@ -883,8 +966,12 @@ static void handle_dele(struct ftp_session *s, const char *arg) {
         send_resp(s->ctrl_fd, 501, "Filename required");
         return;
     }
-    char path[512];
+    char path[1024];
     abs_path(s, arg, path, sizeof(path));
+    if (ftp_touches_trust_store(path)) {
+        send_resp(s->ctrl_fd, 550, "Not permitted");
+        return;
+    }
     if (unlink(path) != 0) {
         send_resp(s->ctrl_fd, 550, "Failed to delete file");
         return;
@@ -902,8 +989,12 @@ static void handle_rmd(struct ftp_session *s, const char *arg) {
         send_resp(s->ctrl_fd, 501, "Directory name required");
         return;
     }
-    char path[512];
+    char path[1024];
     abs_path(s, arg, path, sizeof(path));
+    if (ftp_touches_trust_store(path)) {
+        send_resp(s->ctrl_fd, 550, "Not permitted");
+        return;
+    }
     if (rmdir(path) != 0) {
         send_resp(s->ctrl_fd, 550, "Failed to remove directory");
         return;

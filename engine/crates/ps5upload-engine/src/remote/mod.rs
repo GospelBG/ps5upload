@@ -5,8 +5,6 @@
 //! in-app browser, positioned reads for streaming installs and uploads, and whole-file copies for
 //! the jobs that need the bytes on this computer.
 
-#![allow(dead_code)] // Consumers arrive in later steps of the remote-sources plan.
-
 pub mod api;
 #[cfg(test)]
 pub(crate) mod contract;
@@ -22,9 +20,13 @@ pub mod smb_fs;
 pub mod source_fs;
 pub mod store;
 
+#[cfg(test)]
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
 use serde::Serialize;
 
@@ -64,12 +66,14 @@ pub enum RemoteError {
     HostKey { fingerprint: String, changed: bool },
 }
 
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use future
 #[async_trait::async_trait]
 pub trait RemoteFile: Send + Sync {
     fn size(&self) -> u64;
     async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, RemoteError>;
 }
 
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use future
 #[async_trait::async_trait]
 pub trait RemoteFs: Send + Sync {
     async fn list(&self, path: &str, cursor: Option<String>) -> Result<Page, RemoteError>;
@@ -79,18 +83,23 @@ pub trait RemoteFs: Send + Sync {
     async fn walk(&self, path: &str, limit: usize) -> Result<Vec<(String, Entry)>, RemoteError>;
 }
 
+#[cfg(test)]
 /// An in-memory tree standing in for a server in tests. Directories are implied by file paths.
 pub(crate) struct MemFs {
     files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    /// Modification times by path; a path with none reports `None`, like a protocol that has none.
+    mtimes: Arc<Mutex<BTreeMap<String, i64>>>,
     fail_reads: Arc<AtomicUsize>,
     fail_lists: AtomicUsize,
 }
 
+#[cfg(test)]
 impl MemFs {
     pub fn new(files: &[(&str, &[u8])]) -> Self {
         let map = files.iter().map(|(p, b)| (normal(p), b.to_vec())).collect();
         Self {
             files: Arc::new(Mutex::new(map)),
+            mtimes: Arc::default(),
             fail_reads: Arc::new(AtomicUsize::new(0)),
             fail_lists: AtomicUsize::new(0),
         }
@@ -105,11 +114,22 @@ impl MemFs {
         }
     }
 
+    /// Gives `path` a modification time (seconds since the epoch).
+    #[cfg(test)]
+    pub fn set_mtime(&self, path: &str, t: i64) {
+        self.mtimes.lock().unwrap().insert(normal(path), t);
+    }
+
+    fn mtime_of(&self, p: &str) -> Option<i64> {
+        self.mtimes.lock().unwrap().get(p).copied()
+    }
+
     /// A handle on the same tree, for adding files once this one is owned elsewhere.
     #[cfg(test)]
     pub fn share(&self) -> Self {
         Self {
             files: Arc::clone(&self.files),
+            mtimes: Arc::clone(&self.mtimes),
             fail_reads: Arc::new(AtomicUsize::new(0)),
             fail_lists: AtomicUsize::new(0),
         }
@@ -120,6 +140,7 @@ impl MemFs {
         self.fail_lists.store(n, Ordering::SeqCst);
     }
 
+    #[allow(deprecated)] // fetch_update is the pre-1.99 spelling of try_update
     fn list_fails(&self) -> bool {
         self.fail_lists
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -160,7 +181,7 @@ impl MemFs {
                             name: rest.to_string(),
                             is_dir: false,
                             size: b.len() as u64,
-                            mtime: None,
+                            mtime: self.mtime_of(p),
                         },
                     );
                 }
@@ -174,6 +195,7 @@ impl MemFs {
     }
 }
 
+#[cfg(test)]
 fn normal(p: &str) -> String {
     let segs: Vec<&str> = p
         .split('/')
@@ -182,16 +204,19 @@ fn normal(p: &str) -> String {
     format!("/{}", segs.join("/"))
 }
 
+#[cfg(test)]
 struct MemFile {
     bytes: Vec<u8>,
     fail_reads: Arc<AtomicUsize>,
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl RemoteFile for MemFile {
     fn size(&self) -> u64 {
         self.bytes.len() as u64
     }
+    #[allow(deprecated)] // fetch_update is the pre-1.99 spelling of try_update
     async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, RemoteError> {
         if self
             .fail_reads
@@ -206,6 +231,7 @@ impl RemoteFile for MemFile {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl RemoteFs for MemFs {
     async fn list(&self, path: &str, cursor: Option<String>) -> Result<Page, RemoteError> {
@@ -233,7 +259,7 @@ impl RemoteFs for MemFs {
                 name,
                 is_dir: false,
                 size: b.len() as u64,
-                mtime: None,
+                mtime: self.mtime_of(&p),
             });
         }
         if self.is_dir(&p) {

@@ -24,20 +24,33 @@ services:
 
     environment:
       # EDIT: your PS5's IP address.
-      PS5_ADDR: "192.168.1.50:9113"
+      PS5_ADDR: "192.168.1.50"
       # EDIT: who may use the engine. It has NO password — anyone allowed here
       # can install, delete and read files on your PS5. Your LAN's range is the
       # usual choice; keep it to networks you trust. Never expose the engine
       # to the internet.
       PS5UPLOAD_ALLOW_IP: "192.168.1.0/24"
+      # Where the web UI's file browser opens. Without this it starts at the
+      # engine's home directory (/data), not at your packages below.
+      # Comma-separate the value to offer more than one root.
+      PS5UPLOAD_BROWSE_ROOTS: "/pkgs"
       # Only needed without host networking: this server's LAN IP.
       # PS5UPLOAD_PKG_HOST_IP: "192.168.1.10"
+
+    # Synology and other NAS boxes: the container runs as UID 65532 unless told
+    # otherwise, and your bind mount is owned by someone else. Pick ONE:
+    #   - run as the folder's owner: `user: "1234:77777"` (see `ls -ln` on the
+    #     host folder), or
+    #   - `chown -R 65532:65532 /volume1/docker/ps5upload/data` on the host.
+    # (A USER_ID/GROUP_ID environment variable is not read by these images.)
+    # user: "1234:77777"
 
     volumes:
       # The engine's own state: saved servers, install history, artwork cache.
       - ps5upload-data:/data
-      # EDIT: where your packages and game folders are. They show up in the
-      # web UI's file browser under /pkgs; read-only is enough to install.
+      # EDIT: where your packages and game folders are. The web UI's file
+      # browser opens here (see PS5UPLOAD_BROWSE_ROOTS above); read-only is
+      # enough to install.
       - /srv/ps5/pkgs:/pkgs:ro
 
 volumes:

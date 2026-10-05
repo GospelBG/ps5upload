@@ -6,6 +6,8 @@
  * and copies each file back to its original path. */
 
 #include "backup.h"
+#include "fs_jobs.h"
+#include "mgmt_rpc.h" /* mgmt_op_cancelled / mgmt_op_progress: no-ops outside a job.run operation */
 #include "runtime.h"
 
 #include <ctype.h>
@@ -48,6 +50,18 @@ static int mkpath_p(const char *path) {
     return mkdir(tmp, 0755);
 }
 
+static int bk_cancelled(void *arg) {
+    (void)arg;
+    return mgmt_op_cancelled();
+}
+static void bk_block(void *arg, uint64_t bytes) {
+    (void)arg;
+    mgmt_op_progress(0, bytes);
+}
+
+/* 0, -1, or BACKUP_CANCELLED. The destination is written through a temporary file in its own
+ * folder and renamed into place only when complete (fsjobs.c fsj_copy_atomic): a restore that
+ * fails or is cancelled halfway leaves the user's live file as it was, never truncated. */
 static int copy_file(const char *src, const char *dst) {
     /* Defense-in-depth: every write destination must be inside the
      * writable-roots allowlist. The restore path already validates the
@@ -55,13 +69,6 @@ static int copy_file(const char *src, const char *dst) {
      * any future caller that forgets. Backup snapshot dirs are always
      * under /data/ps5upload/backups/ which passes is_path_allowed. */
     if (!is_path_allowed(dst)) return -1;
-    int sfd = open(src, O_RDONLY);
-    if (sfd < 0) return -1;
-    struct stat st;
-    if (fstat(sfd, &st) != 0) {
-        close(sfd);
-        return -1;
-    }
     char parent[1024];
     snprintf(parent, sizeof(parent), "%s", dst);
     char *slash = strrchr(parent, '/');
@@ -69,36 +76,9 @@ static int copy_file(const char *src, const char *dst) {
         *slash = 0;
         mkpath_p(parent);
     }
-    int dfd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (dfd < 0) {
-        close(sfd);
-        return -1;
-    }
-    char buf[64 * 1024];
-    ssize_t n;
-    while ((n = read(sfd, buf, sizeof(buf))) > 0) {
-        ssize_t off = 0;
-        while (off < n) {
-            ssize_t w = write(dfd, buf + off, n - off);
-            if (w <= 0) {
-                close(sfd);
-                close(dfd);
-                unlink(dst);
-                return -1;
-            }
-            off += w;
-        }
-    }
-    fsync(dfd);
-    close(sfd);
-    close(dfd);
-    struct timespec times[2];
-    times[0].tv_sec = st.st_atime;
-    times[0].tv_nsec = 0;
-    times[1].tv_sec = st.st_mtime;
-    times[1].tv_nsec = 0;
-    utimensat(AT_FDCWD, dst, times, 0);
-    return 0;
+    fsj_hooks_t h = { bk_cancelled, bk_block, NULL, NULL };
+    int rc = fsj_copy_atomic(src, dst, &h);
+    return rc == -2 ? BACKUP_CANCELLED : rc;
 }
 
 static const char *snapshot_dir_for(const char *tag) {
@@ -143,6 +123,7 @@ static int snapshot_tree_inner(const char *snap_dir, const char *src,
     if (!d) return -1;
     struct dirent *e;
     while ((e = readdir(d))) {
+        if (mgmt_op_cancelled()) break;
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
             continue;
         char child[1024];
@@ -162,6 +143,7 @@ static int snapshot_tree_inner(const char *snap_dir, const char *src,
             if (copy_file(child, dst) == 0) {
                 manifest_append(snap_dir, flat, child);
                 (*file_count)++;
+                mgmt_op_progress(1, 0);
             }
         }
     }
@@ -206,7 +188,19 @@ int backup_snapshot(const char *tag, const char *src_path,
         if (copy_file(src_path, dst) == 0) {
             manifest_append(snap, flat, src_path);
             file_count = 1;
+            mgmt_op_progress(1, 0);
         }
+    }
+
+    /* job.cancel arrived: a half snapshot is worse than none, so it goes, and the caller
+     * answers "cancelled" rather than "nothing to back up". */
+    if (mgmt_op_cancelled()) {
+        char tagdir[640];
+        rm_rf(snap);
+        snprintf(tagdir, sizeof(tagdir), "%s/%s", BACKUPS_ROOT, tag);
+        rmdir(tagdir);
+        pthread_mutex_unlock(&g_backup_lock);
+        return BACKUP_CANCELLED;
     }
 
     /* Compute total bytes of the snapshot dir. */
@@ -354,7 +348,15 @@ static int restore_from_manifest(const char *snap_dir, int *restored) {
         if (!is_path_allowed(original)) continue;
         char src[1024];
         snprintf(src, sizeof(src), "%s/%s", snap_dir, snap_basename);
-        if (copy_file(src, original) == 0) n++;
+        int c = copy_file(src, original);
+        if (c == 0) {
+            n++;
+            mgmt_op_progress(1, 0);
+        } else if (c == BACKUP_CANCELLED) {
+            fclose(f);
+            if (restored) *restored = n;
+            return BACKUP_CANCELLED; /* the files restored so far stay restored */
+        }
     }
     fclose(f);
     if (restored) *restored = n;

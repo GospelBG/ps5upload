@@ -1,9 +1,8 @@
-//! Power control + telemetry + user enumeration over FTX2.
+//! Power control + telemetry + user enumeration over AVA1 management.
 //!
 //! These are thin client wrappers around the new SystemControl /
 //! PowerTelemetry / UserList frames the payload added in this round.
-//! Each call opens a fresh management-port connection (caller passes
-//! the `host:9114` address), sends one frame, parses the ACK.
+//! Each call is one management call (the caller passes the console's host), parsed from its reply.
 //!
 //! Power control is treated specially: `reboot`, `shutdown`, and
 //! `standby` are destructive (the PS5's network stack tears down as
@@ -13,11 +12,10 @@
 //! for those actions — anything else would be misleading UX.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 /// Action passed to the SystemControl frame.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -66,20 +64,11 @@ pub fn system_control(addr: &str, action: PowerAction) -> Result<SystemControlAc
         },
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::SystemControl, &body)?;
-    match c.recv_frame() {
-        Ok((hdr, resp)) => {
-            let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-            if ft == FrameType::Error {
-                bail!(
-                    "payload rejected SYSTEM_CONTROL: {}",
-                    String::from_utf8_lossy(&resp)
-                );
-            }
-            if ft != FrameType::SystemControlAck {
-                bail!("expected SYSTEM_CONTROL_ACK, got {ft:?}");
-            }
+    // A destructive action may tear the console's network down; the payload replies first and acts
+    // ~0.4 s later (handle_system_control defers it under the management dispatcher), but a lost reply
+    // is still success for those three, as it always was. A refusal by the payload is an error.
+    match mgmt::call_keep(addr, m::POWER_CONTROL, "SYSTEM_CONTROL", &body) {
+        Ok(resp) => {
             match serde_json::from_slice::<SystemControlAck>(&resp) {
                 Ok(parsed) => {
                     if !parsed.ok {
@@ -122,10 +111,19 @@ pub fn system_control(addr: &str, action: PowerAction) -> Result<SystemControlAc
             }
         }
         Err(e) => {
-            // Destructive actions intentionally sever the connection.
-            // The payload sends the ACK first, but the kernel may RST
-            // before the ACK frame leaves the wire. Treat "send
-            // succeeded + read failed" as success for those actions.
+            // The console refusing the call is not a dropped connection.
+            if e.downcast_ref::<mgmt::MgmtError>().is_some() {
+                return Err(e);
+            }
+            // Nor is a command that never left the desktop: the engine was unreachable or
+            // refused the hop, so nothing was sent to the console.
+            if e.downcast_ref::<crate::mgmt_proxy::ForwardError>()
+                .is_some()
+            {
+                return Err(e);
+            }
+            // Destructive actions intentionally sever the connection: "request sent + reply lost"
+            // is success for those actions.
             match action {
                 PowerAction::Reboot | PowerAction::Shutdown | PowerAction::Standby => {
                     Ok(SystemControlAck {
@@ -183,19 +181,7 @@ pub struct PowerTelemetry {
 /// Fetch the PS5's lifetime power telemetry. Cheap — three ICC calls
 /// on the payload side, no kernel R/W needed.
 pub fn power_telemetry(addr: &str) -> Result<PowerTelemetry> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::PowerTelemetry, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected POWER_TELEMETRY: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::PowerTelemetryAck {
-        bail!("expected POWER_TELEMETRY_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::POWER_TELEMETRY, "POWER_TELEMETRY", &[])?;
     Ok(parse_power_telemetry(&resp))
 }
 

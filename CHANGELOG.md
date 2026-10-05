@@ -4,6 +4,64 @@ What's new in ps5upload, written for humans.
 
 ---
 
+## 6.1.0
+
+**Files works like FileZilla.**
+
+- **Files:** add whole folders, drag files and folders in from your computer, right-click
+  any item (open, download, cut, copy, paste into, rename, copy path, delete), keyboard
+  shortcuts, sort by name, size or date, and type a path to jump to it.
+- **One console at a time:** the upload queue and Activity show only the selected console.
+- **Re-pairing:** a console that got a new identity opens the "forget and re-pair" dialog
+  instead of retrying for 20 seconds.
+- **Fixed:** a resumed zip download from the console could fail on a file that was already
+  complete; a connection could drop right after it was made on a busy console; a stopped
+  console-to-console copy could leave work running in the background.
+
+---
+
+## 6.0.0
+
+**One encrypted connection for everything (AVA1).**
+
+**Update the app and the helper together.** 6.0 uses a new protocol, AVA1, on one port: **9120**.
+Ports 9113 and 9114 are gone, so allow only **9120** and **9021** (your ELF loader) in a
+firewall. A 6.0 app cannot use a v5.41 helper (or the reverse); the app offers **Update the
+helper** and replaces an old one in one click.
+
+- **Pairing:** a helper the app launched pairs by itself; otherwise confirm the 6-digit code
+  shown on the console once.
+- **Uploads resume** after a dropped connection, a helper restart or rest mode, from what is
+  already on the console.
+- **Out of space is said up front:** a job that will not fit is refused in seconds, and a retry
+  counts what is already there (#365).
+- **Convert reads games from the console** without ftpsrv (#351).
+- **7z and RAR uploads resume;** a multi-package RAR installs base, then patch, then DLC.
+- **Links:** a link that serves a .pkg installs, and any other file can be downloaded to a console folder.
+- **Progress and cancel** for copy, paste and Add files; the web UI keeps an upload running when
+  the tab closes.
+- **Installs:** a package the PS5 refuses from its own storage offers **Retry with Stream**.
+- **Fixed:** cheats toggling and names (#373), fan curve at 100% (#354), Windows sleep after a
+  transfer (#360), Windows installer updates (#348), game files offered as packages (#349),
+  Docker "Permission denied" (#361), fpkg output path (#364), macOS 11 white screen (#352),
+  payload build for FW 13.60 (#341).
+- **Removed:** the "Parallel upload streams" setting; AVA1 picks lanes itself.
+- **Thanks** to mrnpc336 (Persian), GriefNorth (NixOS docs), nopoz (`PS5UPLOAD_BROWSE_ROOTS`),
+  intelp917-crypto (queue size chip) and lowbit (#360).
+
+| Measured on two PS5s, gigabit | 6.0 | 5.41 |
+|---|---|---|
+| 4 GiB file, internal SSD | 105-108 MB/s | 108-111 MB/s |
+| Real game, 7 GiB, 1,018 files | **108 MB/s** | 88 MB/s |
+| Resume after helper killed | **94-97 MB/s** | 66-68 MB/s |
+| 2,000 tiny files to USB | **446 files/s** | 330 files/s |
+| 2,000 tiny files to internal SSD | 192-235 files/s | 260-327 files/s |
+
+**Environment variables:** `FTX2_*` settings are now `PS5UPLOAD_*` (old names work for this release only).
+
+**Known limitations:** tiny files to the internal SSD are slower than 5.41; the compressed zip
+download cannot resume.
+
 ## 5.41.0
 
 **Installs that the PS5 used to decline now go through.** On FW 13.60 the

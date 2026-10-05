@@ -8,13 +8,12 @@
 //! `smp_meta_stats` periodically to render the panel.
 //!
 //! All RPCs are synchronous and use a single round-trip on the
-//! mgmt-port FTX2 channel (Connection::connect).
+//! AVA1 management channel (`crate::mgmt`).
 
-use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmpMetaControlRequest {
@@ -64,35 +63,11 @@ pub struct SmpMetaStats {
 
 pub fn smp_meta_control(addr: &str, req: &SmpMetaControlRequest) -> Result<SmpMetaControlAck> {
     let body = serde_json::to_vec(req)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::SmpMetaControl, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected SMP_META_CONTROL: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::SmpMetaControlAck {
-        bail!("expected SMP_META_CONTROL_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::SMP_META_CONTROL, "SMP_META_CONTROL", &body)?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
 pub fn smp_meta_stats(addr: &str) -> Result<SmpMetaStats> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::SmpMetaStats, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected SMP_META_STATS: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::SmpMetaStatsAck {
-        bail!("expected SMP_META_STATS_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::SMP_META_STATS, "SMP_META_STATS", &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }

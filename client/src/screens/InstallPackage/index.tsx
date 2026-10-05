@@ -50,6 +50,8 @@ import {
   Toggle,
 } from "../../components";
 import { BrowseButton } from "../../components/BrowseButton";
+import { FakeGameFirmwareNotice } from "../../components/FakeGameFirmwareNotice";
+import { DOC_ANCHORS, faqLink, installErrorLink } from "../../lib/installErrorDoc";
 import { openInFileSystem } from "../../state/fsNavigation";
 import { useConfirm } from "../../components/ConfirmDialog";
 import { useConnectionStore } from "../../state/connection";
@@ -66,9 +68,11 @@ import {
   recordPkgAlternativeSelection,
   skipPkgAlternativeSelection,
   PKG_ALTERNATIVE_SKIP,
+  stagedRefusedMessage,
   type PkgEntry,
   type PkgAlternativeSelections,
 } from "../../state/pkgLibrary";
+import { NetworkFixActions } from "./NetworkFixActions";
 import { useLinkInstallPrefs } from "../../state/linkInstallPrefs";
 import { useInstallSettingsStore } from "../../state/installSettings";
 import { pkgCategoryLabel, isAddonCategory } from "../../lib/pkgStagingPath";
@@ -82,6 +86,9 @@ import {
   type InstalledPkgArtifact,
 } from "../../api/ps5";
 import { transferAddr, hostOf } from "../../lib/addr";
+import { linkProbe, type LinkClass } from "../../api/links";
+import { LinkDownloadCard } from "./LinkDownloadCard";
+import { RarPackagesCard } from "./RarPackagesCard";
 import { formatBytes, formatDuration } from "../../lib/format";
 import { remainingSeconds } from "../../lib/rollingRate";
 import { acceptPkgDrop, isInstallPackagePath } from "../../lib/pkgDropDedupe";
@@ -107,6 +114,7 @@ function PkgRow({
   selectedForInstallAll,
   onSelectAlternative,
   onInstall,
+  onRetryStream,
   onDelete,
   onView,
 }: {
@@ -119,12 +127,19 @@ function PkgRow({
   selectedForInstallAll?: boolean;
   onSelectAlternative?: () => void;
   onInstall: () => void;
+  /** Re-run a refused package through Stream (shown only when the engine offers it). */
+  onRetryStream?: () => void;
   onDelete: () => void;
   /** Open the package viewer on this row's original file (when known). */
   onView?: () => void;
 }) {
   const tr = useTr();
   const navigate = useNavigate();
+  const kernel = useConnectionStore((s) => s.runtimeByHost[hostOf(host)]?.ps5Kernel ?? null);
+  // After the console refused this package from its own storage the staged route is not offered
+  // again; Retry goes through Stream when the engine says that is safe for this package.
+  const stagedRefused = !!entry.lastResult?.stagedRefused;
+  const streamOffered = !!entry.lastResult?.retryWithStream && !!onRetryStream;
   const uploading = entry.status === "uploading";
   const installingThis = entry.status === "installing";
   const queued = entry.status === "queued";
@@ -356,27 +371,58 @@ function PkgRow({
         {/* Actions */}
         {!busy && (
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
-            <Button
-              variant={installed ? "secondary" : "primary"}
-              size="sm"
-              leftIcon={
-                installed ? <RotateCcw size={13} /> : <Download size={13} />
-              }
-              onClick={onInstall}
-              disabled={installDisabled}
-              title={
-                installDisabled
-                  ? tr(
-                      "pkglib.install.busyHint",
-                      "Installing replaces the PS5 payload, which would interrupt an active upload. Wait for the current upload (or install) to finish first.",
-                    )
-                  : undefined
-              }
-            >
-              {installed
-                ? tr("pkglib.reinstall", "Reinstall")
-                : tr("pkglib.install", "Install")}
-            </Button>
+            {stagedRefused ? (
+              // The console refused this package from its own storage. The button that would
+              // repeat that is replaced: Retry switches the route to Stream, or says why it can't.
+              streamOffered ? (
+                <Button
+                  variant="primary"
+                  size="sm"
+                  leftIcon={<Download size={13} />}
+                  onClick={onRetryStream}
+                  disabled={installDisabled}
+                  title={tr(
+                    "pkglib.retry_stream_hint",
+                    undefined,
+                    "Send this package from the PS5's own storage through Stream instead. The PS5 refused it the other way (0x80b2116f); the package is not copied again.",
+                  )}
+                >
+                  {tr("pkglib.retry_stream", undefined, "Retry with Stream")}
+                </Button>
+              ) : (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  leftIcon={<Download size={13} />}
+                  disabled
+                  title={stagedRefusedMessage(false)}
+                >
+                  {tr("pkglib.retry_unavailable", undefined, "Retry unavailable")}
+                </Button>
+              )
+            ) : (
+              <Button
+                variant={installed ? "secondary" : "primary"}
+                size="sm"
+                leftIcon={
+                  installed ? <RotateCcw size={13} /> : <Download size={13} />
+                }
+                onClick={onInstall}
+                disabled={installDisabled}
+                title={
+                  installDisabled
+                    ? tr(
+                        "pkglib.install.busyHint",
+                        "Installing replaces the PS5 payload, which would interrupt an active upload. Wait for the current upload (or install) to finish first.",
+                      )
+                    : undefined
+                }
+              >
+                {installed
+                  ? tr("pkglib.reinstall", "Reinstall")
+                  : tr("pkglib.install", "Install")}
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="sm"
@@ -504,8 +550,40 @@ function PkgRow({
           ) : (
             <XCircle size={13} className="mt-px shrink-0" />
           )}
-          <span>{entry.lastResult.message}</span>
+          <span>
+            {entry.lastResult.message}
+            {(!entry.lastResult.ok || entry.lastResult.warn) && (
+              <button
+                type="button"
+                className="ml-1.5 underline underline-offset-2"
+                onClick={() =>
+                  navigate(
+                    entry.lastResult!.ok
+                      ? faqLink(DOC_ANCHORS.wontLaunch)
+                      : installErrorLink(entry.lastResult!.message),
+                  )
+                }
+              >
+                {entry.lastResult.ok
+                  ? tr("install_help_wont_launch", undefined, "Game won't launch?")
+                  : tr("install_help_what_means", undefined, "What does this mean?")}
+              </button>
+            )}
+          </span>
         </div>
+      )}
+      {/* Windows: the console could not reach this computer, and the engine knows why. */}
+      {!busy && !entry.lastResult?.ok && entry.lastResult?.netDiag && (
+        <NetworkFixActions diag={entry.lastResult.netDiag} />
+      )}
+      {/* A fake PS5 GAME on firmware above 11.60 installs but cannot be
+          played. Not shown for a retail-signed package, PS4, or homebrew. */}
+      {!installed && entry.authenticity !== "retail" && (
+        <FakeGameFirmwareNotice
+          compact
+          kernel={kernel}
+          contentId={entry.contentId || entry.titleId}
+        />
       )}
     </li>
   );
@@ -541,6 +619,7 @@ export default function InstallPackageScreen() {
   const install = usePkgLibrary(host, (s) => s.install);
   const installAll = usePkgLibrary(host, (s) => s.installAll);
   const installStream = usePkgLibrary(host, (s) => s.installStream);
+  const retryWithStream = usePkgLibrary(host, (s) => s.retryWithStream);
   // How this console should fetch a link, remembered per host — the right
   // answer follows the link, and two consoles can sit behind different ones.
   const linkMode = useLinkInstallPrefs((s) => s.modeFor(host));
@@ -585,6 +664,9 @@ export default function InstallPackageScreen() {
   const [viewEntry, setViewEntry] = useState<PkgEntry | null>(null);
   const [picking, setPicking] = useState(false);
   const [remoteUrl, setRemoteUrl] = useState("");
+  // A link that is a real file but not a package (R4, #368): offered as a download-only.
+  const [linkDownload, setLinkDownload] = useState<{ url: string; info: LinkClass } | null>(null);
+  const [checkingLink, setCheckingLink] = useState(false);
   const [dropActive, setDropActive] = useState(false);
   const browserPkgInputRef = useRef<HTMLInputElement>(null);
   const [alternativeSelections, setAlternativeSelections] =
@@ -928,6 +1010,27 @@ export default function InstallPackageScreen() {
 
   async function handleUrlInstall() {
     setPickError(null);
+    setLinkDownload(null);
+    const link = remoteUrl.trim();
+    // Decide by what the link serves, after its redirects: a package installs, another real
+    // file is download-only, and a page / error / login / empty body is refused with the
+    // reason. The URL's spelling decides nothing (R4, #368). A probe that cannot be made
+    // (offline from here, an old engine) falls through: the install reports its own errors.
+    setCheckingLink(true);
+    const info: LinkClass | null = await linkProbe(link, linkInsecure)
+      .catch(() => null)
+      .finally(() => setCheckingLink(false));
+    if (info?.kind === "refused") {
+      setPickError(
+        info.message ??
+          tr("linkdl.refused", undefined, "That link is not a file download."),
+      );
+      return;
+    }
+    if (info?.kind === "file") {
+      setLinkDownload({ url: link, info });
+      return;
+    }
     const approved = await confirm({
       title: tr("pkglib.url.confirmTitle", "Start experimental link install?"),
       message: tr("pkglib.url.confirmBody", "This computer downloads the package from the link and feeds it to the PS5, so it must stay awake and connected until the install finishes. Reinstalling over an existing title may remove it if Sony's installer fails. Use only a trusted package URL you are authorized to install."),
@@ -935,11 +1038,12 @@ export default function InstallPackageScreen() {
       cancelLabel: tr("pkglib.stream.fallback.cancel", "Not now"),
     });
     if (!approved) return;
-    const link = remoteUrl.trim();
     const startedAt = Date.now();
     try {
       const result = await installUrl(link, host, {
         mode: linkMode,
+        // The name the link ended up with (a redirect or Content-Disposition), for the row.
+        displayName: info?.filename,
       });
       // A link that reached the queue (as itself, or as the file a
       // download-first produced) reports on its row. One that never got there
@@ -1249,6 +1353,7 @@ export default function InstallPackageScreen() {
           alternativeKey ? () => toggleAlternative(entry) : undefined
         }
         onInstall={() => void handleInstall(entry)}
+        onRetryStream={() => void retryWithStream(entry.path, host)}
         onDelete={() => void handleDelete(entry)}
         onView={() => setViewEntry(entry)}
       />
@@ -1520,11 +1625,23 @@ export default function InstallPackageScreen() {
               className="min-w-52 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-surface-1)] px-2 py-1.5 text-sm text-[var(--color-text)]"
             />
             <Button variant="secondary" size="sm" onClick={handleUrlInstall}
-              disabled={!hostReady || !remoteUrl.trim()}>
-              {tr("pkglib.url.install", "Install link")}
+              disabled={!hostReady || !remoteUrl.trim() || checkingLink}>
+              {checkingLink
+                ? tr("linkdl.checking", undefined, "Checking link…")
+                : tr("pkglib.url.install", "Install link")}
             </Button>
           </div>
         </div>
+        {linkDownload && (
+          <LinkDownloadCard
+            host={host}
+            url={linkDownload.url}
+            info={linkDownload.info}
+            insecureTls={linkInsecure}
+            onClose={() => setLinkDownload(null)}
+          />
+        )}
+        {hostReady && <RarPackagesCard host={host} />}
         {hostReady && <ExternalPackages host={host} />}
         {/* Workflow options, grouped near the top where they're set before
             adding a package (not buried under the library list). Both govern the

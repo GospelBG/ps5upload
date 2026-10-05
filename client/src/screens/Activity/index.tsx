@@ -17,6 +17,7 @@ import {
   Badge,
 } from "../../components";
 import { TaskList } from "../../components/TaskList";
+import { RunningEngineJobs } from "../../components/RunningEngineJobs";
 import { TelemetryDashboard } from "../../components/TelemetryDashboard";
 import { useConfirm } from "../../components/ConfirmDialog";
 import { useTr } from "../../state/lang";
@@ -33,6 +34,8 @@ import { useFsBulkOpStore, useFsDownloadOpStore } from "../../state/fsBulkOp";
 import { useTransferStore } from "../../state/transfer";
 import { useUploadQueueStore } from "../../state/uploadQueue";
 import { useTaskStore } from "../../state/tasks";
+import { useConnectionStore } from "../../state/connection";
+import { activityForHost } from "../../lib/activityScope";
 import { profileNameForAddr, useRosterStore } from "../../state/roster";
 import { ConsoleChip } from "../../components/ConsoleChip";
 
@@ -48,7 +51,11 @@ import { ConsoleChip } from "../../components/ConsoleChip";
  */
 export default function ActivityScreen() {
   const tr = useTr();
-  const entries = useActivityHistoryStore((s) => s.entries);
+  const allEntries = useActivityHistoryStore((s) => s.entries);
+  // The selected console's activity only (a PS5 tab is that console's workspace); entries
+  // with no console (local-only work) show under every console.
+  const activeHost = useConnectionStore((s) => s.host);
+  const entries = activityForHost(allEntries, activeHost);
   const clear = useActivityHistoryStore((s) => s.clear);
   const clearRunning = useActivityHistoryStore((s) => s.clearRunning);
   const taskCount = useTaskStore((s) => s.tasks.length);
@@ -170,6 +177,7 @@ export default function ActivityScreen() {
       {/* The unified task projection and legacy operation history are separate
           views. Stacking both produced duplicate rows for the same upload and
           made it unclear which controls were authoritative. */}
+      {view === "tasks" && <RunningEngineJobs />}
       {view === "tasks" && <TaskList />}
       {view === "tasks" && taskCount === 0 && (
         <EmptyState

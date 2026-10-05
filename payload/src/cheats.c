@@ -15,10 +15,11 @@
  *     redeploy.
  *
  * Ported from elf-arsenal/src/cheats.c, adapted to ps5upload's ptrace
- * infrastructure (ptrace_remote.c) and FTX2 frame protocol.
+ * infrastructure (ptrace_remote.c) and management protocol.
  */
 
 #include "cheats.h"
+#include "cheats_list.h"
 #include "notif.h"
 
 #include <ps5/kernel.h>
@@ -251,20 +252,36 @@ static void jb_init(jbuf_t *jb, char *buf, size_t cap) {
 
 static void jb_str(jbuf_t *jb, const char *s) {
     if (!s) return;
-    for (; *s && jb->off + 2 < jb->cap; s++) {
+    while (*s && jb->off + 2 < jb->cap) {
         char c = *s;
         if (c == '"' || c == '\\') {
             if (jb->off + 3 >= jb->cap) break;
             jb->buf[jb->off++] = '\\';
             jb->buf[jb->off++] = c;
+            s++;
         } else if (c == '\n') {
             if (jb->off + 3 >= jb->cap) break;
             jb->buf[jb->off++] = '\\';
             jb->buf[jb->off++] = 'n';
+            s++;
         } else if ((unsigned char)c < 0x20) {
-            continue;
-        } else {
+            s++;
+        } else if ((unsigned char)c < 0x80) {
             jb->buf[jb->off++] = c;
+            s++;
+        } else {
+            /* A non-ASCII byte must start a valid UTF-8 character, or the whole reply fails to
+             * parse on the engine (Latin-1 / Shift-JIS names; a name cut mid-character). */
+            int n = cheats_utf8_char_len(s);
+            if (n == 0) {
+                jb->buf[jb->off++] = '?';
+                s++;
+            } else {
+                if (jb->off + (size_t)n + 2 >= jb->cap) break;
+                memcpy(jb->buf + jb->off, s, (size_t)n);
+                jb->off += (size_t)n;
+                s += n;
+            }
         }
     }
     jb->buf[jb->off] = '\0';
@@ -917,8 +934,12 @@ static int mc4_base64_decode(const char *in, size_t in_len, uint8_t *out, size_t
         unsigned char c = (unsigned char)in[i];
         if (c == '=' ) break;
         if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+        /* T[] is zero for every unlisted byte, so membership is checked
+         * against the alphabet; otherwise garbage decoded as 'A'. */
+        /* strchr matches the terminator, so a NUL byte must be refused explicitly. */
+        if (c == 0 || !strchr("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", c))
+            return -1;
         int8_t v = T[c];
-        if (v < 0 && c != 'A') return -1; /* 'A' legitimately maps to 0 */
         acc = (acc << 6) | (uint32_t)v;
         bits += 6;
         if (bits >= 8) {
@@ -957,6 +978,11 @@ static int parse_mc4_file(const char *encoded, size_t enc_len, cheat_file_t *cf)
      * it before handing off to the ASCII-oriented SHN parser. */
     size_t clen = 0;
     char *conv = xml_to_utf8(xml, (size_t)bin_len, &clen);
+    /* Real MC4 plaintext is entity/backslash-escaped XML ("&lt;Trainer
+     * Game=\&quot;..."). Without unescaping it the parser sees no tags and
+     * every MC4 file lists zero cheats (R16, #373). */
+    if (conv) clen = xml_unescape_entities(conv, clen);
+    else      bin_len = (int)xml_unescape_entities(xml, (size_t)bin_len);
     int rc = conv ? parse_shn_file(conv, clen, cf)
                   : parse_shn_file(xml, (size_t)bin_len, cf);
     free(conv);
@@ -1015,7 +1041,7 @@ static void state_path(const char *title_id, char *out, size_t cap) {
 }
 
 /* Load enabled state from sidecar. Updates cf->mods[].enabled. */
-static void load_state(const char *title_id, cheat_file_t *cf) {
+static void cheats_load_state(const char *title_id, cheat_file_t *cf) {
     char path[MAX_CHEAT_FILEPATH];
     state_path(title_id, path, sizeof(path));
     int fd = open(path, O_RDONLY);
@@ -1257,7 +1283,7 @@ static int reapply_enabled_for_game(pid_t pid, intptr_t base,
             free(cf);
             continue;
         }
-        load_state(title_id, cf);
+        cheats_load_state(title_id, cf);
 
         int has_enabled = 0;
         for (int m = 0; m < cf->mod_count; m++) {
@@ -1337,7 +1363,7 @@ static void *watcher_thread(void *arg) {
             snprintf(msg, sizeof(msg), "%d cheat%s applied to %s",
                      applied, applied == 1 ? "" : "s",
                      game_name[0] ? game_name : title);
-            notif_send(msg, NOTIF_LEVEL_INFO);
+            notif_send_serialised(msg, NOTIF_LEVEL_INFO);
         }
     }
     return NULL;
@@ -1378,51 +1404,26 @@ void cheats_init(void) {
 
 /* ── Engine flag ─────────────────────────────────────────────────── */
 
-int cheats_engine_enabled(void) {
-    return atomic_load(&g_engine_enabled);
-}
-
 void cheats_engine_set_enabled(int on) {
     atomic_store(&g_engine_enabled, on ? 1 : 0);
-}
-
-int cheats_patches_last_mod_count(void) {
-    return atomic_load(&g_patches_last);
-}
-
-int cheats_patches_total_writes(void) {
-    return atomic_load(&g_patches_total);
 }
 
 /* ── Public API implementations ──────────────────────────────────── */
 
 /* List all titles that have cheat files. */
-/* Pull the target game version out of a cheat filename, mirroring the
- * client's parse: strip the extension, split on '_', and take the second
- * segment when it looks like a version (digits and dots, at least one dot).
- * `CUSA25234_01.08.shn` -> "01.08", `CUSA00018_01.21_default.elf.json` ->
- * "01.21". Leaves `out` empty for names that carry no version. */
-static void extract_cheat_version(const char *filename, char *out, size_t cap) {
-    if (cap) out[0] = '\0';
-    const char *dot = strrchr(filename, '.');
-    size_t stem_len = dot ? (size_t)(dot - filename) : strlen(filename);
-    const char *us = memchr(filename, '_', stem_len);
-    if (!us) return;
-    const char *v = us + 1;
-    const char *stem_end = filename + stem_len;
-    const char *vend = v;
-    while (vend < stem_end && *vend != '_') vend++;
-    size_t vlen = (size_t)(vend - v);
-    if (vlen == 0 || vlen >= cap) return;
-    int has_dot = 0;
-    for (size_t i = 0; i < vlen; i++) {
-        char c = v[i];
-        if (c == '.') has_dot = 1;
-        else if (c < '0' || c > '9') return; /* not a version segment */
+/* The list's per-file reader: the game's own name and the number of mods. The caches in
+ * cheats_list.c call this only when a file's mtime or size changed. */
+static int list_load_file(const char *path, int format, char *name, size_t name_cap,
+                          int *mod_count) {
+    cheat_file_t *cf = (cheat_file_t *)malloc(sizeof(cheat_file_t));
+    if (!cf) return -1;
+    int rc = load_cheat_file(path, format, cf);
+    if (rc == 0) {
+        snprintf(name, name_cap, "%s", cf->game_name);
+        *mod_count = cf->mod_count;
     }
-    if (!has_dot) return;
-    memcpy(out, v, vlen);
-    out[vlen] = '\0';
+    free(cf);
+    return rc;
 }
 
 int cheats_list_titles(char *buf, size_t cap, size_t *written) {
@@ -1432,68 +1433,17 @@ int cheats_list_titles(char *buf, size_t cap, size_t *written) {
     intptr_t rg_base = 0;
     pid_t rg_pid = get_running_game_cached(rg_title, sizeof(rg_title), &rg_base);
 
-    jbuf_t jb;
-    jb_init(&jb, buf, cap);
-
-    jb_raw(&jb, "{\"titles\":[");
-
-    const char *dirs[] = {CHEATS_JSON_DIR, CHEATS_SHN_DIR, CHEATS_MC4_DIR};
-    int first = 1;
-    char seen_titles[256][MAX_TITLE_ID];
-    int seen_count = 0;
-
-    for (int d = 0; d < 3; d++) {
-        DIR *dir = opendir(dirs[d]);
-        if (!dir) continue;
-        struct dirent *de;
-        while ((de = readdir(dir))) {
-            if (de->d_name[0] == '.') continue;
-
-            /* Extract title_id from filename (up to first . or _) */
-            char title[MAX_TITLE_ID] = "";
-            size_t i = 0;
-            while (de->d_name[i] && de->d_name[i] != '.' &&
-                   de->d_name[i] != '_' && i < sizeof(title) - 1) {
-                title[i] = de->d_name[i];
-                i++;
-            }
-            title[i] = '\0';
-            if (i < 4) continue;  /* too short to be a real title id */
-
-            /* Check if we already listed this title */
-            int dup = 0;
-            for (int s = 0; s < seen_count; s++) {
-                if (strcasecmp(seen_titles[s], title) == 0) {
-                    dup = 1;
-                    break;
-                }
-            }
-            if (dup) continue;
-            if (seen_count < 256) {
-                snprintf(seen_titles[seen_count++], MAX_TITLE_ID, "%s", title);
-            }
-
-            int is_running = (rg_pid > 0 &&
-                              strcasecmp(rg_title, title) == 0);
-
-            char version[32] = "";
-            extract_cheat_version(de->d_name, version, sizeof(version));
-
-            if (!first) jb_raw(&jb, ",");
-            JB_PRINTF(&jb,
-                      "{\"title_id\":\"%s\",\"name\":\"%s\",\"version\":\"%s\",\"running\":%s}",
-                      title, title, version,
-                      is_running ? "true" : "false");
-            first = 0;
-        }
-        closedir(dir);
-    }
-
-    JB_PRINTF(&jb, "],\"game_running\":%s,\"game_title_id\":\"%s\"}",
-              rg_pid > 0 ? "true" : "false", rg_title);
-
-    if (written) *written = jb.off;
-    return 0;
+    cheats_list_cfg_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.dirs[0] = CHEATS_JSON_DIR;
+    cfg.dirs[1] = CHEATS_SHN_DIR;
+    cfg.dirs[2] = CHEATS_MC4_DIR;
+    cfg.state_dir = CHEATS_STATE_DIR;
+    cfg.load = list_load_file;
+    cfg.usable_name = is_usable_game_name;
+    cfg.running_title = rg_title;
+    cfg.running = rg_pid > 0;
+    return cheats_list_build(&cfg, buf, cap, written);
 }
 
 /* List all mods for a title. */
@@ -1529,7 +1479,7 @@ int cheats_list_mods(const char *title_id, char *buf, size_t cap,
             free(cf);
             continue;
         }
-        load_state(title_id, cf);
+        cheats_load_state(title_id, cf);
 
         for (int mi = 0; mi < cf->mod_count; mi++) {
             cheat_mod_t *m = &cf->mods[mi];
@@ -1571,8 +1521,8 @@ int cheats_toggle(const char *title_id, int mod_index, int turn_on,
     int n = find_cheat_files(title_id, files, 16, 0);
     if (n == 0) {
         if (err) snprintf(err, err_cap,
-                          "no cheat file for %s. Drop a .json/.shn into "
-                          CHEATS_JSON_DIR " or " CHEATS_SHN_DIR,
+                          "no cheat file for %s. Drop a .json/.shn/.mc4 into "
+                          CHEATS_ROOT,
                           title_id);
         return -1;
     }
@@ -1676,7 +1626,7 @@ int cheats_toggle(const char *title_id, int mod_index, int turn_on,
         } else {
             snprintf(msg, sizeof(msg), "%s %s", label, turn_on ? "on" : "off");
         }
-        notif_send(msg, NOTIF_LEVEL_INFO);
+        notif_send_serialised(msg, NOTIF_LEVEL_INFO);
     }
 
     free(target_cf);
@@ -1744,7 +1694,7 @@ int cheats_reload(char *err, size_t err_cap) {
         snprintf(msg, sizeof(msg), "No cheats enabled for %s",
                  game_name[0] ? game_name : title);
     }
-    notif_send(msg, NOTIF_LEVEL_INFO);
+    notif_send_serialised(msg, NOTIF_LEVEL_INFO);
 
     return 0;
 }

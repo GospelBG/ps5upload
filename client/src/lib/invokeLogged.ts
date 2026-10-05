@@ -9,6 +9,7 @@ import { isTauriEnv } from "./tauriEnv";
 import { browserInvoke } from "./browserInvoke";
 import { engineIsOnThisDevice } from "../state/engine";
 import { observeInvokeOutcome } from "./invokeLogDedup";
+import { hostFromArgs, reportIfNotPaired } from "./consoleSession";
 
 /** The in-app file browser's commands. Against a remote engine they must list
  *  that engine's filesystem — the paths are handed to it — not this device's. */
@@ -95,6 +96,9 @@ export async function invoke<T>(
           : `${cmd} failed: ${msg}`,
       );
     }
+    // A console that has not accepted this app: the pairing dialog opens (once).
+    const host = hostFromArgs(args);
+    reportIfNotPaired(msg, host);
     throw e;
   }
 }

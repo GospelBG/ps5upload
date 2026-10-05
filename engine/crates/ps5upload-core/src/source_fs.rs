@@ -21,6 +21,11 @@ pub trait SourceFs: Send + Sync + std::fmt::Debug {
     fn metadata(&self, p: &Path) -> std::io::Result<SourceMeta>;
     /// Direct children of `p` as (full path, is_dir).
     fn read_dir(&self, p: &Path) -> std::io::Result<Vec<(PathBuf, bool)>>;
+    /// Modification time of `p` in seconds since the Unix epoch, when the backend can say.
+    /// `None` means unknown; callers must not guess (AVA1 falls back to a content check).
+    fn mtime(&self, _p: &Path) -> Option<u64> {
+        None
+    }
 }
 
 /// This computer's disk.
@@ -38,6 +43,12 @@ impl SourceFs for LocalFs {
             is_dir: m.is_dir(),
             is_file: m.is_file(),
         })
+    }
+    fn mtime(&self, p: &Path) -> Option<u64> {
+        let t = std::fs::metadata(p).ok()?.modified().ok()?;
+        t.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
     }
     fn read_dir(&self, p: &Path) -> std::io::Result<Vec<(PathBuf, bool)>> {
         std::fs::read_dir(p)?

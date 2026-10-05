@@ -4,8 +4,8 @@
  *
  * 1. Start a 1 GiB single-file upload with a fixed tx_id.
  * 2. Kill the engine mid-transfer (simulates a crash / hard network drop).
- * 3. Restart the engine, re-issue the SAME tx_id → payload resumes from its
- *    journaled last_acked_shard (BeginTxAck), engine sends only the remainder.
+ * 3. Restart the engine, re-issue the SAME tx_id → the payload resumes from the
+ *    progress it journaled (AVA1 job journal), and the engine sends only the remainder.
  * 4. Verify: run-2 sent < full size (proves resume, not re-send) AND the
  *    final file on the PS5 byte-matches the source (download-back sha256).
  *
@@ -23,7 +23,7 @@ const ENGINE_BIN = path.join(repoRoot, "engine", "target", "release", "ps5upload
 const ENGINE = "http://127.0.0.1:19113";
 const HOST = process.argv[2];
 if (!HOST) { console.error("usage: resume-test.mjs <ps5-ip>"); process.exit(2); }
-const ADDR = `${HOST}:9113`;
+const ADDR = HOST;
 const SRC = path.join(repoRoot, "bench", "fixtures", "huge-file", "huge-file.bin");
 const TXID = "aabbccddeeff00112233445566778899";
 const DEST = "/data/ps5upload/tests/resume/huge.bin";
@@ -98,11 +98,12 @@ async function main() {
   console.log("  run-2: re-issuing SAME tx_id (resume)...");
   const r2 = await jpost("/api/transfer/file", { src: SRC, dest: DEST, addr: ADDR, tx_id: TXID });
   if (!r2.job_id) { console.log("  ✗ run-2 start failed", JSON.stringify(r2)); process.exit(1); }
-  // Diagnostic: log run-2 progress + payload active-tx every 5s so a stall is visible.
+  // Diagnostic: log run-2 progress + the payload's command count every 5s so a stall is visible
+  // (AVA1's node.status has no transaction fields).
   const diag = setInterval(async () => {
     const j = await jget(`/api/jobs/${r2.job_id}`).catch(() => ({}));
     const st = await jget(`/api/ps5/status?addr=${encodeURIComponent(ADDR)}`).catch(() => ({}));
-    console.log(`    [diag] job=${j.status} sent=${((j.bytes_sent||0)/1048576).toFixed(0)}MiB | payload active_tx=${st.active_transactions} last_seq=${st.last_tx_seq}`);
+    console.log(`    [diag] job=${j.status} sent=${((j.bytes_sent||0)/1048576).toFixed(0)}MiB | payload commands=${st.command_count}`);
   }, 5000);
   const res2 = await pollJob(r2.job_id, 150000);
   clearInterval(diag);
@@ -126,7 +127,7 @@ async function main() {
   if (back.length !== fullSize) { console.log(`  ✗ size mismatch: ${back.length} vs ${fullSize}`); okAll = false; }
   if (backSha !== srcSha) { console.log(`  ✗ SHA MISMATCH — resumed file is corrupt`); okAll = false; }
   else console.log(`  ✓ final file byte-identical to source (sha match)`);
-  if (partialSeen && sent2 >= fullSize) console.log(`  ⚠ run-2 re-sent the whole file (${(sent2/1048576).toFixed(0)} MiB) — resume did not skip acked shards`);
+  if (partialSeen && sent2 >= fullSize) console.log(`  ⚠ run-2 re-sent the whole file (${(sent2/1048576).toFixed(0)} MiB) — resume did not skip the data the console already had`);
   else if (partialSeen) console.log(`  ✓ resume skipped already-acked data (run-2 sent only ${(sent2 / 1048576).toFixed(0)}/${(fullSize/1048576).toFixed(0)} MiB)`);
 
   await jpost("/api/ps5/fs/delete", { path: DESTDIR, addr: ADDR });

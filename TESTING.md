@@ -37,6 +37,15 @@ caught real regressions:
 Running a narrower check and assuming the wider one follows is the most
 common way to burn a cycle here.
 
+`npm run validate` is not the whole gate. Before a PR also run:
+
+```sh
+( cd client/src-tauri && cargo fmt --all -- --check )   # validate only checks fmt in engine/
+( cd engine && cargo test -p ava1-ctest -- --test-threads=1 )
+make test-payload                                       # needs PS5_PAYLOAD_SDK
+make check-no-ftx2                                      # the retired protocol must stay gone
+```
+
 ## Layer 2 — payload build and self-tests
 
 ```sh
@@ -48,19 +57,12 @@ Builds `payload/ps5upload.elf` and the DPI daemon, checks both are PS5
 ELFs with valid gzip resources, then runs every host self-test with
 `-Wall -Wextra -Werror`:
 
-| Self-test | Pins |
-|---|---|
-| `hw_guard` | Recovering from a faulting Sony getter without losing the helper |
-| `ptrace_recovery` | Timeout recovery never resuming injected registers |
-| `timed_init` | Bounded one-time init never starting a second initializer |
-| `appdb_scan` | Reading `app.db` as real SQLite records, not printable runs |
-| `ftp_format` | PASV/EPSV/LIST reply shapes clients parse strictly |
-| `ftp_lifecycle` | Session registration, generations, stop-to-kill |
-| `sdk_param` | `param.json` rewrite, and reporting when nothing changed |
-| `elf_param` | Finding SDK fields via program headers, not stray magic bytes |
-| `sdk_changer_file` | Patching only tracked sources; durable backups |
+Each self-test lives in `payload/tests/*_selftest.c` (hardware guards, ptrace recovery,
+`app.db` reading, FTP, SDK param rewriting, installer, cheats, wake watchdog and more). The
+AVA1 C itself is tested by `ava1-ctest`, which compiles it on the host and checks it against the
+Rust side (see the full gate below).
 
-The SDK version is pinned in `scripts/ps5-sdk.env` (currently **v0.42**)
+The SDK version is pinned in `scripts/ps5-sdk.env` (currently **v0.43**)
 and verified by checksum. Local installers and CI read the same file.
 
 **Adding payload logic?** If it can be separated from the console, put it
@@ -73,7 +75,7 @@ Nothing here is tied to one network. Every entry point takes an address:
 
 ```sh
 export PS5_HOST=192.168.1.50            # console IP (loader + payload)
-export PS5_ADDR=192.168.1.50:9113       # transfer port, for scripts/bench
+export PS5_ADDR=192.168.1.50            # console IP; the engine owns the port (9120)
 
 make send-payload PS5_HOST=$PS5_HOST
 npm run smoke:hardware                  # or: node tests/smoke-hardware.mjs
@@ -85,7 +87,7 @@ committed defaults — those stay generic on purpose.
 
 | Command | Does |
 |---|---|
-| `make validate` | Build, send, wait for `:9113`, smoke, sweep, write `bench/reports/<ts>-sweep.{json,md}` |
+| `make validate` | Build, send, wait for `:9120`, smoke, sweep, write `bench/reports/<ts>-sweep.{json,md}` |
 | `make validate-xl` | Adds the 200k-file stress profile |
 | `node tests/smoke-hardware.mjs --no-spawn-engine` | Against an engine already running |
 
@@ -94,11 +96,11 @@ Clean up test uploads afterwards:
 ```sh
 curl -X POST http://127.0.0.1:19113/api/ps5/cleanup \
   -H 'content-type: application/json' \
-  -d '{"addr":"'"$PS5_HOST"':9114","path":"/data/ps5upload/tests/manual"}'
+  -d '{"addr":"'"$PS5_HOST"'","path":"/data/ps5upload/tests/manual"}'
 ```
 
-**Use a live console when touching:** the payload C runtime, FTX2
-framing, transfer/reconcile/resume, storage, mount, cleanup, the file
+**Use a live console when touching:** the payload C runtime, AVA1
+(`payload/ava1/`), transfer/reconcile/resume, storage, mount, cleanup, the file
 browser, volume commands, or anything performance-sensitive.
 
 ### Hardware testing has teeth
@@ -220,8 +222,7 @@ out-of-bounds read in release. `0.5.8` is the latest release, so the crate
 is vendored at `third_party/unrar` with the fix and both workspaces
 redirect to it via `[patch.crates-io]`.
 
-See `third_party/unrar/README.md` for the patch and
-`docs/unrar-upstream-bug.md` for the report to send upstream. If you bump
+See `third_party/unrar/README.md` for the patch. If you bump
 the crate, re-apply the hunk or drop the vendoring once upstream ships the
 fix.
 

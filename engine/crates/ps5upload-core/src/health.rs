@@ -229,22 +229,19 @@ pub fn human_bytes(bytes: u64) -> String {
 
 // ── The scan ────────────────────────────────────────────────────────
 
-/// Directories this tool needs on the console.
-const TOOL_DIRS: [&str; 5] = [
+/// Directories this tool needs on the console. The pre-6.0 helper's `spool` and `tx` folders are gone:
+/// the AVA1 helper never reads them, and the 6.0 upgrade deletes them (listing them here would
+/// flag them missing and the fix would recreate them).
+const TOOL_DIRS: [&str; 3] = [
     "/data/ps5upload/cheats",
     "/data/ps5upload/backups",
-    "/data/ps5upload/spool",
-    "/data/ps5upload/tx",
     "/data/ps5upload/runtime",
 ];
 
-/// Read the payload's STATUS frame as raw JSON.
+/// Read the payload's node status as the legacy JSON object (the AVA1 transport rebuilds it
+/// from the typed `NodeStatus`).
 fn fetch_status(addr: &str) -> Result<serde_json::Value> {
-    use crate::connection::Connection;
-    use ftx2_proto::FrameType;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::Status, b"")?;
-    let (_hdr, body) = c.recv_frame()?;
+    let body = crate::mgmt::call(addr, crate::mgmt::m::NODE_STATUS, b"")?;
     Ok(serde_json::from_slice(&body)?)
 }
 

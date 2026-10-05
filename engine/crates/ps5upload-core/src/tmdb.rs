@@ -4,10 +4,9 @@
 //! then pushes the result back to the payload cache via TmdbStore.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m, Method};
 
 #[cfg(not(target_os = "android"))]
 use std::io::Read;
@@ -35,12 +34,6 @@ pub struct TmdbFetchRequest {
     /// only that prefix is tried instead of all 24 known prefixes.
     #[serde(default)]
     pub region: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TmdbStoreRequest {
-    pub title_id: String,
-    pub json: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -73,29 +66,10 @@ pub struct TmdbFetchResponse {
     pub sku: Option<String>,
 }
 
-fn send_recv(
-    addr: &str,
-    req_type: FrameType,
-    ack_type: FrameType,
-    body: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    let mut c = Connection::connect(addr)?;
-    let empty: Vec<u8> = Vec::new();
-    let body = body.unwrap_or(&empty);
-    c.send_frame(req_type, body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected {:?}: {}",
-            req_type,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != ack_type {
-        bail!("expected {:?}, got {:?}", ack_type, ft);
-    }
-    Ok(resp)
+fn send_recv(addr: &str, method: Method, label: &str, body: Option<&[u8]>) -> Result<Vec<u8>> {
+    // The handler's `{"ok":false,...}` bodies carry data the callers read; call_keep gives them back
+    // as before, and leaves a plain refusal an error ("payload rejected <label>: <cause>").
+    mgmt::call_keep(addr, method, label, body.unwrap_or(&[]))
 }
 
 fn is_valid_title_id(s: &str) -> bool {
@@ -323,14 +297,14 @@ fn fetch_from_store(
 }
 
 /// Push a metadata JSON blob into the payload's on-console cache.
-/// Available on every host (including Android) — it only uses FTX2,
+/// Available on every host (including Android) — it only uses management calls,
 /// not the desktop-only store scrape.
 fn tmdb_store_on_payload(addr: &str, title_id: &str, json: &str) -> Result<()> {
     let req = serde_json::json!({ "title_id": title_id, "json": json });
     let resp = send_recv(
         addr,
-        FrameType::TmdbStore,
-        FrameType::TmdbStoreAck,
+        m::TMDB_STORE,
+        "TmdbStore",
         Some(&serde_json::to_vec(&req)?),
     )?;
     let v: serde_json::Value = serde_json::from_slice(&resp)?;
@@ -361,8 +335,8 @@ pub fn tmdb_fetch(
     let req = serde_json::json!({ "title_id": input, "refresh": refresh });
     let resp = send_recv(
         addr,
-        FrameType::TmdbFetch,
-        FrameType::TmdbFetchAck,
+        m::TMDB_FETCH,
+        "TmdbFetch",
         Some(&serde_json::to_vec(&req)?),
     )?;
     let v: serde_json::Value = serde_json::from_slice(&resp)?;

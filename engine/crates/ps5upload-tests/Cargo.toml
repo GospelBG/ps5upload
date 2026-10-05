@@ -6,8 +6,13 @@ license.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-ftx2-proto = { path = "../ftx2-proto" }
+blake3.workspace = true
 ps5upload-core = { path = "../ps5upload-core" }
+# The AVA1 test console: the Rust job host and a scripted management node.
+ava1 = { path = "../ava1" }
+ava1-chaos = { path = "../ava1-chaos" }
+ps5upload-ava1 = { path = "../ps5upload-ava1" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
 serde.workspace = true
 serde_json.workspace = true
 # Build .zip fixtures for the zip-transfer integration tests.
@@ -16,3 +21,4 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # feature (encoder) is test-only and pure Rust (lzma-rust2/encoder); the
 # production engine crate pins sevenz-rust2 with default-features=false.
 sevenz-rust2 = { version = "0.23", features = ["compress"] }
+crc32fast = "1"

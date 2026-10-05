@@ -37,6 +37,12 @@ mod engine;
 // HTTP client for talking to either engine. `pub` only so
 // tests/engine_http_proxy.rs can drive it with proxy variables set.
 pub mod engine_http;
+// Desktop management calls ride the sidecar engine's AVA1 session (see the module doc).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod mgmt_forward;
+// One-time 6.0 upgrade clean-up of the app's data folder (see the module doc).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod migrate_6;
 
 /// Build and run the Tauri application. The desktop `main.rs` calls this
 /// directly; on mobile the `tauri::mobile_entry_point` macro generates
@@ -146,10 +152,26 @@ pub fn run() {
         // (see lib/osNotify.ts). Works on every platform.
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            // Before anything can call into core: management calls forward to the sidecar.
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            mgmt_forward::install();
+
             // Open the main window centred + fully on-screen. Desktop-only —
             // the centre/monitor/size window APIs don't exist on mobile, so
             // this is a no-op there (see center_main_window).
             center_main_window(app.handle());
+
+            // One-time 6.0 upgrade clean-up of this app's data folder (old files are moved
+            // aside, never reset). Desktop-only: mobile installs start on 6.x.
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                use tauri::Manager;
+                if let Ok(dir) = app.path().app_data_dir() {
+                    for line in migrate_6::run(&dir) {
+                        eprintln!("[tauri] 6.0 upgrade: {line}");
+                    }
+                }
+            }
 
             // Spawn the Rust engine binary as a sidecar. On failure we log and
             // keep the window open so the user can see diagnostic info — the
@@ -320,17 +342,23 @@ pub fn run() {
             commands::pkg_remote_download_status,
             commands::pkg_remote_download_cancel,
             commands::pkg_remote_probe,
+            commands::link_probe,
+            commands::link_download,
+            commands::rar_packages,
+            commands::pkg_console_probe,
             commands::pkg_install,
             commands::pkg_install_status_v2,
             commands::pkg_install_history,
             commands::pkg_install_cancel,
+            commands::host_net_open_settings,
+            commands::host_net_allow_firewall,
             // ── Scene-tool integration ──────────────────────────────
             // `companion_probe` checks which well-known scene tools
             // are alive on the PS5 host.
             commands::companion_probe,
             // ── LAN discovery (mDNS-SD + TCP probe) ─────────────────
             // `discover_ps5` browses well-known mDNS service types
-            // and TCP-probes :9021/:9114 on each discovered host so
+            // and TCP-probes :9021/:9120 on each discovered host so
             // the Connection screen's "Find PS5s" button can populate
             // the IP field automatically. Read-only (we don't
             // advertise ourselves). See commands/discover.rs.

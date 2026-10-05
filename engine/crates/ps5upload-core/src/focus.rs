@@ -13,11 +13,10 @@
 //! foreground application; comparing its id against a game's known app id
 //! is a direct foreground/background answer.
 //!
-//! Opens a fresh management-port connection (`host:9114`) per call. Cheap
+//! Makes one management call per probe. Cheap
 //! enough to poll at 1 Hz.
 
-use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -25,7 +24,7 @@ fn minus_one() -> i64 {
     -1
 }
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 /// Which candidate symbol this probe uses as the authoritative answer.
 pub const BIG_APP_SYMBOL: &str = "sceSystemServiceGetAppIdOfBigApp";
@@ -139,19 +138,7 @@ impl FocusProbe {
 
 /// Ask the console which app owns the screen. Read-only.
 pub fn focus_probe(addr: &str) -> Result<FocusProbe> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::FocusProbe, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FOCUS_PROBE: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::FocusProbeAck {
-        bail!("expected FOCUS_PROBE_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::PROC_FOCUS, &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 

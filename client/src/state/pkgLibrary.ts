@@ -23,6 +23,7 @@ import {
   pkgInstallStatus,
   type InstallSource,
   type InstallStatus,
+  type NetDiag,
 } from "../api/ps5";
 import {
   listVolumes,
@@ -57,6 +58,7 @@ import { useInstallSettingsStore } from "./installSettings";
 import { useConnectionStore } from "./connection";
 import { log } from "./logs";
 import { pushNotification } from "./notifications";
+import { installErrorLink } from "../lib/installErrorDoc";
 import { useActivityHistoryStore } from "./activityHistory";
 import {
   useLinkInstallPrefs,
@@ -287,8 +289,20 @@ export function statusToOutcome(st: InstallStatus): PkgInstallOutcome {
       // likely cause (a firewall dropping the connection, say) — keep it.
       const reachCheck =
         st.reason === "stream_unreachable" && st.code === 0 && !!st.hint?.trim();
+      // The engine's unreachable-stream hint names the exact cause and the fix
+      // (a container address needs PS5UPLOAD_PKG_HOST_IP or host networking;
+      // a firewall needs a rule). The static wording cannot, so the engine's
+      // text wins whenever it carries that host-IP guidance.
+      const engineHostIpHint =
+        st.reason === "stream_unreachable" && /PS5UPLOAD_PKG_HOST_IP/.test(st.hint ?? "");
+      // Windows knew which adapter and category the console is on: that text names the cause
+      // and the fix, so it beats the generic wording the same way.
+      const engineNetDiag = st.reason === "stream_unreachable" && !!st.net_diag && !!st.hint?.trim();
       const preferred =
-        !reachCheck && (st.reason ? REASON_GUIDANCE[st.reason]?.[2] : false);
+        !reachCheck &&
+        !engineHostIpHint &&
+        !engineNetDiag &&
+        (st.reason ? REASON_GUIDANCE[st.reason]?.[2] : false);
       const guidance = reasonGuidance(st.reason);
       errMessage = preferred
         ? st.code
@@ -301,7 +315,26 @@ export function statusToOutcome(st: InstallStatus): PkgInstallOutcome {
     installed,
     mayNotLaunch,
     errMessage,
+    ...(!installed && st.retry_with_stream ? { retryWithStream: true } : {}),
+    ...(!installed && st.reason === "staged_refused" ? { stagedRefused: true } : {}),
+    ...(!installed && st.net_diag ? { netDiag: st.net_diag } : {}),
   };
+}
+
+/** What to tell the person when a package the console already refused from its own storage is
+ *  asked to go that way again. After one refusal the staged route is never retried by itself:
+ *  repeating it only repeats the refusal (and a refused re-install of an installed title can
+ *  remove it), so the row switches route instead. */
+export function stagedRefusedMessage(streamOffered: boolean): string {
+  return streamOffered
+    ? trStatic(
+        "pkglib.staged_refused_use_stream",
+        "The PS5 already refused this package from its own storage, so it will not be tried that way again. Use Retry with Stream.",
+      )
+    : trStatic(
+        "pkglib.staged_refused_no_stream",
+        "The PS5 already refused this package from its own storage, so it will not be tried that way again, and Stream is not offered for it from here. Install it with Stream & install from the original file on a computer.",
+      );
 }
 
 /** Derive a live progress sample from the unified status. The unified metrics
@@ -428,7 +461,17 @@ export interface PkgEntry {
   /** Outcome of the last install attempt this session, for inline feedback.
    *  `warn` renders amber for either a may-not-launch success or an accepted
    *  request whose asynchronous completion could not be verified. */
-  lastResult?: { ok: boolean; message: string; warn?: boolean };
+  lastResult?: {
+    ok: boolean;
+    message: string;
+    warn?: boolean;
+    /** Show "Retry with Stream" beside this failure (see `PkgInstallOutcome`). */
+    retryWithStream?: boolean;
+    /** The console refused this package from its own storage: Install switches route. */
+    stagedRefused?: boolean;
+    /** Windows: the link to the console, for the network fixes (see `PkgInstallOutcome`). */
+    netDiag?: NetDiag;
+  };
 }
 
 /** PS5 title ids look like `CUSA12345` / `PPSA01234` — four letters then five
@@ -979,12 +1022,20 @@ interface PkgLibraryState {
   /** Queue an install of a staged library row on this console's queue and
    *  wait for it. */
   install: (path: string, host: string) => Promise<InstallResult>;
+  /** Re-queue a package the PS5 refused from its own storage through Stream. A no-op (with a
+   *  message) while the package already has an install waiting or running. */
+  retryWithStream: (path: string, host: string) => Promise<InstallResult>;
   // ── Executors: run ONE install now. Only the console queue calls these
   // (through the executor registered at the bottom of this file); the public
   // methods above and below queue instead. An executor that needs another
   // install path calls that path's executor, never its public method — a
   // queued install waiting on a second queued install would wait forever.
-  _execLibrary: (path: string, host: string, hooks?: InstallHooks) => Promise<InstallResult>;
+  _execLibrary: (
+    path: string,
+    host: string,
+    hooks?: InstallHooks,
+    forceStream?: boolean,
+  ) => Promise<InstallResult>;
   _execStream: (
     source: StreamInstallSource,
     host: string,
@@ -1038,7 +1089,7 @@ interface PkgLibraryState {
   installUrl: (
     url: string,
     host: string,
-    opts?: { mode?: LinkInstallMode },
+    opts?: { mode?: LinkInstallMode; displayName?: string },
   ) => ReturnType<PkgLibraryState["installStream"]>;
   /** Download a link to this computer's disk, then install the local file.
    *
@@ -1175,6 +1226,15 @@ export interface PkgInstallOutcome {
    *  real DLC/patch artifact and either strand the row forever or, worse,
    *  match an unrelated already-installed base of the same size. */
   resolvedPackageType?: string;
+  /** The engine says the PS5 refused this package from its own storage and it can safely be
+   *  sent through Stream: the row offers "Retry with Stream". */
+  retryWithStream?: boolean;
+  /** The console refused the package from its own storage (0x80b2116f and kin). The staged
+   *  route is never tried again for this package by itself; see `stagedRefusedMessage`. */
+  stagedRefused?: boolean;
+  /** Windows: the adapter facing the console and its network category, when the console could
+   *  not reach this computer. The row offers the fixes it implies. */
+  netDiag?: NetDiag;
 }
 
 /**
@@ -1226,6 +1286,7 @@ export function streamUnreachableMessage(rcHex: string, servedFrom: string | nul
     `The PS5 never reached this computer${where} to fetch the package (${rcHex}). ` +
     "Allow ps5upload through this computer's firewall (on Windows, for both Private and Public networks), " +
     "keep the computer and the PS5 on the same network with any VPN off, and set the PS5's Proxy Server to “Do Not Use”. " +
+    "If the address shown is not this computer's LAN address (a VPN, virtual-machine or container address), set PS5UPLOAD_PKG_HOST_IP to the LAN IP and restart the engine. " +
     "Upload & install works without this connection."
   );
 }
@@ -1943,6 +2004,7 @@ async function driveUnifiedInstall(
     options?: {
       delete_source_copy_after?: boolean;
       allow_destructive_reinstall?: boolean;
+      force_stream?: boolean;
     };
   },
   onSample?: (s: InstallSample) => void,
@@ -2045,6 +2107,8 @@ export async function runPkgInstall(
   /** `APP_VER` the package declares. Enables the post-install check that an
    *  update actually raised the installed version. */
   packageAppVer?: string,
+  /** Skip the console-local attempt and send the package through Stream. */
+  forceStream?: boolean,
 ): Promise<PkgInstallOutcome> {
   const name = basenameOf(localPs5Path) || contentId || "package";
   const tasks = useTaskStore.getState();
@@ -2105,7 +2169,10 @@ export async function runPkgInstall(
         // preflight above already surfaced any "already installed" state, so
         // let the engine's guard proceed — matching the prior behaviour, where
         // a re-install was warned about, never blocked.
-        options: { allow_destructive_reinstall: true },
+        options: {
+          allow_destructive_reinstall: true,
+          ...(forceStream ? { force_stream: true } : {}),
+        },
       },
       (sample) => {
         latestProgress = {
@@ -2640,7 +2707,16 @@ const makePkgLibraryStore = () =>
       };
     },
 
-    async _execLibrary(path, host, hooks) {
+    async _execLibrary(path, host, hooks, forceStream) {
+      // The console already refused this package from its own storage: never try that route
+      // again by itself, whoever asks (Install, Install all, a queued retry). Only the explicit
+      // Stream retry goes on, and the console is not touched here.
+      {
+        const prior = get().entries.find((e) => e.path === path)?.lastResult;
+        if (!forceStream && prior?.stagedRefused) {
+          return { ok: false, message: stagedRefusedMessage(!!prior.retryWithStream) };
+        }
+      }
       // Runs from the console queue, one install at a time per console.
       set({ installing: true, busyNotice: null });
       let outcome: InstallResult;
@@ -2663,10 +2739,15 @@ const makePkgLibraryStore = () =>
           const rt =
             useConnectionStore.getState().runtimeByHost[hostOf(host)] ?? null;
           const fw = parsePS5Firmware(rt?.ps5Kernel ?? null);
-          const note = trStatic(
-            "pkglib.staged_install_note",
-            "Installing from the PS5's own storage (FW {fw})… Some firmwares refuse packages from this route. If it's refused, the package stays on the console; install it with Stream & install from a computer instead.",
-          ).replace("{fw}", fw ?? "?");
+          const note = forceStream
+            ? trStatic(
+                "pkglib.stream_retry_note",
+                "Sending the package through Stream from the PS5's own storage…",
+              )
+            : trStatic(
+                "pkglib.staged_install_note",
+                "Installing from the PS5's own storage (FW {fw})… Some firmwares refuse packages from this route. If it's refused, the package stays on the console; install it with Stream & install from a computer instead.",
+              ).replace("{fw}", fw ?? "?");
           set({ busyNotice: note });
           hooks?.onStatus(note);
         }
@@ -2718,6 +2799,9 @@ const makePkgLibraryStore = () =>
           installed,
           mayNotLaunch,
           errMessage: mainErr,
+          retryWithStream,
+          stagedRefused,
+          netDiag,
         } = await runPkgInstall(
           host,
           path,
@@ -2750,6 +2834,7 @@ const makePkgLibraryStore = () =>
           // Lets the engine confirm an update actually raised APP_VER instead
           // of trusting Sony's return code, which is 0 either way.
           entry?.appVer,
+          forceStream,
         );
         useActivityHistoryStore
           .getState()
@@ -2776,6 +2861,9 @@ const makePkgLibraryStore = () =>
             lastResult: {
               ok: false,
               message: mainErr || "Install was rejected.",
+              ...(retryWithStream ? { retryWithStream: true } : {}),
+              ...(stagedRefused ? { stagedRefused: true } : {}),
+              ...(netDiag ? { netDiag } : {}),
             },
           });
           // Surface failures in the bell too (success already notifies above).
@@ -2783,6 +2871,7 @@ const makePkgLibraryStore = () =>
           // if the user navigated away from the Library tab mid-install.
           pushNotification("error", `${label} install failed`, {
             body: mainErr || "The PS5 didn’t confirm the install. Try again.",
+            link: installErrorLink(mainErr),
           });
         }
       } catch (e) {
@@ -2795,7 +2884,10 @@ const makePkgLibraryStore = () =>
           (candidate) => candidate.path === path,
         );
         const label = entry?.title || entry?.contentId || basenameOf(path);
-        pushNotification("error", `${label} install failed`, { body: message });
+        pushNotification("error", `${label} install failed`, {
+          body: message,
+          link: installErrorLink(message),
+        });
         outcome = { ok: false, message };
       } finally {
         set({ installing: false, busyNotice: null });
@@ -2809,6 +2901,34 @@ const makePkgLibraryStore = () =>
       return enqueueInstall({
         host,
         request: { via: "library", path },
+        displayName: entry?.title || entry?.contentId || basenameOf(path),
+        contentId: entry?.contentId ?? null,
+        category: entry?.category ?? null,
+      }).done;
+    },
+
+    async retryWithStream(path, host) {
+      if (!host?.trim()) return { ok: false, message: "No PS5 host selected." };
+      const entry = get().entries.find((e) => e.path === path);
+      // Never start a second install of a package that is already waiting or running: the row
+      // hides the button then, and this guards a double click that beats the re-render.
+      if (entry && entry.status !== "idle") {
+        return { ok: false, message: "This package already has an install in progress." };
+      }
+      // The engine decides whether Stream is safe for this package (a patch or add-on only goes
+      // through the installer daemon). A refusal it did not mark as retryable is explained, not
+      // sent anyway.
+      if (entry?.lastResult?.stagedRefused && !entry.lastResult.retryWithStream) {
+        return { ok: false, message: stagedRefusedMessage(false) };
+      }
+      set({
+        entries: get().entries.map((e) =>
+          e.path === path ? { ...e, lastResult: undefined } : e,
+        ),
+      });
+      return enqueueInstall({
+        host,
+        request: { via: "library", path, forceStream: true },
         displayName: entry?.title || entry?.contentId || basenameOf(path),
         contentId: entry?.contentId ?? null,
         category: entry?.category ?? null,
@@ -3060,6 +3180,8 @@ const makePkgLibraryStore = () =>
       } catch {
         /* _execUrl reports the invalid link */
       }
+      // A redirect or an extensionless link says nothing in its own path; the probe's name does.
+      if (opts?.displayName) name = opts.displayName;
       return enqueueInstall({
         host,
         request: {
@@ -3944,7 +4066,7 @@ registerInstallExecutor(async (req, host, hooks) => {
   const store = pkgLibraryStore(host).getState();
   switch (req.via) {
     case "library":
-      return store._execLibrary(req.path, host, hooks);
+      return store._execLibrary(req.path, host, hooks, req.forceStream);
     case "console-path":
       return store._execConsolePath(req.path, host, hooks);
     case "external":

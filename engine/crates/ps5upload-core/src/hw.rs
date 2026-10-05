@@ -1,4 +1,4 @@
-//! Hardware monitoring over FTX2.
+//! Hardware monitoring over AVA1 management.
 //!
 //! Three RPCs — HW_INFO / GET_TEMPS / GET_POWER_INFO:
 //!   - [`hw_info`] returns static info (model, serial, OS, RAM, CPU count).
@@ -15,10 +15,9 @@
 //! Browser launch ([`app_launch_browser`]) fits here because it shares
 //! the Sony-API theme even if it's not strictly monitoring.
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m, Method};
 
 /// Static hardware info. `physmem` is in bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -132,40 +131,21 @@ fn parse_kv<'a>(body: &'a [u8]) -> impl Fn(&str) -> Option<&'a str> {
     }
 }
 
-fn round_trip(addr: &str, req: FrameType, ack: FrameType, label: &str) -> Result<Vec<u8>> {
-    round_trip_body(addr, req, &[], ack, label)
+fn round_trip(addr: &str, method: Method) -> Result<Vec<u8>> {
+    mgmt::call(addr, method, &[])
 }
 
 /// Like [`round_trip`] but sends a request body. Used by HW_TEMPS to pass
 /// the `extended` selector ("1" = read the on-demand-only telemetry).
-fn round_trip_body(
-    addr: &str,
-    req: FrameType,
-    body: &[u8],
-    ack: FrameType,
-    label: &str,
-) -> Result<Vec<u8>> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(req, body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected {label}: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != ack {
-        bail!("expected {ack:?}, got {ft:?}");
-    }
-    Ok(resp)
+fn round_trip_body(addr: &str, method: Method, body: &[u8]) -> Result<Vec<u8>> {
+    mgmt::call(addr, method, body)
 }
 
 /// Static hardware info. Cached on the payload side, so cheap to call
 /// repeatedly -- subsequent calls just return the already-formatted
 /// text. The client Hardware tab calls this once at mount time.
 pub fn hw_info(addr: &str) -> Result<HwInfo> {
-    let body = round_trip(addr, FrameType::HwInfo, FrameType::HwInfoAck, "HW_INFO")?;
+    let body = round_trip(addr, m::HW_INFO)?;
     let get = parse_kv(&body);
     Ok(HwInfo {
         model: get("model").unwrap_or("PlayStation 5").to_string(),
@@ -260,13 +240,7 @@ pub fn hw_temps(addr: &str, extended: bool) -> Result<HwTemps> {
     // "ufs" = usage + fan + shape (NOT power — see fn doc). Each is
     // independently gated payload-side so this set is the verified-safe one.
     let req_body: &[u8] = if extended { b"ufs" } else { b"" };
-    let body = round_trip_body(
-        addr,
-        FrameType::HwTemps,
-        req_body,
-        FrameType::HwTempsAck,
-        "HW_TEMPS",
-    )?;
+    let body = round_trip_body(addr, m::HW_TEMPS, req_body)?;
     Ok(sanitize_temps(parse_hw_temps(&body)))
 }
 
@@ -308,7 +282,7 @@ fn parse_hw_temps(body: &[u8]) -> HwTemps {
 }
 
 pub fn hw_power(addr: &str) -> Result<HwPower> {
-    let body = round_trip(addr, FrameType::HwPower, FrameType::HwPowerAck, "HW_POWER")?;
+    let body = round_trip(addr, m::HW_POWER)?;
     let get = parse_kv(&body);
     /* Wire format is integer centi-units (× 100). Divide here so
      * consumers downstream see a normal fractional value. Missing
@@ -365,12 +339,7 @@ pub struct HwStorage {
 }
 
 pub fn hw_storage(addr: &str) -> Result<HwStorage> {
-    let body = round_trip(
-        addr,
-        FrameType::HwStorage,
-        FrameType::HwStorageAck,
-        "HW_STORAGE",
-    )?;
+    let body = round_trip(addr, m::HW_STORAGE)?;
     let get = parse_kv(&body);
     let n = |k: &str| get(k).and_then(|v| v.parse().ok()).unwrap_or(0u64);
     Ok(HwStorage {
@@ -427,38 +396,14 @@ pub fn hw_set_fan_threshold_ex(
         Some(interval) => format!("{threshold_c} {interval}"),
         None => threshold_c.to_string(),
     };
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::HwSetFanThreshold, body.as_bytes())?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected HW_SET_FAN_THRESHOLD: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::HwSetFanThresholdAck {
-        bail!("expected HW_SET_FAN_THRESHOLD_ACK, got {ft:?}");
-    }
+    mgmt::call(addr, m::HW_FAN_THRESHOLD, body.as_bytes())?;
     Ok(())
 }
 
 /// Open the PS5's built-in web browser. Handy for self-hosted
 /// payload-loader pages or custom browsing on the console.
 pub fn app_launch_browser(addr: &str) -> Result<()> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppLaunchBrowser, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APP_LAUNCH_BROWSER: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppLaunchBrowserAck {
-        bail!("expected APP_LAUNCH_BROWSER_ACK, got {:?}", ft);
-    }
+    mgmt::call(addr, m::APP_LAUNCH_BROWSER, &[])?;
     Ok(())
 }
 
@@ -533,12 +478,7 @@ pub struct DriveSensorList {
 /// with `O_RDONLY | O_NONBLOCK`, confirms it's a real block device, then
 /// issues a SCSI LOG SENSE (page 0x0D) via CAM pass-through.
 pub fn drive_sensors(addr: &str) -> Result<DriveSensorList> {
-    let body = round_trip(
-        addr,
-        FrameType::HwDriveSensors,
-        FrameType::HwDriveSensorsAck,
-        "HW_DRIVE_SENSORS",
-    )?;
+    let body = round_trip(addr, m::HW_DRIVE_SENSORS)?;
     let parsed: DriveSensorList = serde_json::from_slice(&body)
         .map_err(|e| anyhow::anyhow!("drive_sensors returned non-JSON: {e}"))?;
     Ok(parsed)
@@ -582,12 +522,7 @@ pub struct ProcList {
 /// endpoint exists because the injector path wants to pick targets by
 /// name, which needs the same walk.
 pub fn proc_list(addr: &str) -> Result<ProcList> {
-    let body = round_trip(
-        addr,
-        FrameType::ProcList,
-        FrameType::ProcListAck,
-        "PROC_LIST",
-    )?;
+    let body = round_trip(addr, m::PROC_LIST)?;
     // The payload emits a very small, flat shape — parse straight into
     // a serde_json::Value first so we can handle both the normal case
     // (with a trailing `{"truncated":true}` sentinel object in the
@@ -646,12 +581,7 @@ pub fn proc_list(addr: &str) -> Result<ProcList> {
 /// calls. Most firmwares surface 128 KiB – 256 KiB of recent kernel
 /// output.
 pub fn syslog_tail(addr: &str) -> Result<String> {
-    let body = round_trip(
-        addr,
-        FrameType::SyslogTail,
-        FrameType::SyslogTailAck,
-        "SYSLOG_TAIL",
-    )?;
+    let body = round_trip(addr, m::LOG_SYSLOG)?;
     // Kernel printf output is plain ASCII; lossy decode covers any stray
     // non-UTF-8 byte (driver scribbles, raw register dumps) without
     // failing the whole panel render.

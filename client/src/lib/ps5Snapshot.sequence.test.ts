@@ -44,8 +44,7 @@ describe("bug report collection order", () => {
   it("reads the helper's logs before asking it anything else", async () => {
     const calls = fakeHelper();
     await buildPs5Snapshot({ redact: true });
-    // Reading the logs is a directory listing (for per-transaction journals)
-    // plus one read per file.
+    // Reading the logs is a directory listing per log folder plus one read per file.
     const isLogRead = (c: string) => c === "ps5_list_dir" || c === "fs_read_preview";
     const firstOther = calls.findIndex((c) => !isLogRead(c));
     const lastLogRead = calls.map(isLogRead).lastIndexOf(true);
