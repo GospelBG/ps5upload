@@ -808,6 +808,11 @@ fn spawn_readers(
         // stall to fail the job loudly instead of parking forever.
         let grant = sh.window.lock().unwrap().available();
         let chunk = (chunk.min(grant.saturating_sub(CHUNK_HDR)) / GROUP * GROUP).max(GROUP);
+        // A resumed file (some of it already durable) goes in one-group pieces: on a link
+        // that keeps dropping, a whole-chunk piece can be cut every attempt before it is
+        // durable, and the job then retries the same tail forever. Smaller pieces make each
+        // attempt land something.
+        let chunk = if durable.covered() == 0 { chunk } else { GROUP };
         let plan = pieces(e.size, &durable, &|g| hasher.cv(g).is_some(), chunk);
         let last_piece = plan.len().saturating_sub(1);
         let mut ob_synced = Instant::now();
@@ -1410,20 +1415,10 @@ pub async fn run_upload(
             }
         }
         tokio::select! {
-            r = rrx.recv() => match r {
+            r = rrx.recv() => { match r {
                 Some(Read::Record { file_id, root, data, budget }) => {
                     pending_bytes += data.len() + 48;
                     pending.push((BundleRecord { file_id, root, data }, budget));
-                    // A slow source never holds a half-full bundle back: flush when the
-                    // record channel is momentarily empty; a fast source keeps it full and
-                    // the bundles reach the governor's size.
-                    let flush = pending_bytes >= sh.bundle.load(Ordering::Relaxed) as usize || rrx.is_empty();
-                    if flush {
-                        let f = bundle_frame(job_id, std::mem::take(&mut pending));
-                        pending_bytes = 0;
-                        sh.sched.lock().unwrap().bundles.push_back(f);
-                        sh.wake();
-                    }
                 }
                 Some(Read::Chunk { file_id, offset, data, budget }) => {
                     let f = chunk_frame(job_id, file_id, offset, data, budget);
@@ -1450,6 +1445,20 @@ pub async fn run_upload(
                 Some(Read::Failed(_)) => {} // a failure is already queued: it wins
                 // The retry path holds `rtx` alive, so the channel never closes mid-job.
                 None => {}
+            }
+                // A slow source never holds a half-full bundle back: flush when the
+                // reader channel is momentarily empty; a fast source keeps it full and
+                // the bundles reach the governor's size. Checked after every message,
+                // not only a record: the last record can arrive with a large file's
+                // chunk or root still queued behind it, and nothing would flush it.
+                if !pending.is_empty()
+                    && (pending_bytes >= sh.bundle.load(Ordering::Relaxed) as usize || rrx.is_empty())
+                {
+                    let f = bundle_frame(job_id, std::mem::take(&mut pending));
+                    pending_bytes = 0;
+                    sh.sched.lock().unwrap().bundles.push_back(f);
+                    sh.wake();
+                }
             },
             root_sent = async {
                 let (file_id, root) = root_next
@@ -1728,6 +1737,29 @@ pub async fn run_upload(
             }
             _ => {}
         }
+    }
+    // A failed job leaves one line of the sender's state, so a stall can be placed:
+    // readers parked (budget), frames never acknowledged (inflight), or nothing queued.
+    if result.is_err() {
+        let s = sh.sched.lock().unwrap();
+        let _ = writeln!(
+            std::io::stderr(),
+            "[ava1] sender state at failure: small queue {}, large queue {}, pending records {}, \
+             bundles {}, chunks {}, requeue {}, inflight {}, roots waiting {}, budget free {} KiB, \
+             window {} B, lanes {}, readers running {}",
+            small_q.lock().unwrap().len(),
+            large_q.lock().unwrap().len(),
+            pending.len(),
+            s.bundles.len(),
+            s.chunks.len(),
+            s.requeue.len(),
+            s.inflight.len(),
+            root_next.len(),
+            sh.bytes_budget.available_permits(),
+            sh.window.lock().unwrap().available(),
+            link.lanes().len(),
+            readers.iter().filter(|h| !h.is_finished()).count(),
+        );
     }
     // Every exit: stop the readers' flag, wake the sleepers, cancel and join every
     // lane task still held (correction 5; a dead lane's task was detached at its

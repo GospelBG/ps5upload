@@ -161,7 +161,7 @@ help:
 	@echo "  make coverage         - Rust + frontend coverage reports"
 	@echo "  make coverage-engine  - Rust coverage report only"
 	@echo "  make coverage-client  - Frontend coverage report only"
-	@echo "  make test-engine      - cargo test --workspace"
+	@echo "  make test-engine      - cargo test --workspace (C interop serial)"
 	@echo "  make test-desktop     - Tauri Rust cargo check/clippy/test"
 	@echo "  make test-ava1        - AVA1 Rust + C conformance and interop tests"
 	@echo "  make test-payload     - Validate $(PAYLOAD_ELF)"
@@ -556,6 +556,7 @@ CHECK_NO_FTX2_EXCEPT := \
 	':!engine/crates/ava1-ctest/tests/lifecycle.rs' \
 	':!engine/crates/ava1-ctest/tests/payload_cutover.rs' \
 	':!CHANGELOG.md' \
+	':!CONTRIBUTING.md' ':!TESTING.md' \
 	':!protocol/ava1' \
 	':!Makefile' \
 	':!.github/workflows/engine-ci.yml' \
@@ -752,8 +753,8 @@ DOCKER_ENGINE_IMAGE ?= ps5upload-engine
 
 docker-engine:
 	@command -v $(DOCKER) >/dev/null 2>&1 || { echo "ERROR: docker not found on PATH."; exit 1; }
-	@echo "Building $(DOCKER_ENGINE_IMAGE) image (context: $(ENGINE_DIR)/)..."
-	@$(DOCKER) build -t $(DOCKER_ENGINE_IMAGE) $(ENGINE_DIR)
+	@echo "Building $(DOCKER_ENGINE_IMAGE) image (context: repo root, as in CI)..."
+	@$(DOCKER) build -t $(DOCKER_ENGINE_IMAGE) -f $(ENGINE_DIR)/Dockerfile .
 	@echo "✓ Built image $(DOCKER_ENGINE_IMAGE) — run with: make docker-engine-run"
 
 # Run the locally-built engine image. Binds the published port and points it at
@@ -819,7 +820,9 @@ test-root:
 
 test-engine: setup-engine
 	@echo "Running Rust engine tests..."
-	@cd $(ENGINE_DIR) && $(CARGO) test --workspace
+	@cd $(ENGINE_DIR) && $(CARGO) test --workspace --exclude ava1-ctest
+	@# The C interop tests share one C server and must run serially (as in CI).
+	@cd $(ENGINE_DIR) && $(CARGO) test -p ava1-ctest -- --test-threads=1
 	@echo "✓ Engine tests passed"
 	@# Android cross-compile check. The engine cfg's some modules out on
 	@# Android (remote_pkg, which needs an HTTP client), so a call site added
