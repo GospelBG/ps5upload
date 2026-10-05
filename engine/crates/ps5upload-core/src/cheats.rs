@@ -5,11 +5,10 @@
 //! files from GitHub repositories (etaHEN/PS5_Cheats, GoldHEN, etc.)
 //! and installs them to the PS5 filesystem.
 
-use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m, Method};
 
 #[cfg(not(target_os = "android"))]
 use std::io::Read;
@@ -20,6 +19,17 @@ pub struct CheatTitle {
     pub title_id: String,
     #[serde(default)]
     pub name: String,
+    /// Game version the on-console cheat targets, parsed from its filename
+    /// by the payload. Without this field serde dropped it and the client
+    /// never saw it.
+    #[serde(default)]
+    pub version: String,
+    /// Formats present on the console for this title (`json`, `shn`, `mc4`).
+    #[serde(default)]
+    pub formats: Vec<String>,
+    /// How many of its cheats are switched on (saved state).
+    #[serde(default)]
+    pub enabled: i32,
     #[serde(default)]
     pub running: bool,
 }
@@ -32,6 +42,9 @@ pub struct CheatsListResponse {
     pub game_running: bool,
     #[serde(default)]
     pub game_title_id: String,
+    /// The console stopped adding titles at its reply ceiling: the list is valid but partial.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,34 +113,14 @@ pub struct CheatsEngineSetResponse {
     pub enabled: bool,
 }
 
-/// Helper: send a frame and expect an ACK of the given type.
-fn send_recv(
-    addr: &str,
-    req_type: FrameType,
-    ack_type: FrameType,
-    body: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    let mut c = Connection::connect(addr)?;
-    let empty: Vec<u8> = Vec::new();
-    let body = body.unwrap_or(&empty);
-    c.send_frame(req_type, body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected {:?}: {}",
-            req_type,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != ack_type {
-        bail!("expected {:?}, got {ack_type:?}", ack_type);
-    }
-    Ok(resp)
+fn send_recv(addr: &str, method: Method, label: &str, body: Option<&[u8]>) -> Result<Vec<u8>> {
+    // The handler's `{"ok":false,...}` bodies carry data the callers read; call_keep gives them back
+    // as before, and leaves a plain refusal an error ("payload rejected <label>: <cause>").
+    mgmt::call_keep(addr, method, label, body.unwrap_or(&[]))
 }
 
 pub fn cheats_list(addr: &str) -> Result<CheatsListResponse> {
-    let resp = send_recv(addr, FrameType::CheatsList, FrameType::CheatsListAck, None)?;
+    let resp = send_recv(addr, m::CHEATS_LIST, "CheatsList", None)?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -135,8 +128,8 @@ pub fn cheats_get(addr: &str, title_id: &str) -> Result<CheatsGetResponse> {
     let body = serde_json::json!({ "title_id": title_id });
     let resp = send_recv(
         addr,
-        FrameType::CheatsGet,
-        FrameType::CheatsGetAck,
+        m::CHEATS_GET,
+        "CheatsGet",
         Some(&serde_json::to_vec(&body)?),
     )?;
     Ok(serde_json::from_slice(&resp)?)
@@ -155,8 +148,8 @@ pub fn cheats_toggle(
     };
     let resp = send_recv(
         addr,
-        FrameType::CheatsToggle,
-        FrameType::CheatsToggleAck,
+        m::CHEATS_TOGGLE,
+        "CheatsToggle",
         Some(&serde_json::to_vec(&req)?),
     )?;
     Ok(serde_json::from_slice(&resp)?)
@@ -166,8 +159,8 @@ pub fn cheats_delete(addr: &str, title_id: &str) -> Result<bool> {
     let body = serde_json::json!({ "title_id": title_id });
     let resp = send_recv(
         addr,
-        FrameType::CheatsDelete,
-        FrameType::CheatsDeleteAck,
+        m::CHEATS_DELETE,
+        "CheatsDelete",
         Some(&serde_json::to_vec(&body)?),
     )?;
     let v: serde_json::Value = serde_json::from_slice(&resp)?;
@@ -175,23 +168,13 @@ pub fn cheats_delete(addr: &str, title_id: &str) -> Result<bool> {
 }
 
 pub fn cheats_reload(addr: &str) -> Result<bool> {
-    let resp = send_recv(
-        addr,
-        FrameType::CheatsReload,
-        FrameType::CheatsReloadAck,
-        None,
-    )?;
+    let resp = send_recv(addr, m::CHEATS_RELOAD, "CheatsReload", None)?;
     let v: serde_json::Value = serde_json::from_slice(&resp)?;
     Ok(v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false))
 }
 
 pub fn cheats_status(addr: &str) -> Result<CheatsStatusResponse> {
-    let resp = send_recv(
-        addr,
-        FrameType::CheatsStatus,
-        FrameType::CheatsStatusAck,
-        None,
-    )?;
+    let resp = send_recv(addr, m::CHEATS_STATUS, "CheatsStatus", None)?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -199,8 +182,8 @@ pub fn cheats_engine_set(addr: &str, enabled: bool) -> Result<CheatsEngineSetRes
     let req = CheatsEngineSetRequest { enabled };
     let resp = send_recv(
         addr,
-        FrameType::CheatsEngineSet,
-        FrameType::CheatsEngineSetAck,
+        m::CHEATS_ENGINE_SET,
+        "CheatsEngineSet",
         Some(&serde_json::to_vec(&req)?),
     )?;
     Ok(serde_json::from_slice(&resp)?)
@@ -294,26 +277,12 @@ pub fn parse_cheat_filename(filename: &str) -> (String, String) {
     (title.to_ascii_uppercase(), version)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheatRepoSearchRequest {
-    pub addr: String,
-    pub query: String,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CheatRepoSearchResponse {
     #[serde(default)]
     pub entries: Vec<CheatRepoEntry>,
     #[serde(default)]
     pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheatDownloadRequest {
-    pub addr: String,
-    pub repo_id: String,
-    pub filename: String,
-    pub title_id: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -745,6 +714,20 @@ mod tests {
         assert!(resp.titles[1].running);
         assert!(resp.game_running);
         assert_eq!(resp.game_title_id, "CUSA00002");
+    }
+
+    #[test]
+    fn cheats_list_keeps_version_and_formats() {
+        let json = r#"{"titles":[{"title_id":"CUSA00002","name":"Killzone","version":"01.00","formats":["shn","mc4"],"running":false}]}"#;
+        let resp: CheatsListResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.titles[0].version, "01.00");
+        assert_eq!(resp.titles[0].formats, vec!["shn", "mc4"]);
+        let back = serde_json::to_value(&resp).unwrap();
+        assert_eq!(back["titles"][0]["formats"][1], "mc4");
+        // An older payload without the fields still parses.
+        let old: CheatsListResponse =
+            serde_json::from_str(r#"{"titles":[{"title_id":"X","name":"X"}]}"#).unwrap();
+        assert!(old.titles[0].formats.is_empty());
     }
 
     #[test]

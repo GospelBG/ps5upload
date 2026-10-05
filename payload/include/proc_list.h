@@ -2,6 +2,7 @@
 #define PS5UPLOAD2_PROC_LIST_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Layout offsets inside FreeBSD's kinfo_proc as exposed via
  * sysctl(KERN_PROC_PROC). Same offsets shellui_rpc.c uses. */
@@ -21,7 +22,7 @@
  * This is a simple observability primitive, not a stepping stone to
  * process control. The payload never writes back to the kernel via
  * this path — only reads. The caller (the management-port handler)
- * is responsible for framing the returned bytes into an FTX2 frame.
+ * is responsible for framing the returned bytes into a reply.
  *
  * Returns 0 on success (buf contains valid JSON, *written_out set to
  * byte count), non-zero on internal error. `err_out` receives a short
@@ -63,6 +64,13 @@ int proc_kill(int pid);
  */
 int proc_name_by_pid(int pid, char *out, size_t cap);
 
+/* ki_start of kinfo_proc (a struct timeval, FreeBSD amd64 offset 336): when the process started, in
+ * the clock domain of kern.boottime. 0 and *sec set when read; -1 when the process is gone or the
+ * record is too short. The value is only evidence once it passes instance_proc_start_plausible(): the
+ * offset is the FreeBSD one and has not been measured on every firmware. */
+#define KINFO_START_OFFSET   336
+int proc_start_by_pid(int pid, uint64_t *sec);
+
 /*
  * Find the first process whose thread-name matches `name` via
  * sysctl(KERN_PROC_PROC). Returns the pid (>0) on success, -1 if
@@ -77,10 +85,6 @@ int proc_find_pid_by_name(const char *name);
  * actually proceeding, and re-launching a title that is already starting
  * makes the shell bounce it to the background. */
 int proc_find_pid_by_title_id(const char *title_id);
-
-/* App id of a running title (0 = not running). Sony's focus/kill APIs key on
- * this, which is NOT the pid. */
-unsigned int proc_app_id_by_title_id(const char *title_id);
 
 /* Emit the scheduler-visible state of every APP process, as JSON:
  *

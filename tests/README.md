@@ -1,13 +1,13 @@
 # Tests
 
-Real-hardware integration, scenario, and regression tests for `ps5upload 2.0`.
+Real-hardware integration, scenario, and regression checks. The Rust tests that need no console live in `engine/crates/*/tests/`; see [`../TESTING.md`](../TESTING.md).
 
 ## smoke-hardware.mjs
 
-End-to-end smoke test that exercises the full FTX2 stack on a live PS5.
+End-to-end smoke test that exercises the full AVA1 stack on a live PS5.
 
 **Prerequisites:**
-- PS5 reachable at `PS5_ADDR` (default `192.168.137.2:9113`) with `payload/ps5upload.elf` loaded
+- PS5 reachable at `PS5_ADDR` (default `192.168.137.2`; any port is ignored, the engine uses 9120) with `payload/ps5upload.elf` loaded
 - Engine built at least once (`make engine`) — the smoke runner auto-starts it
 
 **Run:**
@@ -19,7 +19,7 @@ npm run smoke:hardware
 node tests/smoke-hardware.mjs --no-spawn-engine
 
 # override PS5 address
-PS5_ADDR=192.168.1.50:9113 npm run smoke:hardware
+PS5_ADDR=192.168.1.50 npm run smoke:hardware
 ```
 
 **Options:**
@@ -27,7 +27,7 @@ PS5_ADDR=192.168.1.50:9113 npm run smoke:hardware
 | Flag | Default | Description |
 |---|---|---|
 | `--engine-url=URL` | `http://127.0.0.1:19113` | engine HTTP base URL |
-| `--ps5-addr=HOST:PORT` | `192.168.137.2:9113` | PS5 FTX2 address |
+| `--ps5-addr=HOST` | `192.168.137.2` | PS5 address (the engine talks AVA1 on port 9120) |
 | `--dest-root=PATH` | `/data/ps5upload/tests/smoke` | destination root on PS5 |
 | `--no-spawn-engine` | off | use an already-running engine |
 | `--no-cleanup` | off | keep tmp fixture files on exit |
@@ -41,9 +41,9 @@ The runner prefers the pre-built binary (`engine/target/release/` then `debug/`)
 |---|---|
 | engine reachable | GET /api/jobs returns 200 |
 | ps5 status | GET /api/ps5/status returns non-error |
-| single-file transfer | 256 KiB random file → one shard |
+| single-file transfer | 256 KiB random file |
 | directory transfer | 8 × 32 KiB files → dir on PS5 |
-| multi-shard file transfer | 4 MiB file → multiple shards |
+| larger single-file transfer | 4 MiB file |
 | file-list transfer | 3 explicit src→dest pairs |
 | jobs list sanity | /api/jobs returns array |
 
@@ -51,6 +51,6 @@ The runner prefers the pre-built binary (`engine/target/release/` then `debug/`)
 
 ## Planned coverage
 
-- transaction resume and replay after payload restart mid-transfer
-- takeover lifecycle (old payload killed by new one, TX marked interrupted, replayed)
-- fault injection (BLAKE3 mismatch, partial shard, connection drop mid-transfer)
+- resume after the payload restarts mid-transfer (`bench/resume-test.mjs` drives the engine side today)
+- takeover lifecycle (an old payload asked to stand down by a new one; `tests/lab/reload-and-verify-takeover.sh` is the manual version)
+- fault injection on real hardware (corrupted block, dropped connection mid-transfer); the loopback equivalents run in `ava1-chaos`

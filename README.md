@@ -43,14 +43,16 @@
   screenshots and video clips; register, launch and uninstall games.
 - **Backport tools, payload sender, FTP server, hardware view** and more.
 - **Runs everywhere:** macOS, Windows, Linux, Android, or any web browser via
-  the self-hosted engine / Docker image — in 20 languages.
+  the self-hosted engine / Docker image — in 21 languages.
 
 ---
 
 ## What it does
 
-- **Fast transfer** — FTX2 binary protocol with BLAKE3 per-shard
-  verification, small-file packing, and resume on disconnect.
+- **Fast transfer** — the AVA1 protocol (Adaptive Verified Assembly):
+  several connections per transfer, every file verified end to end with
+  BLAKE3, tiny files bundled and applied in parallel, and resume after any
+  interruption — Wi-Fi drops, console rest mode, app restarts.
   Uses your LAN flat-out. Pack worker absorbs transient
   `EIO`/`EMFILE` hiccups so a 200k-file game upload doesn't get
   killed by one unlucky syscall.
@@ -61,7 +63,7 @@
 - **Compressed archive uploads (`.zip` / `.7z` / `.rar`)** — keep a game
   dump as a single archive on your PC (less disk, easier to move) and
   upload it directly. ps5upload decompresses on the host and streams
-  the files into the same FTX2 pipeline, so they land **already
+  the files into the same AVA1 pipeline, so they land **already
   extracted** on the PS5 — no manual unpack, no temp copy of the whole
   game. The Upload screen previews the expansion (`zipped → extracted`,
   file count, space saved) and detects the embedded game. Decompresses
@@ -90,11 +92,11 @@
   shows live progress with a working Stop button.
 - **NAS / SMB upload** — browse a Windows share or Samba NAS from the
   app, download to this computer, or **upload a file or folder
-  straight to the PS5** in one step (streamed to a host temp dir, then
-  FTX2 — no 2 GiB memory cap on that path).
+  straight to the PS5** in one step (streamed from the share over AVA1,
+  resuming where it left off — no 2 GiB memory cap on that path).
 - **FTP server on the PS5** — optional built-in FTP for FileZilla and
   other clients (default port **2122**, so it coexists with ftpsrv on
-  2121). Not a replacement for FTX2 Upload.
+  2121). Not a replacement for the Upload tab.
 - **Backport helpers** — Fakelib folder manager, BPS patch apply, and
   SDK Version Changer for folder dumps that need newer system libs.
   Runtime mount is still BackPork or ShadowMount+ (don’t run both).
@@ -159,10 +161,10 @@
   title inside the image first so the dashboard stays clean —
   no ghost tiles after unmount.
 - **Speaks your language** — the whole UI, including error messages
-  and troubleshooting hints, is available in 20 languages: English,
+  and troubleshooting hints, is available in 21 languages: English,
   Simplified & Traditional Chinese, Spanish, Hindi, Arabic, Bengali,
   Brazilian Portuguese, Russian, Japanese, German, French, Korean,
-  Turkish, Vietnamese, Indonesian, Italian, Thai, Polish, and Hungarian.
+  Turkish, Vietnamese, Indonesian, Italian, Thai, Polish, Hungarian, and Persian.
 
 ## What it doesn't do
 
@@ -191,7 +193,70 @@ Pre-built downloads land on the
 | Linux — Debian / Ubuntu (x64 / ARM64) | `PS5Upload-<ver>-linux-{x64,arm64}.deb` | `sudo apt install ./PS5Upload-<ver>-linux-<arch>.deb` — installs a normal app with a menu entry; pulls in the WebKitGTK deps automatically. |
 | Linux — Fedora / RHEL / Bazzite (x64 / ARM64) | `PS5Upload-<ver>-linux-{x64,arm64}.rpm` | `sudo dnf install ./PS5Upload-<ver>-linux-<arch>.rpm` (Bazzite/Silverblue: `rpm-ostree install`) — menu entry + auto deps. |
 | Linux — any distro (x64 / ARM64) | `PS5Upload-<ver>-linux-{x64,arm64}.zip` | Universal fallback (no install). Unzip, then `chmod +x PS5Upload.sh PS5Upload.AppImage` and run **`./PS5Upload.sh`** (the wrapper — handles the FUSE-less and WebKit white-screen cases for you). Running `./PS5Upload.AppImage` directly also works if your system has libfuse2 and a happy WebKitGTK. |
+| Linux — NixOS (x64 / ARM64) | no release artifact | Packaged in [NUR](https://github.com/GriefNorth/nur-packages) as `ps5upload` — see **NixOS** below. |
 | Android | `PS5Upload-<ver>-android.apk` | Enable "install unknown apps" for your browser/file manager, then open the `.apk`. Same interface, mobile-friendly; connects to and manages your PS5 over Wi-Fi. |
+
+### NixOS
+
+No NixOS artifact is published on the Releases page, but ps5upload is
+packaged in [GriefNorth's NUR](https://github.com/GriefNorth/nur-packages) as
+`ps5upload` (x64 and ARM64) — it wraps the same `.AppImage` and needs no
+FUSE. With flakes:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nur.url = "github:GriefNorth/nur-packages";
+  };
+
+  outputs = { nixpkgs, nur, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ({ pkgs, ... }: {
+          environment.systemPackages = [
+            nur.packages.${pkgs.system}.ps5upload
+          ];
+        })
+      ];
+    };
+  };
+}
+```
+
+Then `nixos-rebuild switch --flake .#myhost` and launch **ps5upload** from
+your app menu. Without flakes, call the package straight out of the repo —
+and note that ps5upload bundles UnRAR for `.rar` support, so nixpkgs needs
+`config.allowUnfree = true`:
+
+```nix
+{ pkgs, ... }:
+{
+  nixpkgs.config.allowUnfree = true;
+
+  environment.systemPackages = [
+    (pkgs.callPackage
+      ((builtins.fetchTarball
+        "https://github.com/GriefNorth/nur-packages/archive/refs/heads/main.tar.gz")
+        + "/pkgs/ps5upload")
+      { })
+  ];
+}
+```
+
+Or try it without installing anything:
+
+```bash
+nix run github:GriefNorth/nur-packages#ps5upload
+```
+
+The Nix expression pins one release version, so bump it there when a new
+ps5upload comes out. Prefer to run the AppImage yourself? Prefer the
+`./PS5Upload.sh` wrapper from the zip above — on NixOS the bare
+`.AppImage` usually renders an empty window, because its bundled
+`libwayland-client` shadows the host one and WebKitGTK then fails to create
+an EGL display. The Nix package works around that for you.
 
 ### First-launch warnings (and why they're there)
 
@@ -263,11 +328,11 @@ make run-client    # launch the Tauri dev app
   (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`,
   `libayatana-appindicator3-dev`, `libxdo-dev`, `libssl-dev`,
   `build-essential`), Node.js 22 LTS via NodeSource (only if missing),
-  Rust via rustup, and checksum-verified PS5 Payload SDK v0.42 →
+  Rust via rustup, and checksum-verified PS5 Payload SDK v0.43 →
   `~/ps5-payload-sdk`.
 - **`make install-macos`** — macOS: Xcode CLT, Homebrew, `node`, current
   `llvm` (LLVM 22 at this release), Rust via rustup, and checksum-verified
-  PS5 Payload SDK v0.42.
+  PS5 Payload SDK v0.43.
 - **`make install-windows`** — Windows 11: Node.js LTS, Rust, VS 2022 Build
   Tools (C++ workload), WebView2 Runtime, 7-Zip, and PS5 Payload SDK
   via `winget`. Run from an elevated PowerShell (or any shell with
@@ -300,17 +365,19 @@ client/ (Tauri 2 · React · TypeScript)
    │
    └── spawns ── ps5upload-engine (HTTP :19113)
                           │
-                          ▼  FTX2 binary framing
-                payload/ps5upload.elf  (PS5 C payload, ports 9113 + 9114)
+                          ▼  AVA1 (Noise-encrypted, port 9120)
+                payload/ps5upload.elf  (PS5 C payload)
 ```
 
 Three layers:
 
 - **`payload/`** — C payload that runs on the PS5 (FreeBSD 11).
-  Ports 9113 (transfer) + 9114 (management). Handles FTX2 framing,
-  BLAKE3 verification, mount pipelines, and FS ops.
-- **`engine/`** — Rust workspace with the protocol types, transfer
-  logic, HTTP service, lab CLI, mock server, and benchmarks.
+  Port 9120 (AVA1). Handles transfers, BLAKE3 verification, mount
+  pipelines, FS ops and every management call. The protocol spec is
+  [`protocol/ava1/SPEC.md`](protocol/ava1/SPEC.md).
+- **`engine/`** — Rust workspace with the AVA1 protocol, transfer
+  logic, HTTP service, lab CLI (with its benchmarks), and the
+  loopback test console.
 - **`client/`** — Tauri 2 desktop app. Tauri IPC commands proxy to the
   sidecar HTTP engine, keeping the engine usable from CLI / CI too.
 
@@ -337,8 +404,9 @@ All workflows go through the root `Makefile` (see `make help`).
 
 ## Test
 
-Unit and integration tests run entirely against an in-process mock
-FTX2 server — no PS5 needed:
+Unit and integration tests run entirely on your computer — the AVA1
+protocol is tested against loopback peers and the console-side C code
+is compiled and run on the host. No PS5 needed:
 
 ```bash
 make test-engine
@@ -357,7 +425,7 @@ Real-hardware smoke test (requires payload already loaded):
 npm run smoke:hardware
 ```
 
-See [`TESTING.md`](TESTING.md) for the complete mock-test, coverage,
+See [`TESTING.md`](TESTING.md) for the complete loopback-test, coverage,
 cross-platform, and live-PS5 validation workflow.
 
 ## Tech stack
@@ -366,8 +434,8 @@ cross-platform, and live-PS5 validation workflow.
 - **Engine** — Rust (edition 2021), tokio + axum 0.8
 - **Desktop client** — Tauri 2, React, TypeScript, Zustand,
   Tailwind CSS v4, Vite
-- **Protocol** — FTX2 (custom binary framing, BLAKE3 shard
-  verification)
+- **Protocol** — AVA1 (binary frames generated from one schema for C and
+  Rust; Noise XX handshake, ChaCha20-Poly1305, BLAKE3 file verification)
 
 ## Supported platforms
 
@@ -382,7 +450,7 @@ cross-platform, and live-PS5 validation workflow.
 **PS5 payload** — every firmware the PS5 Payload SDK supports,
 currently **1.00 through 13.60** on every console model (original
 CFI-1xxx, Slim CFI-2xxx, Pro CFI-7xxx, Digital). Built against SDK
-v0.42, which ships per-firmware kernel offsets and resolves them at
+v0.43, which ships per-firmware kernel offsets and resolves them at
 payload startup via `kernel_get_fw_version()` — the same binary
 runs on every supported firmware without per-release rebuilds.
 
@@ -420,7 +488,7 @@ port 9021 — a third-party component, not part of ps5upload.
   reboot or rest-mode cycle — send the payload again from the
   **Connection** tab.
 * Is your computer's firewall blocking outbound connections to
-  port 9113 / 9114 / 9021 on your PS5?
+  port 9120 / 9021 on your PS5?
 * Your computer and PS5 don't have to be on the same subnet, but
   there has to be a route to the IP.
 
@@ -452,10 +520,10 @@ port 9021 — a third-party component, not part of ps5upload.
   experience.
 
 **Q: Can I use this over the Internet?**
-* Yes, technically. If you forward ports 9113 / 9114 to your PS5
-  it will work. However, the FTX2 protocol is optimised for speed,
-  not for authentication — we don't recommend exposing an
-  exploited PS5 to the open Internet.
+* Technically yes — AVA1 (port 9120) encrypts and authenticates every
+  byte and only talks to paired devices. We still don't recommend
+  exposing an exploited PS5 to the open Internet; use a VPN to reach
+  your home network instead.
 
 **Q: How do I install / launch a game from the Library tab?**
 * The Library row exposes **Mount** for `.exfat` / `.ffpkg` /
@@ -531,7 +599,7 @@ port 9021 — a third-party component, not part of ps5upload.
   11, Zen 2) and calls PS5-only kernel entry points.
 
 **Q: What about older firmware (≤ 9.00)?**
-* The FTX2 payload itself doesn't call firmware-gated APIs, but
+* The payload's transfer code doesn't call firmware-gated APIs, but
   the ELF loader workflow on port 9021 depends on what your
   jailbreak exposes. Patches welcome.
 
@@ -575,7 +643,10 @@ port 9021 — a third-party component, not part of ps5upload.
   in the in-app file picker. That picker browses the *engine's* filesystem,
   not the browser's own machine — a browser tab has no way to reach a
   remote engine's disk except through what the engine itself can already
-  read. A few things are still desktop-only and hidden in the browser UI:
+  read. The picker starts at the engine's home directory (`/data` in the
+  image) unless you point it elsewhere with `PS5UPLOAD_BROWSE_ROOTS=/pkgs`;
+  the value is comma-separated, so it can offer more than one root.
+  A few things are still desktop-only and hidden in the browser UI:
   archive uploads (`.zip`/`.7z`/`.rar`), Payloads (sending a `.elf`/etc. from
   disk) and saving a save-data
   backup to your computer — everything else that operates on the PS5 itself
@@ -683,9 +754,29 @@ This software builds on the following open-source projects:
 
 **Payload (PS5):**
 * [PS5 Payload SDK](https://github.com/ps5-payload-dev/sdk) — Open-source SDK for PS5 payload development
-* [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) — Fast cryptographic hashing (per-shard verification)
+* [elfldr](https://github.com/ps5-payload-dev/elfldr) (GPLv3) — the ELF loader; a patched copy is **vendored** at [`third_party/elfldr`](third_party/elfldr) (fix for a loader that hangs on a silent client)
+* [Monocypher](https://github.com/LoupVaillant/Monocypher) (CC0 / BSD-2) — AVA1's cryptography on the console (X25519, ChaCha20-Poly1305, BLAKE2b)
+* [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) (CC0 / Apache-2.0) — fast hashing for AVA1 file verification
+* [SQLite](https://sqlite.org/) (public domain) — reading the console's app database
+* [tiny-AES-c](https://github.com/kokke/tiny-AES-c) (Unlicense) — MC4 cheat decryption
 
 ## Thanks
+
+Projects whose code ps5upload ships or ported, or whose data it reads (bundled libraries are listed
+under Third-Party Libraries above):
+
+**Code we ported and still ship**
+* [elf-arsenal](https://git.etawen.dev/soniciso/elf-arsenal) (soniciso, Sanad; GPLv3+) — the drive
+  sensor reads (`payload/src/drive_sensors.c`) are ported from it, and the cheat engine
+  (`payload/src/cheats.c`) and the wake watchdog are based on it
+
+**Data sources**
+* [PROSPEROPatches](https://prosperopatches.com/) and [ORBISPatches](https://orbispatches.com/) — game details and cover art
+* [TMDB](https://www.themoviedb.org/) — artwork
+* [etaHEN PS5_Cheats](https://github.com/etaHEN/PS5_Cheats) and the GoldHEN cheat repositories — cheat files
+
+**Contributors** — thanks to everyone who sent code, translations and docs, and to the Discord
+community who test builds and report bugs with logs.
 
 ps5upload stands on the shoulders of the **PS5 homebrew scene**. Huge
 thanks to everyone who makes this ecosystem possible — the exploit and

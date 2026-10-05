@@ -34,12 +34,12 @@ If those terms aren't acceptable, do not use this software.
 **Q: What is ps5upload?**
 A cross-platform desktop app for moving files, game folders, and
 disk images from your computer to a jailbroken PS5. Built around a
-small custom payload that runs on the PS5 and speaks a binary
-protocol (FTX2) over your LAN.
+small custom payload that runs on the PS5 and speaks its own
+encrypted transfer protocol (AVA1) over your LAN.
 
 **Q: What does it actually do?**
 - **Transfer** files and folders at near-wire speed, with BLAKE3
-  per-shard verification and resume on drop.
+  verification and resume on drop.
 - **Upload a compressed archive** — `.zip`, `.7z`, or `.rar` — of a
   game, decompressed on your PC and streamed in so it lands already
   extracted on the PS5 (no manual unpack, no temp copy of the whole
@@ -86,6 +86,91 @@ Game pkgs (UP / EP / JP / HP / CUSA / PPSA / PCSA / etc.) work fine.
 
 ---
 
+## Quick start for new users
+
+New to PS5 homebrew? Read this section first. Everything here is covered in
+more depth further down.
+
+**Q: What are the pieces, in plain words?**
+- **Jailbreak and ELF loader.** Your console has to be jailbroken before
+  anything else works. The jailbreak leaves an *ELF loader* listening on
+  port **9021**; every payload below is sent to that port. ps5upload does not
+  jailbreak your console and cannot load without a loader.
+- **kstuff.** A payload that applies live kernel patches. Installing fake
+  packages and launching what you installed need it (see "Which PS5 firmware
+  works?" above).
+- **ShadowMount+.** A payload that automatically mounts game images
+  (`.ffpkg` / `.exfat`) and game folders it finds on your drives, so they show
+  up on the home screen. Disc-image titles need it running.
+- **etaHEN.** A separate, popular homebrew environment for the PS5. If you
+  already run it, you may not need to load other payloads by hand: ps5upload
+  works with a console that etaHEN has already prepared. Check etaHEN's own
+  documentation for what your version includes, because we do not track that.
+  If something you already run loads kstuff for you, send only ps5upload;
+  loading kstuff a second time stacks another copy.
+- **ps5upload helper.** ps5upload's own payload (`ps5upload.elf`) that runs on
+  the console and does the transfers. It is the `helper` dot at the bottom of
+  the app. The app sends it for you.
+
+**Q: In what order do I load payloads?**
+Send **elfldr** first (if your setup uses it), then **kstuff**, then
+**ShadowMount+**, then **ps5upload**. The **Set up your PS5** wizard does the
+last three in this order for you, with the delays the Payloads catalogue
+recommends. Send them one at a time; the loader takes one file per
+connection. After a reboot or rest mode the payloads are gone, so load them
+again.
+
+**Q: Which payloads must already be running before I install a package?**
+The maintainers' own checklist, before any package install, is that all four
+of these are up: **nanoDNS** (`nanodns.elf`), **kstuff** (`kstuff.elf`),
+**ftpsrv-ps5** (`ftpsrv-ps5.elf`) and **ShadowMount+**
+(`shadowmountplus.elf`), plus ps5upload itself. nanoDNS and ftpsrv-ps5 are not
+part of the Setup wizard; send them from the **Payloads** tab. ps5upload's own
+transfers do not use ftpsrv-ps5 (they use the helper on port 9120). If an
+install is refused, the first thing to check is that kstuff is actually
+running.
+
+**Q: Where do I get etaHEN and its toolbox?**
+From the etaHEN project's releases on GitHub (`github.com/etaHEN/etaHEN`).
+Download from there rather than from a re-upload, and follow that project's
+install instructions. The toolbox, and what else it ships, is described there;
+ps5upload does not bundle or install etaHEN.
+
+**Q: Which firmware limits apply to what I install?**
+Users run everything from 5.x to **13.60**. Two rules matter:
+- **PS5 fake *game* packages install on firmware above 11.60 (including 13.60)
+  but are not playable.** PS4 fake packages work, and PS5 homebrew apps launch.
+  The app warns you about this combination. See "My uploaded game won't
+  launch" below for the folder-dump route.
+- On **13.60**, Stream & install is the dependable install route.
+
+**Q: Where do I get the Android app?**
+Download `PS5Upload-<ver>-android.apk` from the
+[Releases page](https://github.com/phantomptr/ps5upload/releases) and open it
+on your phone (see **Android** above for the permissions it needs).
+
+**Q: Quick start: from a fresh jailbreak to my first upload.**
+1. Jailbreak the console and confirm its ELF loader is running (port 9021).
+   Put the console on the same network as your computer, and note its IP
+   address (PS5 **Settings → Network → View Connection Status**).
+2. Install ps5upload (or open the web UI) on your computer. Use a wired
+   connection if you can.
+3. Open **Connection**, enter the console's IP, and click **Check**. If the
+   loader port is not open, the jailbreak or loader is not running yet.
+4. Run **Set up your PS5**. It downloads kstuff and ShadowMount+ and sends
+   them, then ps5upload, in the right order. If you already run kstuff (for
+   example through etaHEN), send only ps5upload.
+5. Wait for the `helper` dot to turn green. If a code appears on the console
+   (helper loaded by another tool), confirm it in the app to pair.
+6. Open **Upload**, choose your game folder, `.zip` or file, pick the
+   destination drive (internal, M.2 or USB) and click **Start**. The free-space
+   check runs before anything is sent.
+7. Open **Library** to see it. For a `.pkg` or `.fpkg`, use **Install
+   Package → Stream & install** instead. If it will not launch, see "My
+   uploaded game won't launch" below.
+
+---
+
 ## Supported platforms
 
 **Q: Which desktop OSes run ps5upload?**
@@ -109,7 +194,7 @@ Game pkgs (UP / EP / JP / HP / CUSA / PPSA / PCSA / etc.) work fine.
 There is no 32-bit x86 (i386 / i686) build for any desktop OS.
 
 **Q: Which PS5 firmware works?**
-ps5upload is built against PS5 Payload SDK v0.42, which resolves
+ps5upload is built against PS5 Payload SDK v0.43, which resolves
 kernel offsets at startup for every firmware it knows about. The
 same binary runs on the full range **1.00 – 13.60**.
 
@@ -655,14 +740,28 @@ fixes the app expects.
 
 **Q: Can multiple computers connect to the same PS5 payload at the
 same time?**
-Yes. The payload's TCP listeners on ports 9113 and 9114 accept
-concurrent connections, so two laptops both running ps5upload
+Yes. The payload's AVA1 listener on port 9120 accepts up to 16
+sessions at once (each laptop pairs once), so two laptops both running ps5upload
 against one PS5 is supported. Read-only operations (browse, hardware
 monitor) interleave cleanly. The thing to watch for is *destination
 races*: two simultaneous uploads writing to the same path will
-fight — the payload doesn't lock by destination, it commits the
-shards each transfer ACKs in arrival order. For routine use ("one
+fight — the payload doesn't lock by destination, it applies the
+writes each transfer sends in arrival order. For routine use ("one
 person uploading, another browsing"), no coordination is needed.
+
+**Q: What is the pairing code, and which ports does ps5upload use?**
+ps5upload talks to the console on one port, **9120**, plus the ELF loader's
+**9021** to load the helper. Those two are the only ones to allow in a
+firewall. Every connection is encrypted and each computer pairs with the
+console once. A helper that the app launched pairs automatically, with
+nothing to type. A helper you loaded some other way (a different loader or
+tool) shows a 6-digit code on the console; confirm it in the app to pair.
+
+**Q: How do I cap the upload speed?**
+Set `PS5UPLOAD_BANDWIDTH_MBPS` to a number of megabytes per second before
+starting the app or engine; unset, zero or an unreadable value means no
+cap. The old name from before the AVA1 release still works for one release
+and prints a deprecation line in the engine log.
 
 **Q: Can I run the transfer engine on a different machine (remote /
 self-hosted engine)? (3.3.7)**
@@ -743,7 +842,11 @@ own filesystem**, not the browser machine's. There's no way for a browser
 tab to read files off a *different* computer's disk (the one running the
 engine), so the in-app file/folder picker instead browses whatever the
 engine process can see — e.g. mount a folder into the Docker container
-with `-v /host/games:/pkgs:ro` and browse to `/pkgs`. **Install Package →
+with `-v /host/games:/pkgs:ro` and browse to `/pkgs`. The picker starts at
+the engine's home directory (`/data` in the image), so set
+`PS5UPLOAD_BROWSE_ROOTS=/pkgs` to have it open on your mount instead; the
+value is comma-separated, so it can offer more than one root.
+**Install Package →
 From this device** is the exception: it uploads a package from the browser's
 machine to the engine, then installs it. Plain files
 and folders upload the same as desktop; **archive uploads (`.zip`/`.7z`/
@@ -871,10 +974,24 @@ pool that `statfs` does not report accurately; filesystem metadata and other
 console activity also need headroom. The Volumes screen therefore shows both
 raw free space and **safe for new uploads**. ps5upload checks the expanded size
 of files, folders, ZIP, 7z and RAR transfers before sending, and repeats the
-check on the PS5 for retries/resumes using the transaction's actual durable
+check on the PS5 for retries/resumes using the job's actual durable
 progress. If the payload reports `preflight_insufficient_space`, free the
 amount shown in the error or choose another destination. Partial upload files
 are credited on Resume, so already-allocated data is not charged twice.
+
+**Q: My USB drive is too small for this game. What can I do?**
+Pick a destination with more room. ps5upload measures the whole transfer
+(including what a `.zip`, `.7z` or `.rar` expands to) and compares it with the
+destination's free space *before* sending anything, so a game that will not fit
+is refused up front, with the shortfall in the message, rather than failing
+hours in. Your options:
+- **Internal storage.** Choose the internal drive as the destination, if it has
+  the space. The Volumes screen shows raw free space and **safe for new
+  uploads**; go by the second number.
+- **An M.2 or extended-storage drive.** If you have one, choose it as the
+  destination in Upload.
+- **A larger exFAT drive.** Use a bigger USB drive formatted as exFAT.
+- Or free up space on the current drive and click Retry.
 
 **Q: What happens when the destination already has files?**
 The app asks: **Override**, **Resume**, or **Cancel**.
@@ -940,26 +1057,20 @@ rejected with a clear message.
 **Q: Does an archive upload need free space on my PC?**
 It depends on the format.
 
-- **`.rar` and `.7z` — no.** Both are decompressed and sent at the same
-  time: bytes go straight from the decoder onto the network, so nothing
-  is written to your disk. You only need room for the archive you already
-  have.
-- **`.zip` — sometimes.** Each file inside the zip is decompressed before
-  it is sent. Anything under **512 MB** is held in memory, but a larger
-  file is written to your temp folder first and deleted once it has been
-  sent. Only one file is held at a time, so the space you need is the
-  size of the **single biggest file inside the archive** — not the whole
-  game. A zip containing one 20 GB `.pkg` needs 20 GB free in temp; the
-  same game as a `.rar` or `.7z` needs none.
+- **`.zip`, `.rar` and `.7z` — no.** All three are decompressed and sent at
+  the same time: bytes go straight from the decoder onto the network, so
+  nothing is written to your disk. You only need room for the archive you
+  already have.
 
-If your temp drive is small and the game is large, prefer `.rar` or
-`.7z`. You can also raise the in-memory limit with the
-`FTX2_ZIP_RAM_THRESHOLD_MB` environment variable, at the cost of more RAM.
+A `.zip` entry of any size is inflated as it is sent, so nothing is held back in memory
+or written to temp. The `PS5UPLOAD_ZIP_RAM_THRESHOLD_MB` environment variable (and its old
+name from before the AVA1 release, which still works for one release and prints a deprecation line) is still accepted so an existing setup does not
+break, but it is ignored.
 
 This changed in a recent version. Older builds extracted a `.rar` in full
 first, which meant a 180 GB game needed 180 GB free on top of the archive.
-If you set `FTX2_ARCHIVE_STAGE_MB` to work around that, you can remove it —
-it no longer does anything.
+If you set `PS5UPLOAD_ARCHIVE_STAGE_MB` (or its old name from before the AVA1 release)
+to work around that, you can remove it — it no longer does anything.
 
 **Q: Which archive formats work on which system?**
 
@@ -998,8 +1109,7 @@ something still looks off.
 Yes — the Upload screen has a queue panel below the single-shot
 controls. Each row shows live progress, current speed, and ETA
 while running; the wall-clock-average MiB/s after it completes.
-The runner processes one item at a time (the PS5 transfer port is
-single-client), and the queue persists across app restarts so a
+The runner processes one item at a time, and the queue persists across app restarts so a
 queued item interrupted by a crash picks up cleanly when you
 press Start again. Tick **Continue on failure** to keep going
 when one item fails instead of stopping the whole batch.
@@ -1037,7 +1147,7 @@ things go to sleep:
 1. **Your computer.** ps5upload now keeps the computer awake
    **automatically** while any upload, download, or install is running
    (macOS `caffeinate`, Linux `systemd-inhibit`, Windows
-   `SetThreadExecutionState`) and releases it when the queue goes idle.
+   power request) and releases it when the queue goes idle.
    You don't have to do anything. If you want the machine to also stay
    awake while the app is open but *idle*, turn on **Settings → Keep
    Awake**. (On non-systemd Linux that toggle is greyed out — the OS has
@@ -1457,6 +1567,108 @@ the PS5 at all.
 
 ---
 
+## Install routes: what works for what (support matrix)
+
+Most "the installer is broken" reports are really "this route doesn't work for
+this kind of content on this firmware". Find your content in the left column,
+then use a route marked **works**. Error toasts in the app link here.
+
+The routes:
+
+- **Stream & install** — the PS5 downloads the package from this computer (or
+  the engine) over your network. Nothing is staged on the console.
+- **Upload & install** — the package is copied to the console first and installed
+  from there. A phone can only use this route.
+- **Folder dump + ShadowMount+** — a decrypted game folder on the console's
+  drive, mounted by ShadowMount+. No package, no installer.
+- **exFAT image + ShadowMount+** — the same game as a single `.exfat` /
+  `.ffpkg` image, mounted by ShadowMount+.
+
+| Content | Stream & install | Upload & install | Folder dump + ShadowMount+ | exFAT image + ShadowMount+ |
+|---|---|---|---|---|
+| **PS4 package** (base game) | Works. The most reliable route; PS4 fake packages play on every firmware. | Less reliable than Stream; on FW 13.60 Sony refuses it with `0x80B2116F` (the app re-serves it from the engine for you), and a failed staged re-install of an installed game can remove it. Prefer Stream. | Works (PS4 folder dumps). | Works. |
+| **PS5 package** (fake / FPKG game) | Installs. **On firmware above 11.60 the game installs but cannot be played.** | Same as Stream, plus the FW 13.60 refusal above. | Works for a decrypted PS5 dump — the route people use on 13.60. | Works — also the route used on 13.60. |
+| **PS5 homebrew app** (for example Itemzflow, `IV0002-ITEM00001`) | Works and launches, including on FW 13.60. | Works. | n/a | n/a |
+| **Patch / update** | Works (verified: a PS4 base plus its patch, streamed). Install the base first. | Risky: an update shares its content id with the base game, so a failed fallback can remove the base. Prefer Stream. | n/a — copy the update into the game folder. | n/a |
+| **DLC** | Works after its base is installed. | Works after its base is installed. | n/a | n/a |
+| **FPKG made by Convert** | Same as the content type above. | Same as the content type above. | Convert output is a package, not a folder. | Convert can start from an `.exfat` image. |
+| **Folder dump** | n/a | n/a | **Works** — see "My uploaded game won't launch" for the recipe. | Convert the folder to an `.exfat` image first. |
+
+Firmware notes:
+
+- **FW 13.60:** Stream & install works. Upload & install is refused by Sony
+  with `0x80B2116F`; since 5.41.0 the app retries by re-serving the package
+  from the engine, so you normally only see the error if that also fails.
+  Payloads need SDK 0.43 or newer (this build uses it).
+- **PS5 fake game packages above FW 11.60:** they install, but the game cannot
+  be played. PS4 fake packages and PS5 homebrew apps are not affected. The app
+  warns on Install and Convert when it sees this combination.
+- **Load order matters:** send `elfldr` first, then kstuff, ShadowMount+ and
+  ps5upload. Every package install needs kstuff, ShadowMount+ and the other
+  payloads from the Setup wizard to be running.
+
+### What the common messages mean
+
+- **"This PS5 never reached this computer" (`0x80431064`, `0x80431068`,
+  `0x8041013d`).** The console could not open a connection to the engine.
+  Allow ps5upload through the firewall (on Windows, for both Private and Public
+  networks), keep the PS5 and the computer on the same network with any VPN
+  off, and set the PS5's Proxy Server to "Do Not Use". If the address in the
+  message is not your computer's LAN address (a VPN, virtual-machine or
+  container address), set `PS5UPLOAD_PKG_HOST_IP` to the LAN IP (for example
+  `192.168.1.20`) and restart the engine. In Docker, use host networking or set
+  `PS5UPLOAD_PKG_HOST_IP` to the Docker host's LAN IP and publish port 19113.
+  **Upload & install** works without this connection.
+- **Proxy blocked the stream (`0x80431084`).** In the PS5's network Advanced
+  Settings set Proxy Server to "Do Not Use", or use Upload & install.
+- **`0x80B2116F` (or `0x80B2150F` on FW 5.10).** Sony refused a package the
+  console serves from its own storage. It is a limit of that route, not a
+  problem with the file. Use **Stream & install** from a computer.
+- **`E2-80B22410`.** An error code the PS5's own installer or system software
+  shows; ps5upload does not generate it and we have no confirmed single cause.
+  It has been reported on packages the console would not accept as built.
+  Try Stream & install, make sure the package is complete and matches the
+  console (PS4 vs PS5), and send a bug report from the app if it persists.
+- **`CE-108255-1`.** Another code the PS5 shows itself, usually when a game or
+  app fails to start rather than when an install fails. See "My uploaded game
+  won't launch" below; if it appears right after an install, the checks there
+  apply.
+- **"View product" instead of Play, or "missing base entitlement".** The
+  console treats the title as one you have not bought. An update or DLC
+  installed without its base game, or a package whose entitlement is not
+  present, shows this. Install the base game first, or use a method that
+  doesn't rely on an entitlement (see below).
+- **"This PS4 game isn't playable on PS5".** The console's own message for a
+  PS4 title it will not run. It has been seen with an update installed without
+  its base and with fake-package support not loaded. Install the complete
+  package (base first) with kstuff running, and see "My uploaded game won't
+  launch" below.
+
+## My uploaded game won't launch
+
+This is almost never a bug in ps5upload: the transfer worked, and Sony's side
+refuses to start the title. Check these in order.
+
+1. **A PS5 fake game on firmware above 11.60.** The package installs, but PS5
+   fake game packages can't be played on firmware above 11.60. This is the case
+   for a PS5 game installed from a fake package on FW 11.61, 12.xx or 13.60.
+   PS4 packages are fine, and PS5 homebrew apps (Itemzflow and similar) launch.
+   The app shows a warning for this combination on Install, Convert and when a
+   launch fails. Use a PS4 package, or the folder-dump route below.
+2. **"View product" or "missing base entitlement".** Install the base game
+   before its update or DLC. A package that needs an entitlement the console
+   does not have will always show "View product".
+3. **kstuff or ShadowMount+ is not running.** Launching needs kernel access.
+   The Installed screen says when the helper has none; load kstuff and
+   reconnect. Disc-image titles need ShadowMount+ running.
+4. **Convert to exFAT + ShadowMount+ (reported working on FW 13.60).** Put the
+   decrypted game folder on the console's drive (or convert it to an `.exfat`
+   image with **Convert**), let ShadowMount+ mount it, and launch from the
+   console's home screen. This does not depend on the package installer.
+5. **A launch the app sent is not the same as a game that started.** The
+   console accepts a launch and may take a while on the first start. If the
+   game never appears, close it from the PS5 and start it from there.
+
 ## Troubleshooting
 
 **Q: The payload isn't responding; ports appear open but connections
@@ -1485,21 +1697,6 @@ console warning ends up there with timestamps and expandable
 detail. Click **Copy** or **Download** to grab a plain-text dump
 for a bug report.
 
-**Q: An upload fails with "Upload failed — BeginTx rejected (Error):
-manifest_invalid".**
-The PS5 refused the list of files before any data was sent. Two
-common causes:
-1. **A file or folder name contains an unusual character — most often
-   a `}`.** Older payloads mis-read it and rejected the whole upload.
-   The 2.23.0 payload reads these names correctly, so **reload the
-   payload** (Connection → Send payload) and retry.
-2. **A single destination path is too long** (the PS5 caps paths at
-   512 bytes). From 2.23.0 the app catches this before the upload and
-   names the offending file so you can shorten or rename it.
-If you can't reload the payload right now, rename the offending file
-or folder (drop the `}`, or shorten a deeply-nested path) and try
-again.
-
 **Q: Deleting a huge game folder used to fail with a "502 Bad
 Gateway" error.**
 Fixed in 2.2.22. The recursive walk on a small-file-heavy folder
@@ -1510,44 +1707,6 @@ Now `fs_delete` uses the same 1-hour deadline `fs_copy` already
 does, **and** the operation reports live progress (bytes freed)
 to the bulk-delete banner with a Stop button that cleanly bails
 between directory entries.
-
-**Q: An upload of a small-file-heavy game failed with
-`pack_worker_io_error` partway through.**
-Fixed in 2.2.22. The payload's pack worker used to flip a sticky
-worker-error flag on the very first transient `open()` or
-`write()` failure, aborting a 75k-shard transaction outright. It
-now retries transient errnos (EIO/EMFILE/ENOMEM/EINTR/EAGAIN)
-up to 3 times with 20/50/100 ms backoff before giving up.
-Unrecoverable errors (ENOSPC/EROFS/EACCES/ENAMETOOLONG) still
-fail fast — there's no point retrying a full disk. The retry
-counts surface in `COMMIT_TX_ACK` so post-mortem logs show
-exactly how many transient hits were absorbed.
-
-**Q: Library Move shows "Live progress unavailable — your PS5
-payload is older than this app" but I'm on the latest payload.**
-Fixed in 2.2.24. Two coupled bugs produced the false positive:
-
-- The payload registered the in-flight FS_OP slot *after* the
-  recursive_size pre-walk. On small-file-heavy trees the walk
-  outran the client's 250 ms initial poll delay, so the first
-  `FS_OP_STATUS` poll landed on a not-yet-registered op — the
-  engine surfaced that as a transient parse error, which the
-  client mis-attributed to an old payload. The payload now
-  registers up front with `total_bytes=0` and patches the total
-  in via `fs_op_set_total` once the walk completes.
-- The client used brittle substring matching on error text
-  (`"unsupported_frame"` / `"decode FS_OP_STATUS_ACK body"`),
-  which can appear in transient errors even on a current
-  payload. It now consults the running payload's reported
-  version: known-old payloads latch a threshold-specific banner
-  (`predates 2.2.16` or `predates 2.2.7`); current payloads
-  tolerate up to 5 consecutive transient failures and stop
-  silently with no banner — never the misleading "older than
-  this app" string.
-
-If you saw this on 2.2.23 or earlier, click **Replace payload**
-on the Connection screen once you're on 2.2.24+ and the move
-runs cleanly thereafter.
 
 **Q: After clicking Replace payload, the version number on the
 Connection screen still shows the old one for a few seconds.**
@@ -1651,13 +1810,13 @@ It starts a small **FTP server on the PS5** (like `ftpsrv.elf`), so
 FileZilla, curl, or another PC can connect **to the console**. Default
 port is **2122** so it does not fight with ftpsrv on **2121**. Use this
 for interop with other tools — for bulk game uploads, prefer the
-Upload tab (FTX2 is faster and resumes).
+Upload tab (AVA1 is faster and resumes).
 
 **Q: What is the SMB Browser for?**
 It browses a **Windows share or Samba NAS from your computer** (not
 on the PS5). You can download a file to this PC, or **upload a file
 or whole folder straight to the PS5** in one step: the engine streams
-from the share into a temp folder, then FTX2 transfers it. Destination
+straight to the PS5 over AVA1, resuming if the link drops. Destination
 works like Upload — set a parent path such as `/data/homebrew` and the
 source name is appended.
 
@@ -1745,12 +1904,12 @@ on `localhost:19113`. The desktop app uses it under the hood; CLI
 users can hit the `/api/*` endpoints directly.
 
 **Q: Can I write my own client against the payload?**
-Yes. The FTX2 binary protocol is defined in
-`engine/crates/ftx2-proto/src/lib.rs` — all frame types, body
-shapes, and flag bits are documented there. The mock server in
-`engine/crates/ps5upload-tests/tests/mock_server.rs` is a
-reference implementation of the minimum subset needed for
-transfer, which you can read as example protocol code.
+Yes. AVA1 is specified in [`protocol/ava1/SPEC.md`](protocol/ava1/SPEC.md);
+every message is defined once in `protocol/ava1/schema/ava1.toml`, and
+`engine/crates/ava1-gen` generates codecs from it (it already emits Rust
+and C). `protocol/ava1/vectors/` holds byte-exact test vectors your
+implementation must reproduce. You will need to pair with the console:
+it shows a six-digit code that your client must display too.
 
 **Q: How do I contribute a translation?**
 Edit the strings in `client/src/i18n.ts` or use the helper script at

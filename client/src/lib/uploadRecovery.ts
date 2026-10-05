@@ -55,6 +55,42 @@ const FATAL_REASON_SUBSTRINGS = [
   "corrupt", // direct_tx_corrupt etc. — data integrity, not transport
   "source_missing",
   "src_not_found",
+  // The console has not accepted this app / the archive needs a password: only a person
+  // can fix either (the pairing dialog, the password prompt). `helper_not_ava1` is NOT
+  // here: no AVA1 listener means the helper is not running, and re-sending it is the fix.
+  "not_paired",
+  "password_needed",
+  // The console runs an older helper (the banner's Update helper is the fix), its new helper's
+  // transfer server did not start, or nothing is running to replace: a retry changes nothing.
+  // `helper_starting` is NOT here: it clears by waiting.
+  "helper_old",
+  "ava1_failed",
+  "helper_not_running",
+  // An archive the uploader cannot stream fails the same way every time (the engine's
+  // zip_unsupported / 7z_unsupported / rar_unsupported and the ava1_7z_* / ava1_zip_* source reasons).
+  "zip_unsupported",
+  "7z_unsupported",
+  "rar_unsupported",
+] as const;
+
+const AVA1_FATAL_REASON_PREFIXES = [
+  "ava1_exists",
+  "ava1_cross_device",
+  // Download/copy failures a retry cannot change (engine download.rs / copy.rs).
+  "ava1_local_io",
+  "ava1_bad_manifest",
+  "ava1_copy_failed",
+  "ava1_not_paired",
+  "ava1_wrong_console",
+  "ava1_no_identity",
+  // RAR source failures (engine rar_source.rs RarReason): the same archive with
+  // the same password fails the same way. The password ones mean "ask for the
+  // password again" (UI prompt: Task 20); until then they are terminal.
+  "ava1_rar_",
+  "ava1_7z_",
+  "ava1_zip_",
+  "rar_password_required",
+  "rar_password_wrong",
 ] as const;
 
 /** Local (no payload `reason`) error-message substrings that are FATAL. These
@@ -111,6 +147,34 @@ export class PostUploadStepError extends Error {
   }
 }
 
+export interface RecoverOptions {
+  /** True where the app can send the helper itself (desktop). Default true. */
+  canSendHelper?: boolean;
+}
+
+/**
+ * Sharpens a `helper_not_ava1` failure with what the console actually runs (the engine's
+ * `GET /api/ps5/helper/state` token): an older helper reads `helper_old` (the banner offers
+ * Update), a failed one `ava1_failed`, a booting one `helper_starting`. Any other reason, or a
+ * state that adds nothing, comes back unchanged.
+ */
+export function refineHelperReason(
+  reason: string | null,
+  helperState: string | null | undefined,
+): string | null {
+  if (reason !== "helper_not_ava1") return reason;
+  switch (helperState) {
+    case "helper_old":
+      return "helper_old";
+    case "ava1_failed":
+      return "ava1_failed";
+    case "starting":
+      return "helper_starting";
+    default:
+      return reason;
+  }
+}
+
 /**
  * Decide whether a failed upload job should be auto-recovered (wait +
  * re-deploy payload + resume) or surfaced as a terminal failure.
@@ -123,9 +187,38 @@ export class PostUploadStepError extends Error {
 export function isAutoRecoverable(
   reason: string | null | undefined,
   message: string | null | undefined,
+  opts: RecoverOptions = {},
 ): boolean {
   const r = (reason ?? "").toLowerCase();
+  // No AVA1 listener: re-sending the helper is the recovery, but only where this build can send
+  // it. The browser build cannot (no payload_send), so retrying would just fail the same way.
+  if (r === "helper_not_ava1" && opts.canSendHelper === false) return false;
   if (FATAL_REASON_SUBSTRINGS.some((s) => r.includes(s))) return false;
+
+  // AVA1 landed every byte and the console refused the commit/rename
+  // (engine error_reason ava1_commit_exists / ava1_commit_cross_device,
+  // the ps5upload_ava1::PostCommitKind pair). Re-running the item would
+  // re-upload a file that is already on the console — the exact waste
+  // this list exists to prevent. Matched as a PREFIX, not a substring:
+  // a bare "ava1_commit" substring would also catch a future unrelated
+  // reason and silently classify it as post-commit.
+  if (r.startsWith("ava1_commit_")) return false;
+
+  // AVA1 refusals that happen before any data moves and cannot change on a
+  // retry (engine ps5upload_ava1::upload refusal_reason / SessionGate):
+  // the destination is taken, it is on another device, the console refused
+  // for a code we do not name, or this engine is not paired / talks to a
+  // different console / has no identity. NOT ava1_unreachable: nothing was
+  // listening, which a payload re-deploy can fix, so it stays recoverable.
+  if (AVA1_FATAL_REASON_PREFIXES.some((p) => r.startsWith(p))) return false;
+  // ava1_stalled (ERR_STALLED): the source stopped sending data while the link stayed
+  // alive; the journal is kept, so a retry resumes. Deliberately not in the fatal list.
+  // ava1_refused_<code>: fatal only for codes that are protocol/pairing/version
+  // faults (1-6, gen.rs ERR_NOT_PAIRED..ERR_UNKNOWN_METHOD). Internal (7), busy
+  // (8), unknown job (11), io (12), verify (13), credit (17) and any code we do
+  // not know are transient, so they keep the default (recoverable).
+  const refused = /^ava1_refused_(\d+)$/.exec(r);
+  if (refused && Number(refused[1]) >= 1 && Number(refused[1]) <= 6) return false;
 
   // Only consult the raw message for fatality when there's no structured
   // reason — a payload that gave us a (non-fatal) reason has already told us
@@ -152,7 +245,8 @@ export function shouldAutoRecover(
   err: unknown,
   reason: string | null | undefined,
   message: string | null | undefined,
+  opts: RecoverOptions = {},
 ): boolean {
   if (err instanceof PostUploadStepError) return false;
-  return isAutoRecoverable(reason, message);
+  return isAutoRecoverable(reason, message, opts);
 }

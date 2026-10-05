@@ -55,6 +55,7 @@ import {
 } from "../state/tasks";
 import { formatBytes, formatDuration } from "../lib/format";
 import { useRosterStore } from "../state/roster";
+import { consoleAddr } from "../lib/addr";
 import { commandTask, taskCapabilities } from "../state/taskControls";
 
 /** Render the icon for a TaskKind. */
@@ -264,7 +265,7 @@ function TaskRow({ task }: { task: Task }) {
           {task.label}
         </span>
         <ConsoleChip
-          addr={profiles.length > 1 ? `${task.consoleId}:9114` : undefined}
+          addr={profiles.length > 1 ? consoleAddr(task.consoleId) : undefined}
           className="shrink-0"
         />
         <span className="shrink-0 text-[var(--color-muted)]">

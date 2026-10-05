@@ -39,10 +39,10 @@ function sleep(ms: number): Promise<void> {
  *
  * `force` (optional) re-sends the ELF even when the mgmt port reports a
  * matching version. This is REQUIRED for recovery from a mid-transfer drop:
- * the version check probes the mgmt port (:9114), but the transfer listener
- * (:9113) can die while mgmt survives — or the whole payload can be wedged —
+ * the version check can answer from a half-alive helper, but the transfer listener
+ * can die while management survives — or the whole payload can be wedged —
  * so trusting "version matches → current" leaves a dead transfer port in
- * place and the resume retry just fails again on a refused :9113 (the
+ * place and the resume retry just fails again on a refused connection (the
  * "I had to re-send the ELF manually" symptom). On a connection-class
  * failure the payload is already suspect, so force a clean redeploy.
  */

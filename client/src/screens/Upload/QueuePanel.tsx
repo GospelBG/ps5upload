@@ -26,6 +26,7 @@ import {
   Toggle,
 } from "../../components";
 import { queueItemViewPath } from "../../lib/queueView";
+import { queueRemainingBytes } from "../../lib/queueSize";
 import { usePackageViewer } from "../../state/packageViewer";
 import { GameIcon } from "../../components/GameIcon";
 import { PlatformBadge } from "../../components/PlatformBadge";
@@ -48,6 +49,10 @@ import {
 } from "../../state/uploadQueue";
 import { isRemotePath } from "../../lib/remotePath";
 import { useTransferStore } from "../../state/transfer";
+import { BottleneckLine, JobLiveNotes, UnsettledLine } from "./Bottleneck";
+import { WhySlowPanel } from "./WhySlow";
+import { RarPasswordPrompt } from "./RarPasswordPrompt";
+import { rarPasswordProblem } from "../../lib/rarPassword";
 
 /** One console's slice of the queue, in first-seen order. */
 interface ConsoleGroup {
@@ -141,11 +146,15 @@ export function QueuePanel({ host }: { host?: string } = {}) {
   const tr = useTr();
   const allItems = useUploadQueueStore((s) => s.items);
   const items = useMemo(() => queueItemsForHost(allItems, host), [allItems, host]);
+  // Bytes the queue still has to write, across every console shown here.
+  // Counts down live while a transfer runs, alongside the count chips.
+  const totalBytes = useMemo(() => queueRemainingBytes(items), [items]);
   const continueOnFailure = useUploadQueueStore((s) => s.continueOnFailure);
   const running = useUploadQueueStore((s) => s.running);
   const runningHosts = useUploadQueueStore((s) => s.runningHosts);
   const loaded = useUploadQueueStore((s) => s.loaded);
   const persistenceError = useUploadQueueStore((s) => s.persistenceError);
+  const isLeader = useUploadQueueStore((s) => s.isLeader);
   const hydrate = useUploadQueueStore((s) => s.hydrate);
   const start = useUploadQueueStore((s) => s.start);
   const stop = useUploadQueueStore((s) => s.stop);
@@ -202,6 +211,18 @@ export function QueuePanel({ host }: { host?: string } = {}) {
 
   return (
     <section className="mb-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] p-5">
+      {!isLeader && (
+        <div
+          role="status"
+          className="mb-4 rounded border border-[var(--color-border)] bg-[var(--color-surface-3)] px-3 py-2 text-xs text-[var(--color-muted)]"
+        >
+          {tr(
+            "queue_other_tab_notice",
+            undefined,
+            "This queue is running in another tab of this browser. This tab only shows it; use the other tab to start, stop or change it.",
+          )}
+        </div>
+      )}
       {persistenceError && (
         <div className="mb-4">
           <ErrorCard
@@ -235,6 +256,15 @@ export function QueuePanel({ host }: { host?: string } = {}) {
             done={doneCount}
             failed={failedCount}
           />
+          {totalBytes > 0 && (
+            <span className="rounded-full bg-[var(--color-surface-3)] px-2 py-0.5 text-[11px] font-medium tabular-nums text-[var(--color-muted)]">
+              {tr(
+                "queue_size_chip",
+                { size: formatBytes(totalBytes) },
+                `${formatBytes(totalBytes)} to upload`,
+              )}
+            </span>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -444,6 +474,9 @@ function ConsoleGroup({
 
   const positions = useMemo(() => pendingPositions(items), [items]);
   const sections = useMemo(() => queueSections(items), [items]);
+  // This console's remaining queue size, shown as a chip in the group
+  // header next to the counts. Counts down live while an upload runs.
+  const groupBytes = useMemo(() => queueRemainingBytes(items), [items]);
   // A waiting row can move only past a neighbour in the same install tier —
   // the tier (base → update → DLC) decides the order before the list does.
   const movable = useMemo(() => {
@@ -554,6 +587,15 @@ function ConsoleGroup({
               }`,
             )}
           </span>
+          {groupBytes > 0 && (
+            <span className="rounded-full bg-[var(--color-surface-3)] px-2 py-0.5 text-[11px] font-medium tabular-nums text-[var(--color-muted)]">
+              {tr(
+                "queue_size_chip",
+                { size: formatBytes(groupBytes) },
+                `${formatBytes(groupBytes)} to upload`,
+              )}
+            </span>
+          )}
           {hostRunning ? (
             <Button
               variant="secondary"
@@ -989,6 +1031,9 @@ export function QueueRow({
             value={pct / 100}
             label={tr("queue_title", undefined, "Queue")}
           />
+          <div className="mt-1">
+            <JobLiveNotes live={item.live} />
+          </div>
           {isFinalizing && (
             // Always-visible explainer under the bar. The pill itself
             // ("Finalizing on PS5") is short enough to fit on the
@@ -1010,6 +1055,13 @@ export function QueueRow({
       {item.status === "done" && !isInstall && (
         <DoneStats bytesSent={item.bytesSent} bytesPerSec={item.bytesPerSec} />
       )}
+      {item.status === "done" && !isInstall && item.live?.bottleneck && (
+        <BottleneckLine cause={item.live.bottleneck} />
+      )}
+      {item.status === "done" && !isInstall && <UnsettledLine live={item.live} />}
+      {(item.status === "done" || item.status === "failed") && !isInstall && (
+        <WhySlowPanel jobId={item.jobId} />
+      )}
 
       {item.status === "done" && item.installNote && (
         <div className="mt-1 text-xs text-[var(--color-muted)]">
@@ -1024,6 +1076,17 @@ export function QueueRow({
           detail={item.errorDetail}
         />
       )}
+
+      {item.status === "failed" &&
+        !isInstall &&
+        rarPasswordProblem(item.errorReason, item.error) && (
+          <RarPasswordPrompt
+            problem={rarPasswordProblem(item.errorReason, item.error)!}
+            onSubmit={(pw) =>
+              useUploadQueueStore.getState().retryWithPassword(item.id, pw)
+            }
+          />
+        )}
 
       {item.status === "failed" && isInstall && (
         <div className="mt-2 flex flex-wrap gap-2">
@@ -1230,6 +1293,14 @@ function FailedRowErrorCard({
         detail={
           humanized ? (
             <>
+              {reason && (
+                <div
+                  className="mt-0.5 font-mono text-[10px] text-[var(--color-muted)]"
+                  data-testid="error-reason-code"
+                >
+                  {reason}
+                </div>
+              )}
               {detail && (
                 <div className="mt-1 text-xs text-[var(--color-muted)]">
                   {detail}

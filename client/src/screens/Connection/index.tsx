@@ -37,7 +37,7 @@ type StepState = "idle" | "busy" | "ok" | "fail";
  * Three-step guided flow before first upload:
  *
  *   1. Enter PS5 IP, probe the loader port (:9021).
- *   2. Send the payload ELF; poll the payload port (:9113) until it
+ *   2. Send the payload ELF; poll the helper (:9120) until it
  *      answers so we know the payload actually booted.
  *   3. Unlock "Go to Upload".
  *
@@ -548,7 +548,6 @@ export default function ConnectionScreen() {
                 ps5Kernel: status.ps5Kernel,
                 ucredElevated: status.ucredElevated,
                 priorInstance: status.priorInstance,
-                maxTransferStreams: status.maxTransferStreams,
                 payloadProbing: false,
               });
             }

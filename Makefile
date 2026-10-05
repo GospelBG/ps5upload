@@ -2,11 +2,11 @@
 #
 # Tree layout (current):
 #   payload/   — PS5 C payload (FreeBSD 11)
-#   engine/    — Rust workspace: ftx2-proto, ps5upload-core, -engine HTTP service,
-#                -lab CLI, -tests mock server, -bench, -pkg
+#   engine/    — Rust workspace: ava1, ps5upload-core, -ava1, -engine HTTP service,
+#                -lab CLI, -tests, -pkg
 #   client/    — Tauri 2 desktop app, cross-platform (Linux/macOS/Windows, x64+arm64)
 #   tests/     — root integration smoke + tests/lab/ (real-hardware shell scripts)
-#   bench/     — golden workloads, baselines, perf-gate helpers
+#   bench/     — hardware sweep, golden workloads and profiles
 #   scripts/   — install + dev helpers (one per OS, plus shared mjs utilities)
 #
 # Retired pre-2.1: app/ (browser server), shared/ (legacy JS modules),
@@ -35,7 +35,7 @@ export PS5_PAYLOAD_SDK
 PS5_SDK_TAG := $(shell sed -n 's/^PS5_SDK_TAG=//p' scripts/ps5-sdk.env 2>/dev/null)
 
 # On macOS the payload SDK's `prospero-clang` wrapper resolves `ld.lld`
-# and `clang` through `prospero-llvm-config`. SDK v0.42 supports LLVM 16–22.
+# and `clang` through `prospero-llvm-config`. SDK v0.43 supports LLVM 16–22.
 # Homebrew exposes the current major as `llvm` (not `llvm@22`), so discover
 # its real prefix and retain versioned fallbacks for older installations.
 # Linux/WSL picks up `llvm-config-<N>` from apt naturally.
@@ -109,6 +109,7 @@ ADB ?= $(ANDROID_HOME)/platform-tools/adb
 .PHONY: quality quality-full quality-hardware ci ci-full
 .PHONY: clean clean-payload clean-engine clean-client
 .PHONY: verify info install-hooks
+.PHONY: test-ava1 test-ava1-sanitize ava1-fuzz-c ava1-soak check-no-ftx2
 .PHONY: run-engine run-client dev start _check-tauri-system-deps
 .PHONY: install-engine uninstall-engine
 .PHONY: dist dist-win dist-win-arm dist-mac dist-mac-x64 dist-linux dist-linux-arm
@@ -162,6 +163,7 @@ help:
 	@echo "  make coverage-client  - Frontend coverage report only"
 	@echo "  make test-engine      - cargo test --workspace"
 	@echo "  make test-desktop     - Tauri Rust cargo check/clippy/test"
+	@echo "  make test-ava1        - AVA1 Rust + C conformance and interop tests"
 	@echo "  make test-payload     - Validate $(PAYLOAD_ELF)"
 	@echo "  make test-client      - Type-check + lint + unit tests + build client UI"
 	@echo ""
@@ -500,28 +502,90 @@ gen-fixtures:
 	@node scripts/gen-fixtures.mjs
 
 sweep:
-	@echo "Running FTX2 sweep against live PS5 at $(PS5_HOST):9113 ..."
-	@node bench/run-ftx2-sweep.mjs --spawn-engine --gen-fixtures
+	@echo "Running the upload sweep against live PS5 at $(PS5_HOST) ..."
+	@node bench/run-sweep.mjs --spawn-engine --gen-fixtures
 
 # Wait for the payload's runtime port to accept connections after send.
 # Retries 15×/2s = 30s ceiling; exits non-zero if the port never opens.
 _wait-payload-ready:
-	@echo "Waiting for PS5 runtime port 9113 ..."
+	@echo "Waiting for the helper's AVA1 port 9120 ..."
 	@i=0; while [ $$i -lt 15 ]; do \
-		if nc -z -w 1 "$(PS5_HOST)" 9113 >/dev/null 2>&1; then \
+		if nc -z -w 1 "$(PS5_HOST)" 9120 >/dev/null 2>&1; then \
 			echo "✓ runtime port open"; exit 0; \
 		fi; \
 		i=$$((i+1)); sleep 2; \
 	done; \
-	echo "ERROR: PS5 runtime port 9113 did not open within 30s"; exit 1
+	echo "ERROR: PS5 AVA1 port 9120 did not open within 30s"; exit 1
 
-validate: send-payload _wait-payload-ready
+#──────────────────────────────────────────────────────────────────────────────
+# check-no-ftx2: the retired protocol (FTX2) and its ports (9113 transfer, 9114
+# management) must not reappear anywhere in the repository.
+#
+# The scope is the whole tree, payload and the host C tests included, except the history the
+# project keeps on purpose and the files that must name the legacy protocol (listed below). The
+# pattern is case-insensitive "ftx2" or a bare port 9113/9114. Digits on either side are excluded
+# so the engine's own 19113 is not a match. Binary files and lockfiles are not searched.
+#
+# Exceptions (each is a path excluded from the search; keep this list to files that must name
+# the legacy protocol, and reword anything else to AVA1 terms):
+#   payload/src/legacy_takeover.c    the migration shim that asks an old helper to exit.
+#   CHANGELOG.md                     history keeps FTX2 by design.
+#   protocol/ava1/                   the spec, the cutover checklist and the method
+#                                    checklist describe the migration from FTX2.
+#   Makefile, .github/workflows/engine-ci.yml
+#                                    name this check and its pattern.
+#   .../ava1-ctest/tests/lifecycle.rs
+#                                    pins the legacy takeover frame bytes (the shim's header).
+#   .../ava1-ctest/tests/payload_cutover.rs
+#                                    asserts the payload no longer says FTX2 or 9113/9114.
+#   .../ps5upload-engine/src/legacy_helper.rs, legacy_helper_tests.rs, legacy_guard.rs
+#                                    the migration shim: shuts an old helper down and
+#                                    shows the old-helper banner.
+#   .../ps5upload-engine/src/ava1_only_tests.rs
+#                                    the tests that pin the engine free of the retired symbols.
+#   client/src/lib/addr.ts,
+#   client/src/lib/humanizeError.ts  tolerate a stale host:9113 / host:9114 a user or an
+#                                    older engine message still carries.
+#   *.test.ts, *.test.tsx            use 9113/9114 as fixture addresses for that same tolerance.
+#   engine .../install/, fakelibs_api.rs, icon_cache.rs, ps5upload-ava1 pool.rs, the lab's
+#   main.rs and bench.rs             old-port strip logic and its fixtures.
+CHECK_NO_FTX2_PATTERN := ftx2|(^|[^0-9])911[34]([^0-9]|$$)
+CHECK_NO_FTX2_SCOPE := .
+CHECK_NO_FTX2_EXCEPT := \
+	':!payload/src/legacy_takeover.c' \
+	':!engine/crates/ava1-ctest/tests/lifecycle.rs' \
+	':!engine/crates/ava1-ctest/tests/payload_cutover.rs' \
+	':!CHANGELOG.md' \
+	':!protocol/ava1' \
+	':!Makefile' \
+	':!.github/workflows/engine-ci.yml' \
+	':!*Cargo.lock' ':!*package-lock.json' \
+	':!engine/crates/ps5upload-engine/src/legacy_helper.rs' \
+	':!engine/crates/ps5upload-engine/src/legacy_helper_tests.rs' \
+	':!engine/crates/ps5upload-engine/src/legacy_guard.rs' \
+	':!engine/crates/ps5upload-engine/src/ava1_only_tests.rs' \
+	':!engine/crates/ps5upload-engine/src/install' \
+	':!engine/crates/ps5upload-engine/src/fakelibs_api.rs' \
+	':!engine/crates/ps5upload-engine/src/icon_cache.rs' \
+	':!engine/crates/ps5upload-ava1/src/pool.rs' \
+	':!engine/crates/ps5upload-lab/src/main.rs' \
+	':!engine/crates/ps5upload-lab/src/bench.rs' \
+	':!client/src/lib/addr.ts' \
+	':!client/src/lib/humanizeError.ts' \
+	':!client/src/**/*.test.ts' ':!client/src/**/*.test.tsx'
+
+check-no-ftx2:
+	@if git grep -n -I -i -E '$(CHECK_NO_FTX2_PATTERN)' -- $(CHECK_NO_FTX2_SCOPE) $(CHECK_NO_FTX2_EXCEPT); then \
+		echo "ERROR: FTX2 or port 9113/9114 found above (see the check-no-ftx2 notes in the Makefile)"; exit 1; \
+	else echo "✓ check-no-ftx2: clean"; fi
+
+validate: check-no-ftx2 send-payload _wait-payload-ready
 	@echo ""
 	@echo "── Running smoke suite ────────────────────────────────"
 	@npm run --silent smoke:hardware
 	@echo ""
 	@echo "── Running sweep (default profiles) ────────────────────"
-	@node bench/run-ftx2-sweep.mjs --spawn-engine --gen-fixtures
+	@node bench/run-sweep.mjs --spawn-engine --gen-fixtures
 	@echo ""
 	@echo "✓ validate complete — see bench/reports/ for the full report"
 
@@ -531,7 +595,7 @@ validate-xl: send-payload _wait-payload-ready
 	@npm run --silent smoke:hardware
 	@echo ""
 	@echo "── Running sweep (INCLUDING XL 200k-file stress) ───────"
-	@node bench/run-ftx2-sweep.mjs --spawn-engine --gen-fixtures --xl
+	@node bench/run-sweep.mjs --spawn-engine --gen-fixtures --xl
 	@echo ""
 	@echo "✓ validate-xl complete — see bench/reports/ for the full report"
 
@@ -693,10 +757,10 @@ docker-engine:
 	@echo "✓ Built image $(DOCKER_ENGINE_IMAGE) — run with: make docker-engine-run"
 
 # Run the locally-built engine image. Binds the published port and points it at
-# the PS5's transfer port. Override PS5_HOST / the bind address as needed.
+# the PS5 (AVA1, port 9120). Override PS5_HOST / the bind address as needed.
 docker-engine-run: docker-engine
-	@echo "Running $(DOCKER_ENGINE_IMAGE) — engine on :19113, PS5 at $(PS5_HOST):9113 ..."
-	@$(DOCKER) run --rm -p 19113:19113 -e PS5_ADDR=$(PS5_HOST):9113 $(DOCKER_ENGINE_IMAGE)
+	@echo "Running $(DOCKER_ENGINE_IMAGE) — engine on :19113, PS5 at $(PS5_HOST) ..."
+	@$(DOCKER) run --rm -p 19113:19113 -e PS5_ADDR=$(PS5_HOST) $(DOCKER_ENGINE_IMAGE)
 
 #──────────────────────────────────────────────────────────────────────────────
 # Testing
@@ -745,9 +809,7 @@ ci-full: quality-full
 test-root:
 	@echo "Syntax-checking root node scripts..."
 	@node --check tests/smoke-hardware.mjs
-	@node --check bench/run-ftx2-sweep.mjs
-	@node --check bench/run-ftx2-upload.mjs
-	@node --check bench/check-ftx2-baseline.mjs
+	@node --check bench/run-sweep.mjs
 	@node --check scripts/gen-fixtures.mjs
 	@node --check scripts/check-lockfile.mjs
 	@node scripts/check-lockfile.mjs --self-test
@@ -808,16 +870,6 @@ test-payload: payload
 	done
 	@echo "✓ Main payload and PS5Upload installer are PS5 ELFs with gzip resources"
 	@echo "Running play-time launch/resume self-test (host build)..."
-	@echo "Running accept-recovery self-test (host build)..."
-	@cc -O2 -Wall -Wextra -Werror -o /tmp/ps5upload-accept-recovery-selftest \
-		$(PAYLOAD_DIR)/tests/accept_recovery_selftest.c
-	@/tmp/ps5upload-accept-recovery-selftest
-	@echo "✓ accept() failures keep the helper serving until its network is gone"
-	@echo "Running direct-commit apply self-test (host build)..."
-	@cc -O2 -Wall -Wextra -Werror -o /tmp/ps5upload-commit-apply-selftest \
-		$(PAYLOAD_DIR)/tests/commit_apply_selftest.c
-	@/tmp/ps5upload-commit-apply-selftest
-	@echo "✓ a repeat COMMIT never unlinks a destination it cannot replace"
 	@cc -O2 -Wall -Wextra -Werror -o /tmp/ps5upload-activity-selftest \
 		$(PAYLOAD_DIR)/tests/activity_launch_selftest.c
 	@/tmp/ps5upload-activity-selftest
@@ -835,6 +887,12 @@ test-payload: payload
 		$(PAYLOAD_DIR)/tests/xml_encoding_selftest.c
 	@/tmp/ps5upload-xml-encoding-selftest
 	@echo "✓ UTF-16 SHN/MC4 cheat files convert so their cheats appear"
+	@echo "Running cheat title list self-test (host build)..."
+	@cc -O2 -Wall -Wextra -Werror -I$(PAYLOAD_DIR)/include \
+		-o /tmp/ps5upload-cheats-list-selftest \
+		$(PAYLOAD_DIR)/tests/cheats_list_selftest.c
+	@/tmp/ps5upload-cheats-list-selftest
+	@echo "✓ a large or badly encoded cheat pack lists as valid, bounded JSON"
 	@echo "Checking per-console isolation..."
 	@./scripts/check-per-console-isolation.sh
 	@echo "✓ one console's data cannot be shown under another's name"
@@ -917,9 +975,15 @@ test-payload: payload
 	@echo "Running FTP lifecycle self-test (host build)..."
 	@cc -O2 -Wall -Wextra -Werror -pthread -I$(PAYLOAD_DIR)/include \
 		-o /tmp/ps5upload-ftp-lifecycle-selftest \
-		$(PAYLOAD_DIR)/tests/ftp_lifecycle_selftest.c
+		$(PAYLOAD_DIR)/tests/ftp_lifecycle_selftest.c $(PAYLOAD_DIR)/src/path_policy.c
 	@/tmp/ps5upload-ftp-lifecycle-selftest
 	@echo "✓ FTP stop/start drains sessions without stale listeners or fd reuse"
+	@echo "Running FTP trust-store self-test (host build)..."
+	@cc -O2 -Wall -Wextra -Werror -pthread -I$(PAYLOAD_DIR)/include \
+		-o /tmp/ps5upload-ftp-trust-selftest \
+		$(PAYLOAD_DIR)/tests/ftp_trust_store_selftest.c
+	@/tmp/ps5upload-ftp-trust-selftest
+	@echo "✓ FTP cannot reach the AVA1 trust store directly or through an ancestor"
 	@echo "Running timed initializer serialization self-test (host build)..."
 	@cc -O2 -Wall -Wextra -Werror -pthread -I$(PAYLOAD_DIR)/include \
 		-o /tmp/ps5upload-timed-init-selftest \
@@ -1002,11 +1066,6 @@ test-payload: payload
 		$(PAYLOAD_DIR)/tests/cross_device_selftest.c
 	@/tmp/ps5upload-cross-device-selftest
 	@echo "✓ cross-mount renames are refused before they can panic the kernel"
-	@echo "Running single-file resume open self-test (host build)..."
-	@cc -O2 -Wall -Wextra -Werror -o /tmp/ps5upload-direct-open-selftest \
-		$(PAYLOAD_DIR)/tests/direct_open_selftest.c
-	@/tmp/ps5upload-direct-open-selftest
-	@echo "✓ a resumed single-file upload writes where the acknowledged bytes end"
 	@echo "Running Remote Play registry-key self-test (host build)..."
 	@cc -O2 -Wall -Wextra -Werror -o /tmp/ps5upload-rp-keys-selftest \
 		$(PAYLOAD_DIR)/tests/rp_keys_selftest.c
@@ -1236,3 +1295,45 @@ start: run-client
 
 release-post:
 	@node scripts/release-posts.js $(ARGS)
+
+AVA1_C := payload/ava1
+AVA1_C_CODEC := $(AVA1_C)/ava1_wire.c $(AVA1_C)/ava1_frame.c $(AVA1_C)/gen/ava1_gen.c \
+	$(AVA1_C)/ava1_keys.c $(AVA1_C)/ava1_noise.c $(AVA1_C)/ava1_aead.c $(AVA1_C)/platform_posix.c \
+	payload/third_party/monocypher/monocypher.c
+
+# scripts/ava1-aead-test.sh: the C AEAD against RFC 8439 and Monocypher, including the
+# AVX2 path (x86-64 natively, or under Rosetta 2 on an arm64 Mac).
+test-ava1:
+	scripts/ava1-aead-test.sh
+	cd engine && cargo test -p ava1 -p ava1-gen -p ava1-chaos
+	# The C server and the data layer are process-wide singletons
+	# (one CServer at a time, one ava1_data_start): serial, not two shells.
+	cd engine && cargo test -p ava1-ctest -- --test-threads=1
+
+# The whole ctest suite with ASan + UBSan on every C unit (review 009 #2a), LSan included on Linux.
+# Run it on Linux (CI, or `docker run rust:latest` with clang + libclang-rt-dev installed): the Rust link
+# of the sanitized C did not link with Homebrew's clang on macOS when tried (not investigated further).
+# engine/crates/ava1-ctest/lsan.supp lists the intentional leaks (test-side Box::leak), each with its reason.
+CLANG ?= clang
+test-ava1-sanitize:
+	cd engine && CC=$(CLANG) AVA1_CTEST_SANITIZE=1 RUSTFLAGS="-Clinker=$(CLANG) $$RUSTFLAGS" \
+		ASAN_OPTIONS=$${ASAN_OPTIONS:-detect_leaks=$$([ "$$(uname)" = Linux ] && echo 1 || echo 0)} \
+		LSAN_OPTIONS=suppressions=$(CURDIR)/engine/crates/ava1-ctest/lsan.supp \
+		cargo test -p ava1-ctest -- --test-threads=1
+
+# The host soak (review 009 #2c): AVA1_SOAK_MINUTES=60 make ava1-soak. Add AVA1_CTEST_SANITIZE=1 (and
+# CC/RUSTFLAGS as above) to run it under ASan.
+ava1-soak:
+	cd engine && AVA1_SOAK_MINUTES=$${AVA1_SOAK_MINUTES:-5} cargo test -p ava1-ctest --test soak -- --ignored --test-threads=1 --nocapture
+
+ava1-fuzz-c:
+	$${CC:-clang} -g -O1 -fsanitize=fuzzer,address,undefined -DAVA1_AEAD_PORTABLE -I$(AVA1_C) -I$(AVA1_C)/gen -Ipayload/third_party/monocypher \
+		-o /tmp/ava1-fuzz-decode $(AVA1_C)/fuzz/fuzz_decode.c $(AVA1_C_CODEC)
+	/tmp/ava1-fuzz-decode -max_total_time=$${AVA1_FUZZ_SECONDS:-60} -max_len=65536
+	$${CC:-clang} -g -O1 -fsanitize=fuzzer,address,undefined -I$(AVA1_C) -I$(AVA1_C)/gen -Ipayload/third_party/blake3 \
+		-DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0 \
+		-o /tmp/ava1-fuzz-data $(AVA1_C)/fuzz/fuzz_data.c $(AVA1_C)/ava1_manifest.c $(AVA1_C)/ava1_journal.c \
+		$(AVA1_C)/ava1_ranges.c $(AVA1_C)/ava1_wire.c $(AVA1_C)/ava1_frame.c $(AVA1_C)/gen/ava1_gen.c \
+		payload/third_party/blake3/blake3.c payload/third_party/blake3/blake3_dispatch.c \
+		payload/third_party/blake3/blake3_portable.c
+	/tmp/ava1-fuzz-data -max_total_time=$${AVA1_FUZZ_SECONDS:-60} -max_len=65536

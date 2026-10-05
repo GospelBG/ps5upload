@@ -51,13 +51,13 @@ jobs:
         run: node scripts/update-version.js --check
 
   # ─────────────────────────────────────────────────────────────────────
-  # Rust workspace (engine + core + ftx2-proto). Format, clippy, tests.
+  # Rust workspace (engine, core, AVA1 crates). Format, clippy, tests.
   # Gates PRs that touch any Rust code.
   # ─────────────────────────────────────────────────────────────────────
   rust-engine:
     name: rust (engine workspace)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
@@ -108,7 +108,94 @@ jobs:
         working-directory: engine
         env:
           RUST_BACKTRACE: 1
-        run: cargo test --workspace -- --nocapture
+        run: cargo test --workspace --exclude ava1-ctest -- --nocapture
+
+      # The C server and the data layer are process-wide singletons: the C interop suite
+      # runs one test at a time so a test that holds the server cannot starve the others.
+      - name: cargo test (ava1 C interop, serial)
+        working-directory: engine
+        env:
+          RUST_BACKTRACE: 1
+        run: cargo test -p ava1-ctest -- --test-threads=1
+
+  # ─────────────────────────────────────────────────────────────────────
+  # AVA1: C/Rust conformance + interop runs in rust-engine (cargo test
+  # --workspace, then ava1-ctest serially). This job adds what that one cannot:
+  # fuzzing the C decoders and data-plane parsers under ASan/UBSan and the
+  # Rust decoders with cargo-fuzz.
+  # ─────────────────────────────────────────────────────────────────────
+  ava1:
+    name: ava1 (fuzz C + Rust decoders)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install clang + libFuzzer
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-rt-18-dev
+
+      - name: C frame AEAD (RFC 8439 + Monocypher differential, AVX2 and portable paths)
+        run: scripts/ava1-aead-test.sh
+
+      - name: No FTX2 or ports 9113/9114 outside the payload
+        run: make check-no-ftx2
+
+      - name: Fuzz C decoders + data-plane parsers (60 s each)
+        env:
+          AVA1_FUZZ_SECONDS: 60
+        run: make ava1-fuzz-c
+
+      - name: Install Rust nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+
+      - name: Fuzz Rust decoders (60 s + 30 s)
+        working-directory: engine/crates/ava1/fuzz
+        run: |
+          cargo +nightly fuzz run decode -- -max_total_time=60
+          cargo +nightly fuzz run frame_header -- -max_total_time=30
+
+  # ─────────────────────────────────────────────────────────────────────
+  # AVA1 sanitizers (review 009 #2a): the whole ctest suite, i.e. every console C path the host can run,
+  # with ASan + UBSan (+ LSan on Linux) on every C unit. A leak, use-after-free, overflow or UB in the
+  # payload C fails here instead of on a console with no debugger. Slow on purpose.
+  # engine/crates/ava1-ctest/lsan.supp lists the tests that exit on purpose, each with its reason.
+  # ─────────────────────────────────────────────────────────────────────
+  ava1-ctest-sanitize:
+    name: ava1-ctest (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install clang + sanitizer runtimes
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-rt-18-dev
+
+      - name: Cache cargo registry + sanitized target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-cargo-ava1-san-${{ hashFiles('engine/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ava1-san-
+
+      - name: cargo test -p ava1-ctest (sanitized, serial)
+        working-directory: engine
+        env:
+          CC: clang
+          AVA1_CTEST_SANITIZE: '1'
+          RUSTFLAGS: -Clinker=clang
+          ASAN_OPTIONS: detect_leaks=1
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/engine/crates/ava1-ctest/lsan.supp:print_suppressions=0
+          RUST_BACKTRACE: 1
+        run: cargo test -p ava1-ctest -- --test-threads=1
 
   # ─────────────────────────────────────────────────────────────────────
   # Engine/core target portability. This is intentionally separate from
@@ -493,6 +580,8 @@ jobs:
             echo "::error::payload ELF is smaller than expected — build may have failed silently"
             exit 1
           fi
+          # AVA1: the engine stamps its key into exactly one trust slot (SPEC.md §5.1).
+          python3 -c "d=open('payload/ps5upload.elf','rb').read(); n=d.count(b'AVA1TRUST'); assert n==1, n"
           dpi_size_bytes=$(stat -c '%s' payload/installer/ps5upload-installer.elf)
           echo "ps5upload-installer.elf: ${dpi_size_bytes} bytes"
           if [ "$dpi_size_bytes" -lt 50000 ]; then
@@ -662,6 +751,8 @@ jobs:
     needs:
       - version-sync
       - rust-engine
+      - ava1
+      - ava1-ctest-sanitize
       - rust-engine-targets
       - rust-desktop
       - client-frontend

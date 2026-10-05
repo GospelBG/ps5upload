@@ -42,7 +42,8 @@ npm run validate        # lints + unit/integration tests + typecheck + i18n + bu
 - **Lints** — `cargo fmt`/`clippy` (engine + Tauri shell), ESLint, `tsc`,
   script syntax/audit, and the i18n coverage gate.
 - **Unit + integration tests** — `cargo test --workspace` (protocol, core,
-  engine, pkg, and the mock-FTX2 integration tests — no PS5 required),
+  engine, pkg, ava1, and the loopback AVA1 integration tests that run the
+  payload's C on the host — no PS5 required),
   the Tauri shell tests, and the client Vitest suite.
 
 Other useful targets:

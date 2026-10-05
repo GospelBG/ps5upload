@@ -1,13 +1,17 @@
 [workspace]
+exclude = ["crates/ava1/fuzz"]
 members = [
-  "crates/ftx2-proto",
+  "crates/ava1",
+  "crates/ava1-gen",
+  "crates/ava1-chaos",
+  "crates/ava1-ctest",
   "crates/ps5upload-core",
   "crates/ps5upload-lab",
+  "crates/ps5upload-ava1",
   "crates/ps5upload-engine",
   "crates/ps5upload-pkg",
   "crates/ps5upload-fpkg",
   "crates/ps5upload-tests",
-  "crates/ps5upload-bench",
 ]
 resolver = "2"
 

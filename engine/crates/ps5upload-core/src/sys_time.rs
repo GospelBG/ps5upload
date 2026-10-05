@@ -1,5 +1,5 @@
-//! PS5 system clock RPCs — get + set, via TIME_GET / TIME_SET FTX2
-//! frames. The payload side is in payload/src/sys_time.c; both the
+//! PS5 system clock RPCs — get + set, via the `time.get` / `time.set`
+//! management methods. The payload side is in payload/src/sys_time.c; both the
 //! wire shape and the err_code semantics are documented there.
 //!
 //! Set requires a ucred-elevated loader on the PS5 side (kstuff or
@@ -14,12 +14,11 @@
 //! the requested epoch to see whether the clock actually moved.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 // ─── NTP query ────────────────────────────────────────────────────
 //
@@ -306,19 +305,7 @@ fn minus_one() -> i64 {
 
 /// Read the PS5's current system date/time.
 pub fn ps5_time_get(addr: &str) -> Result<PsTime> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::TimeGet, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected TIME_GET: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::TimeGetAck {
-        bail!("expected TIME_GET_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::TIME_GET, "TIME_GET", &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -337,19 +324,7 @@ pub fn ps5_time_set(addr: &str, target_unix_seconds: i64) -> Result<PsTimeSetRes
         "sec": sec,
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::TimeSet, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected TIME_SET: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::TimeSetAck {
-        bail!("expected TIME_SET_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::TIME_SET, "TIME_SET", &body)?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -396,16 +371,6 @@ pub fn humanize_err(err_code: u32) -> String {
 //
 // See reference_ps5_date_registry_keys.md for the hardware-
 // verification status of each individual key.
-
-/// One per-field availability + error triple. Every numeric field in
-/// `PsTimeState` has an `_avail` and `_err` companion field; this is
-/// just the type those companions share.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PsTimeStateField<T> {
-    pub value: T,
-    pub avail: bool,
-    pub err: u32,
-}
 
 /// Full PS5 Date & Time state surfaced by TIME_STATE_GET. The shape
 /// here mirrors the payload's flat JSON (one `<name>` + `<name>_avail`
@@ -595,19 +560,7 @@ pub struct PsTimeStateSetResult {
 /// per-field availability flag lets the caller render partial data
 /// when one or more reads fail.
 pub fn ps5_time_state_get(addr: &str) -> Result<PsTimeState> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::TimeStateGet, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected TIME_STATE_GET: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::TimeStateGetAck {
-        bail!("expected TIME_STATE_GET_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::TIME_STATE_GET, "TIME_STATE_GET", &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -617,19 +570,7 @@ pub fn ps5_time_state_get(addr: &str) -> Result<PsTimeState> {
 /// rejected" rather than one opaque ok/fail.
 pub fn ps5_time_state_set(addr: &str, req: &PsTimeStateSetRequest) -> Result<PsTimeStateSetResult> {
     let body = serde_json::to_vec(req)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::TimeStateSet, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected TIME_STATE_SET: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::TimeStateSetAck {
-        bail!("expected TIME_STATE_SET_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::TIME_STATE_SET, "TIME_STATE_SET", &body)?;
     Ok(serde_json::from_slice(&resp)?)
 }
 

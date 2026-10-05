@@ -32,7 +32,7 @@ import WakeSetup from "./WakeSetup";
  *
  * Lives inside the Connection screen so it's only available when a
  * PS5 is at least nominally reachable. Sends to the management port
- * (host:9114). On the destructive actions we log a notification +
+ * (the console host). On the destructive actions we log a notification +
  * surface the connection-drop note from core (which is success).
  */
 export default function PowerControl({ host }: { host: string }) {

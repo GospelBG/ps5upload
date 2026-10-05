@@ -917,7 +917,7 @@ static atomic_int g_fan_watcher_started  = 0;
 static atomic_int g_fan_reapply_sec = FAN_REAPPLY_DEFAULT_SEC;
 /* Serializes the (ioctl, pin) sequence inside `hw_fan_set_threshold`.
  *
- * Two concurrent FTX2 callers setting different thresholds could
+ * Two concurrent callers setting different thresholds could
  * otherwise interleave: A opens/ioctls 50 → kernel state = 50;
  * B opens/ioctls 70 → kernel state = 70; A pins 50 → atomic = 50;
  * B pins 70 → atomic = 70.   That sequence ends consistent, but
@@ -946,7 +946,7 @@ void hw_fan_pin_threshold(uint8_t threshold_c) {
  * (called by main after runtime_ensure_directories). Saved on every
  * successful set inside `hw_fan_set_threshold`.
  *
- * File format is a single decimal integer (the °C threshold). We
+ * File format is "v2 " and a decimal integer (the °C threshold). We
  * intentionally use a trivial format — no JSON, no key=value — so
  * the file is easy to inspect/edit via FTP and can't be corrupted
  * by a half-written JSON parser. */
@@ -960,8 +960,12 @@ int hw_fan_load_persisted(void) {
     FILE *fp = fopen(FAN_PERSIST_PATH, "r");
     if (!fp) return 0;
 
+    /* "v2 <C>" since #354. A file without the tag was written by a build that pinned a fan
+     * curve's FIRST point as the turbo threshold (fans at 100 % from ~50 C); it cannot be told
+     * apart from a deliberate threshold, so it is ignored once and the console runs stock until
+     * the user sets a threshold or a curve again. */
     int val = 0;
-    int matched = fscanf(fp, "%d", &val);
+    int matched = fscanf(fp, "v2 %d", &val);
     fclose(fp);
 
     if (matched != 1 || val < HW_FAN_THRESHOLD_MIN || val > HW_FAN_THRESHOLD_MAX) {
@@ -980,7 +984,7 @@ int hw_fan_load_persisted(void) {
 static void hw_fan_save_persisted(uint8_t threshold_c) {
     FILE *fp = fopen(FAN_PERSIST_PATH, "w");
     if (!fp) return;
-    fprintf(fp, "%u\n", (unsigned)threshold_c);
+    fprintf(fp, "v2 %u\n", (unsigned)threshold_c);
     fclose(fp);
 }
 
@@ -994,8 +998,12 @@ static void hw_fan_save_persisted(uint8_t threshold_c) {
 int hw_fan_load_reapply_interval(void) {
     FILE *fp = fopen(FAN_REAPPLY_PERSIST_PATH, "r");
     if (!fp) return FAN_REAPPLY_DEFAULT_SEC;
+    /* "v2 <C>" since #354. A file without the tag was written by a build that pinned a fan
+     * curve's FIRST point as the turbo threshold (fans at 100 % from ~50 C); it cannot be told
+     * apart from a deliberate threshold, so it is ignored once and the console runs stock until
+     * the user sets a threshold or a curve again. */
     int val = 0;
-    int matched = fscanf(fp, "%d", &val);
+    int matched = fscanf(fp, "v2 %d", &val);
     fclose(fp);
     if (matched != 1 || val < FAN_REAPPLY_MIN_SEC || val > FAN_REAPPLY_MAX_SEC)
         return FAN_REAPPLY_DEFAULT_SEC;
@@ -1099,7 +1107,7 @@ static int hw_fan_apply_locked(uint8_t threshold_c) {
 int hw_fan_set_threshold(uint8_t threshold_c, const char **err_reason_out) {
     /* Clamp. Intentionally silent — the client UI also clamps, but
      * we enforce here so a malicious/buggy caller can't bypass it by
-     * talking FTX2 directly. Out-of-range values get pulled to the
+     * talking to the payload directly. Out-of-range values get pulled to the
      * nearest safe bound rather than rejected, so the user still gets
      * a working outcome. */
     if (threshold_c < HW_FAN_THRESHOLD_MIN) threshold_c = HW_FAN_THRESHOLD_MIN;

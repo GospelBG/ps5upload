@@ -6,10 +6,9 @@
 //! state beyond that.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -56,19 +55,9 @@ pub fn app_lifecycle(addr: &str, action: AppAction, app_id: u32) -> Result<AppLi
         "app_id": app_id,
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppLifecycle, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APP_LIFECYCLE: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppLifecycleAck {
-        bail!("expected APP_LIFECYCLE_ACK, got {ft:?}");
-    }
+    // A refused action is `{"ok":false,"action":..,"code":..}`; over AVA1 it travels as the error's cause
+    // and `call_legacy_body` returns it, so the Sony return code below still reaches the user.
+    let resp = mgmt::call_legacy_body(addr, m::APP_LIFECYCLE, "APP_LIFECYCLE", &body)?;
     let parsed: AppLifecycleAck = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         // Include the Sony return code. Without it every failure reads
@@ -132,19 +121,9 @@ pub fn toast_send(addr: &str, req: &ToastRequest) -> Result<ToastSendAck> {
         "useIconImageUri": !req.icon.is_empty(),
     });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::ToastSend, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected TOAST_SEND: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::ToastSendAck {
-        bail!("expected TOAST_SEND_ACK, got {ft:?}");
-    }
+    // toast.send: over 4 KiB the payload answers ERR_PROTOCOL "body_too_large" (a refusal, an error here);
+    // `{"ok":false,"code":N}` (daemon offline) comes back as the body, as the handler built it.
+    let resp = mgmt::call_keep(addr, m::TOAST_SEND, "TOAST_SEND", &body)?;
     let parsed: ToastSendAck = serde_json::from_slice(&resp)?;
     if !parsed.ok {
         bail!(

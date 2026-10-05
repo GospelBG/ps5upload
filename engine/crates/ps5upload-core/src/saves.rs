@@ -1,15 +1,14 @@
-//! Save data + screenshot listing over FTX2.
+//! Save data + screenshot listing over AVA1 management.
 //!
 //! Both ops walk a known PS5 path tree on the payload side and return
 //! per-entry metadata. The actual download/upload of save data uses
 //! the existing FS_READ + transfer paths — these RPCs only do the
 //! enumeration.
 
-use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveEntry {
@@ -26,6 +25,9 @@ pub struct SaveEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveList {
     pub saves: Vec<SaveEntry>,
+    /// True when the payload's list buffer filled and later saves were not listed.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// List save data folders. Pass `user_id == 0` to list every user's
@@ -33,19 +35,7 @@ pub struct SaveList {
 pub fn list_saves(addr: &str, user_id: i32) -> Result<SaveList> {
     let body = serde_json::json!({ "user_id": user_id });
     let body = serde_json::to_vec(&body)?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::ListSaves, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected LIST_SAVES: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::ListSavesAck {
-        bail!("expected LIST_SAVES_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::SAVES_LIST, &body)?;
     let parsed: SaveList = serde_json::from_slice(&resp)?;
     Ok(parsed)
 }
@@ -60,22 +50,13 @@ pub struct ScreenshotEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenshotList {
     pub items: Vec<ScreenshotEntry>,
+    /// True when the payload's list buffer filled and later files were not listed.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 pub fn list_screenshots(addr: &str) -> Result<ScreenshotList> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::ListScreenshots, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected LIST_SCREENSHOTS: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::ListScreenshotsAck {
-        bail!("expected LIST_SCREENSHOTS_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::SHOTS_LIST, &[])?;
     let parsed: ScreenshotList = serde_json::from_slice(&resp)?;
     Ok(parsed)
 }
@@ -85,19 +66,7 @@ pub fn list_screenshots(addr: &str) -> Result<ScreenshotList> {
 /// renderer and the generic transfer-download path — the only difference
 /// is the payload walks `/user/av_contents/video` for `.webm`/`.mp4`.
 pub fn list_videos(addr: &str) -> Result<ScreenshotList> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::ListVideos, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected LIST_VIDEOS: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::ListVideosAck {
-        bail!("expected LIST_VIDEOS_ACK, got {ft:?}");
-    }
+    let resp = mgmt::call(addr, m::VIDEOS_LIST, &[])?;
     let parsed: ScreenshotList = serde_json::from_slice(&resp)?;
     Ok(parsed)
 }

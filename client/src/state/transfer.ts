@@ -23,6 +23,7 @@ import {
   type PlannedFile,
   type ReconcileMode,
 } from "../api/ps5";
+import { startPs5ToPs5 } from "../api/ava1";
 import { createRunGen } from "../lib/runGen";
 import { log } from "./logs";
 import {
@@ -33,7 +34,10 @@ import {
 import { archiveFormat, useUploadStore, type SourceKind } from "./upload";
 import { useUploadSettingsStore } from "./uploadSettings";
 import { useRecentHostMetricsStore } from "./recentHostMetrics";
-import { effectiveUploadStreams } from "../lib/uploadStreams";
+import { jobLiveFromSnapshot, type JobLive } from "../lib/jobLive";
+import { pushNotification } from "./notifications";
+import { withConsolePrefix } from "./roster";
+import { trStatic } from "../lib/trStatic";
 
 /** Module-level shortcut to the recent-host-metrics recorder. Pulled
  *  out as a function (not a direct `store.record`) so future call
@@ -93,12 +97,15 @@ export type TransferPhase =
       /** Reconcile-mode counters. 0 for plain uploads. */
       skippedFiles: number;
       skippedBytes: number;
-      /** P3 / v2.18.0 — post-100% commit-phase counters fed by
-       *  payload's APPLY_PROGRESS frames. Zero outside the
-       *  finalize phase and on old payloads that don't emit. */
+      /** Durable-file counters fed by the console (files and bytes it has
+       *  made durable so far, and the file total). Zero until the console
+       *  reports its first durable file. */
       filesFinalized: number;
       filesFinalizingTotal: number;
       bytesFinalized: number;
+      /** Skipping phase, bottleneck and "finishing on the console" notes,
+       *  present only when the engine sent them (see lib/jobLive.ts). */
+      live?: JobLive;
     }
   | {
       kind: "done";
@@ -109,6 +116,8 @@ export type TransferPhase =
       filesSent: number;
       skippedFiles: number;
       skippedBytes: number;
+      /** What limited the finished transfer, from its commit ack, when reported. */
+      live?: JobLive;
       mountedAt?: string;
       /** Non-fatal mount diagnostics surfaced when `mountAfterUpload`
        *  ran — image-layout invalid, kernel forced RO, etc. Kept on
@@ -126,7 +135,7 @@ export type TransferPhase =
        *  the user can still register manually from the Library. */
       registerWarning?: string;
     }
-  | { kind: "failed"; error: string };
+  | { kind: "failed"; error: string; /** The engine job that failed (when one was started). */ jobId?: string };
 
 interface StartArgs {
   sourceKind: SourceKind;
@@ -155,6 +164,10 @@ interface StartArgs {
    *  safely on the console); it surfaces as `registerWarning` on the
    *  done phase instead. */
   registerAfterUpload?: boolean;
+  /** PS5 to PS5: the bytes come from another console through this engine instead of from a
+   *  local path. `srcPath` is then a path on that console (`fromAddr`), `addr` the destination
+   *  console. The rest of the lifecycle (job card, poll, done/failed) is the ordinary one. */
+  ps5Source?: { fromAddr: string };
 }
 
 /** Stable idle reference — returned by `phaseForHost`/selectors when a console
@@ -244,6 +257,7 @@ export const useTransferStore = create<TransferState>((set) => {
       mountAfterUpload = false,
       mountReadOnly = true,
       registerAfterUpload = false,
+      ps5Source,
     }) {
       // Per-console key: everything below (gen, poll timer, phase write) is
       // scoped to this host so a concurrent one-shot on another console runs
@@ -344,13 +358,11 @@ export const useTransferStore = create<TransferState>((set) => {
       // through here, so users believed throttling was active when
       // it wasn't.
       const bandwidthCap = useUploadSettingsStore.getState().bandwidthCapMbps;
-      // Resolve parallel streams once at start (min of user setting +
-      // payload's advertised max). Only the reconcile/resume folder path
-      // is multi-stream today; everything else stays single-stream.
-      const streams = effectiveUploadStreams(addr);
       let jobId: string;
       try {
-        if (isFolder && strategy === "resume") {
+        if (ps5Source) {
+          jobId = await startPs5ToPs5(ps5Source.fromAddr, srcPath, addr, dest);
+        } else if (isFolder && strategy === "resume") {
           jobId = await startTransferDirReconcile(
             srcPath,
             dest,
@@ -359,7 +371,6 @@ export const useTransferStore = create<TransferState>((set) => {
             txId,
             excludes,
             bandwidthCap,
-            streams,
           );
         } else if (isFolder) {
           jobId = await startTransferDir(
@@ -449,7 +460,7 @@ export const useTransferStore = create<TransferState>((set) => {
         if (!isLive()) return;
         let snap: JobSnapshot;
         try {
-          snap = await jobStatus(jobId);
+          snap = await jobStatus(jobId, addr);
         } catch (e) {
           if (!isLive()) return;
           const msg = e instanceof Error ? e.message : String(e);
@@ -671,6 +682,7 @@ export const useTransferStore = create<TransferState>((set) => {
             filesSent: snap.files_sent ?? 0,
             skippedFiles: snap.skipped_files ?? 0,
             skippedBytes: snap.skipped_bytes ?? 0,
+            live: jobLiveFromSnapshot(snap),
             mountedAt,
             mountWarnings: mountWarnings.length > 0 ? mountWarnings : undefined,
             registeredAs,
@@ -680,6 +692,21 @@ export const useTransferStore = create<TransferState>((set) => {
             "upload",
             `done "${uploadName}" → ${finalDest}: ${snap.files_sent ?? 0} files, ${snap.bytes_sent ?? 0} bytes in ${snap.elapsed_ms ?? 0}ms${mountedAt ? `, mounted ${mountedAt}` : ""}`,
           );
+          if (jobLiveFromSnapshot(snap)?.unsettled) {
+            pushNotification(
+              "warning",
+              withConsolePrefix(
+                host ?? "",
+                trStatic("upload_warn_unsettled_title", "Upload finished, but not confirmed saved"),
+              ),
+              {
+                body: trStatic(
+                  "upload_warn_unsettled",
+                  "Every byte reached the console, but it has not confirmed saving all files yet. They finish on their own; if the console loses power first, send the folder again.",
+                ),
+              },
+            );
+          }
           // Matching "complete" toast on the PS5 itself.
           if (host) {
             void toastPush(mgmtAddr(host), "Upload complete", {
@@ -694,6 +721,7 @@ export const useTransferStore = create<TransferState>((set) => {
           setPhase(key, {
             kind: "failed",
             error: snap.error ?? "upload failed",
+            jobId,
           });
         } else {
           const now = Date.now();
@@ -751,6 +779,7 @@ export const useTransferStore = create<TransferState>((set) => {
             filesFinalized: snap.files_finalized ?? 0,
             filesFinalizingTotal: snap.files_finalizing_total ?? 0,
             bytesFinalized: snap.bytes_finalized ?? 0,
+            live: jobLiveFromSnapshot(snap),
           });
           pollTimers.set(key, setTimeout(poll, POLL_INTERVAL_MS));
         }
@@ -802,10 +831,10 @@ export const useTransferStore = create<TransferState>((set) => {
   };
 });
 
-/** Pull the host (no port) out of an addr like `192.168.1.2:9113` for
+/** Pull the host (no port) out of an addr like `192.168.1.2:port` for
  *  use as the resume-txid cache key. We deliberately key by host, not
  *  full addr, so the port choice doesn't fragment records — a user who
- *  later lands on a payload with a different transfer port should still
+ *  later lands on a payload with a different port should still
  *  be able to resume, because the payload's tx journal is port-agnostic.
  *
  *  2.12.0: migrated to canonical `hostOf` from lib/addr. Behaviour

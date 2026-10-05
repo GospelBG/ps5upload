@@ -1,11 +1,10 @@
 //! SDK Changer proxy: scan installed titles for SDK version and patch
 //! binaries + param.json to a target SDK version.
 
-use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m, Method};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SdkTitle {
@@ -122,33 +121,16 @@ pub struct SdkPatchResponse {
     pub error: Option<String>,
 }
 
-fn send_recv(
-    addr: &str,
-    req_type: FrameType,
-    ack_type: FrameType,
-    body: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    let mut c = Connection::connect(addr)?;
-    let empty: Vec<u8> = Vec::new();
-    let body = body.unwrap_or(&empty);
-    c.send_frame(req_type, body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected {:?}: {}",
-            req_type,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != ack_type {
-        bail!("expected {:?}, got {:?}", ack_type, ft);
-    }
-    Ok(resp)
+fn send_recv(addr: &str, method: Method, label: &str, body: Option<&[u8]>) -> Result<Vec<u8>> {
+    // The handler's `{"ok":false,...}` bodies carry data the callers read; call_keep gives them back
+    // as before, and leaves a plain refusal an error ("payload rejected <label>: <cause>").
+    mgmt::call_keep(addr, method, label, body.unwrap_or(&[]))
 }
 
 pub fn sdk_scan(addr: &str) -> Result<SdkScanResponse> {
-    let resp = send_recv(addr, FrameType::SdkScan, FrameType::SdkScanAck, None)?;
+    // `mgmt::call` with `m::SDK_SCAN` on purpose: Task 5 serves this method as a job op through the
+    // transport, and this one line is the only coordination with it.
+    let resp = mgmt::call(addr, m::SDK_SCAN, &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -165,8 +147,8 @@ pub fn sdk_patch(
     };
     let resp = send_recv(
         addr,
-        FrameType::SdkPatch,
-        FrameType::SdkPatchAck,
+        m::SDK_PATCH,
+        "SdkPatch",
         Some(&serde_json::to_vec(&req)?),
     )?;
     Ok(serde_json::from_slice(&resp)?)
@@ -195,8 +177,8 @@ pub fn sdk_restore(addr: &str, title_id: &str) -> Result<SdkRestoreResponse> {
     };
     let resp = send_recv(
         addr,
-        FrameType::SdkRestore,
-        FrameType::SdkRestoreAck,
+        m::SDK_RESTORE,
+        "SdkRestore",
         Some(&serde_json::to_vec(&req)?),
     )?;
     Ok(serde_json::from_slice(&resp)?)

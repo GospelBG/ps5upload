@@ -372,7 +372,10 @@ diagnostics to help debug an issue — no games or app data.\n\
   report.json          Summary: app version, OS, your description, the\n\
                        selected log level/window, the diagnostic bundle,\n\
                        engine state (transfer jobs with why they failed, and\n\
-                       live install sessions), and a snapshot of the connected\n\
+                       live install sessions, and engine.job_summaries: the last\n\
+                       20 per-job records of where each transfer's time went —\n\
+                       a hash names the console, no address or path), and a\n\
+                       snapshot of the connected\n\
                        PS5 (if any) — including per-volume free space with the\n\
                        safety reserve, the installed title list, and which\n\
                        service ports (loader :9021, DPI :9040, ours) were\n\
@@ -604,8 +607,8 @@ mod tests {
             "ts=1780601834.879 bad=<IPv4>"
         );
         assert_eq!(
-            redact_diagnostic_text("connect [fe80::1234]:9114 refused"),
-            "connect [<IPv6>]:9114 refused"
+            redact_diagnostic_text("connect [fe80::1234]:9120 refused"),
+            "connect [<IPv6>]:9120 refused"
         );
     }
 }

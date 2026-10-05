@@ -53,6 +53,17 @@ memory at a few chunks.
 `Output` with `Default::default()`, and a channel cannot be conjured from
 `Default`.
 
+### Third change: a callback sink that can stop UnRAR
+
+`read_to_fn` / `FnSink` / `ReadToFn` and `ProcessMode::abort` are local
+additions. `read_to_fn` decompresses an entry through a closure on the calling
+thread; the closure returns `false` to stop, and the `UCM_PROCESSDATA` callback
+then answers `-1`, which makes UnRAR abort at once instead of finishing the
+entry (a 30 GB entry would otherwise run to the end). The AVA1 RAR source uses
+it so a cancel, or a failing upload lane, ends a decode (including the
+decode-and-discard of a solid archive's already-uploaded entries) within one
+callback piece.
+
 ## Why vendored rather than upgraded
 
 `0.5.8` is the latest release; there is no upstream fix to take. The

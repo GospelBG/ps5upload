@@ -1,10 +1,9 @@
-//! Remote Play PIN generation over FTX2.
+//! Remote Play PIN generation over AVA1 management.
 
 use anyhow::{bail, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemotePlayStatus {
@@ -22,20 +21,63 @@ pub struct RemotePlayStatus {
     /// the bare word "failed".
     #[serde(default)]
     pub err: String,
+    /// ConfirmDeviceRegist probes made for the live PIN, and the last answer (rc, status,
+    /// reason code). Diagnostics only: `state` is already the payload's verdict. Absent
+    /// (zero) from payloads before the pairing-state rewrite.
+    #[serde(default)]
+    pub probes: u32,
+    #[serde(default)]
+    pub confirm_rc: u32,
+    #[serde(default)]
+    pub confirm_status: u32,
+    #[serde(default)]
+    pub confirm_err: u32,
+}
+
+/// Where a pairing stands, from the payload's `state` word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingPhase {
+    /// No PIN outstanding.
+    Idle,
+    /// A PIN is live; `seconds_left` counts down to its expiry. Older payloads also said
+    /// `starting` while making the PIN.
+    Waiting,
+    /// A device registration was confirmed by the console.
+    Paired,
+    /// The request or the registration failed; `err` says why.
+    Failed,
+    /// The PIN expired with no registration.
+    Timeout,
+    /// A word this engine does not know (a newer payload).
+    Unknown,
+}
+
+impl RemotePlayStatus {
+    pub fn phase(&self) -> PairingPhase {
+        match self.state.as_str() {
+            "idle" => PairingPhase::Idle,
+            "waiting" | "starting" => PairingPhase::Waiting,
+            "paired" => PairingPhase::Paired,
+            "failed" => PairingPhase::Failed,
+            "timeout" => PairingPhase::Timeout,
+            _ => PairingPhase::Unknown,
+        }
+    }
+
+    /// The PIN can still be entered on a device.
+    pub fn pin_is_live(&self) -> bool {
+        self.phase() == PairingPhase::Waiting && !self.pin.is_empty() && self.seconds_left > 0
+    }
 }
 
 pub fn remoteplay_request(addr: &str, manual_account_id: Option<&str>) -> Result<PinSnapshot> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::json!({ "manual_account_id": manual_account_id.unwrap_or("") });
-    c.send_frame(FrameType::RemotePlayRequest, &serde_json::to_vec(&body)?)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected REMOTEPLAY_REQUEST: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
+    let resp = mgmt::call_keep(
+        addr,
+        m::RP_REQUEST,
+        "REMOTEPLAY_REQUEST",
+        &serde_json::to_vec(&body)?,
+    )?;
     // The payload acks with frame type RemotePlayStatus (189) and body
     // {"ok":true|false}. A non-Error frame was previously treated as success
     // without inspecting the body — so a genuine on-console failure
@@ -72,34 +114,13 @@ pub struct PinSnapshot {
 }
 
 pub fn remoteplay_status(addr: &str) -> Result<RemotePlayStatus> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::RemotePlayStatus, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected REMOTEPLAY_STATUS: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::RemotePlayStatus {
-        bail!("expected REMOTEPLAY_STATUS response, got {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::RP_STATUS, "REMOTEPLAY_STATUS", &[])?;
     let parsed: RemotePlayStatus = serde_json::from_slice(&resp)?;
     Ok(parsed)
 }
 
 pub fn remoteplay_cancel(addr: &str) -> Result<()> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::RemotePlayCancel, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected REMOTEPLAY_CANCEL: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
+    mgmt::call_keep(addr, m::RP_CANCEL, "REMOTEPLAY_CANCEL", &[])?;
     Ok(())
 }
 
@@ -214,19 +235,7 @@ pub struct RemotePlayDevices {
 
 /// Read the readiness snapshot. Performs no writes on the console.
 pub fn remoteplay_readiness(addr: &str) -> Result<RemotePlayReadiness> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::RemotePlayReadiness, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected RemotePlayReadiness: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::RemotePlayReadiness {
-        bail!("unexpected reply to RemotePlayReadiness: {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::RP_READINESS, "RemotePlayReadiness", &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -235,38 +244,19 @@ pub fn remoteplay_readiness(addr: &str) -> Result<RemotePlayReadiness> {
 /// Returns the re-read readiness snapshot, so the caller never has to
 /// assume the write took effect.
 pub fn remoteplay_enable(addr: &str, scope: &str) -> Result<RemotePlayReadiness> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::json!({ "scope": scope });
-    c.send_frame(FrameType::RemotePlayEnable, &serde_json::to_vec(&body)?)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected RemotePlayEnable: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::RemotePlayEnable {
-        bail!("unexpected reply to RemotePlayEnable: {ft:?}");
-    }
+    let resp = mgmt::call_keep(
+        addr,
+        m::RP_ENABLE,
+        "RemotePlayEnable",
+        &serde_json::to_vec(&body)?,
+    )?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
 /// Devices this console has been paired with.
 pub fn remoteplay_devices(addr: &str) -> Result<RemotePlayDevices> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::RemotePlayDevices, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected RemotePlayDevices: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::RemotePlayDevices {
-        bail!("unexpected reply to RemotePlayDevices: {ft:?}");
-    }
+    let resp = mgmt::call_keep(addr, m::RP_DEVICES, "RemotePlayDevices", &[])?;
     Ok(serde_json::from_slice(&resp)?)
 }
 
@@ -312,5 +302,83 @@ mod firmware_tests {
     #[test]
     fn unknown_firmware_has_no_version() {
         assert_eq!(with_magic(0).firmware(), None);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::{PairingPhase, RemotePlayStatus};
+
+    fn parse(json: &str) -> RemotePlayStatus {
+        serde_json::from_str(json).expect("a payload status body")
+    }
+
+    #[test]
+    fn a_live_pin_is_waiting_with_its_countdown() {
+        // Shape of the payload's answer three seconds after a request (Phat, FW 13.60).
+        let s = parse(
+            r#"{"state":"waiting","pin":"36876659","account_id":"XCDiqZluNXo=",
+                "seconds_left":297,"err":"","probes":1,"confirm_rc":0,
+                "confirm_status":0,"confirm_err":0}"#,
+        );
+        assert_eq!(s.phase(), PairingPhase::Waiting);
+        assert!(s.pin_is_live());
+        assert_eq!(s.seconds_left, 297);
+        assert_eq!(s.probes, 1);
+    }
+
+    #[test]
+    fn every_payload_state_maps() {
+        for (word, phase) in [
+            ("idle", PairingPhase::Idle),
+            ("waiting", PairingPhase::Waiting),
+            ("starting", PairingPhase::Waiting),
+            ("paired", PairingPhase::Paired),
+            ("failed", PairingPhase::Failed),
+            ("timeout", PairingPhase::Timeout),
+            ("", PairingPhase::Unknown),
+            ("registering", PairingPhase::Unknown),
+        ] {
+            let s = parse(&format!(r#"{{"state":"{word}"}}"#));
+            assert_eq!(s.phase(), phase, "{word:?}");
+        }
+    }
+
+    #[test]
+    fn paired_timeout_and_failed_carry_no_live_pin() {
+        let paired = parse(r#"{"state":"paired","pin":"","seconds_left":0,"confirm_status":2}"#);
+        assert_eq!(paired.phase(), PairingPhase::Paired);
+        assert!(!paired.pin_is_live());
+        assert_eq!(paired.confirm_status, 2);
+
+        let timeout = parse(
+            r#"{"state":"timeout","pin":"","seconds_left":0,
+                "err":"the PIN expired before a device paired"}"#,
+        );
+        assert_eq!(timeout.phase(), PairingPhase::Timeout);
+        assert!(timeout.err.contains("expired"));
+
+        let failed = parse(
+            r#"{"state":"failed","err":"pairing failed: the PIN was entered wrong (status 3, 0x80FC1047)",
+                "confirm_status":3,"confirm_err":2164002887}"#,
+        );
+        assert_eq!(failed.phase(), PairingPhase::Failed);
+        assert_eq!(failed.confirm_err, 0x80FC1047);
+        assert!(!failed.pin_is_live());
+    }
+
+    #[test]
+    fn a_waiting_state_with_no_time_left_is_not_a_live_pin() {
+        let s = parse(r#"{"state":"waiting","pin":"12345678","seconds_left":0}"#);
+        assert!(!s.pin_is_live());
+    }
+
+    #[test]
+    fn an_older_payload_without_the_diagnostics_still_parses() {
+        let s = parse(
+            r#"{"state":"idle","pin":"","account_id":"XCDiqZluNXo=","seconds_left":0,"err":""}"#,
+        );
+        assert_eq!(s.phase(), PairingPhase::Idle);
+        assert_eq!((s.probes, s.confirm_rc, s.confirm_status), (0, 0, 0));
     }
 }

@@ -1,3 +1,4 @@
+import { consoleAddr } from "../../lib/addr";
 import { useEffect, useRef, useState } from "react";
 import {
   Search as SearchIcon,
@@ -6,7 +7,7 @@ import {
   X,
 } from "lucide-react";
 
-import { useConnectionStore, PS5_PAYLOAD_PORT } from "../../state/connection";
+import { useConnectionStore } from "../../state/connection";
 import {
   searchPS5,
   appsInstalled,
@@ -211,7 +212,7 @@ export default function SearchScreen() {
         // trim() to match the gate above and every other screen — a stored
         // host with stray whitespace would otherwise form a bad address
         // even though the Search button was enabled.
-        `${searchedHost.trim()}:${PS5_PAYLOAD_PORT}`,
+        consoleAddr(searchedHost.trim()),
         pattern,
         minSize,
         setProgress,

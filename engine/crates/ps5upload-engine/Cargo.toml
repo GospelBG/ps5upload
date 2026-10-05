@@ -20,6 +20,8 @@ path = "src/main.rs"
 webui = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
+ava1 = { path = "../ava1" }
+ps5upload-ava1 = { path = "../ps5upload-ava1" }
 anyhow.workspace = true
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 async-trait = "0.1"
@@ -31,7 +33,6 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # Cache keys and ETags for the on-disk artwork cache (icon_cache.rs).
 # Already a workspace dependency via ps5upload-core; not a new build cost.
 blake3.workspace = true
-ftx2-proto = { path = "../ftx2-proto" }
 mime_guess = { version = "2", optional = true }
 smb2 = "0.23"
 ps5upload-core = { path = "../ps5upload-core" }
@@ -56,3 +57,7 @@ russh-sftp = "3"
 # ps5upload-core gates it: the Android cross-compile stays pure Rust.
 [target.'cfg(not(target_os = "android"))'.dependencies]
 ureq = { version = "3", features = ["rustls"] }
+
+[dev-dependencies]
+# Writes the tiny archives the no-helper tests plan against (the decode side is ps5upload-core's).
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["compress"] }

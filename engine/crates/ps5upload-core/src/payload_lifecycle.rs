@@ -4,19 +4,20 @@
 //! Why this exists: the PS5 ELF loader (port 9021) is fire-and-forget —
 //! when the desktop pushes new payload bytes it spawns a fresh process,
 //! but the OLD payload process is unaware and keeps running. The two
-//! contend for the same management port (:9114). On most firmwares the
-//! new payload's bind(:9114) fails, the new process exits, and the
-//! user is left with the OLD payload still answering — but now with
-//! wire-protocol expectations that may not match the desktop's current
-//! build. Symptoms: install RPCs that bail with "read frame header"
-//! because the old payload's frame handler doesn't understand a newer
-//! frame, lingering :9113 transfers, the user's "I sent the payload
-//! but nothing changed" report.
+//! contend for the same listening port (:9120). On most firmwares the
+//! new payload's bind fails, the new process exits, and the user is
+//! left with the OLD payload still answering — but now with
+//! expectations that may not match the desktop's current build. Symptom:
+//! the user's "I sent the payload but nothing changed" report.
 //!
 //! The fix is desktop-side: BEFORE pushing fresh ELF bytes to :9021,
-//! send a Shutdown frame to the existing :9114. The payload's
-//! shutdown handler sets a flag the main loop honours; the old
-//! process exits, its ports go free, the new payload's bind succeeds.
+//! ask the running helper to exit with `node.shutdown` over the paired
+//! AVA1 session. The payload's shutdown handler sets a flag the main loop
+//! honours; the old process exits, its port goes free, the new payload's
+//! bind succeeds. A helper from before the cutover speaks only the old
+//! protocol; the engine's `legacy_helper` shim (replace route) handles
+//! it. A new payload that starts while an old one is alive takes over
+//! by itself (the payload's takeover, flag file).
 //!
 //! Best-effort by design — every error path returns Ok(false) because
 //! "no old payload running" is the common case (first session boot,
@@ -26,9 +27,8 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::time::Duration;
 
-use ftx2_proto::FrameType;
-
-use crate::connection::{resolve_connect_targets, Connection};
+use crate::mgmt::{self, m};
+use crate::net::resolve_connect_targets;
 
 /// The PS5 ELF loader's well-known port. Bytes written here are executed
 /// as a fresh process once the sender half-closes the socket.
@@ -74,40 +74,24 @@ const ELF_SEND_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const ELF_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ELF_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Send a Shutdown frame to the payload running at `mgmt_addr`
-/// (typically `<ps5-ip>:9114`).
+/// Ask the helper running at `mgmt_addr` (the console's host; a `:port` suffix is ignored, the
+/// AVA1 session uses its own port) to exit: `node.shutdown` over the paired session.
 ///
-/// Returns Ok(true) iff a Shutdown_Ack was received — i.e. we hit a
-/// real ps5upload payload and it acknowledged. Ok(false) on any
-/// failure (nothing listening, wrong process answering, ACK timeout):
-/// the caller proceeds as if there were no payload to displace, which
-/// is the right behaviour for the "first-send-of-the-session" path.
-///
-/// IO timeout is tightened from Connection's default 30 s down to
-/// 2 s for both the frame send and the ACK read — the payload's
-/// shutdown handler is one mutex flip and a 2-byte response; if
-/// either takes longer than 2 s we'd rather give up and let the
-/// new payload's bind tell the user whatever is really wrong.
+/// Returns Ok(true) iff the helper acknowledged. Ok(false) on any failure (nothing listening, not
+/// paired, ACK timeout): the caller proceeds as if there were no payload to displace, which is the
+/// right behaviour for the "first-send-of-the-session" path. The 2 s deadline is the old one: the
+/// handler is a flag flip and a tiny reply; if it takes longer we would rather give up and let
+/// the new payload's own takeover (or the bind error) say what is really wrong.
 pub fn shutdown_running_payload(mgmt_addr: &str) -> std::io::Result<bool> {
-    let mut c = match Connection::connect(mgmt_addr) {
-        Ok(c) => c,
-        Err(_) => return Ok(false),
-    };
-    // Tighten IO timeout for the small handshake. A failure here is
-    // surprising (the TCP socket is freshly connected) so we surface
-    // it as a real io::Error — but the caller treats anything ≠ true
-    // the same way, so this still degrades gracefully.
-    c.set_io_timeout(Duration::from_secs(2))?;
-    if c.send_frame(FrameType::Shutdown, &[]).is_err() {
-        return Ok(false);
-    }
-    match c.recv_frame() {
-        Ok((hdr, _)) => {
-            let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-            Ok(ft == FrameType::ShutdownAck)
-        }
-        Err(_) => Ok(false),
-    }
+    // `node.shutdown` through the management seam: over AVA1. Any failure, a refusal for not being paired included, is "nothing to displace".
+    Ok(mgmt::call_with(
+        mgmt_addr,
+        m::NODE_SHUTDOWN,
+        "SHUTDOWN",
+        &[],
+        Some(Duration::from_secs(2)),
+    )
+    .is_ok())
 }
 
 /// Join a bare host/IP with a port. A bare IPv6 literal has to be
@@ -163,7 +147,7 @@ pub fn probe_port(host: &str, port: u16, timeout: Duration) -> Result<(), String
 /// What is being loaded, which decides whether a payload already running
 /// on the console has to be shut down first.
 ///
-/// Only ps5upload binds :9114/:9113. Sending it while an older instance is
+/// Only ps5upload binds :9120. Sending it while an older instance is
 /// still alive means the new process loses the bind and the console keeps
 /// answering with the old one — the "I sent the payload but nothing
 /// changed" class of report. A companion daemon binds other ports and must
@@ -199,7 +183,7 @@ pub enum LoaderImage {
 ///
 /// Pulled out as a pure predicate because getting it wrong is silent in
 /// both directions: too eager tears the helper down on every patch
-/// install, too lax leaves the old process holding :9114 while the new one
+/// install, too lax leaves the old process holding its port while the new one
 /// exits. A non-loader port is a scene loader on its own port, which never
 /// contends with our helper.
 fn should_evict_running_payload(port: u16, image: LoaderImage) -> bool {
@@ -227,9 +211,8 @@ pub fn send_elf_to_loader(
         ));
     }
     if should_evict_running_payload(port, image) {
-        let mgmt_addr = join_host_port(ip, 9114);
-        let _ = shutdown_running_payload(&mgmt_addr);
-        // Grace period for FreeBSD to recycle :9114 after the old process
+        let _ = shutdown_running_payload(ip);
+        // Grace period for FreeBSD to recycle the port after the old process
         // exits — the same 600 ms the desktop send waits.
         std::thread::sleep(Duration::from_millis(600));
     }
@@ -268,19 +251,64 @@ pub fn send_elf_to_loader(
 mod tests {
     use super::*;
 
-    /// We can't easily spin up a fake payload server in a unit test
-    /// (Connection wants raw FTX2 framing and we'd be re-implementing
-    /// the server side just to handshake). The interesting failure
-    /// mode for callers is "nothing listening on that addr" — assert
-    /// that surfaces as Ok(false), not Err.
+    /// The interesting failure mode for callers is "nothing listening on
+    /// that addr" — assert that surfaces as Ok(false), not Err. The
+    /// acknowledged path is covered with a scripted transport below.
     #[test]
     fn nothing_listening_returns_ok_false() {
         // 198.51.100.0/24 is RFC 5737 TEST-NET-2; nothing should answer.
-        let res = shutdown_running_payload("198.51.100.1:9114");
+        let res = shutdown_running_payload("198.51.100.1");
         match res {
             Ok(false) => {}
             other => panic!("expected Ok(false), got {other:?}"),
         }
+    }
+
+    struct Scripted {
+        ok: bool,
+        seen: std::sync::Mutex<Vec<(u16, Vec<u8>)>>,
+    }
+    impl crate::mgmt::MgmtTransport for Scripted {
+        fn call(
+            &self,
+            _addr: &str,
+            method: crate::mgmt::Method,
+            label: &str,
+            body: &[u8],
+            _timeout: Duration,
+        ) -> anyhow::Result<Option<Vec<u8>>> {
+            self.seen.lock().unwrap().push((method.id, body.to_vec()));
+            if self.ok {
+                Ok(Some(b"{}".to_vec()))
+            } else {
+                Err(crate::mgmt::MgmtError {
+                    label: label.to_string(),
+                    status: 3,
+                    cause: "unpaired".into(),
+                }
+                .into())
+            }
+        }
+    }
+
+    /// The shutdown goes out as `node.shutdown` (method 5, empty body) through the management
+    /// seam, so it rides the paired AVA1 session; a refusal is Ok(false).
+    #[test]
+    fn shutdown_is_node_shutdown_over_the_seam() {
+        let t = std::sync::Arc::new(Scripted {
+            ok: true,
+            seen: Default::default(),
+        });
+        let _g = crate::mgmt::scoped_transport(t.clone());
+        assert!(shutdown_running_payload("10.0.0.2").unwrap());
+        assert_eq!(t.seen.lock().unwrap().as_slice(), &[(5u16, Vec::new())]);
+
+        let t = std::sync::Arc::new(Scripted {
+            ok: false,
+            seen: Default::default(),
+        });
+        let _g = crate::mgmt::scoped_transport(t);
+        assert!(!shutdown_running_payload("10.0.0.2").unwrap());
     }
 
     /// A non-ELF blob must never reach the loader. The loader has no
@@ -329,7 +357,7 @@ mod tests {
     }
 
     /// The DPI daemon binds :9040 and must load ALONGSIDE a running
-    /// ps5upload payload; only the helper itself contends for :9114.
+    /// ps5upload payload; only the helper itself contends for :9120.
     /// Getting this backwards tears the helper down on every patch
     /// install — or, the way it first shipped, silently never evicts,
     /// because the "ps5upload" signature this used to sniff for sits ~1.4
@@ -375,14 +403,14 @@ mod tests {
         // A name that cannot resolve and a host that never answers are
         // different problems, and the Connection screen says so (#272).
         // Collapsing them is what made a typo read as "not jailbroken".
-        let unresolvable = probe_port("no-such-host.invalid", 9113, Duration::from_millis(300))
+        let unresolvable = probe_port("no-such-host.invalid", 9020, Duration::from_millis(300))
             .expect_err("should not resolve");
         assert!(
             unresolvable.starts_with("resolve "),
             "want a resolve error, got: {unresolvable}"
         );
 
-        let unreachable = probe_port("198.51.100.1", 9113, Duration::from_millis(300))
+        let unreachable = probe_port("198.51.100.1", 9020, Duration::from_millis(300))
             .expect_err("nothing listens on TEST-NET-2");
         assert!(
             unreachable.starts_with("connect "),

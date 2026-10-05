@@ -127,7 +127,7 @@ pub struct Outcome {
 
 /// Make sure `host` runs the patched elfldr. Needs the helper up (it reads the process list).
 pub fn ensure(host: &str) -> Result<Outcome, String> {
-    let mgmt = join_host_port(host, 9114);
+    let mgmt = crate::console_addr(host);
     let before = elfldr_pids(&mgmt)?;
     let mine = installed()
         .lock()

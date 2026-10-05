@@ -1,20 +1,15 @@
-//! File-system ops over FTX2.
+//! File-system ops over AVA1 management.
 //!
-//! This module is the home for all non-transfer RPCs the UI needs:
-//! list_dir, stat, mkdir, move, copy, read_file, query_hashes. Starting
-//! with `list_dir`; others land in phases.
-//!
-//! Each helper opens a fresh TCP connection, sends one request frame,
-//! awaits the matching ACK, and returns the parsed body. All helpers
-//! surface payload-side errors (frames with `FrameType::Error`) as anyhow
-//! errors with the payload's error string verbatim, so UI can switch on
-//! the vocabulary the payload defines.
+//! This module is the home for the non-transfer file RPCs the UI needs: list_dir, stat,
+//! mkdir, move, read_file, query_hashes and the rest. Each helper makes one management
+//! call (`crate::mgmt`) and returns the parsed body. Payload-side refusals surface as
+//! anyhow errors holding a `MgmtError`, with the payload's error string verbatim, so the
+//! UI can switch on the vocabulary the payload defines.
 
 use anyhow::{bail, Context, Result};
-use ftx2_proto::FrameType;
 use serde::{Deserialize, Serialize};
 
-use crate::connection::Connection;
+use crate::mgmt::{self, m};
 
 // ─── FS_LIST_DIR ─────────────────────────────────────────────────────────────
 
@@ -91,33 +86,71 @@ pub fn list_dir_with_timeout(
     opts: ListDirOptions,
     io_timeout: Option<std::time::Duration>,
 ) -> Result<DirListing> {
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .context("applying reconcile I/O timeout")?;
-    }
     let body = serde_json::to_vec(&serde_json::json!({
         "path": path,
         "offset": opts.offset,
         "limit": opts.limit,
     }))
     .context("serialize list_dir body")?;
-    c.send_frame(FrameType::FsListDir, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_LIST_DIR({}): {}",
-            path,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::FsListDirAck {
-        bail!("expected FS_LIST_DIR_ACK, got {:?}", ft);
-    }
+    let resp = mgmt::call_with(
+        addr,
+        m::FS_LIST,
+        &format!("FS_LIST_DIR({path})"),
+        &body,
+        io_timeout,
+    )?;
     let parsed: DirListing =
         serde_json::from_slice(&resp).context("decode FS_LIST_DIR_ACK body as JSON")?;
     Ok(parsed)
+}
+
+// ─── fs.stat ────────────────────────────────────────────────────────────────
+
+/// What `fs.stat` says about a path (a symbolic link is followed; a dangling one is `link`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathStat {
+    /// `file`, `dir`, `link`, `other` or `unknown`.
+    pub kind: String,
+    pub size: u64,
+    pub mtime: u64,
+    pub mode: u32,
+    /// The device id (`st_dev`): two paths with the same value share a mount.
+    #[serde(default)]
+    pub dev: u64,
+}
+
+/// `fs.stat`: metadata of one path. An absent path is an error whose text carries
+/// `fs_stat_failed_errno_2` (see [`is_not_found`]).
+pub fn fs_stat(addr: &str, path: &str) -> Result<PathStat> {
+    let body = serde_json::to_vec(&serde_json::json!({ "path": path }))
+        .context("serialize fs_stat body")?;
+    match mgmt::call_as(addr, m::FS_STAT, &format!("FS_STAT({path})"), &body) {
+        Ok(resp) => serde_json::from_slice(&resp).context("decode FS_STAT reply as JSON"),
+        Err(e) => Err(e),
+    }
+}
+
+/// True when an error from [`fs_stat`], [`fs_read`] or [`list_dir`] means "no such path".
+pub fn is_not_found(message: &str) -> bool {
+    message.contains("ENOENT")
+        || message.contains("No such file")
+        || message.split("_errno_").skip(1).any(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                == "2"
+        })
+        || message.contains("fs_read_stat_failed")
+}
+
+/// Whether `path` exists. `Ok(false)` only for a definite "no such path"; any other failure (a
+/// busy port, a timeout) is an error the caller decides about.
+pub fn fs_exists(addr: &str, path: &str) -> Result<bool> {
+    match fs_stat(addr, path) {
+        Ok(_) => Ok(true),
+        Err(e) if is_not_found(&format!("{e:#}")) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 // ─── FS_HASH ────────────────────────────────────────────────────────────────
@@ -149,26 +182,21 @@ pub fn fs_hash_with_timeout(
     path: &str,
     io_timeout: Option<std::time::Duration>,
 ) -> Result<HashResult> {
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .context("applying fs_hash I/O timeout")?;
-    }
     let body = serde_json::to_vec(&serde_json::json!({ "path": path }))
         .context("serialize fs_hash body")?;
-    c.send_frame(FrameType::FsHash, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_HASH({}): {}",
-            path,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::FsHashAck {
-        bail!("expected FS_HASH_ACK, got {:?}", ft);
-    }
+    // A job over AVA1 (the hash of a multi-GiB file outlives any request deadline); the
+    // caller's timeout is now the whole wait.
+    let resp = mgmt::run_op(
+        addr,
+        mgmt::ops::HASH,
+        &format!("FS_HASH({path})"),
+        &body,
+        &mgmt::JobCall {
+            op_id: 0,
+            subject: path,
+            deadline: io_timeout.unwrap_or(mgmt::DEFAULT_TIMEOUT),
+        },
+    )?;
     let parsed: HashResult =
         serde_json::from_slice(&resp).context("decode FS_HASH_ACK body as JSON")?;
     Ok(parsed)
@@ -206,11 +234,6 @@ pub fn fs_read_with_timeout(
     io_timeout: Option<std::time::Duration>,
     unsafe_read: bool,
 ) -> Result<Vec<u8>> {
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .context("applying fs_read I/O timeout")?;
-    }
     let body = serde_json::to_vec(&serde_json::json!({
         "path": path,
         "offset": offset,
@@ -218,69 +241,19 @@ pub fn fs_read_with_timeout(
         "unsafe": unsafe_read,
     }))
     .context("serialize fs_read body")?;
-    c.send_frame(FrameType::FsRead, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_READ({}): {}",
-            path,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::FsReadAck {
-        bail!("expected FS_READ_ACK, got {:?}", ft);
-    }
+    // The AVA1 transport loops `fs.read` on `eof` until `limit` bytes (at most the legacy
+    // ceiling) have arrived, so the caller sees one call as before.
+    let resp = mgmt::call_with(
+        addr,
+        m::FS_READ,
+        &format!("FS_READ({path})"),
+        &body,
+        io_timeout,
+    )?;
     Ok(resp)
 }
 
 // ─── Destructive ops (delete / move / chmod / mkdir) ────────────────────────
-
-/// Send a management-port frame that expects an empty ACK body (or an
-/// error frame). Used for delete/move/chmod/mkdir which have no data
-/// to return on success — the frame type itself is the confirmation.
-fn send_empty_ack_op(
-    addr: &str,
-    frame: FrameType,
-    body: &[u8],
-    expected: FrameType,
-    what: &str,
-) -> Result<()> {
-    send_empty_ack_op_with_timeout(addr, frame, body, expected, what, None)
-}
-
-/// Same as [`send_empty_ack_op`] but with a caller-supplied per-socket
-/// I/O timeout. Used for long-running ops (fs_copy of multi-GiB files,
-/// fs_move that cross-volume falls through to copy) where the default
-/// 30 s read timeout would fire long before the payload finishes the
-/// internal disk-to-disk copy.
-fn send_empty_ack_op_with_timeout(
-    addr: &str,
-    frame: FrameType,
-    body: &[u8],
-    expected: FrameType,
-    what: &str,
-    io_timeout: Option<std::time::Duration>,
-) -> Result<()> {
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .with_context(|| format!("applying {what} I/O timeout"))?;
-    }
-    c.send_frame(frame, body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected {what}: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != expected {
-        bail!("expected {expected:?}, got {ft:?}");
-    }
-    Ok(())
-}
 
 /// Delete a file or directory recursively on the PS5. Path must be under
 /// the payload's writable-root allowlist (/data, /user, /mnt/ext*, /mnt/usb*).
@@ -327,121 +300,33 @@ pub fn fs_delete_with_op_id(
 ) -> Result<()> {
     let body =
         serde_json::to_vec(&serde_json::json!({ "path": path })).context("serialize fs_delete")?;
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .context("applying FS_DELETE I/O timeout")?;
+    match mgmt::run_op(
+        addr,
+        mgmt::ops::DELETE,
+        "FS_DELETE",
+        &body,
+        &mgmt::JobCall {
+            op_id,
+            subject: path,
+            deadline: io_timeout.unwrap_or(mgmt::DEFAULT_TIMEOUT),
+        },
+    ) {
+        Ok(_) => Ok(()),
+        // Cancellation is a non-error outcome from the user's POV (they hit Stop): surface
+        // it distinctly so the engine HTTP layer can return 409 instead of 502, mirroring
+        // fs_copy.
+        Err(e) if is_cancel(&e, "fs_delete_cancelled") => bail!("cancelled"),
+        Err(e) => Err(e),
     }
-    c.send_frame_with_trace(FrameType::FsDelete, &body, op_id)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        let msg = String::from_utf8_lossy(&resp).to_string();
-        // Cancellation is a non-error outcome from the user's POV
-        // (they hit Stop) — surface it distinctly so the engine HTTP
-        // layer can return 409 instead of 502, mirroring fs_copy.
-        if msg == "fs_delete_cancelled" {
-            bail!("cancelled");
-        }
-        bail!("payload rejected FS_DELETE: {msg}");
-    }
-    if ft != FrameType::FsDeleteAck {
-        bail!("expected FS_DELETE_ACK, got {:?}", ft);
-    }
-    Ok(())
 }
 
-/// Copy a file or directory recursively on the PS5. Both `from` and `to`
-/// must pass the writable-root allowlist; `to` must not already exist.
-/// Unlike FS_MOVE (which is rename()-based and errors EXDEV across
-/// mounts), FS_COPY works cross-volume — the payload reads and writes
-/// bytes explicitly.
-pub fn fs_copy(addr: &str, from: &str, to: &str) -> Result<()> {
-    fs_copy_with_timeout(addr, from, to, None)
+/// True when `e` is the payload's own cancel outcome `token`.
+fn is_cancel(e: &anyhow::Error, token: &str) -> bool {
+    e.downcast_ref::<mgmt::MgmtError>()
+        .is_some_and(|m| m.cause == token)
 }
 
-/// Like [`fs_copy`] but with a caller-supplied per-socket I/O timeout.
-/// fs_copy is a single-shot RPC: the payload performs the entire copy
-/// (recursive, multi-GiB capable) and sends a single FS_COPY_ACK at
-/// the end. With the default 30 s socket timeout, copying anything
-/// larger than ~3 GiB on PS5 UFS times out mid-copy and the engine
-/// surfaces as "read frame header" 502. Callers handling user-visible
-/// copies of game-sized images should pass a generous deadline (an
-/// hour or more) so the operation completes naturally.
-pub fn fs_copy_with_timeout(
-    addr: &str,
-    from: &str,
-    to: &str,
-    io_timeout: Option<std::time::Duration>,
-) -> Result<()> {
-    fs_copy_with_op_id(addr, from, to, 0, io_timeout)
-}
-
-/// Like [`fs_copy_with_timeout`] but stamps a caller-chosen op_id
-/// into the FS_COPY frame's trace_id. The payload uses that as the
-/// key into its in-flight ops table — pass the same op_id to
-/// [`fs_op_status`] / [`fs_op_cancel`] from a separate connection to
-/// observe progress or cancel mid-flight. Pass 0 if you don't need
-/// progress/cancel (matches the old behavior).
-pub fn fs_copy_with_op_id(
-    addr: &str,
-    from: &str,
-    to: &str,
-    op_id: u64,
-    io_timeout: Option<std::time::Duration>,
-) -> Result<()> {
-    fs_copy_full(addr, from, to, op_id, io_timeout, false)
-}
-
-/// Like [`fs_copy_with_op_id`] plus an explicit `overwrite` flag.
-///
-/// `overwrite` selects MERGE semantics on the payload side: a colliding file
-/// is replaced, a colliding directory is descended into, and anything in the
-/// destination the source doesn't mention is left alone. Without it the
-/// payload refuses to touch an existing destination (`fs_copy_dest_exists`),
-/// which is the right default for a copy the user hasn't been asked about.
-pub fn fs_copy_full(
-    addr: &str,
-    from: &str,
-    to: &str,
-    op_id: u64,
-    io_timeout: Option<std::time::Duration>,
-    overwrite: bool,
-) -> Result<()> {
-    let body = serde_json::to_vec(&serde_json::json!({
-        "from": from,
-        "to": to,
-        // Numeric, matching the payload's other boolean knobs (it parses
-        // these with a JSON-uint helper, not a bool one).
-        "overwrite": if overwrite { 1 } else { 0 },
-    }))
-    .context("serialize fs_copy")?;
-    let mut c = Connection::connect(addr)?;
-    if let Some(t) = io_timeout {
-        c.set_io_timeout(t)
-            .context("applying FS_COPY I/O timeout")?;
-    }
-    c.send_frame_with_trace(FrameType::FsCopy, &body, op_id)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        let msg = String::from_utf8_lossy(&resp).to_string();
-        // The cancel path is a non-error outcome from the user's
-        // POV; surface it distinctly so the engine job state goes
-        // to "Failed{error: 'cancelled'}" rather than collapsing
-        // into a generic FS_COPY failure.
-        if msg == "fs_copy_cancelled" {
-            bail!("cancelled");
-        }
-        bail!("payload rejected FS_COPY: {msg}");
-    }
-    if ft != FrameType::FsCopyAck {
-        bail!("expected FS_COPY_ACK, got {:?}", ft);
-    }
-    Ok(())
-}
-
-/// Snapshot returned by FS_OP_STATUS. `found = false` means the
+/// Snapshot of a running job. `found = false` means the
 /// op_id is not currently registered (either finished or never
 /// started). Caller should stop polling on `found = false`.
 #[derive(Debug, Clone, Deserialize)]
@@ -463,281 +348,45 @@ pub struct FsOpSnapshot {
     pub cancel_requested: bool,
 }
 
-/// Poll the payload for the current state of an in-flight FS op.
-/// Used by the engine's progress-tracker task while the FS_COPY
-/// connection is blocked waiting for FS_COPY_ACK; this opens a
-/// second mgmt-port connection so the two requests don't serialize
-/// behind each other on the payload's worker pool.
+/// Ask the console for the current state of an in-flight job (a delete, a checksum, ...).
 pub fn fs_op_status(addr: &str, op_id: u64) -> Result<FsOpSnapshot> {
-    let mut c = Connection::connect(addr)?;
-    // Short timeout — status calls should return in milliseconds. A
-    // hung payload here would otherwise stall the poller every
-    // iteration; bailing fast lets the next tick try a fresh
-    // connection.
-    c.set_io_timeout(std::time::Duration::from_secs(5))
-        .context("applying FS_OP_STATUS I/O timeout")?;
-    let body = serde_json::to_vec(&serde_json::json!({ "op_id": op_id }))
-        .context("serialize fs_op_status body")?;
-    c.send_frame(FrameType::FsOpStatus, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_OP_STATUS({op_id}): {}",
-            String::from_utf8_lossy(&resp)
-        );
+    // An operation the AVA1 transport runs as a job (delete, ...): its progress is the job's.
+    if let Some(found) = mgmt::op_progress(addr, op_id)? {
+        return Ok(match found {
+            Some(p) => FsOpSnapshot {
+                found: true,
+                op_id,
+                kind: p.kind,
+                from: p.subject,
+                to: String::new(),
+                total_bytes: p.bytes_total,
+                bytes_copied: p.bytes_done,
+                cancel_requested: p.cancel_requested,
+            },
+            None => FsOpSnapshot {
+                found: false,
+                op_id: 0,
+                kind: String::new(),
+                from: String::new(),
+                to: String::new(),
+                total_bytes: 0,
+                bytes_copied: 0,
+                cancel_requested: false,
+            },
+        });
     }
-    if ft != FrameType::FsOpStatusAck {
-        bail!("expected FS_OP_STATUS_ACK, got {:?}", ft);
-    }
-    let parsed: FsOpSnapshot =
-        serde_json::from_slice(&resp).context("decode FS_OP_STATUS_ACK body")?;
-    Ok(parsed)
+    // No registered transport: nothing is running under `op_id` that this process could ask about.
+    Err(mgmt::helper_not_ava1("FS_OP_STATUS"))
 }
 
 /// Send FS_OP_CANCEL to the payload. Returns true if the op was
 /// found and the cancel flag was set; false if the op_id wasn't
 /// recognized (already finished or never registered).
 pub fn fs_op_cancel(addr: &str, op_id: u64) -> Result<bool> {
-    let mut c = Connection::connect(addr)?;
-    c.set_io_timeout(std::time::Duration::from_secs(5))
-        .context("applying FS_OP_CANCEL I/O timeout")?;
-    let body = serde_json::to_vec(&serde_json::json!({ "op_id": op_id }))
-        .context("serialize fs_op_cancel body")?;
-    c.send_frame(FrameType::FsOpCancel, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_OP_CANCEL({op_id}): {}",
-            String::from_utf8_lossy(&resp)
-        );
+    if let Some(found) = mgmt::op_cancel(addr, op_id)? {
+        return Ok(found);
     }
-    if ft != FrameType::FsOpCancelAck {
-        bail!("expected FS_OP_CANCEL_ACK, got {:?}", ft);
-    }
-    #[derive(Deserialize)]
-    struct AckBody {
-        found: bool,
-    }
-    let parsed: AckBody = serde_json::from_slice(&resp).context("decode FS_OP_CANCEL_ACK body")?;
-    Ok(parsed.found)
-}
-
-// ─── robust (drop-tolerant) copy ───────────────────────────────────────────
-//
-// A bare `fs_copy_with_op_id` holds ONE connection for the entire copy and
-// fails the moment that connection blips — but the payload's `cp_rf` keeps
-// copying even after the connection drops (it doesn't read the socket during
-// the byte loop). On a 25 GB USB→internal copy over flaky Wi-Fi this surfaced
-// as "read frame header" 9 min in, with a half-copied file and a perfectly
-// healthy copy still running on the console (HW: Bloodborne).
-//
-// `fs_copy_robust` fires the copy with an op_id, then tracks COMPLETION by
-// polling `fs_op_status` on fresh short-lived connections. A dropped copy
-// connection or a dropped poll is irrelevant — we resync on the next tick. The
-// copy is done when the op reports all bytes written; it failed only if the op
-// vanished short of the total (and the worker thread confirms a hard error), or
-// if byte progress flatlines past the stall deadline.
-
-/// One poll's decision in the robust-copy loop. Pure + unit-tested.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CopyPollVerdict {
-    /// Every expected byte landed — the copy is complete.
-    Done,
-    /// Still progressing (or the op hasn't appeared yet) — keep polling.
-    Continue,
-    /// The op vanished before completion — defer to the worker thread's result
-    /// (it holds the real success/error verdict).
-    OpEnded,
-    /// No byte progress past the stall deadline — give up.
-    Stalled,
-}
-
-/// Decide from one poll. `found`/`ever_found` = op presence now / ever;
-/// `max_copied` = running max bytes observed; `total` = op total_bytes (0 =
-/// not known yet); `idle_secs` = seconds since `max_copied` last advanced.
-pub(crate) fn copy_progress_verdict(
-    found: bool,
-    ever_found: bool,
-    max_copied: u64,
-    total: u64,
-    idle_secs: u64,
-    stall_secs: u64,
-) -> CopyPollVerdict {
-    // All bytes written → done, regardless of connection state.
-    if total > 0 && max_copied >= total {
-        return CopyPollVerdict::Done;
-    }
-    if !found {
-        // Op gone. If we'd ever seen it, the copy ended short of total — the
-        // worker thread has the real verdict (clean ACK that raced our poll, or
-        // a hard error). If we never saw it, the poll raced the op registering;
-        // keep going until the stall deadline.
-        if ever_found {
-            return CopyPollVerdict::OpEnded;
-        }
-        return if idle_secs >= stall_secs {
-            CopyPollVerdict::OpEnded
-        } else {
-            CopyPollVerdict::Continue
-        };
-    }
-    if idle_secs >= stall_secs {
-        CopyPollVerdict::Stalled
-    } else {
-        CopyPollVerdict::Continue
-    }
-}
-
-/// Best-effort size of a single file (lists the parent dir, finds the entry).
-/// None for a directory / missing / unreadable. Used to verify a copy actually
-/// landed when the connection dropped at the finish line.
-fn file_size(addr: &str, path: &str) -> Option<u64> {
-    let (parent, name) = path.rsplit_once('/')?;
-    let parent = if parent.is_empty() { "/" } else { parent };
-    let listing = list_dir(addr, parent, ListDirOptions::default()).ok()?;
-    listing
-        .entries
-        .iter()
-        .find(|e| e.name == name && e.kind == "file")
-        .map(|e| e.size)
-}
-
-/// Drop-tolerant copy. `op_id` must be non-zero so the copy is trackable; the
-/// caller can poll `fs_op_status(op_id)` independently for a progress bar.
-/// `stall` is the no-byte-progress deadline before we declare it stuck.
-pub fn fs_copy_robust(
-    addr: &str,
-    from: &str,
-    to: &str,
-    op_id: u64,
-    stall: std::time::Duration,
-    // Merge into an existing destination rather than refusing it. See
-    // `fs_copy_full`.
-    overwrite: bool,
-) -> Result<()> {
-    let (a, f, t) = (addr.to_string(), from.to_string(), to.to_string());
-    // Fire the copy on a worker thread. A generous 4h cap covers a huge image
-    // on slow USB; the thread returns Ok on the ACK, or Err if its connection
-    // drops (tolerated — the console keeps copying) or the payload rejects it
-    // pre-flight (e.g. dest_exists — that we DO surface fast).
-    let mut worker: Option<std::thread::JoinHandle<Result<()>>> =
-        Some(std::thread::spawn(move || {
-            fs_copy_full(
-                &a,
-                &f,
-                &t,
-                op_id,
-                Some(std::time::Duration::from_secs(4 * 3600)),
-                overwrite,
-            )
-        }));
-
-    let mut max_copied: u64 = 0;
-    let mut total: u64 = 0;
-    let mut ever_found = false;
-    let mut last_advance = std::time::Instant::now();
-
-    // True once we know the copy actually landed (all bytes written), so a
-    // late connection-drop error from the worker can't override success.
-    let complete = |max: u64, tot: u64| tot > 0 && max >= tot;
-
-    loop {
-        // Reap the worker if it finished. A clean ACK = done. A pre-flight
-        // rejection (op never registered) = surface it FAST. A connection-drop
-        // error WHILE copying is ignored — the console keeps going; we track it
-        // via fs_op_status below.
-        if worker.as_ref().is_some_and(|h| h.is_finished()) {
-            let r = worker
-                .take()
-                .unwrap()
-                .join()
-                .map_err(|_| anyhow::anyhow!("copy worker panicked"))?;
-            match r {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if complete(max_copied, total) {
-                        return Ok(());
-                    }
-                    if !ever_found {
-                        return Err(e); // never started → real pre-flight reject
-                    }
-                    // else: dropped mid-copy — fall through and keep polling.
-                }
-            }
-        }
-
-        std::thread::sleep(std::time::Duration::from_secs(2));
-
-        match fs_op_status(addr, op_id) {
-            Ok(s) => {
-                if s.found {
-                    ever_found = true;
-                    if s.total_bytes > 0 {
-                        total = s.total_bytes;
-                    }
-                    if s.bytes_copied > max_copied {
-                        max_copied = s.bytes_copied;
-                        last_advance = std::time::Instant::now();
-                    }
-                }
-                let idle = last_advance.elapsed().as_secs();
-                match copy_progress_verdict(
-                    s.found,
-                    ever_found,
-                    max_copied,
-                    total,
-                    idle,
-                    stall.as_secs(),
-                ) {
-                    CopyPollVerdict::Done => return Ok(()),
-                    CopyPollVerdict::Continue => {}
-                    CopyPollVerdict::Stalled => {
-                        return Err(anyhow::anyhow!(
-                            "copy stalled: no progress for {}s ({} of {} bytes)",
-                            stall.as_secs(),
-                            max_copied,
-                            total
-                        ));
-                    }
-                    CopyPollVerdict::OpEnded => {
-                        // Op gone short of total. If the worker already returned
-                        // a clean ACK we'd have returned above; this is either a
-                        // genuine failure OR the op released in the gap after a
-                        // dropped connection but the bytes really all landed.
-                        // Verify the file on disk before declaring failure.
-                        if let Some(sz) = file_size(addr, to) {
-                            if total == 0 || sz >= total {
-                                return Ok(());
-                            }
-                        }
-                        if let Some(h) = worker.take() {
-                            return h
-                                .join()
-                                .map_err(|_| anyhow::anyhow!("copy worker panicked"))?;
-                        }
-                        return Err(anyhow::anyhow!(
-                            "copy ended before completion ({} of {} bytes)",
-                            max_copied,
-                            total
-                        ));
-                    }
-                }
-            }
-            Err(_) => {
-                // Poll-connection blip — must not kill a copy that's still
-                // running. The worker reap at the top handles a finished worker;
-                // here we only guard against a total flatline.
-                if last_advance.elapsed() >= stall {
-                    return Err(anyhow::anyhow!(
-                        "copy stalled: status unreachable + no progress for {}s",
-                        stall.as_secs()
-                    ));
-                }
-            }
-        }
-    }
+    Err(mgmt::helper_not_ava1("FS_OP_CANCEL"))
 }
 
 // ─── FS_MOUNT / FS_UNMOUNT ─────────────────────────────────────────────────
@@ -811,7 +460,6 @@ pub fn fs_mount(
     mount_point: Option<&str>,
     read_only: bool,
 ) -> Result<MountResult> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::to_vec(&serde_json::json!({
         "image_path": image_path,
         "mount_name": mount_name,
@@ -819,19 +467,7 @@ pub fn fs_mount(
         "read_only": if read_only { 1 } else { 0 },
     }))
     .context("serialize fs_mount body")?;
-    c.send_frame(FrameType::FsMount, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected FS_MOUNT({}): {}",
-            image_path,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::FsMountAck {
-        bail!("expected FS_MOUNT_ACK, got {:?}", ft);
-    }
+    let resp = mgmt::call_as(addr, m::FS_MOUNT, &format!("FS_MOUNT({image_path})"), &body)?;
     let parsed: MountResult =
         serde_json::from_slice(&resp).context("decode FS_MOUNT_ACK body as JSON")?;
     Ok(parsed)
@@ -843,13 +479,8 @@ pub fn fs_mount(
 pub fn fs_unmount(addr: &str, mount_point: &str) -> Result<()> {
     let body = serde_json::to_vec(&serde_json::json!({ "mount_point": mount_point }))
         .context("serialize fs_unmount")?;
-    send_empty_ack_op(
-        addr,
-        FrameType::FsUnmount,
-        &body,
-        FrameType::FsUnmountAck,
-        "FS_UNMOUNT",
-    )
+    mgmt::call(addr, m::FS_UNMOUNT, &body)?;
+    Ok(())
 }
 
 /// Rename/move a file or directory intra-volume. Cross-volume moves
@@ -871,14 +502,8 @@ pub fn fs_move_with_timeout(
 ) -> Result<()> {
     let body = serde_json::to_vec(&serde_json::json!({ "from": from, "to": to }))
         .context("serialize fs_move")?;
-    send_empty_ack_op_with_timeout(
-        addr,
-        FrameType::FsMove,
-        &body,
-        FrameType::FsMoveAck,
-        "FS_MOVE",
-        io_timeout,
-    )
+    mgmt::call_with(addr, m::FS_RENAME, "FS_MOVE", &body, io_timeout)?;
+    Ok(())
 }
 
 /// Change permissions. `mode` is octal like "0777" (passed as string so
@@ -906,14 +531,23 @@ pub fn fs_chmod_with_timeout(
         "recursive": if recursive { 1 } else { 0 },
     }))
     .context("serialize fs_chmod")?;
-    send_empty_ack_op_with_timeout(
-        addr,
-        FrameType::FsChmod,
-        &body,
-        FrameType::FsChmodAck,
-        "FS_CHMOD",
-        io_timeout,
-    )
+    if recursive {
+        // The walk of a big tree is a job (progress, cancel, no socket held for minutes).
+        mgmt::run_op(
+            addr,
+            mgmt::ops::CHMOD_R,
+            "FS_CHMOD",
+            &body,
+            &mgmt::JobCall {
+                op_id: 0,
+                subject: path,
+                deadline: io_timeout.unwrap_or(mgmt::DEFAULT_TIMEOUT),
+            },
+        )?;
+        return Ok(());
+    }
+    mgmt::call_with(addr, m::FS_CHMOD, "FS_CHMOD", &body, io_timeout)?;
+    Ok(())
 }
 
 /// Create a directory (and any missing parents). Idempotent — succeeds
@@ -921,18 +555,13 @@ pub fn fs_chmod_with_timeout(
 pub fn fs_mkdir(addr: &str, path: &str) -> Result<()> {
     let body =
         serde_json::to_vec(&serde_json::json!({ "path": path })).context("serialize fs_mkdir")?;
-    send_empty_ack_op(
-        addr,
-        FrameType::FsMkdir,
-        &body,
-        FrameType::FsMkdirAck,
-        "FS_MKDIR",
-    )
+    mgmt::call(addr, m::FS_MKDIR, &body)?;
+    Ok(())
 }
 
 // ─── App lifecycle (register / unregister / launch / list) ─────────────────
 //
-// Mirrors the payload's register.c pipeline. See ftx2-proto's lib.rs
+// Mirrors the payload's register.c pipeline. See the payload's register.c
 // FrameType doc comments for the wire shape (the standalone specs/
 // directory was consolidated into in-tree doc comments).
 // "Register" stages + installs a title dir; "Launch" calls
@@ -960,29 +589,27 @@ pub struct RegisterResult {
 /// `"PSN"` or `"disc"` and the launcher rejects it. Invasive:
 /// modifies the user's source file in place, so it's opt-in.
 pub fn app_register(addr: &str, src_path: &str, patch_drm_type: bool) -> Result<RegisterResult> {
-    let mut c = Connection::connect(addr)?;
     let body = serde_json::to_vec(&serde_json::json!({
         "src_path": src_path,
         "patch_drm_type": if patch_drm_type { 1 } else { 0 },
     }))
     .context("serialize app_register body")?;
-    c.send_frame(FrameType::AppRegister, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APP_REGISTER({}): {}",
-            src_path,
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppRegisterAck {
-        bail!("expected APP_REGISTER_ACK, got {:?}", ft);
-    }
+    // A register can run 10 s or more (copy of the metadata, the nullfs mount, Sony's installer
+    // under its lock), so it gets the 60 s deadline a launch has.
+    let resp = mgmt::call_with(
+        addr,
+        m::APP_REGISTER,
+        &format!("APP_REGISTER({src_path})"),
+        &body,
+        Some(SONY_CALL_TIMEOUT),
+    )?;
     let parsed: RegisterResult =
         serde_json::from_slice(&resp).context("decode APP_REGISTER_ACK body as JSON")?;
     Ok(parsed)
 }
+
+/// The deadline of the Sony-lock calls that can queue behind one another or run long.
+const SONY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Reverse of `app_register`. Unmounts the nullfs at
 /// `/system_ex/app/<title_id>/`, removes tracking link files, and
@@ -1019,19 +646,14 @@ impl UnregisterOutcome {
 pub fn app_unregister(addr: &str, title_id: &str) -> Result<UnregisterOutcome> {
     let body = serde_json::to_vec(&serde_json::json!({ "title_id": title_id }))
         .context("serialize app_unregister body")?;
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppUnregister, &body)?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APP_UNREGISTER: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppUnregisterAck {
-        bail!("expected APP_UNREGISTER_ACK, got {ft:?}");
-    }
+    // On FW 13.60 the unregister repeats for two records and can run 10 s or more: 60 s deadline.
+    let resp = mgmt::call_with(
+        addr,
+        m::APP_UNREGISTER,
+        "APP_UNREGISTER",
+        &body,
+        Some(SONY_CALL_TIMEOUT),
+    )?;
     // Older payloads answer with an empty body — treat that as "Sony's
     // result unknown", i.e. 0, rather than failing the call.
     let rc = serde_json::from_slice::<serde_json::Value>(&resp)
@@ -1055,14 +677,14 @@ pub fn app_unregister(addr: &str, title_id: &str) -> Result<UnregisterOutcome> {
 pub fn app_launch(addr: &str, title_id: &str) -> Result<()> {
     let body = serde_json::to_vec(&serde_json::json!({ "title_id": title_id }))
         .context("serialize app_launch body")?;
-    send_empty_ack_op_with_timeout(
+    mgmt::call_with(
         addr,
-        FrameType::AppLaunch,
-        &body,
-        FrameType::AppLaunchAck,
+        m::APP_LAUNCH,
         "APP_LAUNCH",
-        Some(std::time::Duration::from_secs(60)),
-    )
+        &body,
+        Some(SONY_CALL_TIMEOUT),
+    )?;
+    Ok(())
 }
 
 /// One entry returned by `app_list_registered`.
@@ -1095,19 +717,8 @@ pub struct RegisteredApps {
 /// old `list_sqlite_unavailable` failure is no longer reachable — callers
 /// that still map it are harmless, and older payloads can still send it.
 pub fn app_list_registered(addr: &str) -> Result<RegisteredApps> {
-    let mut c = Connection::connect(addr)?;
-    c.send_frame(FrameType::AppListRegistered, &[])?;
-    let (hdr, resp) = c.recv_frame()?;
-    let ft = hdr.frame_type().unwrap_or(FrameType::Error);
-    if ft == FrameType::Error {
-        bail!(
-            "payload rejected APP_LIST_REGISTERED: {}",
-            String::from_utf8_lossy(&resp)
-        );
-    }
-    if ft != FrameType::AppListRegisteredAck {
-        bail!("expected APP_LIST_REGISTERED_ACK, got {:?}", ft);
-    }
+    // Over AVA1 the transport pages the list (a reply holds ~1,700 entries) and returns one document.
+    let resp = mgmt::call(addr, m::APP_LIST, &[])?;
     let parsed: RegisteredApps =
         serde_json::from_slice(&resp).context("decode APP_LIST_REGISTERED_ACK body as JSON")?;
     Ok(parsed)
@@ -1209,8 +820,8 @@ pub struct ReconcileFile {
 /// dir-diff-preview. Two problems this gate solves:
 ///
 ///   1. mgmt-port storm: without serialization, several 800+-call remote walks
-///      run at once, each opening a *fresh* mgmt-port (9114) connection per
-///      directory (mgmt is one-frame-per-connection). That connection storm
+///      run at once, each opening a management call per
+///      directory. That connection storm
 ///      overran the payload's small accept backlog + 8-thread mgmt cap and
 ///      wedged/crashed the helper (reported on "it takes two", ~863 dirs → red
 ///      helper, failed upload, shards_incomplete, fs_delete_failed).
@@ -1585,11 +1196,7 @@ pub fn reconcile(
                     // 30 s socket timeout would multiply N files × 30 s
                     // on a crashed payload — at hundreds of files the
                     // user would think the app is dead.
-                    match fs_hash_with_timeout(
-                        addr,
-                        &remote_path,
-                        Some(std::time::Duration::from_secs(10)),
-                    ) {
+                    match hash_remote_waiting_out_busy(addr, &remote_path)? {
                         Ok(r) => local_hash != r.hash,
                         Err(e) => {
                             crate::core_log!(
@@ -1624,6 +1231,31 @@ pub fn reconcile(
         already_present,
         bytes_already_present,
     })
+}
+
+/// `ERR_BUSY` (AVA1 status 8): the console has no free job slot or operation worker right now.
+const STATUS_BUSY: u16 = 8;
+
+/// Hashes one remote file for the reconcile. A busy console is not an answer about the file:
+/// waiting it out (up to ~15 s) is right, and giving up is an error of the whole reconcile, never a
+/// silent "unverified, must re-send" (which would re-upload everything while the console is merely
+/// working). Any other failure is the inner `Err`, which the caller treats as unverified.
+fn hash_remote_waiting_out_busy(addr: &str, remote_path: &str) -> Result<Result<HashResult>> {
+    for attempt in 0..60 {
+        match fs_hash_with_timeout(addr, remote_path, Some(std::time::Duration::from_secs(10))) {
+            Err(e)
+                if e.downcast_ref::<mgmt::MgmtError>()
+                    .is_some_and(|m| m.status == STATUS_BUSY) =>
+            {
+                if attempt == 59 {
+                    return Err(e.context("reconcile: the console stayed busy"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            r => return Ok(r),
+        }
+    }
+    unreachable!("the loop returns on its last attempt")
 }
 
 /// Stream a local file through BLAKE3 in 64 KiB chunks. Mirrors the
@@ -1757,60 +1389,6 @@ mod tests {
 
     use super::*;
 
-    // ── robust-copy poll verdict (the 25 GB USB copy stability fix) ──
-    #[test]
-    fn copy_verdict_done_when_all_bytes_landed() {
-        // All bytes written → Done regardless of connection / op presence.
-        assert_eq!(
-            copy_progress_verdict(true, true, 25_000, 25_000, 0, 180),
-            CopyPollVerdict::Done
-        );
-        // Even if the op already vanished (released right at completion).
-        assert_eq!(
-            copy_progress_verdict(false, true, 25_000, 25_000, 0, 180),
-            CopyPollVerdict::Done
-        );
-    }
-
-    #[test]
-    fn copy_verdict_continue_while_progressing() {
-        // Mid-copy, bytes advancing (idle below stall) → keep polling — a
-        // dropped copy connection must NOT abort this.
-        assert_eq!(
-            copy_progress_verdict(true, true, 10_000, 25_000, 4, 180),
-            CopyPollVerdict::Continue
-        );
-        // Op not seen yet (poll raced the register) → keep waiting.
-        assert_eq!(
-            copy_progress_verdict(false, false, 0, 0, 2, 180),
-            CopyPollVerdict::Continue
-        );
-    }
-
-    #[test]
-    fn copy_verdict_stalled_on_flatline() {
-        // Op present but zero progress past the deadline → genuinely stuck.
-        assert_eq!(
-            copy_progress_verdict(true, true, 10_000, 25_000, 181, 180),
-            CopyPollVerdict::Stalled
-        );
-    }
-
-    #[test]
-    fn copy_verdict_op_ended_defers_to_worker() {
-        // Op vanished short of total after being seen → the worker thread holds
-        // the real verdict (clean ACK that raced our poll, or a hard error).
-        assert_eq!(
-            copy_progress_verdict(false, true, 10_000, 25_000, 4, 180),
-            CopyPollVerdict::OpEnded
-        );
-        // Never-seen op past the stall deadline → also defer (it never started).
-        assert_eq!(
-            copy_progress_verdict(false, false, 0, 0, 181, 180),
-            CopyPollVerdict::OpEnded
-        );
-    }
-
     /// All gate tests below manipulate the process-global RECONCILE_KEYS set.
     /// cargo runs tests in parallel by default, so without forcing them
     /// sequential, one test holding a key makes another's "free" assertion
@@ -1924,10 +1502,10 @@ mod tests {
     fn preview_bails_before_local_walk_when_gate_held() {
         let _serial = GATE_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // Hold the console key the reconcile below will try to reserve.
-        let _held = acquire_reconcile_gate(vec!["addr:127.0.0.1:9114".to_string()], true).unwrap();
+        let _held = acquire_reconcile_gate(vec!["addr:127.0.0.1".to_string()], true).unwrap();
         let missing = std::path::Path::new("/this/path/should/not/exist/ps5upload-test");
         let err = reconcile(
-            "127.0.0.1:9114",
+            "127.0.0.1",
             missing,
             "/data/whatever",
             ReconcileMode::Fast,
@@ -2013,5 +1591,58 @@ mod tests {
         assert!(!inv.contains_key(".git/HEAD"));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A console that answers `ERR_BUSY` to the first `busy` hash jobs, then hashes.
+    struct BusyThenOk {
+        busy: std::sync::atomic::AtomicUsize,
+    }
+
+    impl mgmt::MgmtTransport for BusyThenOk {
+        fn call(
+            &self,
+            _: &str,
+            _: mgmt::Method,
+            _: &str,
+            _: &[u8],
+            _: std::time::Duration,
+        ) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn run_job(
+            &self,
+            _: &str,
+            _: mgmt::JobOp,
+            label: &str,
+            _: &[u8],
+            _: &mgmt::JobCall<'_>,
+        ) -> Result<Option<Vec<u8>>> {
+            use std::sync::atomic::Ordering;
+            if self
+                .busy
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(mgmt::MgmtError {
+                    label: label.into(),
+                    status: STATUS_BUSY,
+                    cause: "the job table is full".into(),
+                }
+                .into());
+            }
+            Ok(Some(br#"{"path":"/p","size":1,"hash":"ab"}"#.to_vec()))
+        }
+    }
+
+    #[test]
+    fn a_busy_console_is_waited_out_never_read_as_must_resend() {
+        let _g = mgmt::scoped_transport(std::sync::Arc::new(BusyThenOk { busy: 3.into() }));
+        let r = hash_remote_waiting_out_busy("c:1", "/p").unwrap().unwrap();
+        assert_eq!(r.hash, "ab");
+        // Busy for good is an error of the whole reconcile, not an `Ok(Err(..))` the caller would
+        // turn into "unverified".
+        let _g = mgmt::scoped_transport(std::sync::Arc::new(BusyThenOk { busy: 1000.into() }));
+        assert!(hash_remote_waiting_out_busy("c:1", "/p").is_err());
     }
 }

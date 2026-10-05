@@ -16,6 +16,7 @@ import { useUploadSettingsStore } from "../state/uploadSettings";
 import { getEngineUrl } from "../state/engine";
 import { Spinner } from "../components/Spinner";
 import { hostOf } from "../lib/addr";
+import { sessionNeedsAttention } from "../lib/consoleSession";
 
 /**
  * App-footer status strip: engine + payload liveness, plus the versions
@@ -33,6 +34,7 @@ export default function StatusBar() {
   const engineStatus = useConnectionStore((s) => s.engineStatus);
   const engineError = useConnectionStore((s) => s.engineError);
   const payloadStatus = useConnectionStore((s) => s.payloadStatus);
+  const session = useConnectionStore((s) => s.session);
   const payloadVersion = useConnectionStore((s) => s.payloadVersion);
   const ps5Kernel = useConnectionStore((s) => s.ps5Kernel);
   const ps5Firmware = parsePS5Firmware(ps5Kernel);
@@ -49,9 +51,11 @@ export default function StatusBar() {
     ? profiles.filter((p) => p.id !== activeProfile?.id)
     : [];
 
-  const dot = (status: "up" | "down" | "unknown") => {
+  const dot = (status: "up" | "down" | "unknown", warn = false) => {
     const color =
-      status === "up"
+      warn
+        ? "bg-[var(--color-warn)]"
+        : status === "up"
         ? "bg-[var(--color-good)]"
         : status === "down"
           ? "bg-[var(--color-bad)]"
@@ -79,10 +83,17 @@ export default function StatusBar() {
   // Pack the connection state, kernel build and helper version into one
   // hover string. Reads top-to-bottom: are we connected, what firmware,
   // what helper build.
+  // The one probe's verdict: a console that answers but needs pairing, or an
+  // update, is not "connected" and not "down" either.
+  const sessionWarn = sessionNeedsAttention(session);
   const ps5Tooltip = [
-    ps5Connected
-      ? tr("status_ps5_connected", undefined, "Connected")
-      : tr("status_ps5_disconnected", undefined, "Not connected"),
+    sessionWarn && session === "needs_pairing"
+      ? tr("status_ps5_needs_pairing", undefined, "Needs pairing")
+      : sessionWarn
+        ? tr("status_ps5_helper_old", undefined, "Older helper, update it")
+        : ps5Connected
+          ? tr("status_ps5_connected", undefined, "Connected")
+          : tr("status_ps5_disconnected", undefined, "Not connected"),
     ps5Kernel || null,
     payloadVersion
       ? tr(
@@ -117,7 +128,7 @@ export default function StatusBar() {
 
       {/* Group 2 — the PS5 console (helper + firmware). */}
       <div className="flex items-center gap-2" title={ps5Tooltip}>
-        {dot(payloadStatus)}
+        {dot(payloadStatus, sessionWarn)}
         <span className={ps5Connected ? undefined : "opacity-70"}>
           {ps5Name}
         </span>
@@ -151,7 +162,7 @@ export default function StatusBar() {
                     profileAccentForHost(p.host, profiles) ?? "transparent",
                 }}
               >
-                {dot(rt.payloadStatus)}
+                {dot(rt.payloadStatus, sessionNeedsAttention(rt.session))}
               </span>
             );
           })}

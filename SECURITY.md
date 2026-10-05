@@ -32,9 +32,11 @@ reports are taken seriously and prioritized.
 
 ## Scope
 
-ps5upload talks to a **jailbroken PS5 over a trusted LAN**. The FTX2
-transfer protocol is optimized for speed, not authentication, and is not
-designed to be exposed to untrusted networks — see the README's FAQ. The
+ps5upload talks to a **jailbroken PS5 over a LAN**. The AVA1 protocol
+(port 9120) uses the Noise XX handshake and encrypts and authenticates
+every byte; the console only accepts devices that were paired by comparing
+a six-digit code, or the engine that launched it. Weaknesses in pairing,
+the handshake, or AVA1's message parsers are squarely in scope. The
 local engine binds loopback (`127.0.0.1:19113`) and rejects non-loopback
 callers except the PS5-facing `/pkg-host/` route. Reports most in scope:
 
