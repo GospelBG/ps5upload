@@ -9837,11 +9837,13 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
     let app = if let Ok(base) = std::env::var("PS5UPLOAD_BASE_URL") {
         let base = base.trim_end_matches('/');
         if !base.is_empty() {
+            // Format Base URL
             let base = if !base.starts_with('/') {
                 format!("/{}", base)
             } else {
                 base.to_string()
             };
+            // Create Axum Router using the base URL as a prefix for all routes.
             axum::Router::new()
                 .nest(&base, app)
                 .route(&format!("{}/", base), get(ui_handler))
